@@ -5,6 +5,8 @@
 #include <faabric/scheduler/Scheduler.h>
 #include <faabric/transport/MessageEndpointServer.h>
 
+#include <list>
+
 namespace faabric::scheduler {
 class FunctionCallServer final
   : public faabric::transport::MessageEndpointServer
@@ -34,5 +36,7 @@ class FunctionCallServer final
     void recvResetMaxReplicas(std::span<const uint8_t> buffer);
 
     void recvResetParameter(std::span<const uint8_t> buffer);
+
+    void recvExecuteFunctionsBatch(std::span<const uint8_t> buffer);
 };
 }

@@ -492,6 +492,9 @@ void PlannerEndpointHandler::onRequest(
             else if (parameter == "is_repartition"){
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             }
+            else if (parameter == "dispatch_period"){
+                faabric::planner::getPlanner().resetParameter(parameter, value, true);
+            }
             else {
                 SPDLOG_ERROR("Unrecognized parameter {}", parameter);
                 response.result(beast::http::status::bad_request);

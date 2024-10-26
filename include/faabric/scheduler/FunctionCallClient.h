@@ -8,6 +8,8 @@
 #include <faabric/util/concurrent_map.h>
 #include <faabric/util/config.h>
 
+#include <list>
+
 namespace faabric::scheduler {
 
 // -----------------------------------
@@ -53,6 +55,9 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
 
     void resetParameter(
       std::shared_ptr<faabric::planner::ResetStreamParameterRequest> req);
+
+    void executeFunctionsBatch(
+      std::list<std::shared_ptr<faabric::BatchExecuteRequest>> reqs);
 };
 
 // -----------------------------------

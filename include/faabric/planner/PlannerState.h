@@ -6,7 +6,9 @@
 #include <faabric/planner/planner.pb.h>
 #include <faabric/proto/faabric.pb.h>
 
+#include <list>
 #include <map>
+#include <shared_mutex>
 
 namespace faabric::planner {
 /* This helper struct encapsulates the internal state of the planner
@@ -40,6 +42,12 @@ struct PlannerState
 
     // MAP<chainedId, in_flight_counting> Map of inflight chained requests.
     std::map<int, int> inFlightChains;
+
+    std::shared_mutex  scheduledRequestsMapMx;
+    // MAP<host, list<BatchExecuteRequest>> shceduled but not yet executed
+    // requests.
+    std::map<std::string, std::list<std::shared_ptr<BatchExecuteRequest>>>
+      scheduledRequestsMap;
 
     // The metrics for each function-parallelismId
     // Map<User-Function-ParallelismId, Metrics>

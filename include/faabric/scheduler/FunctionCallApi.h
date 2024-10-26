@@ -11,5 +11,6 @@ enum FunctionCalls
     ResetBatchsize = 5,
     ResetMaxReplicas = 6,
     ResetParameter = 7,
+    ExecuteFunctionsBatch = 8,
 };
 }

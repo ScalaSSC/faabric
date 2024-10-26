@@ -100,14 +100,19 @@ Planner::Planner()
     isPreloadParallelism = faabric::util::getSystemConfig().preloadParallelism;
 
     batchTimerThread = std::thread(&Planner::batchTimerCheck, this);
+    dequeueScheduledRequestsThread =
+      std::thread(&Planner::dequeueScheduledRequests, this);
 }
 
 Planner::~Planner()
 {
     // Stop the batch timer thread
-    stopBatchTimer = true;
+    stopThreadTimer = true;
     if (batchTimerThread.joinable()) {
         batchTimerThread.join();
+    }
+    if (dequeueScheduledRequestsThread.joinable()) {
+        dequeueScheduledRequestsThread.join();
     }
 }
 
@@ -647,7 +652,7 @@ void Planner::enqueueCallBatch(std::shared_ptr<BatchExecuteRequest> req,
 
 void Planner::batchTimerCheck()
 {
-    while (!stopBatchTimer) {
+    while (!stopThreadTimer) {
         // If empty, this thread will be blocked.
         std::shared_ptr<BatchExecuteRequest> req =
           batchExecuteReqQueue.dequeue();
@@ -824,12 +829,55 @@ void Planner::dispatchSchedulingDecision(
             }
         }
 
-        faabric::scheduler::getFunctionCallClient(hostIp)->executeFunctions(
-          hostReq);
+        enqueueScheduledRequests(hostIp, hostReq);
     }
 
     SPDLOG_DEBUG("Finished dispatching {} messages for execution",
                  req->messages_size());
+}
+
+void Planner::enqueueScheduledRequests(std::string host,
+                                       std::shared_ptr<BatchExecuteRequest> req)
+{
+    faabric::util::FullLock lock(state.scheduledRequestsMapMx);
+    state.scheduledRequestsMap[host].push_back(req);
+}
+
+void Planner::dequeueScheduledRequests()
+{
+    while (!stopThreadTimer) {
+        // If empty, this thread will be blocked.
+        faabric::util::FullLock lock(state.scheduledRequestsMapMx);
+        // Create a local filterd copy of the scheduledRequestsMap
+        std::map<std::string, std::list<std::shared_ptr<BatchExecuteRequest>>>
+          reqsCallMap;
+        for (auto& [hostIp, reqsList] : state.scheduledRequestsMap) {
+            if (!reqsList.empty()) {
+                reqsCallMap[hostIp] = reqsList;
+                reqsList.clear();
+            }
+        }
+        lock.unlock();
+
+        std::vector<std::thread> threads;
+        for (auto& [hostIp, reqs] : reqsCallMap) {
+            auto reqsCopy = std::move(reqs);
+
+            threads.emplace_back(
+              [hostIp, reqsCopy = std::move(reqsCopy)]() mutable {
+                  faabric::scheduler::getFunctionCallClient(hostIp)
+                    ->executeFunctionsBatch(reqsCopy);
+              });
+        }
+        // Join all threads to ensure they complete before next iteration
+        for (auto& t : threads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        // Sleep for a while to batch the scheduled requests
+        std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
+    }
 }
 
 int Planner::getInFlightChainsSize()
@@ -927,8 +975,17 @@ bool Planner::resetMaxReplicas(int32_t maxReplicas)
     return true;
 }
 
-bool Planner::resetParameter(const std::string& key, const int32_t value)
-{
+bool Planner::resetParameter(const std::string& key, const int32_t value, bool plannerParameter)
+{   
+    // Reset the parameter of planner
+    if (plannerParameter) {
+        if (key == "dispatch_period") {
+            SPDLOG_INFO("Planner reset dispatchPeriod to {}", value);
+            dispatchPeriod = value;
+        }
+        return true;
+    }
+    // Reset the parameter of the worker hosts
     auto availableHosts = getAvailableHosts();
     faabric::planner::ResetStreamParameterRequest req;
     req.set_parameter(key);

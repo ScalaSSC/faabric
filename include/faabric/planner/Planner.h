@@ -116,7 +116,7 @@ class Planner
 
     bool resetMaxReplicas(int32_t newMaxReplicas);
 
-    bool resetParameter(const std::string& key, const int32_t value);
+    bool resetParameter(const std::string& key, const int32_t value, bool plannerParameter = false);
 
     // ----------
     // Metrics public API
@@ -142,9 +142,12 @@ class Planner
     // Check the waiting queue peroiodically.
     void batchTimerCheck();
 
-    // ---- Batch Execution ----
+    // ---- Batch Execution ---- 
     std::thread batchTimerThread;
-    bool stopBatchTimer = false;
+    bool stopThreadTimer = false;
+
+    // ---- Batch Call Scheduled Requests ----
+    std::thread dequeueScheduledRequestsThread;
 
     bool streamMode = faabric::util::getSystemConfig().streamMode;
     long lastParallelismUpdate;
@@ -180,6 +183,14 @@ class Planner
     void dispatchSchedulingDecision(
       std::shared_ptr<faabric::BatchExecuteRequest> req,
       std::shared_ptr<faabric::batch_scheduler::SchedulingDecision> decision);
+
+    int dispatchPeriod = 20; // ms
+
+    void enqueueScheduledRequests(std::string host,
+                                  std::shared_ptr<BatchExecuteRequest> req);
+
+    void dequeueScheduledRequests();
+
 };
 
 Planner& getPlanner();

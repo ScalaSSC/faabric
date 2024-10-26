@@ -126,6 +126,19 @@ void FunctionCallClient::resetParameter(
     asyncSend(faabric::scheduler::FunctionCalls::ResetParameter, req.get());
 }
 
+void FunctionCallClient::executeFunctionsBatch(
+  std::list<std::shared_ptr<faabric::BatchExecuteRequest>> reqs)
+{
+    // Formulate a batch execute request Batch
+    auto batchReqList = std::make_shared<faabric::BatchExecuteRequestList>();
+    SPDLOG_DEBUG("Batch execute call Batch size: {}", reqs.size());
+    for (auto& req : reqs) {
+        batchReqList->add_batchrequests()->CopyFrom(*req);
+    }
+    asyncSend(faabric::scheduler::FunctionCalls::ExecuteFunctionsBatch,
+              batchReqList.get());
+}
+
 // -----------------------------------
 // Static setter/getters
 // -----------------------------------

@@ -26,6 +26,10 @@ void FunctionCallServer::doAsyncRecv(transport::Message& message)
             recvExecuteFunctions(message.udata());
             break;
         }
+        case faabric::scheduler::FunctionCalls::ExecuteFunctionsBatch: {
+            recvExecuteFunctionsBatch(message.udata());
+            break;
+        }
         case faabric::scheduler::FunctionCalls::ExecuteFunctionsLazy: {
             recvExecuteFunctionsLazy(message.udata());
             break;
@@ -120,6 +124,26 @@ void FunctionCallServer::recvExecuteFunctionsLazy(
 
     scheduler.executeBatchLazy(
       std::make_shared<faabric::BatchExecuteRequest>(parsedMsg));
+}
+
+void FunctionCallServer::recvExecuteFunctionsBatch(
+  std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::BatchExecuteRequestList, buffer.data(), buffer.size())
+
+    auto currentMillis = faabric::util::getGlobalClock().epochMillis();
+    auto endPoint = faabric::util::getSystemConfig().endpointHost;
+    SPDLOG_DEBUG("Batch execute call Batch size: {}", parsedMsg.batchrequests_size());
+    for (int i = 0; i < parsedMsg.batchrequests_size(); i++) {
+        faabric::BatchExecuteRequest batchReq = parsedMsg.batchrequests(i);
+        for (int i = 0; i < batchReq.messages_size(); i++) {
+            batchReq.mutable_messages()->at(i).set_starttimestamp(
+              currentMillis);
+            batchReq.mutable_messages()->at(i).set_executedhost(endPoint);
+        }
+        scheduler.executeBatchLazy(
+          std::make_shared<faabric::BatchExecuteRequest>(batchReq));
+    }
 }
 
 void FunctionCallServer::recvSetMessageResult(std::span<const uint8_t> buffer)
