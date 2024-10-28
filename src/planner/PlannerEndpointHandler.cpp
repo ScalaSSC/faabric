@@ -218,6 +218,7 @@ void PlannerEndpointHandler::onRequest(
             // Parse the message payload
             SPDLOG_DEBUG("Planner received EXECUTE_BATCH request");
             faabric::BatchExecuteRequest rawBer;
+            SPDLOG_DEBUG("RECEIVED EXECUTE_BATCH request {}", msg.payloadjson());
             try {
                 faabric::util::jsonToMessage(msg.payloadjson(), &rawBer);
             } catch (faabric::util::JsonSerialisationException e) {
@@ -226,13 +227,6 @@ void PlannerEndpointHandler::onRequest(
                 return ctx.sendFunction(std::move(response));
             }
             auto ber = std::make_shared<faabric::BatchExecuteRequest>(rawBer);
-
-            // Sanity check the BER
-            if (!faabric::util::isBatchExecRequestValid(ber)) {
-                response.result(beast::http::status::bad_request);
-                response.body() = "Bad BatchExecRequest";
-                return ctx.sendFunction(std::move(response));
-            }
 
             // For Request from the user, we will return false if the waiting
             // queue is too large.
@@ -245,15 +239,7 @@ void PlannerEndpointHandler::onRequest(
             }
             // Execute the BER
             // auto decision = getPlanner().callBatch(ber);
-            getPlanner().enqueueCallBatch(ber);
-
-            // Handle cases where the scheduling failed
-            // In Stream Processing, slots are always enough.
-            // if (*decision == NOT_ENOUGH_SLOTS_DECISION) {
-            //     response.result(beast::http::status::internal_server_error);
-            //     response.body() = "No available hosts";
-            //     return ctx.sendFunction(std::move(response));
-            // }
+            getPlanner().scheduleMessages(ber);
 
             // Prepare the response
             response.result(beast::http::status::ok);
@@ -547,8 +533,8 @@ void PlannerEndpointHandler::onRequest(
                 return ctx.sendFunction(std::move(response));
             }
             auto inFlightApps =
-              faabric::planner::getPlanner().getInFlightReqs();
-            if (inFlightApps.size() > 0){
+              faabric::planner::getPlanner().getInFlightApps();
+            if (inFlightApps > 0){
                 SPDLOG_ERROR("In-flight apps are not empty, can not output result");
                 response.result(beast::http::status::internal_server_error);
                 response.body() = std::string("In-flight Request is not empty");

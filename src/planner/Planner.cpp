@@ -1,6 +1,4 @@
-#include <faabric/batch-scheduler/BatchScheduler.h>
 #include <faabric/batch-scheduler/SchedulingDecision.h>
-#include <faabric/batch-scheduler/StateAwareScheduler.h>
 #include <faabric/planner/Planner.h>
 #include <faabric/proto/faabric.pb.h>
 #include <faabric/scheduler/FunctionCallClient.h>
@@ -28,50 +26,21 @@
 namespace faabric::planner {
 
 // ----------------------
-// Utility Functions
+// Static methods
 // ----------------------
 
-// static void claimHostSlots(std::shared_ptr<Host> host, int slotsToClaim = 1)
-// {
-//     host->set_usedslots(host->usedslots() + slotsToClaim);
-//     assert(host->usedslots() <= host->slots());
-// }
+static faabric::batch_scheduler::HostMap convertToBatchSchedHostMap(
+  std::map<std::string, std::shared_ptr<Host>> hostMapIn)
+{
+    faabric::batch_scheduler::HostMap hostMap;
 
-// static void releaseHostSlots(std::shared_ptr<Host> host, int slotsToRelease =
-// 1)
-// {
-//     host->set_usedslots(host->usedslots() - slotsToRelease);
-//     assert(host->usedslots() >= 0);
-// }
+    for (const auto& [ip, host] : hostMapIn) {
+        hostMap[ip] = std::make_shared<faabric::batch_scheduler::HostState>(
+          host->ip(), host->slots(), host->usedslots());
+    }
 
-// static void printHostState(std::map<std::string, std::shared_ptr<Host>>
-// hostMap,
-//                            const std::string& logLevel = "debug")
-// {
-//     std::string printedText;
-//     std::string header = "\n-------------- Host Map --------------";
-//     std::string subhead = "Ip\t\tSlots";
-//     std::string footer = "--------------------------------------";
-
-//     printedText += header + "\n" + subhead + "\n";
-//     for (const auto& [ip, hostState] : hostMap) {
-//         printedText += fmt::format(
-//           "{}\t{}/{}\n", ip, hostState->usedslots(), hostState->slots());
-//     }
-//     printedText += footer;
-
-//     if (logLevel == "debug") {
-//         SPDLOG_DEBUG(printedText);
-//     } else if (logLevel == "info") {
-//         SPDLOG_INFO(printedText);
-//     } else if (logLevel == "warn") {
-//         SPDLOG_WARN(printedText);
-//     } else if (logLevel == "error") {
-//         SPDLOG_ERROR(printedText);
-//     } else {
-//         SPDLOG_ERROR("Unrecognised log level: {}", logLevel);
-//     }
-// }
+    return hostMap;
+}
 
 // ----------------------
 // Planner
@@ -99,20 +68,16 @@ Planner::Planner()
       faabric::util::getSystemConfig().parallelismUpdateInterval;
     isPreloadParallelism = faabric::util::getSystemConfig().preloadParallelism;
 
-    batchTimerThread = std::thread(&Planner::batchTimerCheck, this);
-    dequeueScheduledRequestsThread =
-      std::thread(&Planner::dequeueScheduledRequests, this);
+    dequeueScheduledMsgsThread =
+      std::thread(&Planner::dequeueScheduledMsgs, this);
 }
 
 Planner::~Planner()
 {
     // Stop the batch timer thread
     stopThreadTimer = true;
-    if (batchTimerThread.joinable()) {
-        batchTimerThread.join();
-    }
-    if (dequeueScheduledRequestsThread.joinable()) {
-        dequeueScheduledRequestsThread.join();
+    if (dequeueScheduledMsgsThread.joinable()) {
+        dequeueScheduledMsgsThread.join();
     }
 }
 
@@ -165,19 +130,12 @@ void Planner::flushHosts()
     faabric::util::FullLock lock(plannerMx);
 
     state.hostMap.clear();
+    state.batchSchedHostMap.clear();
 }
 
 void Planner::flushExecutors()
 {
-    // Flush Planner State
-    // state.funcLatencyStats.clear();
-    // state.chainFuncLatencyStats.clear();
-    // state.appChainedInflights.clear();
     // Flush Aware Scheduler State
-    auto batchScheduler = faabric::batch_scheduler::getBatchScheduler();
-    auto stateAwareScheduler =
-      std::dynamic_pointer_cast<batch_scheduler::StateAwareScheduler>(
-        batchScheduler);
     // If preload the parallelism desision, we change the parallelism here
     if (stateAwareScheduler) {
         stateAwareScheduler->flushStateInfo();
@@ -284,6 +242,7 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
       ->mutable_registerts()
       ->set_epochms(faabric::util::getGlobalClock().epochMillis());
 
+    state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
     return true;
 }
 
@@ -301,6 +260,7 @@ void Planner::removeHost(const Host& hostIn)
         SPDLOG_DEBUG("Planner removing host {}", hostIn.ip());
         state.hostMap.erase(it);
     }
+    state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
 }
 
 bool Planner::isHostExpired(std::shared_ptr<Host> host, long epochTimeMs)
@@ -314,100 +274,36 @@ bool Planner::isHostExpired(std::shared_ptr<Host> host, long epochTimeMs)
     return (epochTimeMs - host->registerts().epochms()) > hostTimeoutMs;
 }
 
-void Planner::setMessageResult(std::shared_ptr<faabric::Message> msg,
-                               bool locked)
-{}
-
-void Planner::setMessageResultWitoutLock(std::shared_ptr<faabric::Message> msg)
-{
-    int appId = msg->appid();
-    int msgId = msg->id();
-
-    faabric::util::FullLock lock(plannerMx);
-
-    SPDLOG_TRACE("Planner setting message result (id: {}) for {}:{}:{}",
-                 msg->id(),
-                 msg->appid(),
-                 msg->groupid(),
-                 msg->groupidx());
-
-    // Release the slot only once
-    assert(state.hostMap.contains(msg->executedhost()));
-
-    // Set the result
-    state.appResults[appId][msgId] = msg;
-
-    if (!state.inFlightReqs.contains(appId)) {
-        // We don't want to error if any client uses `setMessageResult`
-        // liberally. This means that it may happen that when we set a message
-        // result a second time, the app is already not in-flight
-        SPDLOG_DEBUG("Setting result for non-existant (or finished) app: {}",
-                     appId);
-    } else {
-        auto req = state.inFlightReqs.at(appId).first;
-        auto decision = state.inFlightReqs.at(appId).second;
-
-        // Work out the message position in the BER
-        auto it = std::find_if(
-          req->messages().begin(), req->messages().end(), [&](auto innerMsg) {
-              return innerMsg.id() == msg->id();
-          });
-        if (it == req->messages().end()) {
-            // Ditto as before. We want to allow setting the message result
-            // more than once without breaking
-            SPDLOG_DEBUG(
-              "Setting result for non-existant (or finished) message: {}",
-              appId);
-        } else {
-            SPDLOG_TRACE("Removing message {} from app {}", msg->id(), appId);
-
-            // Remove message from in-flight requests
-            req->mutable_messages()->erase(it);
-
-            // Remove message from decision
-            decision->removeMessage(msg->id());
-
-            // Record the Metrics
-            std::string userFunc = msg->user() + "_" + msg->function();
-            int parallelismId = msg->parallelismid();
-            std::string userFuncPar =
-              userFunc + "_" + std::to_string(parallelismId);
-
-            // Remove from in-flight chained requests
-            int chainedId = msg->chainedid();
-            state.inFlightChains[chainedId]--;
-            if (state.inFlightChains[chainedId] < 0) {
-                SPDLOG_ERROR("In-flight chains count is negative: {}",
-                             state.inFlightChains[chainedId]);
-                throw std::runtime_error("Chained Id removes negative count");
-            }
-            if (state.inFlightChains[chainedId] == 0) {
-                state.inFlightChains.erase(chainedId);
-            }
-
-            // Remove pair altogether if no more messages left
-            if (req->messages_size() == 0) {
-                state.inFlightReqs.erase(appId);
-            }
-        }
-    }
-    // Finally, dispatch an async message to all hosts that are waiting once
-    // all planner accounting is updated
-    if (state.appResultWaiters.find(msgId) != state.appResultWaiters.end()) {
-        for (const auto& host : state.appResultWaiters[msgId]) {
-            SPDLOG_DEBUG("Sending result to waiting host: {}", host);
-            faabric::scheduler::getFunctionCallClient(host)->setMessageResult(
-              msg);
-        }
-    }
-}
-
 void Planner::setMessageResultBatch(
   std::shared_ptr<faabric::BatchExecuteRequest> batchMsg)
 {
+    faabric::util::FullLock lock(plannerStateMx);
     for (int msgIdx = 0; msgIdx < batchMsg->messages_size(); msgIdx++) {
         auto msg = batchMsg->messages(msgIdx);
-        setMessageResultWitoutLock(std::make_shared<faabric::Message>(msg));
+        int appId = msg.appid();
+        int msgId = msg.id();
+        int chainedId = msg.chainedid();
+        state.appResults[appId][msgId] =
+          std::make_shared<faabric::Message>(msg);
+
+        int inFlightChainCount = --state.inFlightChains[chainedId];
+        if (inFlightChainCount < 0) {
+            SPDLOG_ERROR("In-flight chains count is negative: {}",
+                         inFlightChainCount);
+            throw std::runtime_error("Chained Id removes negative count");
+        }
+        if (inFlightChainCount == 0) {
+            state.inFlightChains.erase(chainedId);
+        }
+        int inFlightAppCount = --state.inFlightApps[appId];
+        if (inFlightAppCount < 0) {
+            SPDLOG_ERROR("In-flight apps count is negative: {}",
+                         inFlightAppCount);
+            throw std::runtime_error("App Id removes negative count");
+        }
+        if (inFlightAppCount == 0) {
+            state.inFlightApps.erase(appId);
+        }
     }
 }
 
@@ -530,7 +426,7 @@ std::shared_ptr<faabric::BatchExecuteRequestStatus> Planner::getBatchResults(
         }
 
         // If it's not finish, we just return the empty result
-        if (state.inFlightReqs.contains(appId)) {
+        if (state.inFlightApps.contains(appId)) {
             berStatus->set_finished(false);
             return berStatus;
         }
@@ -589,31 +485,22 @@ int Planner::getNumMigrations()
     return state.numMigrations.load(std::memory_order_acquire);
 }
 
-static faabric::batch_scheduler::HostMap convertToBatchSchedHostMap(
-  std::map<std::string, std::shared_ptr<Host>> hostMapIn)
-{
-    faabric::batch_scheduler::HostMap hostMap;
-
-    for (const auto& [ip, host] : hostMapIn) {
-        hostMap[ip] = std::make_shared<faabric::batch_scheduler::HostState>(
-          host->ip(), host->slots(), host->usedslots());
-    }
-
-    return hostMap;
-}
-
-void Planner::enqueueCallBatch(std::shared_ptr<BatchExecuteRequest> req,
+void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
                                bool isChained)
 {
-    int appId = req->appid();
-
-    faabric::util::FullLock lock(plannerMx);
-
-    // Record planner enqueue time
+    SPDLOG_DEBUG("Planner is Scheduling {} messages", req->messages_size());
     auto currentTime = faabric::util::getGlobalClock().epochMicros();
+
+    // First loop: handle state without creating a shared_ptr
+    faabric::util::FullLock lock(plannerStateMx);
     for (int i = 0; i < req->messages_size(); i++) {
-        req->mutable_messages(i)->set_plannerqueuetime(currentTime);
-        int chainedId = req->messages(i).chainedid();
+        auto* message = req->mutable_messages(i); // Use a pointer directly
+
+        // Record planner enqueue time
+        message->set_plannerqueuetime(currentTime);
+
+        // Record the chained call count
+        int chainedId = message->chainedid();
         if (isChained) {
             if (!state.inFlightChains.contains(chainedId)) {
                 SPDLOG_ERROR("ChainedId {} is not running", chainedId);
@@ -628,255 +515,84 @@ void Planner::enqueueCallBatch(std::shared_ptr<BatchExecuteRequest> req,
             }
             state.inFlightChains[chainedId] = 1;
         }
+        state.inFlightApps[message->appid()]++;
     }
+    lock.unlock();
 
-    if (isChained) {
-        // If the message is chained, we need to record it to the state inflight
-        // and chained count at first. Otherwise, the caller function might
-        // finish before this function is recorded. In this case, the set batch
-        // result might mark this chained functions are finished.
-        auto oldReq = state.inFlightReqs.at(appId).first;
-        auto oldDec = state.inFlightReqs.at(appId).second;
-
-        for (size_t i = 0; i < req->messages_size(); i++) {
-            *oldReq->add_messages() = req->messages(i);
-            oldDec->addMessage("enqueue_not_set", req->messages(i));
-
-            faabric::Message tempMessage = req->messages(i);
-            // int chainedid = tempMessage.chainedid();
-            // state.appChainedInflights[appId][chainedid]++;
-        }
+    // Second loop: prepare messages and transfer ownership
+    for (int i = 0; i < req->messages_size(); i++) {
+        auto message =
+          std::make_unique<faabric::Message>(*req->mutable_messages(i));
+        // Schedule the message, then enqueue with ownership transfer
+        std::string host = stateAwareScheduler->scheduleMessage(
+          state.batchSchedHostMap, message);
+        enqueueMessage(host, std::move(message)); // Move ownership
     }
-    return batchExecuteReqQueue.enqueue(req);
 }
 
-void Planner::batchTimerCheck()
+void Planner::enqueueMessage(std::string host,
+                             std::unique_ptr<faabric::Message> msg)
+{
+    auto currentTime = faabric::util::getGlobalClock().epochMicros();
+    msg->set_plannerpoptime(currentTime);
+    faabric::util::FullLock lock(state.scheduledMsgsMapMx);
+    state.scheduledMsgsMap[host].push_back(std::move(msg));
+}
+
+void Planner::dequeueScheduledMsgs()
 {
     while (!stopThreadTimer) {
-        // If empty, this thread will be blocked.
-        std::shared_ptr<BatchExecuteRequest> req =
-          batchExecuteReqQueue.dequeue();
-        callBatchWithoutLock(req);
-    }
-}
+        // Lock only for copying and clearing `scheduledMsgsMap`
+        faabric::util::FullLock lock(state.scheduledMsgsMapMx);
 
-void Planner::callBatchWithoutLock(std::shared_ptr<BatchExecuteRequest> req)
-{
-    int appId = req->appid();
+        if (state.scheduledMsgsMap.empty()) {
+            lock.unlock();
+            continue;
+        }
+        auto currentTime = faabric::util::getGlobalClock().epochMicros();
 
-    faabric::util::FullLock lock(plannerMx);
-
-    // Record planner dequeue time
-    auto currentTime = faabric::util::getGlobalClock().epochMicros();
-    for (int i = 0; i < req->messages_size(); i++) {
-        req->mutable_messages(i)->set_plannerpoptime(currentTime);
-    }
-
-    auto batchScheduler = faabric::batch_scheduler::getBatchScheduler();
-    auto decisionType =
-      batchScheduler->getDecisionType(state.inFlightReqs, req);
-
-    std::shared_ptr<batch_scheduler::StateAwareScheduler> stateAwareScheduler =
-      std::dynamic_pointer_cast<batch_scheduler::StateAwareScheduler>(
-        batchScheduler);
-
-    if (!stateAwareScheduler) {
-        throw std::runtime_error(
-          "enqueue call batch is only supported by state aware scheduler");
-    }
-
-    // In stream processing, only the NEW and SCALE_CHANGE are supported.
-    if (decisionType == faabric::batch_scheduler::DecisionType::DIST_CHANGE) {
-        throw std::runtime_error(
-          "Dist change is not supported in the stream mode");
-    }
-
-    auto hostMapCopy = convertToBatchSchedHostMap(state.hostMap);
-
-    std::shared_ptr<batch_scheduler::SchedulingDecision> decision = nullptr;
-
-    decision = stateAwareScheduler->scheduleWithoutLock(
-      hostMapCopy, state.inFlightReqs, req);
-
-    assert(decision != nullptr);
-    switch (decisionType) {
-        case faabric::batch_scheduler::DecisionType::NEW: {
-
-            // 1. For a new decision, we just add it to the in-flight map
-            state.inFlightReqs[appId] = std::make_pair(req, decision);
-            // 2 For a new decision, we record its metrics
-            // Metrics include chained metrics and function metrics (BOTH
-            // message level)
-            for (size_t i = 0; i < req->messages_size(); i++) {
-                faabric::Message tempMessage = req->messages(i);
-                int tempParallelisimId = tempMessage.parallelismid();
-                // int msgId = tempMessage.id();
-                // int chainedId = tempMessage.chainedid();
-                std::string userFunc =
-                  tempMessage.user() + "_" + tempMessage.function();
-                std::string userFuncPar =
-                  userFunc + "_" + std::to_string(tempParallelisimId);
+        // Create a local filtered copy of scheduledRequestsMap
+        std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>
+          msgsCallMap;
+        for (auto& [hostIp, msgsList] : state.scheduledMsgsMap) {
+            if (msgsList.empty()) {
+                continue;
             }
-            break;
-        }
-        case faabric::batch_scheduler::DecisionType::SCALE_CHANGE: {
-            // 1. TODO - Up date the enqueue_not_set deceision
-
-            // 2. Record the metrics for each function.
-            for (size_t i = 0; i < req->messages_size(); i++) {
-                faabric::Message tempMessage = req->messages(i);
-                std::string userFunc =
-                  tempMessage.user() + "_" + tempMessage.function();
-                int tempParallelisimId = tempMessage.parallelismid();
-                // int msgId = tempMessage.id();
-                std::string userFuncPar =
-                  userFunc + "_" + std::to_string(tempParallelisimId);
+            for (auto& msg : msgsList) {
+                msg->set_plannerdispatchtime(currentTime);
             }
-            break;
+            msgsCallMap[hostIp] = std::move(msgsList); // Move ownership
         }
-        default: {
-            SPDLOG_ERROR("Unrecognised decision type: {} (app: {})",
-                         decisionType,
-                         req->appid());
-            throw std::runtime_error("Unrecognised decision type");
-        }
-    }
-    // Sanity-checks before actually dispatching functions for execution
-    assert(req->messages_size() == decision->hosts.size());
-    assert(req->appid() == decision->appId);
-
-    dispatchSchedulingDecision(req, decision);
-}
-
-std::shared_ptr<faabric::batch_scheduler::SchedulingDecision>
-Planner::callBatch(std::shared_ptr<BatchExecuteRequest> req)
-{
-    return nullptr;
-}
-
-void Planner::dispatchSchedulingDecision(
-  std::shared_ptr<faabric::BatchExecuteRequest> req,
-  std::shared_ptr<faabric::batch_scheduler::SchedulingDecision> decision)
-{
-    std::map<std::string, std::shared_ptr<faabric::BatchExecuteRequest>>
-      hostRequests;
-
-    assert(req->messages_size() == decision->hosts.size());
-    bool isSingleHost = decision->isSingleHost();
-
-    auto currentTime = faabric::util::getGlobalClock().epochMicros();
-    // First we build all the BatchExecuteRequests for all the different hosts.
-    // We need to keep a map as the hosts may not be contiguous in the decision
-    // (i.e. we may have (hostA, hostB, hostA)
-    for (int i = 0; i < req->messages_size(); i++) {
-        auto mutable_msg = req->mutable_messages(i);
-        mutable_msg->set_plannerdispatchtime(currentTime);
-        auto msg = req->messages().at(i);
-
-        // Initialise the BER if it is not there
-        std::string thisHost = decision->hosts.at(i);
-        if (hostRequests.find(thisHost) == hostRequests.end()) {
-            hostRequests[thisHost] = faabric::util::batchExecFactory();
-            hostRequests[thisHost]->set_appid(decision->appId);
-            hostRequests[thisHost]->set_groupid(decision->groupId);
-            hostRequests[thisHost]->set_user(msg.user());
-            hostRequests[thisHost]->set_function(msg.function());
-            hostRequests[thisHost]->set_snapshotkey(req->snapshotkey());
-            hostRequests[thisHost]->set_type(req->type());
-            hostRequests[thisHost]->set_subtype(req->subtype());
-            hostRequests[thisHost]->set_contextdata(req->contextdata());
-            hostRequests[thisHost]->set_singlehost(isSingleHost);
-            // Propagate the single host hint
-            hostRequests[thisHost]->set_singlehosthint(req->singlehosthint());
-        }
-
-        *hostRequests[thisHost]->add_messages() = msg;
-    }
-
-    bool isThreads = req->type() == faabric::BatchExecuteRequest::THREADS;
-    if (!isSingleHost && req->singlehosthint()) {
-        SPDLOG_ERROR(
-          "User provided single-host hint in BER, but decision is not!");
-    }
-
-    for (const auto& [hostIp, hostReq] : hostRequests) {
-        SPDLOG_DEBUG("Dispatching {} messages to host {} for execution",
-                     hostReq->messages_size(),
-                     hostIp);
-        assert(faabric::util::isBatchExecRequestValid(hostReq));
-
-        // In a THREADS request, before sending an execution request we need to
-        // push the main (caller) thread snapshot to all non-main hosts
-        // FIXME: ideally, we would do this from the caller thread, once we
-        // know the scheduling decision and all other threads would be awaiting
-        // for the snapshot
-        if (isThreads && !isSingleHost) {
-            auto snapshotKey =
-              faabric::util::getMainThreadSnapshotKey(hostReq->messages(0));
-            try {
-                auto snap = snapshotRegistry.getSnapshot(snapshotKey);
-
-                // TODO(thread-opt): push only diffs
-                if (hostIp != req->messages(0).mainhost()) {
-                    faabric::snapshot::getSnapshotClient(hostIp)->pushSnapshot(
-                      snapshotKey, snap);
-                }
-            } catch (std::runtime_error& e) {
-                // Catch errors, but don't let them crash the planner. Let the
-                // worker crash instead
-                SPDLOG_ERROR("Snapshot {} not regsitered in planner!",
-                             snapshotKey);
-            }
-        }
-
-        enqueueScheduledRequests(hostIp, hostReq);
-    }
-
-    SPDLOG_DEBUG("Finished dispatching {} messages for execution",
-                 req->messages_size());
-}
-
-void Planner::enqueueScheduledRequests(std::string host,
-                                       std::shared_ptr<BatchExecuteRequest> req)
-{
-    faabric::util::FullLock lock(state.scheduledRequestsMapMx);
-    state.scheduledRequestsMap[host].push_back(req);
-}
-
-void Planner::dequeueScheduledRequests()
-{
-    while (!stopThreadTimer) {
-        // If empty, this thread will be blocked.
-        faabric::util::FullLock lock(state.scheduledRequestsMapMx);
-        // Create a local filterd copy of the scheduledRequestsMap
-        std::map<std::string, std::list<std::shared_ptr<BatchExecuteRequest>>>
-          reqsCallMap;
-        for (auto& [hostIp, reqsList] : state.scheduledRequestsMap) {
-            if (!reqsList.empty()) {
-                reqsCallMap[hostIp] = reqsList;
-                reqsList.clear();
-            }
-        }
+        state.scheduledMsgsMap.clear();
         lock.unlock();
 
+        // Parallel execution of function calls for each host
         std::vector<std::thread> threads;
-        for (auto& [hostIp, reqs] : reqsCallMap) {
-            auto reqsCopy = std::move(reqs);
-
+        for (auto& [hostIp, msgs] : msgsCallMap) {
+            // Single thread method
+            // faabric::scheduler::getFunctionCallClient(hostIp)
+            //   ->executeFunctionsBatch(std::move(msgs));
+            // Multi-thread method (concurrent execution)
             threads.emplace_back(
-              [hostIp, reqsCopy = std::move(reqsCopy)]() mutable {
+              [hostIp](
+                std::list<std::unique_ptr<faabric::Message>> msgsIn) mutable {
                   faabric::scheduler::getFunctionCallClient(hostIp)
-                    ->executeFunctionsBatch(reqsCopy);
-              });
-        }
-        // Join all threads to ensure they complete before next iteration
-        for (auto& t : threads) {
-            if (t.joinable()) {
-                t.join();
+                    ->executeFunctionsBatch(std::move(msgsIn));
+              },
+              std::move(msgs));
+
+            // Join all threads to ensure they complete before next iteration
+            for (auto& t : threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
             }
+            SPDLOG_DEBUG("Finished dequeueing scheduled messages for {} hosts");
+
+            // Sleep for a while to batch the scheduled requests
+            std::this_thread::sleep_for(
+              std::chrono::milliseconds(dispatchPeriod));
         }
-        // Sleep for a while to batch the scheduled requests
-        std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
     }
 }
 
@@ -889,35 +605,11 @@ std::map<std::string, FunctionMetrics> Planner::collectMetrics()
 {
     // metrics states contains two types information: topology and function
     // Topology info is stored with source function name: UserFunction
-    // Function info is stored with function name with parallelism: UserFuncPar
+    // Function info is stored with function name with parallelism:
+    // UserFuncPar
     std::map<std::string, FunctionMetrics> metricsStats;
-
-    std::map<std::string, std::map<std::string, int>> tempMetrics;
-    // Retrive Metrics from State Server.
-    for (auto [ithHostName, ithHostObject] : state.hostMap) {
-        state::FunctionStateClient cli(ithHostName);
-        auto hostMetrics = cli.getMetrics();
-        for (auto& [ithUserFuncPar, ithStateMetrics] : hostMetrics) {
-            // Accumulate metrics
-            tempMetrics[ithUserFuncPar][LOCK_BLOCK_TIME] +=
-              ithStateMetrics[LOCK_BLOCK_TIME];
-            tempMetrics[ithUserFuncPar][LOCK_HOLD_TIME] +=
-              ithStateMetrics[LOCK_HOLD_TIME];
-        }
-    }
-
-    // Print the metrics.
-    for (auto [ithFunc, ithMetrics] : metricsStats) {
-        SPDLOG_DEBUG("Metrics for {}: throughput: {}, processLatency: {}, "
-                     "averageWaitingTime: {}, lockCongestionTime: {}, "
-                     "lockHoldTime: {}",
-                     ithFunc,
-                     ithMetrics.throughput,
-                     ithMetrics.processLatency,
-                     ithMetrics.averageWaitingTime,
-                     ithMetrics.lockCongestionTime,
-                     ithMetrics.lockHoldTime);
-    }
+    SPDLOG_ERROR("Collecting metrics is not implemented yet");
+    throw std::runtime_error("Collecting metrics is not implemented yet");
     return metricsStats;
 }
 
@@ -928,17 +620,13 @@ bool Planner::updateFuncParallelism(const std::string& userFunction,
                  userFunction,
                  changedParallelism);
     faabric::util::FullLock lock(plannerMx);
-    auto batchScheduler = faabric::batch_scheduler::getBatchScheduler();
-    std::shared_ptr<batch_scheduler::StateAwareScheduler> stateAwareScheduler =
-      std::dynamic_pointer_cast<batch_scheduler::StateAwareScheduler>(
-        batchScheduler);
+
     if (!stateAwareScheduler) {
         SPDLOG_ERROR("State-aware scheduler is not enabled");
         return false;
     }
-    auto hostMapCopy = convertToBatchSchedHostMap(state.hostMap);
     stateAwareScheduler->increaseFunctionParallelism(
-      changedParallelism, userFunction, hostMapCopy);
+      changedParallelism, userFunction, state.batchSchedHostMap);
     return true;
 }
 
@@ -975,8 +663,10 @@ bool Planner::resetMaxReplicas(int32_t maxReplicas)
     return true;
 }
 
-bool Planner::resetParameter(const std::string& key, const int32_t value, bool plannerParameter)
-{   
+bool Planner::resetParameter(const std::string& key,
+                             const int32_t value,
+                             bool plannerParameter)
+{
     // Reset the parameter of planner
     if (plannerParameter) {
         if (key == "dispatch_period") {
@@ -1001,6 +691,11 @@ bool Planner::resetParameter(const std::string& key, const int32_t value, bool p
     }
 
     return true;
+}
+
+int Planner::getInFlightApps()
+{
+    return state.inFlightApps.size();
 }
 
 void Planner::outputAppResultsToJson()

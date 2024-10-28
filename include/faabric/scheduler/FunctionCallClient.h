@@ -57,7 +57,7 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
       std::shared_ptr<faabric::planner::ResetStreamParameterRequest> req);
 
     void executeFunctionsBatch(
-      std::list<std::shared_ptr<faabric::BatchExecuteRequest>> reqs);
+      std::list<std::unique_ptr<faabric::Message>>&& reqs);
 };
 
 // -----------------------------------

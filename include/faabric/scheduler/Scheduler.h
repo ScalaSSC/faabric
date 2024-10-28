@@ -83,6 +83,8 @@ class Scheduler
 
     void executeBatchLazy(std::shared_ptr<faabric::BatchExecuteRequest> req);
 
+    void enqueueMessageBatch(std::shared_ptr<faabric::MessageBatch> msgs);
+
     // Check the waiting queue peroiodically.
     void batchTimerCheck();
 

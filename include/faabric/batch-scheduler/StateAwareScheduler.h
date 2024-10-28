@@ -9,6 +9,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <shared_mutex>
 
 namespace faabric::batch_scheduler {
 
@@ -28,21 +29,17 @@ class StateAwareScheduler final : public BatchScheduler
         funcStateInitializer();
     }
 
+    std::string scheduleMessage(const HostMap& hostMap, const std::unique_ptr<Message>& msg);
     std::shared_ptr<SchedulingDecision> makeSchedulingDecision(
       HostMap& hostMap,
       const InFlightReqs& inFlightReqs,
       std::shared_ptr<faabric::BatchExecuteRequest> req) override;
 
-    std::shared_ptr<SchedulingDecision> scheduleWithoutLock(
-      HostMap& hostMap,
-      const InFlightReqs& inFlightReqs,
-      std::shared_ptr<faabric::BatchExecuteRequest> req);
-
     // the following functions are public only for tests.
     std::shared_ptr<std::map<std::string, std::string>>
     increaseFunctionParallelism(int numIncrease,
                                 const std::string& userFunction,
-                                HostMap& hostMap);
+                                const HostMap& hostMap);
 
     bool repartitionParitionedState(
       std::string userFunction,
@@ -51,7 +48,7 @@ class StateAwareScheduler final : public BatchScheduler
     void flushStateInfo();
 
     void updateParallelism(
-      HostMap& hostMap,
+      const HostMap& hostMap,
       std::map<std::string, faabric::planner::FunctionMetrics> metrics);
 
     const std::map<std::string, std::string>& getStateHostMap() const
@@ -83,6 +80,9 @@ class StateAwareScheduler final : public BatchScheduler
     int rbCounter = 0;
     std::atomic<unsigned int> atomicRbCounter{ 0 };
 
+    // scheduler lock
+    std::shared_mutex scheduleMx;
+
     /***
      * The following maps are used to store the state of the functions.
      */
@@ -109,7 +109,7 @@ class StateAwareScheduler final : public BatchScheduler
     // Key is User-function : Value is <parititonInputKey, partitionStateKey>
     std::map<std::string, std::tuple<std::string, std::string>> funcStateRegMap;
 
-    void initializeState(HostMap& hostMap,
+    void initializeState(const HostMap& hostMap,
                          std::string userFunc,
                          int parallelism = 1);
 

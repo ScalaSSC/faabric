@@ -149,8 +149,8 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvRemoveHost(
 
 void PlannerServer::recvSetMessageResult(std::span<const uint8_t> buffer)
 {
-    PARSE_MSG(Message, buffer.data(), buffer.size());
-    planner.setMessageResult(std::make_shared<faabric::Message>(parsedMsg));
+    SPDLOG_ERROR("SetMessageResult not implemented in PlannerServer");
+    throw std::runtime_error("SetMessageResult not implemented in PlannerServer");
 }
 
 void PlannerServer::recvSetMessageResultBatch(std::span<const uint8_t> buffer)
@@ -241,24 +241,9 @@ PlannerServer::recvPreloadSchedulingDecision(std::span<const uint8_t> buffer)
 std::unique_ptr<google::protobuf::Message> PlannerServer::recvCallBatch(
   std::span<const uint8_t> buffer)
 {
-    PARSE_MSG(BatchExecuteRequest, buffer.data(), buffer.size());
-    auto req = std::make_shared<faabric::BatchExecuteRequest>(parsedMsg);
-
-    auto decision = planner.callBatch(req);
-
-    // Build PointToPointMappings from scheduling decision
-    faabric::PointToPointMappings mappings;
-    mappings.set_appid(decision->appId);
-    mappings.set_groupid(decision->groupId);
-    for (int i = 0; i < decision->hosts.size(); i++) {
-        auto* mapping = mappings.add_mappings();
-        mapping->set_host(decision->hosts.at(i));
-        mapping->set_messageid(decision->messageIds.at(i));
-        mapping->set_appidx(decision->appIdxs.at(i));
-        mapping->set_groupidx(decision->groupIdxs.at(i));
-    }
-
-    return std::make_unique<faabric::PointToPointMappings>(mappings);
+    SPDLOG_ERROR("CallBatch not implemented in PlannerServer");
+    throw std::runtime_error("CallBatch not implemented in PlannerServer");
+    return nullptr;
 }
 
 std::unique_ptr<google::protobuf::Message> PlannerServer::recvEnqueueBatch(
@@ -268,7 +253,7 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvEnqueueBatch(
     auto req = std::make_shared<faabric::BatchExecuteRequest>(parsedMsg);
 
     // This request will only be called by chained call. Mark it.
-    planner.enqueueCallBatch(req, true);
+    planner.scheduleMessages(req, true);
 
     faabric::EmptyResponse resp;
     return std::make_unique<faabric::EmptyResponse>();

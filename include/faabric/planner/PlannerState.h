@@ -5,6 +5,7 @@
 #include <faabric/planner/FunctionLatency.h>
 #include <faabric/planner/planner.pb.h>
 #include <faabric/proto/faabric.pb.h>
+#include <faabric/util/queue.h>
 
 #include <list>
 #include <map>
@@ -20,6 +21,7 @@ struct PlannerState
     // id for redundancy
     std::map<std::string, std::shared_ptr<Host>> hostMap;
 
+    faabric::batch_scheduler::HostMap batchSchedHostMap;
     // Double-map holding the message results. The first key is the app id. For
     // each app id, we keep a map of the message id, and the actual message
     // result
@@ -43,27 +45,11 @@ struct PlannerState
     // MAP<chainedId, in_flight_counting> Map of inflight chained requests.
     std::map<int, int> inFlightChains;
 
-    std::shared_mutex  scheduledRequestsMapMx;
-    // MAP<host, list<BatchExecuteRequest>> shceduled but not yet executed
-    // requests.
-    std::map<std::string, std::list<std::shared_ptr<BatchExecuteRequest>>>
-      scheduledRequestsMap;
+    // MAP<appId, in_flight_counting> Map of inflight requests.
+    std::map<int, int> inFlightApps;
 
-    // The metrics for each function-parallelismId
-    // Map<User-Function-ParallelismId, Metrics>
-    // std::map<std::string, std::shared_ptr<FunctionLatency>> funcLatencyStats;
-
-    // The metrics for the whole chain function application (Same chain Id)
-    // For chain functions, it is the metrics from the first function is invoked
-    // until the last function is finished.
-    // We don't record parallelism at first since the new BatchRequest can has
-    // multiple [chain functions source], they belong to different parallelism.
-    // source_1 -> func1_1 -> func2_2 and source_2 -> func1_2 -> func2_2
-    // Map<First(User-Function), Metrics>
-    // std::map<std::string, std::shared_ptr<FunctionLatency>>
-    //   chainFuncLatencyStats;
-
-    // Map<appId, <chainedId, count>>
-    // std::map<int, std::map<int, int>> appChainedInflights;
+    std::shared_mutex scheduledMsgsMapMx;
+    std::map<std::string, std::list<std::unique_ptr<Message>>>
+      scheduledMsgsMap;
 };
 }

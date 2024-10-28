@@ -127,16 +127,16 @@ void FunctionCallClient::resetParameter(
 }
 
 void FunctionCallClient::executeFunctionsBatch(
-  std::list<std::shared_ptr<faabric::BatchExecuteRequest>> reqs)
+  std::list<std::unique_ptr<faabric::Message>>&& msgs)
 {
     // Formulate a batch execute request Batch
-    auto batchReqList = std::make_shared<faabric::BatchExecuteRequestList>();
-    SPDLOG_DEBUG("Batch execute call Batch size: {}", reqs.size());
-    for (auto& req : reqs) {
-        batchReqList->add_batchrequests()->CopyFrom(*req);
+    auto batchMsgsList = std::make_shared<faabric::MessageBatch>();
+    SPDLOG_DEBUG("Batch execute call Batch size: {}", msgs.size());
+    for (auto& msg : msgs) {
+        batchMsgsList->add_messages()->CopyFrom(*msg);
     }
     asyncSend(faabric::scheduler::FunctionCalls::ExecuteFunctionsBatch,
-              batchReqList.get());
+              batchMsgsList.get());
 }
 
 // -----------------------------------

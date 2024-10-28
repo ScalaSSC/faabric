@@ -321,6 +321,42 @@ void Scheduler::executeBatch(std::shared_ptr<faabric::BatchExecuteRequest> req)
     }
 }
 
+void Scheduler::enqueueMessageBatch(std::shared_ptr<faabric::MessageBatch> msgs)
+{
+    faabric::util::FullLock lock(mx);
+
+    auto current = faabric::util::getGlobalClock().epochMicros();
+    auto currentMillis = faabric::util::getGlobalClock().epochMillis();
+    auto endPoint = faabric::util::getSystemConfig().endpointHost;
+    for (int i = 0; i < msgs->messages_size(); i++) {
+        faabric::Message& msg = msgs->mutable_messages()->at(i);
+        std::string waitingQueueName = msg.user() + "_" + msg.function() + "_" +
+                                       std::to_string(msg.parallelismid());
+        msg.set_workerqueuetime(current);
+        msg.set_starttimestamp(currentMillis);
+        msg.set_executedhost(endPoint);
+
+        size_t hash = msg.hash();
+        int messageType = msg.messagetype();
+        if (isRepartition && messageType == 2) {
+            if (!partitionedWaitingQueues.contains(waitingQueueName)) {
+                faabric::util::PartitionedStateMessageQueue tempWaitingQueue(
+                  maxReplicas, executeBatchsize);
+                partitionedWaitingQueues.emplace(waitingQueueName,
+                                                 tempWaitingQueue);
+            }
+            partitionedWaitingQueues.at(waitingQueueName)
+              .addMessage(hash,
+                          std::make_shared<faabric::Message>(std::move(msg)));
+        } else {
+            auto [iterator, inserted] =
+              waitingQueues.emplace(waitingQueueName, waitingQueueName);
+            iterator->second.insertMsg(
+              std::make_shared<faabric::Message>(std::move(msg)));
+        }
+    }
+}
+
 void Scheduler::executeBatchLazy(
   std::shared_ptr<faabric::BatchExecuteRequest> req)
 {
@@ -422,9 +458,6 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                          newReq->messages_size());
             // Execute the tasks for Paritioned State
             if (localMsg.messagetype() == 2) {
-                // logStatistics(funcStr,
-                //               newReq->messages_size(),
-                //               waitingBatch.batchQueue.size());
                 std::string lockHint =
                   std::to_string(waitingBatch.lockVersion) + "/" +
                   std::to_string(waitingBatch.rangeStart) + "/" +

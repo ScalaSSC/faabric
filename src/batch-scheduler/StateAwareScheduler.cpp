@@ -26,33 +26,7 @@ Otherwise, it will increase the parallelism and repartition function state
 // We register the function state in the functionStateRegister map.
 void StateAwareScheduler::funcStateInitializer()
 {
-
     maxParallelism = faabric::util::getSystemConfig().maxParallelism;
-    // // Register the chaining functions in the same topology.
-    // funcChainedMap["stream_function_source"] = {
-    //     "stream_function_state_source", "stream_function_parstate_source"
-    // };
-
-    // funcChainedMap["stream_wordcount_source"] = { "stream_wordcount_source",
-    //                                               "stream_wordcount_split",
-    //                                               "stream_wordcount_count" };
-
-    // Register the function state
-    // If the function state is partitioned, we need to register the partition
-    // input key and partition state key, otherwise, empty is ok
-    // funcStateRegMap["stream_function_state"] = std::make_tuple("", "");
-    // funcStateRegMap["stream_function_parstate"] =
-    //   std::make_tuple("partitionedAttribute", "partitionStateKey");
-    // funcStateRegMap["stream_wordcount_count"] =
-    //   std::make_tuple("partitionedAttribute", "partitionStateKey");
-    // funcStateRegMap["stream_wordcountindiv_count"] =
-    //   std::make_tuple("partitionedAttribute", "partitionStateKey");
-    // funcStateRegMap["stream_sd_moving_avg"] =
-    //   std::make_tuple("partitionedAttribute", "partitionStateKey");
-    // funcStateRegMap["stream_mo_score"] = std::make_tuple("", "");
-    // funcStateRegMap["stream_mo_anomaly"] =
-    //   std::make_tuple("partitionedAttribute", "partitionStateKey");
-    // funcStateRegMap["stream_mo_alert"] = std::make_tuple("", "");
 }
 
 void StateAwareScheduler::registerFunctionState(const std::string& userFunction,
@@ -358,7 +332,7 @@ K getNthKey(const std::map<K, V>& map, std::size_t n)
     return it->first;
 }
 
-void StateAwareScheduler::initializeState(HostMap& hostMap,
+void StateAwareScheduler::initializeState(const HostMap& hostMap,
                                           std::string userFunc,
                                           int parallelism)
 {
@@ -393,75 +367,6 @@ void StateAwareScheduler::initializeState(HostMap& hostMap,
     }
 }
 
-std::shared_ptr<SchedulingDecision> StateAwareScheduler::scheduleWithoutLock(
-  HostMap& hostMap,
-  const InFlightReqs& inFlightReqs,
-  std::shared_ptr<BatchExecuteRequest> req)
-{
-    auto decision = std::make_shared<SchedulingDecision>(req->appid(), 0);
-    // Round-Robin scheduling
-    for (int msgIdx = 0; msgIdx < req->messages_size(); msgIdx++) {
-        bool roundRobinFlag = true;
-        std::string host = "unknown";
-
-        std::string userFunc =
-          req->messages(msgIdx).user() + "_" + req->messages(msgIdx).function();
-        // It it is a function-state function, we might need to assign it near
-        // the state.
-        if (funcStateRegMap.contains(userFunc)) {
-            // If function-state has not been initialized, initialize it.
-            if (!functionParallelism.contains(userFunc)) {
-                initializeState(hostMap, userFunc);
-            }
-            // TODO - get parallelism is not thread safe now
-            auto hashAndIndex =
-              getHashAndParallelismIndex(userFunc, req->messages(msgIdx));
-            int messageType = hashAndIndex.messageType;
-            size_t hash = hashAndIndex.hash;
-            int parallelismId = hashAndIndex.parallelismIdx;
-            // Register the parallelismIdx to it. It is safe to register there.
-            // Even if the Scheduling failed this time, the next scheduling will
-            // overwrite it.
-            auto tempMsg = req->mutable_messages(msgIdx);
-            tempMsg->set_messagetype(messageType);
-            tempMsg->set_hash(hash);
-            tempMsg->set_parallelismid(parallelismId);
-            std::string userFuncPar =
-              userFunc + "_" + std::to_string(parallelismId);
-
-            bool unavailableFlag = false;
-            // If stateHost doesn't contains the userFuncPar, use round-robin.
-            if (stateHost.find(userFuncPar) == stateHost.end()) {
-                unavailableFlag = true;
-            }
-            // If host is not available, use round-robin.
-            host = stateHost[userFuncPar];
-            if (hostMap.find(host) == hostMap.end()) {
-                SPDLOG_WARN("Host {} is not disconnected, but the state in "
-                            "stored in here",
-                            host);
-                unavailableFlag = true;
-            }
-            if (!unavailableFlag) {
-                roundRobinFlag = false;
-            }
-        }
-        // Allocate the request by using round robin.
-        if (roundRobinFlag) {
-            int hostIdx =
-              atomicRbCounter.fetch_add(1, std::memory_order_relaxed) %
-              hostMap.size();
-            host = getNthKey(hostMap, hostIdx);
-        }
-        if (host == "unknown") {
-            throw std::runtime_error("Host is unknown");
-        }
-        decision->addMessage(host, req->messages(msgIdx));
-    }
-
-    return decision;
-}
-
 // The BinPack's scheduler decision algorithm is very simple. It first sorts
 // hosts (i.e. bins) in a specific order (depending on the scheduling type),
 // and then starts filling bins from begining to end, until it runs out of
@@ -483,13 +388,56 @@ std::shared_ptr<SchedulingDecision> StateAwareScheduler::makeSchedulingDecision(
     return decision;
 }
 
+std::string StateAwareScheduler::scheduleMessage(const HostMap& hostMap,
+                                                 const std::unique_ptr<faabric::Message>& msg)
+{   
+    if (msg->user().empty() || msg->function().empty()) {
+        throw std::runtime_error("User or function is empty");
+    }
+    std::string userFunc = msg->user() + "_" + msg->function();
+    std::string host = "unknown";
+    // For function-state function, assign near state
+    if (funcStateRegMap.contains(userFunc)) {
+        // If function-state has not been initialized, initialize it.
+        if (!functionParallelism.contains(userFunc)) {
+            initializeState(hostMap, userFunc);
+        }
+        // TODO - get parallelism is not thread safe now
+        faabric::util::FullLock lock(scheduleMx);
+        auto parallelismInfo = getHashAndParallelismIndex(userFunc, *msg);
+        lock.unlock();
+        std::string userFuncPar =
+          userFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
+        if (stateHost.find(userFuncPar) == stateHost.end()) {
+            throw std::runtime_error("StateHost is not initialized");
+        }
+        host = stateHost[userFuncPar];
+        // Register the parallelismIdx to it.
+        // If Scheduling failed, the next scheduling will overwrite it.
+        msg->set_messagetype(parallelismInfo.messageType);
+        msg->set_hash(parallelismInfo.hash);
+        msg->set_parallelismid(parallelismInfo.parallelismIdx);
+    }
+    // Otherwise the request by using round robin.
+    else {
+        int hostIdx = atomicRbCounter.fetch_add(1, std::memory_order_relaxed) %
+                      hostMap.size();
+        host = getNthKey(hostMap, hostIdx);
+        msg->set_messagetype(0);
+    }
+    if (host == "unknown") {
+        throw std::runtime_error("Host is unknown");
+    }
+    return host;
+}
+
 // TODO - change it to increase or decrease function parallelism. It should
 // return the old stateHost instead of the true/false
 std::shared_ptr<std::map<std::string, std::string>>
 StateAwareScheduler::increaseFunctionParallelism(
   int numIncrease,
   const std::string& userFunction,
-  HostMap& hostMap)
+  const HostMap& hostMap)
 {
     SPDLOG_DEBUG("Increasing {} parallelism for {}", numIncrease, userFunction);
     // Double check if the function exists
@@ -555,7 +503,7 @@ StateAwareScheduler::increaseFunctionParallelism(
           std::make_shared<faabric::util::ConsistentHashRing>(
             functionParallelism[userFunction]);
         // Repartition the state in old stateHost.
-        // Temporarily removed. 
+        // Temporarily removed.
         // if (oldPara != 0) {
         //     repartitionParitionedState(userFunction, oldStateHostPtr);
         // }
@@ -608,7 +556,7 @@ bool StateAwareScheduler::repartitionParitionedState(
 }
 
 void StateAwareScheduler::updateParallelism(
-  HostMap& hostMap,
+  const HostMap& hostMap,
   std::map<std::string, faabric::planner::FunctionMetrics> metrics)
 {
     // Iterate over the Functions Chained Maps

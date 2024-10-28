@@ -7,6 +7,8 @@
 #include <faabric/proto/faabric.pb.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/util/queue.h>
+#include <faabric/batch-scheduler/BatchScheduler.h>
+#include <faabric/batch-scheduler/StateAwareScheduler.h>
 
 #include <shared_mutex>
 
@@ -62,11 +64,6 @@ class Planner
 
     // Setters/getters for individual message results
 
-    void setMessageResult(std::shared_ptr<faabric::Message> msg,
-                          bool locked = false);
-
-    void setMessageResultWitoutLock(std::shared_ptr<faabric::Message> msg);
-
     void setMessageResultBatch(
       std::shared_ptr<faabric::BatchExecuteRequest> batchMsg);
 
@@ -98,14 +95,11 @@ class Planner
     int getNumMigrations();
 
     // Main entrypoint to request the execution of batches
-    std::shared_ptr<faabric::batch_scheduler::SchedulingDecision> callBatch(
-      std::shared_ptr<BatchExecuteRequest> req);
 
-    void callBatchWithoutLock(std::shared_ptr<BatchExecuteRequest> req);
+    void scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
+                         bool isChained = false);
 
-    void enqueueCallBatch(std::shared_ptr<BatchExecuteRequest> req,
-                          bool isChained = false);
-
+    void enqueueMessage(std::string host, std::unique_ptr<faabric::Message> msg);
     // ----------
     // Function State public API
     // ----------
@@ -116,7 +110,9 @@ class Planner
 
     bool resetMaxReplicas(int32_t newMaxReplicas);
 
-    bool resetParameter(const std::string& key, const int32_t value, bool plannerParameter = false);
+    bool resetParameter(const std::string& key,
+                        const int32_t value,
+                        bool plannerParameter = false);
 
     // ----------
     // Metrics public API
@@ -125,12 +121,18 @@ class Planner
     // MAP<Function, MAP<metric, value>>
     std::map<std::string, FunctionMetrics> collectMetrics();
 
+    int getInFlightApps();
     void outputAppResultsToJson();
 
   private:
+    std::shared_ptr<batch_scheduler::StateAwareScheduler> stateAwareScheduler =
+      std::dynamic_pointer_cast<batch_scheduler::StateAwareScheduler>(
+        faabric::batch_scheduler::getBatchScheduler());
+
     // There's a singleton instance of the planner running, but it must allow
     // concurrent requests
     std::shared_mutex plannerMx;
+    std::shared_mutex plannerStateMx;
 
     PlannerState state;
     PlannerConfig config;
@@ -139,15 +141,11 @@ class Planner
       std::shared_ptr<faabric::BatchExecuteRequest>>
       batchExecuteReqQueue;
 
-    // Check the waiting queue peroiodically.
-    void batchTimerCheck();
-
-    // ---- Batch Execution ---- 
-    std::thread batchTimerThread;
+    // ---- Batch Execution ----
     bool stopThreadTimer = false;
 
     // ---- Batch Call Scheduled Requests ----
-    std::thread dequeueScheduledRequestsThread;
+    std::thread dequeueScheduledMsgsThread;
 
     bool streamMode = faabric::util::getSystemConfig().streamMode;
     long lastParallelismUpdate;
@@ -180,17 +178,9 @@ class Planner
     // Request scheduling private API
     // ----------
 
-    void dispatchSchedulingDecision(
-      std::shared_ptr<faabric::BatchExecuteRequest> req,
-      std::shared_ptr<faabric::batch_scheduler::SchedulingDecision> decision);
-
     int dispatchPeriod = 20; // ms
 
-    void enqueueScheduledRequests(std::string host,
-                                  std::shared_ptr<BatchExecuteRequest> req);
-
-    void dequeueScheduledRequests();
-
+    void dequeueScheduledMsgs();
 };
 
 Planner& getPlanner();
