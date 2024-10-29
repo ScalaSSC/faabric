@@ -1,14 +1,14 @@
 #pragma once
 
+#include <faabric/batch-scheduler/BatchScheduler.h>
 #include <faabric/batch-scheduler/SchedulingDecision.h>
+#include <faabric/batch-scheduler/StateAwareScheduler.h>
 #include <faabric/planner/FunctionMetrics.h>
 #include <faabric/planner/PlannerState.h>
 #include <faabric/planner/planner.pb.h>
 #include <faabric/proto/faabric.pb.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/util/queue.h>
-#include <faabric/batch-scheduler/BatchScheduler.h>
-#include <faabric/batch-scheduler/StateAwareScheduler.h>
 
 #include <shared_mutex>
 
@@ -97,9 +97,11 @@ class Planner
     // Main entrypoint to request the execution of batches
 
     void scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
-                         bool isChained = false);
+                          bool isChained = false);
 
-    void enqueueMessage(std::string host, std::unique_ptr<faabric::Message> msg);
+    void enqueueMessageBatch(
+      std::vector<std::string> hosts,
+      std::vector<std::unique_ptr<faabric::Message>> msgs);
     // ----------
     // Function State public API
     // ----------

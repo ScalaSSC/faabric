@@ -7,9 +7,9 @@
 
 #include <map>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <tuple>
-#include <shared_mutex>
 
 namespace faabric::batch_scheduler {
 
@@ -29,7 +29,13 @@ class StateAwareScheduler final : public BatchScheduler
         funcStateInitializer();
     }
 
-    std::string scheduleMessage(const HostMap& hostMap, const std::unique_ptr<Message>& msg);
+    std::string scheduleMessage(const HostMap& hostMap,
+                                const std::unique_ptr<Message>& msg);
+
+    std::vector<std::string> scheduleMessagesBatch(
+      const HostMap& hostMap,
+      const std::vector<std::unique_ptr<faabric::Message>>& msgs);
+
     std::shared_ptr<SchedulingDecision> makeSchedulingDecision(
       HostMap& hostMap,
       const InFlightReqs& inFlightReqs,

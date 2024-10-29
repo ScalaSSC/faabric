@@ -388,9 +388,10 @@ std::shared_ptr<SchedulingDecision> StateAwareScheduler::makeSchedulingDecision(
     return decision;
 }
 
-std::string StateAwareScheduler::scheduleMessage(const HostMap& hostMap,
-                                                 const std::unique_ptr<faabric::Message>& msg)
-{   
+std::string StateAwareScheduler::scheduleMessage(
+  const HostMap& hostMap,
+  const std::unique_ptr<faabric::Message>& msg)
+{
     if (msg->user().empty() || msg->function().empty()) {
         throw std::runtime_error("User or function is empty");
     }
@@ -429,6 +430,18 @@ std::string StateAwareScheduler::scheduleMessage(const HostMap& hostMap,
         throw std::runtime_error("Host is unknown");
     }
     return host;
+}
+
+std::vector<std::string> StateAwareScheduler::scheduleMessagesBatch(
+  const HostMap& hostMap,
+  const std::vector<std::unique_ptr<faabric::Message>>& msgs)
+{
+    std::vector<std::string> hosts;
+    hosts.resize(msgs.size());
+    for (int i = 0; i < msgs.size(); i++) {
+        hosts[i] = scheduleMessage(hostMap, msgs[i]);
+    }
+    return hosts;
 }
 
 // TODO - change it to increase or decrease function parallelism. It should

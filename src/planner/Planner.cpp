@@ -520,23 +520,31 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
     lock.unlock();
 
     // Second loop: prepare messages and transfer ownership
+    std::vector<std::unique_ptr<faabric::Message>> messages;
+    messages.reserve(req->messages_size());
     for (int i = 0; i < req->messages_size(); i++) {
         auto message =
           std::make_unique<faabric::Message>(*req->mutable_messages(i));
-        // Schedule the message, then enqueue with ownership transfer
-        std::string host = stateAwareScheduler->scheduleMessage(
-          state.batchSchedHostMap, message);
-        enqueueMessage(host, std::move(message)); // Move ownership
+        messages.push_back(std::move(message));
     }
+    auto hosts = stateAwareScheduler->scheduleMessagesBatch(
+      state.batchSchedHostMap, messages);
+
+    enqueueMessageBatch(hosts, std::move(messages)); // Move ownership
 }
 
-void Planner::enqueueMessage(std::string host,
-                             std::unique_ptr<faabric::Message> msg)
+void Planner::enqueueMessageBatch(
+  std::vector<std::string> hosts,
+  std::vector<std::unique_ptr<faabric::Message>> msgs)
 {
     auto currentTime = faabric::util::getGlobalClock().epochMicros();
-    msg->set_plannerpoptime(currentTime);
     faabric::util::FullLock lock(state.scheduledMsgsMapMx);
-    state.scheduledMsgsMap[host].push_back(std::move(msg));
+    for (int i = 0; i < msgs.size(); i++) {
+        auto msg = std::move(msgs[i]);
+        auto host = hosts[i];
+        msg->set_plannerpoptime(currentTime);
+        state.scheduledMsgsMap[host].push_back(std::move(msg));
+    }
 }
 
 void Planner::dequeueScheduledMsgs()
