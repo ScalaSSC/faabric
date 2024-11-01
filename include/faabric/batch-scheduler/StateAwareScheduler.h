@@ -53,15 +53,6 @@ class StateAwareScheduler final : public BatchScheduler
 
     void flushStateInfo();
 
-    void updateParallelism(
-      const HostMap& hostMap,
-      std::map<std::string, faabric::planner::FunctionMetrics> metrics);
-
-    const std::map<std::string, std::string>& getStateHostMap() const
-    {
-        return stateHost;
-    }
-
     const std::map<std::string, int>& getFunctionParallelismMap() const
     {
         return functionParallelism;
@@ -120,26 +111,6 @@ class StateAwareScheduler final : public BatchScheduler
                          int parallelism = 1);
 
     void funcStateInitializer();
-
-    /***
-     * example should be like:
-     * Function Parallelism Map:
-     * Function: demo_function1, Parallelism: 1
-     * Function: demo_function2, Parallelism: 1
-
-     * State Host Map:
-     * Function: demo_function1_0, Host: 172.31.0.6
-     * Function: demo_function2_0, Host: 172.31.0.6
-
-     * State Partition By Map:
-     * Function: demo_function1, Partitioned By: k1
-     * Function: demo_function2, Partitioned By: k2
-    ***/
-    // bool registerState(const std::string& userFunction,
-    //                    const std::string& host,
-    //                    const std::string& partitionBy = "");
-    // return the message type, hash and parallelism index of this function,
-    // which is align with state.
 
     // Message Type : 0 - Stateless, 1 - Stateful, 2 - Paritioned Stateful
 

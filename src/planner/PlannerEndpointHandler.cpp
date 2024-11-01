@@ -218,7 +218,6 @@ void PlannerEndpointHandler::onRequest(
             // Parse the message payload
             SPDLOG_DEBUG("Planner received EXECUTE_BATCH request");
             faabric::BatchExecuteRequest rawBer;
-            SPDLOG_DEBUG("RECEIVED EXECUTE_BATCH request {}", msg.payloadjson());
             try {
                 faabric::util::jsonToMessage(msg.payloadjson(), &rawBer);
             } catch (faabric::util::JsonSerialisationException e) {
@@ -231,15 +230,15 @@ void PlannerEndpointHandler::onRequest(
             // For Request from the user, we will return false if the waiting
             // queue is too large.
             int numInFlight =
-              faabric::planner::getPlanner().getInFlightChainsSize();
-            if (numInFlight >= maxInflightReqs) {
+              faabric::planner::getPlanner().getInFlightAppsSize();
+            if (numInFlight >= maxInflightApps) {
                 response.result(beast::http::status::internal_server_error);
                 response.body() = "No available hosts";
                 return ctx.sendFunction(std::move(response));
             }
             // Execute the BER
             // auto decision = getPlanner().callBatch(ber);
-            getPlanner().scheduleMessages(ber);
+            getPlanner().scheduleMessages(ber, false);
 
             // Prepare the response
             response.result(beast::http::status::ok);
@@ -324,50 +323,7 @@ void PlannerEndpointHandler::onRequest(
         }
         case faabric::planner::HttpMessage_Type_GET_FUNCTION_METRICS: {
             SPDLOG_DEBUG("Planner received GET_FUNCTION_METRICS request");
-            // Collect metrics
-            std::map<std::string, FunctionMetrics> metrics =
-              faabric::planner::getPlanner().collectMetrics();
-            // Prepare response
-            faabric::planner::FunctionMetricResponse metricsResponse;
-            auto batchScheduler = faabric::batch_scheduler::getBatchScheduler();
-            std::map<std::string, std::string> stateHost;
-            std::shared_ptr<faabric::batch_scheduler::StateAwareScheduler>
-              stateAwareScheduler = std::dynamic_pointer_cast<
-                faabric::batch_scheduler::StateAwareScheduler>(batchScheduler);
-            if (stateAwareScheduler) {
-                stateHost = stateAwareScheduler->getStateHostMap();
-            }
-            for (const auto& [funcName, funcMetrics] : metrics) {
-                // For chained functions, we add it as ChainedFunctionsMetrics
-                if (funcMetrics.isChained) {
-                    auto* metricsResp = metricsResponse.add_chainedmetrics();
-                    metricsResp->set_name(funcMetrics.function);
-                    metricsResp->set_throughput(funcMetrics.throughput);
-                    metricsResp->set_processlatency(funcMetrics.processLatency);
-                }
-                // For single function, we add it as FunctionMetrics
-                else {
-                    auto* metricsResp = metricsResponse.add_functionmetrics();
-                    metricsResp->set_name(funcMetrics.function);
-                    metricsResp->set_throughput(funcMetrics.throughput);
-                    metricsResp->set_processlatency(funcMetrics.processLatency);
-                    metricsResp->set_averagewaitingtime(
-                      funcMetrics.averageWaitingTime);
-                    metricsResp->set_averageexecutetime(
-                      funcMetrics.averageExecuteTime);
-                    // The following parameters are only used for stateful
-                    // functions
-                    auto it = stateHost.find(funcMetrics.function);
-                    if (it != stateHost.end()) {
-                        metricsResp->set_hostip(it->second);
-                        metricsResp->set_lockcongestiontime(
-                          funcMetrics.lockCongestionTime);
-                        metricsResp->set_lockholdtime(funcMetrics.lockHoldTime);
-                    }
-                }
-            }
             response.result(beast::http::status::ok);
-            response.body() = faabric::util::messageToJson(metricsResponse);
             return ctx.sendFunction(std::move(response));
         }
         case faabric::planner::HttpMessage_Type_SCALE_FUNCTION_PARALLELISM: {
@@ -470,7 +426,7 @@ void PlannerEndpointHandler::onRequest(
                         parameter,
                         value);
             if (parameter == "max_inflight_reqs") {
-                maxInflightReqs = value;
+                maxInflightApps = value;
             }
             else if (parameter == "max_executors"){
                 faabric::planner::getPlanner().resetParameter(parameter, value);
@@ -530,14 +486,6 @@ void PlannerEndpointHandler::onRequest(
             } catch (faabric::util::JsonSerialisationException e) {
                 response.result(beast::http::status::bad_request);
                 response.body() = std::string("Bad JSON in body's payload");
-                return ctx.sendFunction(std::move(response));
-            }
-            auto inFlightApps =
-              faabric::planner::getPlanner().getInFlightApps();
-            if (inFlightApps > 0){
-                SPDLOG_ERROR("In-flight apps are not empty, can not output result");
-                response.result(beast::http::status::internal_server_error);
-                response.body() = std::string("In-flight Request is not empty");
                 return ctx.sendFunction(std::move(response));
             }
             faabric::planner::getPlanner().outputAppResultsToJson();

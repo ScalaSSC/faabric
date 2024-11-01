@@ -111,9 +111,6 @@ class State
                   const std::string& func,
                   int32_t parallelismId);
 
-    // Get all the metrics of the master function states from this host.
-    std::map<std::string, std::map<std::string, int>> getFSMetrics();
-
   private:
     const std::string thisIP;
 

@@ -44,10 +44,6 @@ class FunctionStateClient : public faabric::transport::MessageEndpointClient
 
     bool createState(std::string stateKey);
 
-    // MAP<UserFunctionPar, MAP<MetricName, MetricResult>>
-    // Get the matrics of all the master function states from this host.
-    std::map<std::string, std::map<std::string, int>> getMetrics();
-
   private:
     // void sendStateRequest(faabric::state::FunctionStateCalls header,
     //                       const uint8_t* data,

@@ -88,7 +88,7 @@ class Planner
 
     faabric::batch_scheduler::InFlightReqs getInFlightReqs();
 
-    int getInFlightChainsSize();
+    int getInFlightAppsSize();
 
     // Helper method to get the number of migrations that have happened since
     // the planner was last reset
@@ -123,7 +123,6 @@ class Planner
     // MAP<Function, MAP<metric, value>>
     std::map<std::string, FunctionMetrics> collectMetrics();
 
-    int getInFlightApps();
     void outputAppResultsToJson();
 
   private:

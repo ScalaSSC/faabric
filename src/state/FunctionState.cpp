@@ -1,6 +1,7 @@
 #include <faabric/state/FunctionState.h>
 #include <faabric/state/FunctionStateClient.h>
 #include <faabric/util/hash.h>
+#include <faabric/util/locks.h>
 #include <faabric/util/logging.h>
 #include <faabric/util/macros.h>
 #include <faabric/util/memory.h>
@@ -106,26 +107,6 @@ void FunctionState::unlockWrite()
     sem.release();
 }
 
-long FunctionState::lockMasterWrite()
-{
-    if (isMaster) {
-        return lockWrite();
-    }
-    FunctionStateClient cli(user, function, parallelismId, masterIp);
-    cli.lock();
-    // TODO - return the locking time.
-    return 0;
-}
-
-void FunctionState::unlockMasterWrite()
-{
-    if (isMaster) {
-        return unlockWrite();
-    }
-    FunctionStateClient cli(user, function, parallelismId, masterIp);
-    cli.unlock();
-}
-
 void FunctionState::checkSizeConfigured()
 {
     if (stateSize <= 0) {
@@ -219,6 +200,8 @@ void FunctionState::reSize(long length)
 
 void FunctionState::set(const uint8_t* buffer, long length, bool unlock)
 {
+    faabric::util::FullLock lock(funcStateMutex);
+
     reSize(length);
     doSet(buffer);
     if (!isMaster) {
@@ -340,6 +323,7 @@ void FunctionState::pushToRemote(bool unlock)
 // Only the Master node can return its data, otherwise pull at first.
 void FunctionState::get(uint8_t* buffer)
 {
+    faabric::util::FullLock lock(funcStateMutex);
     doPull();
 
     auto bytePtr = BYTES(sharedMemory);
@@ -497,6 +481,8 @@ uint8_t* FunctionState::getChunk(long offset, long len)
 std::vector<uint8_t> FunctionState::readPartitionState(
   std::set<std::string>& keys)
 {
+    faabric::util::FullLock lock(funcStateMutex);
+
     std::map<std::string, std::vector<uint8_t>> filteredMap;
     for (const auto& key : keys) {
         if (!indivStateMap.contains(key)) {
@@ -514,34 +500,20 @@ std::vector<uint8_t> FunctionState::readPartitionState(
 
 int FunctionState::readPartitionStateSize(std::set<std::string>& keys)
 {
-    FullLock(funcStateMutex);
     return readPartitionState(keys).size();
-}
-
-void FunctionState::writePartitionState(std::vector<uint8_t>& states)
-{
-    FullLock(funcStateMutex);
-    auto stateMap = faabric::util::deserializeParState(states);
-    for (auto& [key, value] : stateMap) {
-        if (!indivStateMap.contains(key)) {
-            SPDLOG_ERROR("Key {} is not found when writing", key);
-            throw std::runtime_error("Key is not found when writing");
-        }
-        indivStateMap.at(key).setState(value);
-    }
 }
 
 int FunctionState::acquireIndivLocks(std::set<std::string>& keys,
                                      uint8_t* buffer,
                                      int acquireTimes)
 {
-    FullLock(funcStateMutex);
 
     // Get the thread ID
     std::map<std::string, std::vector<uint8_t>> filteredMap;
 
     std::string acquiredKeysStr;
     auto acquiredKeys = multiKeyLock.tryAcquire(keys);
+    faabric::util::FullLock lock(funcStateMutex);
     for (const auto& key : acquiredKeys) {
         if (!acquiredKeysStr.empty()) {
             acquiredKeysStr += "|";
@@ -568,6 +540,8 @@ int FunctionState::acquireIndivLocks(std::set<std::string>& keys,
 
 void FunctionState::writeIndivStateUnlocks(std::vector<uint8_t>& states)
 {
+    faabric::util::FullLock lock(funcStateMutex);
+
     std::set<std::string> keys;
     auto stateMap = faabric::util::deserializeParState(states);
     for (auto& [key, value] : stateMap) {
@@ -576,51 +550,6 @@ void FunctionState::writeIndivStateUnlocks(std::vector<uint8_t>& states)
     }
     // Get the mx and unlock
     multiKeyLock.release(keys);
-}
-
-std::map<std::string, std::vector<uint8_t>> FunctionState::getStateMap()
-{
-    if (stateSize == 0 || sharedMemory == nullptr) {
-        return std::map<std::string, std::vector<uint8_t>>();
-    }
-    auto bytePtr = BYTES(sharedMemory);
-    std::vector<uint8_t> stateVector(bytePtr, bytePtr + stateSize);
-    std::map<std::string, std::vector<uint8_t>> stateMap =
-      faabric::util::deserializeFuncState(stateVector);
-    return stateMap;
-}
-
-std::map<std::string, std::vector<uint8_t>> FunctionState::getParStateMap()
-{
-    std::map<std::string, std::vector<uint8_t>> stateMap = getStateMap();
-    std::map<std::string, std::vector<uint8_t>> parStateMap =
-      faabric::util::deserializeParState(stateMap[partitionKey]);
-    return parStateMap;
-}
-
-std::map<std::string, int> FunctionState::getMetrics()
-{
-    SPDLOG_TRACE("Get function state metrics for {}: {}/{}-{}",
-                 hostIp,
-                 user,
-                 function,
-                 parallelismId);
-    std::map<std::string, int> metricsResult;
-    if (!isMaster) {
-        SPDLOG_WARN("Only the master node record metrics");
-        return metricsResult;
-    }
-    metricsResult["lockBlockTime"] = metrics.lockBlockTimeQueue.average();
-    metricsResult["lockHoldTime"] = metrics.lockHoldTimeQueue.average();
-    // Print the metrics
-    // SPDLOG_DEBUG("Metrics for {}/{}-{}: lockBlockTime {} µs lockHoldTime {}
-    // µs",
-    //              user,
-    //              function,
-    //              parallelismId,
-    //              metricsResult["lockBlockTime"],
-    //              metricsResult["lockHoldTime"]);
-    return metricsResult;
 }
 
 size_t FunctionState::getStateSize()

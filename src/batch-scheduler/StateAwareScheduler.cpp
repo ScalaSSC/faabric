@@ -47,71 +47,15 @@ void StateAwareScheduler::registerFunctionState(const std::string& userFunction,
     }
 }
 
-static std::map<std::string, int> getHostFreqCount(
-  std::shared_ptr<SchedulingDecision> decision)
-{
-    std::map<std::string, int> hostFreqCount;
-    for (auto host : decision->hosts) {
-        hostFreqCount[host] += 1;
-    }
-
-    return hostFreqCount;
-}
-
-// For the BinPack scheduler, a decision is better than another one if it spans
-// less hosts. In case of a tie, we calculate the number of cross-VM links
-// (i.e. better locality, or better packing)
 bool StateAwareScheduler::isFirstDecisionBetter(
   std::shared_ptr<SchedulingDecision> decisionA,
   std::shared_ptr<SchedulingDecision> decisionB)
 {
-    // The locality score is currently the number of cross-VM links. You may
-    // calculate this number as follows:
-    // - If the decision is single host, the number of cross-VM links is zero
-    // - Otherwise, in a fully-connected graph, the number of cross-VM links
-    //   is the sum of edges that cross a VM boundary
-    auto getLocalityScore =
-      [](std::shared_ptr<SchedulingDecision> decision) -> std::pair<int, int> {
-        // First, calculate the host-message histogram (or frequency count)
-        std::map<std::string, int> hostFreqCount;
-        for (auto host : decision->hosts) {
-            hostFreqCount[host] += 1;
-        }
-
-        // If scheduling is single host, return one host and 0 cross-host links
-        if (hostFreqCount.size() == 1) {
-            return std::make_pair(1, 0);
-        }
-
-        // Else, sum all the egressing edges for each element and divide by two
-        int score = 0;
-        for (auto [host, freq] : hostFreqCount) {
-
-            int thisHostScore = 0;
-            for (auto [innerHost, innerFreq] : hostFreqCount) {
-                if (innerHost != host) {
-                    thisHostScore += innerFreq;
-                }
-            }
-
-            score += thisHostScore * freq;
-        }
-
-        score = int(score / 2);
-
-        return std::make_pair(hostFreqCount.size(), score);
-    };
-
-    auto scoreA = getLocalityScore(decisionA);
-    auto scoreB = getLocalityScore(decisionB);
-
-    // The first decision is better if it has a LOWER host set size
-    if (scoreA.first != scoreB.first) {
-        return scoreA.first < scoreB.first;
-    }
-
-    // The first decision is better if it has a LOWER locality score
-    return scoreA.second < scoreB.second;
+    SPDLOG_ERROR(
+      "isFirstDecisionBetter function Not implemented in StateAwareScheduler");
+    throw std::runtime_error(
+      "isFirstDecisionBetter function Not implemented in StateAwareScheduler");
+    return true;
 }
 
 std::vector<Host> StateAwareScheduler::getSortedHosts(
@@ -121,142 +65,23 @@ std::vector<Host> StateAwareScheduler::getSortedHosts(
   const DecisionType& decisionType)
 {
     std::vector<Host> sortedHosts;
-    for (auto [ip, host] : hostMap) {
-        sortedHosts.push_back(host);
-    }
-
-    std::shared_ptr<SchedulingDecision> oldDecision = nullptr;
-    std::map<std::string, int> hostFreqCount;
-    if (decisionType != DecisionType::NEW) {
-        oldDecision = inFlightReqs.at(req->appid()).second;
-        hostFreqCount = getHostFreqCount(oldDecision);
-    }
-
-    auto isFirstHostLarger = [&](const Host& hostA, const Host& hostB) -> bool {
-        // The BinPack scheduler sorts hosts by number of available slots
-        int nAvailableA = numSlotsAvailable(hostA);
-        int nAvailableB = numSlotsAvailable(hostB);
-        if (nAvailableA != nAvailableB) {
-            return nAvailableA > nAvailableB;
-        }
-
-        // In case of a tie, it will pick larger hosts first
-        int nSlotsA = numSlots(hostA);
-        int nSlotsB = numSlots(hostB);
-        if (nSlotsA != nSlotsB) {
-            return nSlotsA > nSlotsB;
-        }
-
-        // Lastly, in case of a tie, return the largest host alphabetically
-        return getIp(hostA) > getIp(hostB);
-    };
-
-    auto isFirstHostLargerWithFreq = [&](auto hostA, auto hostB) -> bool {
-        // When updating an existing scheduling decision (SCALE_CHANGE or
-        // DIST_CHANGE), the BinPack scheduler takes into consideration the
-        // existing host-message histogram (i.e. how many messages for this app
-        // does each host _already_ run)
-
-        int numInHostA = hostFreqCount.contains(getIp(hostA))
-                           ? hostFreqCount.at(getIp(hostA))
-                           : 0;
-        int numInHostB = hostFreqCount.contains(getIp(hostB))
-                           ? hostFreqCount.at(getIp(hostB))
-                           : 0;
-
-        // If at least one of the hosts has messages for this request, return
-        // the host with the more messages for this request (note that it is
-        // possible that this host has no available slots at all, in this case
-        // we will just pack 0 messages here but we still want to sort it first
-        // nontheless)
-        if (numInHostA != numInHostB) {
-            return numInHostA > numInHostB;
-        }
-
-        // In case of a tie, use the same criteria than NEW
-        return isFirstHostLarger(hostA, hostB);
-    };
-
-    auto isFirstHostLargerWithFreqTaint = [&](const Host& hostA,
-                                              const Host& hostB) -> bool {
-        // In a DIST_CHANGE decision we want to globally minimise the
-        // number of cross-VM links (i.e. best BIN_PACK), but break the ties
-        // with hostFreqCount (i.e. if two hosts have the same number of free
-        // slots, without counting for the to-be-migrated app, prefer the host
-        // that is already running messags for this app)
-        int nAvailableA = numSlotsAvailable(hostA);
-        int nAvailableB = numSlotsAvailable(hostB);
-        if (nAvailableA != nAvailableB) {
-            return nAvailableA > nAvailableB;
-        }
-
-        // In case of a tie, use the same criteria as FREQ count
-        return isFirstHostLargerWithFreq(hostA, hostB);
-    };
-
-    switch (decisionType) {
-        case DecisionType::NEW: {
-            // For a NEW decision type, the BinPack scheduler just sorts the
-            // hosts in decreasing order of capacity, and bin-packs messages
-            // to hosts in this order
-            std::sort(
-              sortedHosts.begin(), sortedHosts.end(), isFirstHostLarger);
-            break;
-        }
-        case DecisionType::SCALE_CHANGE: {
-            // If we are changing the scale of a running app (i.e. via chaining
-            // or thread/process forking) we want to prioritise co-locating
-            // as much as possible. This means that we will sort first by the
-            // frequency of messages of the running app, and second with the
-            // same criteria than NEW
-            // IMPORTANT: a SCALE_CHANGE request with 4 messages means that we
-            // want to add 4 NEW messages to the running app (not that the new
-            // total count is 4)
-            std::sort(sortedHosts.begin(),
-                      sortedHosts.end(),
-                      isFirstHostLargerWithFreq);
-            break;
-        }
-        case DecisionType::DIST_CHANGE: {
-            // When migrating, we want to know if the provided for app (which
-            // is already in-flight) can be improved according to the bin-pack
-            // scheduling logic. This is equivalent to saying that the number
-            // of cross-vm links can be reduced (i.e. we improve locality)
-            auto oldDecision = inFlightReqs.at(req->appid()).second;
-            auto hostFreqCount = getHostFreqCount(oldDecision);
-
-            // To decide on a migration opportunity, is like having another
-            // shot at re-scheduling the app from scratch. Thus, we remove
-            // the current slots we occupy, and return the largest slots.
-            // However, in case of a tie, we prefer DIST_CHANGE decisions
-            // that minimise the number of migrations, so we need to sort
-            // hosts in decreasing order of capacity BUT break ties with
-            // frequency
-            // WARNING: this assumes negligible migration costs
-
-            // First remove the slots the app occupies to have a fresh new
-            // shot at the scheduling
-            for (auto h : sortedHosts) {
-                if (hostFreqCount.contains(getIp(h))) {
-                    freeSlots(h, hostFreqCount.at(getIp(h)));
-                }
-            }
-
-            // Now sort the emptied hosts breaking ties with the freq count
-            // criteria
-            std::sort(sortedHosts.begin(),
-                      sortedHosts.end(),
-                      isFirstHostLargerWithFreqTaint);
-
-            break;
-        }
-        default: {
-            SPDLOG_ERROR("Unrecognised decision type: {}", decisionType);
-            throw std::runtime_error("Unrecognised decision type");
-        }
-    }
-
+    SPDLOG_ERROR(
+      "getSortedHosts function Not implemented in StateAwareScheduler");
+    throw std::runtime_error(
+      "getSortedHosts function Not implemented in StateAwareScheduler");
     return sortedHosts;
+}
+
+template<typename K, typename V>
+K getNthKey(const std::map<K, V>& map, std::size_t n)
+{
+    if (n >= map.size()) {
+        throw std::out_of_range("Index out of range");
+    }
+
+    auto it = map.begin();
+    std::advance(it, n);
+    return it->first;
 }
 
 HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
@@ -320,18 +145,6 @@ bool registerStateToHost(const std::string& userFunctionParIdx,
     return true;
 }
 
-template<typename K, typename V>
-K getNthKey(const std::map<K, V>& map, std::size_t n)
-{
-    if (n >= map.size()) {
-        throw std::out_of_range("Index out of range");
-    }
-
-    auto it = map.begin();
-    std::advance(it, n);
-    return it->first;
-}
-
 void StateAwareScheduler::initializeState(const HostMap& hostMap,
                                           std::string userFunc,
                                           int parallelism)
@@ -379,9 +192,8 @@ std::shared_ptr<SchedulingDecision> StateAwareScheduler::makeSchedulingDecision(
 
     auto decision = std::make_shared<SchedulingDecision>(req->appid(), 0);
 
-    // Our Methods used scheduleWithoutLock instead of makeschedulingdecision to
-    // get the decision.
-
+    SPDLOG_ERROR(
+      "makeSchedulingDecision function Not implemented in StateAwareScheduler");
     throw std::runtime_error(
       "makeSchedulingDecision function Not implemented in StateAwareScheduler");
 
@@ -400,11 +212,11 @@ std::string StateAwareScheduler::scheduleMessage(
     // For function-state function, assign near state
     if (funcStateRegMap.contains(userFunc)) {
         // If function-state has not been initialized, initialize it.
+        faabric::util::FullLock lock(scheduleMx);
         if (!functionParallelism.contains(userFunc)) {
             initializeState(hostMap, userFunc);
         }
         // TODO - get parallelism is not thread safe now
-        faabric::util::FullLock lock(scheduleMx);
         auto parallelismInfo = getHashAndParallelismIndex(userFunc, *msg);
         lock.unlock();
         std::string userFuncPar =
@@ -566,105 +378,6 @@ bool StateAwareScheduler::repartitionParitionedState(
     }
     // Wait until get the response from all state server.
     return true;
-}
-
-void StateAwareScheduler::updateParallelism(
-  const HostMap& hostMap,
-  std::map<std::string, faabric::planner::FunctionMetrics> metrics)
-{
-    // Iterate over the Functions Chained Maps
-    for (const auto& [ithSource, ithChainedFunctions] : funcChainedMap) {
-        // Record the average metrics for each function.
-        std::vector<std::string> userFunction;
-        std::vector<int> avgLatencyVector;
-        std::vector<int> avgLockTimeVector;
-        std::vector<int> statefulFunctionIdx;
-        int index = 0;
-
-        // We only increase the parallelism for function-state functions.
-        for (const auto& function : ithChainedFunctions) {
-            // Calculate the average Latency and Locking time for this function.
-            // For stateless functions, the parallelism is 1 and it is not
-            // recorded.
-            int avgLatency = 0;
-            int avgLockTime = 0;
-
-            // If this function is stateless
-            if (functionParallelism.find(function) ==
-                functionParallelism.end()) {
-                // Get the average processLatency and lockHoldTime for stateless
-                // functions.
-                auto metricIt = metrics.find(function + "_0");
-                if (metricIt != metrics.end()) {
-                    avgLatency = metricIt->second.processLatency;
-                    avgLockTime = metricIt->second.lockHoldTime;
-                }
-            } else {
-                // For each parallelism, get the average metrics
-                int totalLatency = 0;
-                int totalLockTime = 0;
-                for (int idx = 0; idx < functionParallelism[function]; idx++) {
-                    std::string userFuncPar =
-                      function + "_" + std::to_string(idx);
-                    auto metricIt = metrics.find(userFuncPar);
-                    if (metricIt != metrics.end()) {
-                        totalLatency += metricIt->second.processLatency;
-                        totalLockTime += metricIt->second.lockHoldTime;
-                    }
-                }
-                // Get the average processLatency and lockHoldTime.
-                if (functionParallelism[function] == 0) {
-                    SPDLOG_ERROR("Function {} has no parallelism", function);
-                } else {
-                    avgLatency = totalLatency / functionParallelism[function];
-                    avgLockTime = totalLockTime / functionParallelism[function];
-                }
-            }
-
-            // Record the average metrics for this function.
-            userFunction.push_back(function);
-            avgLatencyVector.push_back(avgLatency);
-            avgLockTimeVector.push_back(avgLockTime);
-            if (funcStateRegMap.find(function) != funcStateRegMap.end()) {
-                statefulFunctionIdx.push_back(index);
-            }
-            index++;
-        }
-
-        // Increase the stateful function's parallelism if necessary.
-        if (statefulFunctionIdx.empty()) {
-            continue;
-        }
-
-        for (const auto& idx : statefulFunctionIdx) {
-            // Calculate the latency except for the current function.
-            int totalLatency = 0;
-            for (int i = 0; i < avgLatencyVector.size(); i++) {
-                if (i == idx) {
-                    continue;
-                }
-                totalLatency += avgLatencyVector[i];
-            }
-            int incParallelism = 0;
-            int freeParallelism =
-              maxParallelism - functionParallelism[userFunction[idx]];
-            // Increase the parallelism if latency is higher than others.
-            if (avgLatencyVector.size() != 1) {
-                int avgLatency = totalLatency / (avgLatencyVector.size() - 1);
-                if (avgLatency == 0) {
-                    incParallelism = freeParallelism;
-                } else {
-                    incParallelism = std::min(
-                      avgLatencyVector[idx] / avgLatency - 1, freeParallelism);
-                }
-            }
-            // TODO - Increase Parallelism if Locking time it High
-            if (incParallelism > 0) {
-                increaseFunctionParallelism(
-                  incParallelism, userFunction[idx], hostMap);
-            }
-        }
-    }
 }
 
 void StateAwareScheduler::flushStateInfo()

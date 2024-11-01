@@ -131,7 +131,7 @@ void FunctionCallClient::executeFunctionsBatch(
 {
     // Formulate a batch execute request Batch
     auto batchMsgsList = std::make_shared<faabric::MessageBatch>();
-    SPDLOG_DEBUG("Batch execute call Batch size: {}", msgs.size());
+    SPDLOG_DEBUG("Batch execute call {} with Batch size: {}", host, msgs.size());
     for (auto& msg : msgs) {
         batchMsgsList->add_messages()->CopyFrom(*msg);
     }

@@ -84,7 +84,7 @@ void SystemConfig::initialise()
     functionServerThreads =
       this->getSystemConfIntParam("FUNCTION_SERVER_THREADS", "10");
     stateServerThreads =
-      this->getSystemConfIntParam("STATE_SERVER_THREADS", "10");
+      this->getSystemConfIntParam("STATE_SERVER_THREADS", "15");
     snapshotServerThreads =
       this->getSystemConfIntParam("SNAPSHOT_SERVER_THREADS", "2");
     // FIXME: temporarily set this value to a higher number to work-around:

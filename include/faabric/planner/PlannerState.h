@@ -42,9 +42,6 @@ struct PlannerState
     // Helper coutner of the total number of migrations
     std::atomic<int> numMigrations = 0;
 
-    // MAP<chainedId, in_flight_counting> Map of inflight chained requests.
-    std::map<int, int> inFlightChains;
-
     // MAP<appId, in_flight_counting> Map of inflight requests.
     std::map<int, int> inFlightApps;
 

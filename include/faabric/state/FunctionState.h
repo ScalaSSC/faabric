@@ -4,7 +4,6 @@
 #include <faabric/state/FunctionStateMetrics.h>
 #include <faabric/state/FunctionStateRegistry.h>
 #include <faabric/state/StateKeyValue.h>
-#include <faabric/util/locks.h>
 #include <map>
 #include <semaphore>
 #include <set>
@@ -51,8 +50,6 @@ class FunctionState
     // lock the function state and return the time to acquire the lock (ms)
     long lockWrite();
     void unlockWrite();
-    long lockMasterWrite();
-    void unlockMasterWrite();
 
     size_t size() const;
     void set(const uint8_t* buffer);
@@ -78,17 +75,11 @@ class FunctionState
     // Local-Tier Parition State
     std::vector<uint8_t> readPartitionState(std::set<std::string>& keys);
     int readPartitionStateSize(std::set<std::string>& keys);
-    void writePartitionState(std::vector<uint8_t>& states);
 
     int acquireIndivLocks(std::set<std::string>& keys,
                           uint8_t* buffer,
                           int acquireTimes);
     void writeIndivStateUnlocks(std::vector<uint8_t>& states);
-
-    /***
-     * Fucntions related to the metrics
-     */
-    std::map<std::string, int> getMetrics();
 
     const std::string user;
     const std::string function;
@@ -105,7 +96,7 @@ class FunctionState
     // starvation.
     std::counting_semaphore<1> sem;
 
-    std::mutex funcStateMutex;
+    std::shared_mutex funcStateMutex;
 
     faabric::util::MultiKeyLock multiKeyLock;
     std::map<std::string, IndivState> indivStateMap;
@@ -140,12 +131,7 @@ class FunctionState
     void pushToRemote(bool unlock = false);
     void doPull();
     void pullFromRemote();
-    std::map<std::string, std::vector<uint8_t>> getStateMap();
-    // It parsed the partition state from the sharedmemory space
-    std::map<std::string, std::vector<uint8_t>> getParStateMap();
-    // It added the partition state to the temp state. After the instruction
-    // from the planner, it will be added to the state.
-    std::set<std::vector<uint8_t>> tempParState;
+
 };
 
 class FunctionStateException : public std::runtime_error

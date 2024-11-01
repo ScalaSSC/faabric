@@ -158,7 +158,7 @@ void Planner::flushSchedulingState()
     state.appResultWaiters.clear();
     state.numMigrations = 0;
 
-    state.inFlightChains.clear();
+    state.inFlightApps.clear();
 }
 
 std::vector<std::shared_ptr<Host>> Planner::getAvailableHosts()
@@ -277,34 +277,35 @@ bool Planner::isHostExpired(std::shared_ptr<Host> host, long epochTimeMs)
 void Planner::setMessageResultBatch(
   std::shared_ptr<faabric::BatchExecuteRequest> batchMsg)
 {
+    SPDLOG_DEBUG("Planner received message result batch with {} messages",
+                 batchMsg->messages_size());
     faabric::util::FullLock lock(plannerStateMx);
+    SPDLOG_DEBUG("InFlightApps size before set: {}", state.inFlightApps.size());
     for (int msgIdx = 0; msgIdx < batchMsg->messages_size(); msgIdx++) {
         auto msg = batchMsg->messages(msgIdx);
         int appId = msg.appid();
         int msgId = msg.id();
         int chainedId = msg.chainedid();
+        if (appId != chainedId){
+            SPDLOG_ERROR("App Id and Chained ID are different: {} and {}",
+                         appId,
+                         chainedId);
+            throw std::runtime_error("Message ID and Chained ID are different");
+        }
+        if (!state.inFlightApps.contains(appId)) {
+            SPDLOG_ERROR("App {} is not in flight", appId);
+            continue;
+        }
         state.appResults[appId][msgId] =
           std::make_shared<faabric::Message>(msg);
 
-        int inFlightChainCount = --state.inFlightChains[chainedId];
-        if (inFlightChainCount < 0) {
-            SPDLOG_ERROR("In-flight chains count is negative: {}",
-                         inFlightChainCount);
-            throw std::runtime_error("Chained Id removes negative count");
-        }
-        if (inFlightChainCount == 0) {
-            state.inFlightChains.erase(chainedId);
-        }
         int inFlightAppCount = --state.inFlightApps[appId];
-        if (inFlightAppCount < 0) {
-            SPDLOG_ERROR("In-flight apps count is negative: {}",
-                         inFlightAppCount);
-            throw std::runtime_error("App Id removes negative count");
-        }
-        if (inFlightAppCount == 0) {
+        if (inFlightAppCount <= 0) {
             state.inFlightApps.erase(appId);
         }
     }
+    SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
+
 }
 
 std::shared_ptr<faabric::Message> Planner::getMessageResult(
@@ -436,7 +437,7 @@ std::shared_ptr<faabric::BatchExecuteRequestStatus> Planner::getBatchResults(
         }
 
         // Set the finished condition
-        berStatus->set_finished(!state.inFlightReqs.contains(appId));
+        berStatus->set_finished(!state.inFlightApps.contains(appId));
 
         // WARNING: It might affect the get message result function and the
         // ExecGraph function. But in stream processing, it is not a problem.
@@ -493,29 +494,39 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
 
     // First loop: handle state without creating a shared_ptr
     faabric::util::FullLock lock(plannerStateMx);
-    for (int i = 0; i < req->messages_size(); i++) {
+    int i = 0;
+    while (i < req->messages_size()) {
         auto* message = req->mutable_messages(i); // Use a pointer directly
 
         // Record planner enqueue time
         message->set_plannerqueuetime(currentTime);
 
         // Record the chained call count
-        int chainedId = message->chainedid();
-        if (isChained) {
-            if (!state.inFlightChains.contains(chainedId)) {
-                SPDLOG_ERROR("ChainedId {} is not running", chainedId);
-                throw std::runtime_error("Chained call id cannot be found");
-            }
-            state.inFlightChains[chainedId]++;
-        } else {
-            if (state.inFlightChains.contains(chainedId)) {
-                SPDLOG_ERROR("ChainedId {} already exists", chainedId);
-                throw std::runtime_error(
-                  "ChainedId already exists and running");
-            }
-            state.inFlightChains[chainedId] = 1;
+        int appid = message->appid();
+        int chainedid = message->chainedid();
+        // Now we asssume AppId is equal to ChainedId
+        if (chainedid != appid) {
+            SPDLOG_ERROR("ChainedId is not equal to AppId");
+            throw std::runtime_error("ChainedId is not equal to AppId");
         }
-        state.inFlightApps[message->appid()]++;
+        if (isChained) {
+            if (!state.inFlightApps.contains(appid)) {
+                SPDLOG_ERROR("app Id {} is not running", appid);
+
+                // We don't schedule it if the chainedId is not running
+                req->mutable_messages()->DeleteSubrange(i, 1);
+                continue;
+            }
+        } else {
+            if (state.inFlightApps.contains(appid)) {
+                SPDLOG_ERROR("app Id {} is already running", appid);
+
+                // Flush the old chainedId
+                state.inFlightApps[appid] = 0;
+            }
+        }
+        state.inFlightApps[appid] ++;
+        i++; // Only increment i if a message was not removed
     }
     lock.unlock();
 
@@ -595,8 +606,6 @@ void Planner::dequeueScheduledMsgs()
                     t.join();
                 }
             }
-            SPDLOG_DEBUG("Finished dequeueing scheduled messages for {} hosts");
-
             // Sleep for a while to batch the scheduled requests
             std::this_thread::sleep_for(
               std::chrono::milliseconds(dispatchPeriod));
@@ -604,9 +613,11 @@ void Planner::dequeueScheduledMsgs()
     }
 }
 
-int Planner::getInFlightChainsSize()
+int Planner::getInFlightAppsSize()
 {
-    return state.inFlightChains.size();
+    faabric::util::SharedLock lock(plannerStateMx);
+    SPDLOG_DEBUG("Getting in-flight apps size: {}", state.inFlightApps.size());
+    return state.inFlightApps.size();
 }
 
 std::map<std::string, FunctionMetrics> Planner::collectMetrics()
@@ -701,13 +712,9 @@ bool Planner::resetParameter(const std::string& key,
     return true;
 }
 
-int Planner::getInFlightApps()
-{
-    return state.inFlightApps.size();
-}
-
 void Planner::outputAppResultsToJson()
 {
+    faabric::util::FullLock lock(plannerStateMx);
     if (state.appResults.empty()) {
         SPDLOG_INFO("No results to output");
         return;
@@ -719,6 +726,10 @@ void Planner::outputAppResultsToJson()
         rapidjson::Document::AllocatorType& allocator = document.GetAllocator();
 
         for (const auto& [appId, messages] : state.appResults) {
+            if (state.inFlightApps.contains(appId)) {
+                SPDLOG_DEBUG("App {} is still in flight", appId);
+                continue;
+            }
             rapidjson::Value appData(rapidjson::kArrayType);
             for (const auto& [messageId, message] : messages) {
                 rapidjson::Value messageData(rapidjson::kObjectType);
