@@ -182,6 +182,8 @@ class Planner
     int dispatchPeriod = 20; // ms
 
     void dequeueScheduledMsgs();
+
+    bool isOutputting = false;
 };
 
 Planner& getPlanner();

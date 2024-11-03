@@ -25,6 +25,15 @@
 
 namespace faabric::planner {
 
+#define CONTINUE_IF_OUTPUTTING                                                 \
+    if (isOutputting) {                                                        \
+        continue;                                                              \
+    }
+#define RETURN_IF_OUTPUTTING                                                   \
+    if (isOutputting) {                                                        \
+        return;                                                                \
+    }
+
 // ----------------------
 // Static methods
 // ----------------------
@@ -279,14 +288,18 @@ void Planner::setMessageResultBatch(
 {
     SPDLOG_DEBUG("Planner received message result batch with {} messages",
                  batchMsg->messages_size());
+    // When outputing result, we doesn't allow any set result operation.
+    RETURN_IF_OUTPUTTING
     faabric::util::FullLock lock(plannerStateMx);
+    // Check again
+    RETURN_IF_OUTPUTTING
     SPDLOG_DEBUG("InFlightApps size before set: {}", state.inFlightApps.size());
     for (int msgIdx = 0; msgIdx < batchMsg->messages_size(); msgIdx++) {
         auto msg = batchMsg->messages(msgIdx);
         int appId = msg.appid();
         int msgId = msg.id();
         int chainedId = msg.chainedid();
-        if (appId != chainedId){
+        if (appId != chainedId) {
             SPDLOG_ERROR("App Id and Chained ID are different: {} and {}",
                          appId,
                          chainedId);
@@ -305,7 +318,6 @@ void Planner::setMessageResultBatch(
         }
     }
     SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
-
 }
 
 std::shared_ptr<faabric::Message> Planner::getMessageResult(
@@ -492,8 +504,12 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
     SPDLOG_DEBUG("Planner is Scheduling {} messages", req->messages_size());
     auto currentTime = faabric::util::getGlobalClock().epochMicros();
 
+    // When outputing result, we doesn't allow any schedule message operation.
+    RETURN_IF_OUTPUTTING
     // First loop: handle state without creating a shared_ptr
     faabric::util::FullLock lock(plannerStateMx);
+    // check again
+    RETURN_IF_OUTPUTTING
     int i = 0;
     while (i < req->messages_size()) {
         auto* message = req->mutable_messages(i); // Use a pointer directly
@@ -525,7 +541,7 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
                 state.inFlightApps[appid] = 0;
             }
         }
-        state.inFlightApps[appid] ++;
+        state.inFlightApps[appid]++;
         i++; // Only increment i if a message was not removed
     }
     lock.unlock();
@@ -561,9 +577,12 @@ void Planner::enqueueMessageBatch(
 void Planner::dequeueScheduledMsgs()
 {
     while (!stopThreadTimer) {
+                // Sleep for a while to batch the scheduled requests
+        std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
+        CONTINUE_IF_OUTPUTTING
         faabric::util::FullLock lock(state.scheduledMsgsMapMx);
-
+        CONTINUE_IF_OUTPUTTING
         if (state.scheduledMsgsMap.empty()) {
             lock.unlock();
             continue;
@@ -599,16 +618,12 @@ void Planner::dequeueScheduledMsgs()
                     ->executeFunctionsBatch(std::move(msgsIn));
               },
               std::move(msgs));
-
-            // Join all threads to ensure they complete before next iteration
-            for (auto& t : threads) {
-                if (t.joinable()) {
-                    t.join();
-                }
+        }
+        // Join all threads to ensure they complete before next iteration
+        for (auto& t : threads) {
+            if (t.joinable()) {
+                t.join();
             }
-            // Sleep for a while to batch the scheduled requests
-            std::this_thread::sleep_for(
-              std::chrono::milliseconds(dispatchPeriod));
         }
     }
 }
@@ -692,6 +707,10 @@ bool Planner::resetParameter(const std::string& key,
             SPDLOG_INFO("Planner reset dispatchPeriod to {}", value);
             dispatchPeriod = value;
         }
+        else if (key == "is_outputting"){
+            SPDLOG_INFO("Planner reset isOutputting to {}", value == 1);
+            isOutputting = value == 1;
+        }
         return true;
     }
     // Reset the parameter of the worker hosts
@@ -715,6 +734,9 @@ bool Planner::resetParameter(const std::string& key,
 void Planner::outputAppResultsToJson()
 {
     faabric::util::FullLock lock(plannerStateMx);
+    isOutputting = true;
+    // We have to unlock, since the output operation may take a long time
+    lock.unlock();
     if (state.appResults.empty()) {
         SPDLOG_INFO("No results to output");
         return;

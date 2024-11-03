@@ -131,6 +131,11 @@ void Scheduler::reset()
     // Stop the reaper thread
     reaperThread.stop();
 
+    stopBatchTimer = true;
+    if (batchTimerThread.joinable()) {
+        batchTimerThread.join();
+    }
+
     // Shut down, then clear executors
     for (auto& ep : executors) {
         for (auto& e : ep.second) {
@@ -163,6 +168,12 @@ void Scheduler::reset()
 
     waitingQueues.clear();
     partitionedWaitingQueues.clear();
+    chainedCallMsgs.clear();
+    setResultMsgs.clear();
+
+    stopBatchTimer = false;
+    batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
+
 }
 
 void Scheduler::shutdown()

@@ -78,11 +78,11 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::recvFlush(
     SPDLOG_INFO("Flushing host {}",
                 faabric::util::getSystemConfig().endpointHost);
 
-    // Clear out any cached state
-    faabric::state::getGlobalState().forceClearAll(false);
-
     // Clear the scheduler
     faabric::scheduler::getScheduler().reset();
+
+    // Clear out any cached state
+    faabric::state::getGlobalState().forceClearAll(false);
 
     // Clear the executor factory
     faabric::executor::getExecutorFactory()->flushHost();

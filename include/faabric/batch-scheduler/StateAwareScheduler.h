@@ -97,9 +97,6 @@ class StateAwareScheduler final : public BatchScheduler
     std::map<std::string, std::string> statePartitionBy;
 
     int maxParallelism;
-    // TODO - This can be detected by planner.
-    // Function Source: All the chained functions invoked subsequently
-    std::map<std::string, std::vector<std::string>> funcChainedMap;
 
     // TODO - This can be detected by state server and planner, but logic will
     // be extreamly complex. (How to create new function state, BALABALA)

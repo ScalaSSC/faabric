@@ -12,7 +12,6 @@ namespace faabric::batch_scheduler {
 /*
 HERE is the logic of registering function state to the host.
 BEFORE COMPILE
-write funcChainedMap: records all functions in an chained application.
 write funcStateRegMap: records function state functions and their partition info
 --- These two maps should never be changed after the initialization.
 INITIALIZING
@@ -149,6 +148,7 @@ void StateAwareScheduler::initializeState(const HostMap& hostMap,
                                           std::string userFunc,
                                           int parallelism)
 {
+  SPDLOG_INFO("Initializing function state for {} with parallelism {}", userFunc, parallelism);
     if (parallelism == 1) {
         // Default parallelism is 1.
         functionParallelism[userFunc] = 1;
@@ -383,11 +383,15 @@ bool StateAwareScheduler::repartitionParitionedState(
 void StateAwareScheduler::flushStateInfo()
 {
     SPDLOG_INFO("Flushing state information");
+    rbCounter = 0;
+    atomicRbCounter.store(0);
+
     functionParallelism.clear();
     functionCounter.clear();
     stateHost.clear();
     stateHashRing.clear();
     statePartitionBy.clear();
+    funcStateRegMap.clear();
 }
 
 } // namespace faabric::batch_scheduler
