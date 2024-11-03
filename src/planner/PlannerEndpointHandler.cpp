@@ -437,6 +437,9 @@ void PlannerEndpointHandler::onRequest(
             else if (parameter == "dispatch_period"){
                 faabric::planner::getPlanner().resetParameter(parameter, value, true);
             }
+            else if (parameter == "planner_call_interval"){
+                faabric::planner::getPlanner().resetParameter(parameter, value);
+            }
             else {
                 SPDLOG_ERROR("Unrecognized parameter {}", parameter);
                 response.result(beast::http::status::bad_request);

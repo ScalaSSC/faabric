@@ -5,6 +5,7 @@
 #include <faabric/mpi/MpiWorldRegistry.h>
 #include <faabric/planner/PlannerClient.h>
 #include <faabric/proto/faabric.pb.h>
+#include <faabric/scheduler/Scheduler.h>
 #include <faabric/snapshot/SnapshotClient.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/state/State.h>
@@ -470,9 +471,9 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                 availablePoolThreads.insert(threadPoolIdx);
             }
 
-            // Set normal function result
-            faabric::planner::getPlannerClient().setMessageResultBatch(
-              task.req);
+            // Enqueue the message result
+            faabric::scheduler::getScheduler().enqueueSetResults(
+              std::move(task.req));
             continue;
         }
 

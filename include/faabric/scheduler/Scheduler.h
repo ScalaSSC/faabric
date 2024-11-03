@@ -88,6 +88,10 @@ class Scheduler
     // Check the waiting queue peroiodically.
     void batchTimerCheck();
 
+    void enqueueChainedCalls(std::vector<std::unique_ptr<faabric::Message>> msgs);
+
+    void enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> req);
+
     void executeBatchForQueue(const std::string& userFuncPar,
                               BatchQueue& waitingBatch,
                               faabric::util::FullLock& lock);
@@ -215,13 +219,20 @@ class Scheduler
 
     // A queue stores the uninvoked requests: MAP<UserFuncPar, Queue>
     std::map<std::string, BatchQueue> waitingQueues;
-    // A queue stores the uninvoked partitioned function requests:
+
+    std::vector<std::unique_ptr<faabric::Message>> chainedCallMsgs;
+
+    std::vector<std::unique_ptr<faabric::Message>> setResultMsgs;
+
     // MAP<UserFuncPar, Queue>,
     std::map<std::string, faabric::util::PartitionedStateMessageQueue>
       partitionedWaitingQueues;
     // ---- Batch Execution ----
     std::thread batchTimerThread;
     bool stopBatchTimer = false;
+
+    long lastPlannerCallCheck = 0;
+    int plannerCallInterval = 20;
 };
 
 }

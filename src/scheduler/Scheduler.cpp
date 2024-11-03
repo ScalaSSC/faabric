@@ -539,6 +539,31 @@ void Scheduler::executeBatchForPartitionQueue(
     }
 }
 
+void Scheduler::enqueueChainedCalls(
+  std::vector<std::unique_ptr<faabric::Message>> msgs)
+{
+    SPDLOG_DEBUG("Enqueueing chained calls for {} messages", msgs.size());
+    faabric::util::FullLock lock(mx);
+
+    for (auto& msg : msgs) {
+        if (msg) {
+            chainedCallMsgs.emplace_back(std::move(msg));
+        }
+    }
+    msgs.clear();
+}
+
+void Scheduler::enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> req){
+    SPDLOG_DEBUG("Enqueueing set results for {} messages", req->messages_size());
+    faabric::util::FullLock lock(mx);
+
+    for (int i = 0; i < req->messages_size(); i++) {
+        faabric::Message& msg = req->mutable_messages()->at(i);
+        setResultMsgs.emplace_back(std::make_unique<faabric::Message>(msg));
+    }
+}
+
+
 void Scheduler::batchTimerCheck()
 {
     while (!stopBatchTimer) {
@@ -571,6 +596,37 @@ void Scheduler::batchTimerCheck()
                 executeBatchForPartitionQueue(userFuncPar, waitingBatch, lock);
             }
         }
+
+        auto currentMillis = faabric::util::getGlobalClock().epochMillis();
+
+        if (currentMillis - lastPlannerCallCheck < plannerCallInterval) {
+            continue;
+        }
+        lastPlannerCallCheck = currentMillis;
+        auto& plannerCli = faabric::planner::getPlannerClient();
+
+        // Check the chained calls
+        if (!chainedCallMsgs.empty()) {
+            auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
+            for (auto& msg : chainedCallMsgs) {
+                auto* message = req->add_messages();
+                *message = std::move(*msg);
+            }
+            SPDLOG_DEBUG("Chaining call batch size: {}", req->messages_size());
+            plannerCli.enqueueFunctions(req);
+            chainedCallMsgs.clear();
+        }
+
+        if (!setResultMsgs.empty()) {
+            auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
+            for (auto& msg : setResultMsgs) {
+                auto* message = req->add_messages();
+                *message = std::move(*msg);
+            }
+            SPDLOG_DEBUG("Set result batch size: {}", req->messages_size());
+            plannerCli.setMessageResultBatch(req);
+            setResultMsgs.clear();
+        }
     }
 }
 
@@ -583,7 +639,11 @@ void Scheduler::resetParameter(std::string key, int32_t value)
     } else if (key == "max_executors") {
         maxExecutors = value;
         SPDLOG_INFO("Reset maxExecutors parameter to : {}", maxExecutors);
-    } else {
+    } else if (key == "planner_call_interval") {
+        plannerCallInterval = value;
+        SPDLOG_INFO("Reset plannerCallInterval parameter to : {}", plannerCallInterval);
+    }
+    else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }

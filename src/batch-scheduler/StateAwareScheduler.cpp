@@ -382,7 +382,7 @@ bool StateAwareScheduler::repartitionParitionedState(
 
 void StateAwareScheduler::flushStateInfo()
 {
-    SPDLOG_DEBUG("Flushing state information");
+    SPDLOG_INFO("Flushing state information");
     functionParallelism.clear();
     functionCounter.clear();
     stateHost.clear();
