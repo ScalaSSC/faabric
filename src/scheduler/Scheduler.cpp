@@ -592,10 +592,6 @@ void Scheduler::batchTimerCheck()
             }
         }
 
-        if (!isRepartition) {
-            continue;
-        }
-
         // if Repartitioned, parititioned state functions are in the
         // partitionedWaitingQueues.
         for (auto& [userFuncPar, waitingBatch] : partitionedWaitingQueues) {
