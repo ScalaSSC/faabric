@@ -128,8 +128,12 @@ bool registerStateToHost(const std::string& userFunctionParIdx,
                          const std::string& partitionBy,
                          const std::string stateKey)
 {
-    SPDLOG_DEBUG("Registering state {} to host {}", userFunctionParIdx, host);
-    SPDLOG_DEBUG("Partition by: {} and stateKey : {}", partitionBy, stateKey);
+    SPDLOG_INFO(
+      "Registering state {} to host {}, partition by: {} and stateKey : {}",
+      userFunctionParIdx,
+      host,
+      partitionBy,
+      stateKey);
     // Update Redis Information
     redis::Redis& redis = redis::Redis::getState();
     std::string mainKey = MAIN_KEY_PREFIX + userFunctionParIdx;
@@ -148,7 +152,9 @@ void StateAwareScheduler::initializeState(const HostMap& hostMap,
                                           std::string userFunc,
                                           int parallelism)
 {
-  SPDLOG_INFO("Initializing function state for {} with parallelism {}", userFunc, parallelism);
+    SPDLOG_INFO("Initializing function state for {} with parallelism {}",
+                userFunc,
+                parallelism);
     if (parallelism == 1) {
         // Default parallelism is 1.
         functionParallelism[userFunc] = 1;
@@ -258,63 +264,69 @@ std::vector<std::string> StateAwareScheduler::scheduleMessagesBatch(
 
 // TODO - change it to increase or decrease function parallelism. It should
 // return the old stateHost instead of the true/false
-std::shared_ptr<std::map<std::string, std::string>>
-StateAwareScheduler::increaseFunctionParallelism(
+void StateAwareScheduler::increaseFunctionParallelism(
   int numIncrease,
   const std::string& userFunction,
   const HostMap& hostMap)
 {
-    SPDLOG_DEBUG("Increasing {} parallelism for {}", numIncrease, userFunction);
+    SPDLOG_INFO("Increasing {} parallelism for {}", numIncrease, userFunction);
     // Double check if the function exists
     if (functionParallelism.find(userFunction) == functionParallelism.end()) {
         SPDLOG_ERROR("Function {} does not exist as function-state function",
                      userFunction);
-        return nullptr;
+        return;
     }
-    // Increase the num Parallelism
-    int oldPara = functionParallelism[userFunction];
-    functionParallelism[userFunction] += numIncrease;
-    SPDLOG_DEBUG("New parallelism for {} is {}",
-                 userFunction,
-                 functionParallelism[userFunction]);
-    // Copy the old stateHost to return
-    std::map<std::string, std::string> oldStateHost = stateHost;
-    auto oldStateHostPtr =
-      std::make_shared<std::map<std::string, std::string>>(oldStateHost);
     // Construct the userFunctionIdx for the new parallelism level
-    for (size_t idx = oldPara; idx < functionParallelism[userFunction]; idx++) {
+    for (int i = 0; i < numIncrease; i++) {
+        int idx = functionParallelism[userFunction] + i;
         std::string userFunctionIdx = userFunction + "_" + std::to_string(idx);
-        // Find the idlest host
-        std::map<std::string, int> usedHosts;
-        for (const auto& [ip, host] : hostMap) {
-            usedHosts[ip] = 0;
+
+        // Step 1: Count user-specific and total states for each host
+        std::map<std::string, int> userFuncCount;
+        std::map<std::string, int> totalStateCount;
+
+        for (const auto& [host, _] : hostMap) {
+            userFuncCount[host] = 0;
+            totalStateCount[host] = 0;
         }
-        // Count the used hosts for the specific user function
+
         for (const auto& [userFuncParallelism, host] : stateHost) {
             if (userFuncParallelism.find(userFunction + "_") !=
                 std::string::npos) {
-                usedHosts[host]++;
+                userFuncCount[host]++;
             }
+            totalStateCount[host]++;
         }
-        // Find the host with the minimum count (used the least)
+
+        // Step 2: Select host with minimum `userFuncCount` and tie-break with
+        // `totalStateCount`
         std::string minHost;
-        int minCount = std::numeric_limits<int>::max();
-        for (const auto& [host, count] : usedHosts) {
-            if (count < minCount) {
-                minCount = count;
+        int minUserFuncCount = std::numeric_limits<int>::max();
+        int minTotalCount = std::numeric_limits<int>::max();
+
+        for (const auto& [host, _] : hostMap) {
+            if ((userFuncCount[host] < minUserFuncCount) ||
+                (userFuncCount[host] == minUserFuncCount &&
+                 totalStateCount[host] < minTotalCount)) {
+                minUserFuncCount = userFuncCount[host];
+                minTotalCount = totalStateCount[host];
                 minHost = host;
             }
         }
+
         // Check if a host was found
         if (minHost.empty()) {
             SPDLOG_ERROR("No host found for the new parallelism level");
-            return nullptr;
+            return;
         }
-        SPDLOG_DEBUG(
+
+        SPDLOG_INFO(
           "Assigning new parallelism {} to {}", userFunctionIdx, minHost);
-        // Assign the least used host to the new parallelism level
+
+        // Step 3: Assign the selected host to the new parallelism level
         stateHost[userFunctionIdx] = minHost;
-        // Update Redis Information and register the state
+
+        // Step 4: Update Redis Information and register the state
         std::string partitionBy = std::get<0>(funcStateRegMap[userFunction]);
         std::string stateKey = std::get<1>(funcStateRegMap[userFunction]);
         registerStateToHost(userFunction + "_" + std::to_string(idx),
@@ -322,18 +334,19 @@ StateAwareScheduler::increaseFunctionParallelism(
                             partitionBy,
                             stateKey);
     }
+
+    functionParallelism[userFunction] += numIncrease;
+
+    SPDLOG_INFO("New parallelism for {} is {}",
+                userFunction,
+                functionParallelism[userFunction]);
+    // If the state is partitioned, update the Hash method.
     if (statePartitionBy.contains(userFunction)) {
         // Change the state hashing ring
         stateHashRing[userFunction] =
           std::make_shared<faabric::util::ConsistentHashRing>(
             functionParallelism[userFunction]);
-        // Repartition the state in old stateHost.
-        // Temporarily removed.
-        // if (oldPara != 0) {
-        //     repartitionParitionedState(userFunction, oldStateHostPtr);
-        // }
     }
-    return oldStateHostPtr;
 }
 
 // TODO - before repartition. no in flight request.

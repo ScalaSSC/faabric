@@ -42,10 +42,9 @@ class StateAwareScheduler final : public BatchScheduler
       std::shared_ptr<faabric::BatchExecuteRequest> req) override;
 
     // the following functions are public only for tests.
-    std::shared_ptr<std::map<std::string, std::string>>
-    increaseFunctionParallelism(int numIncrease,
-                                const std::string& userFunction,
-                                const HostMap& hostMap);
+    void increaseFunctionParallelism(int numIncrease,
+                                     const std::string& userFunction,
+                                     const HostMap& hostMap);
 
     bool repartitionParitionedState(
       std::string userFunction,
