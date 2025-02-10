@@ -1,4 +1,4 @@
-FROM faasm.azurecr.io/faabric-base:0.15.0
+FROM tqiunimelb/faabric-base:0.0.1
 ARG FAABRIC_VERSION
 
 # Flag to say we're in a container
@@ -10,7 +10,7 @@ RUN rm -rf /code \
     && mkdir -p /code/faabric \
     && git clone \
         -b v${FAABRIC_VERSION} \
-        https://github.com/faasm/faabric \
+        https://github.com/ScalaSSC/faabric \
         /code/faabric \
     && cd /code/faabric \
     && ./bin/create_venv.sh \

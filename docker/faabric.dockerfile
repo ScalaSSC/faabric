@@ -1,4 +1,5 @@
-FROM faasm.azurecr.io/faabric-base:0.15.0
+# It is used for github test (actions workflow). So we do not build it now.
+FROM tqiunimelb/faabric-base:0.0.1
 ARG FAABRIC_VERSION
 
 # faabic-base image is not re-built often, so tag may be behind
@@ -10,7 +11,7 @@ ENV FAABRIC_DOCKER="on"
 # Put the code in place
 WORKDIR /code
 RUN git clone \
-        -b v${FAABRIC_VERSION} https://github.com/faasm/faabric \
+        -b v${FAABRIC_VERSION} https://github.com/ScalaSSC/faabric \
     && git config --global --add safe.directory /code/faabric
 
 WORKDIR /code/faabric
