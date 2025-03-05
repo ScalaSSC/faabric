@@ -57,15 +57,36 @@ class State
 
     size_t getKVCount();
 
-    std::shared_ptr<FunctionState> doGetFunctionState(const std::string& user,
-                                                      const std::string& func,
-                                                      int32_t parallelismId);
+    //---------------------
+    // Function State API
+    //---------------------
+    size_t getFunctionStateSize(const std::string& user,
+                                const std::string& func,
+                                int32_t parallelismId,
+                                bool lock = false);
+
+    int readFuncState(const std::string& user,
+                      const std::string& func,
+                      int32_t parallelismId,
+                      char* buffer);
+
+    void setFuncState(const std::string& user,
+                      const std::string& func,
+                      int32_t parallelismId,
+                      char* buffer,
+                      int32_t bufferLen,
+                      bool unlock = false);
+
+    //---------------------
+    // Stateful Function State API
+    //---------------------
 
     int getIndivFuncStateSizeLock(const std::string& user,
                                   const std::string& func,
                                   int32_t parallelismId,
                                   uint8_t* buffer,
-                                  std::set<std::string>& keys, int acquireTimes);
+                                  std::set<std::string>& keys,
+                                  int acquireTimes);
 
     void readIndivFuncState(const std::string& user,
                             const std::string& func,
@@ -81,31 +102,14 @@ class State
 
     std::string getThisIP();
 
-    // The folowing function is designed for Function State
-    size_t getFunctionStateSize(const std::string& user,
-                                const std::string& func,
-                                int32_t parallelismId,
-                                bool lock = false);
-
-    std::shared_ptr<FunctionState> createFS(
-      const std::string& user,
-      const std::string& func,
-      int32_t parallelismId,
-      const std::string& parStateKey = "");
-
-    std::shared_ptr<FunctionState> getFS(const std::string& user,
-                                         const std::string& func,
-                                         int32_t parallelismId,
-                                         size_t size);
+    std::shared_ptr<FunctionState> createFS(const std::string& user,
+                                            const std::string& func,
+                                            int32_t parallelismId,
+                                            const bool partitionable);
 
     std::shared_ptr<FunctionState> getFS(const std::string& user,
                                          const std::string& func,
                                          int32_t parallelismId);
-
-    // In this function, it will return nullptr if no FunctionState is found.
-    std::shared_ptr<FunctionState> getOnlyFS(const std::string& user,
-                                             const std::string& func,
-                                             int32_t parallelismId);
 
     void deleteFS(const std::string& user,
                   const std::string& func,
@@ -127,9 +131,7 @@ class State
 
     std::shared_ptr<FunctionState> doGetFS(const std::string& user,
                                            const std::string& func,
-                                           int32_t parallelismId,
-                                           bool sizeless,
-                                           size_t size);
+                                           int32_t parallelismId);
 };
 
 State& getGlobalState();

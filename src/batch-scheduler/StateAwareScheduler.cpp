@@ -9,41 +9,25 @@
 #define MAIN_KEY_PREFIX "main_"
 
 namespace faabric::batch_scheduler {
-/*
-HERE is the logic of registering function state to the host.
-BEFORE COMPILE
-write funcStateRegMap: records function state functions and their partition info
---- These two maps should never be changed after the initialization.
-INITIALIZING
-When stateful function is invoked first time. It would initialize the function
-state with parallelism 1
-Faasmctl stream.scale can change the parallelism:
-When parallelism is not initlized, it only register new parallelism
-Otherwise, it will increase the parallelism and repartition function state
-*/
 
-// We register the function state in the functionStateRegister map.
-void StateAwareScheduler::funcStateInitializer()
-{
-    maxParallelism = faabric::util::getSystemConfig().maxParallelism;
-}
+/* Virtual functions which must be implemented. However, it is not used in
+ * StateAwareScheduler.
+ */
 
-void StateAwareScheduler::registerFunctionState(const std::string& userFunction,
-                                                const std::string& partitionBy,
-                                                const std::string& stateKey)
+std::shared_ptr<SchedulingDecision> StateAwareScheduler::makeSchedulingDecision(
+  HostMap& hostMap,
+  const InFlightReqs& inFlightReqs,
+  std::shared_ptr<BatchExecuteRequest> req)
 {
-    if (partitionBy == "None" || stateKey == "None") {
-        SPDLOG_INFO("Registering function state {} with no partitioning",
-                    userFunction);
-        funcStateRegMap[userFunction] = std::make_tuple("", "");
-    } else {
-        SPDLOG_INFO("Registering function state {} with partitioning by {} and "
-                    "state key {}",
-                    userFunction,
-                    partitionBy,
-                    stateKey);
-        funcStateRegMap[userFunction] = std::make_tuple(partitionBy, stateKey);
-    }
+
+    auto decision = std::make_shared<SchedulingDecision>(req->appid(), 0);
+
+    SPDLOG_ERROR(
+      "makeSchedulingDecision function Not implemented in StateAwareScheduler");
+    throw std::runtime_error(
+      "makeSchedulingDecision function Not implemented in StateAwareScheduler");
+
+    return decision;
 }
 
 bool StateAwareScheduler::isFirstDecisionBetter(
@@ -71,6 +55,10 @@ std::vector<Host> StateAwareScheduler::getSortedHosts(
     return sortedHosts;
 }
 
+// ------------------------------------------
+// The following functions are implemented in StateAwareScheduler
+// ------------------------------------------
+
 template<typename K, typename V>
 K getNthKey(const std::map<K, V>& map, std::size_t n)
 {
@@ -81,6 +69,74 @@ K getNthKey(const std::map<K, V>& map, std::size_t n)
     auto it = map.begin();
     std::advance(it, n);
     return it->first;
+}
+
+std::string to_string(const faabric::batch_scheduler::FunctionStateInfo& info)
+{
+    std::ostringstream oss;
+    oss << "FunctionStateInfo {\n"
+        << "  functionName: " << info.functionName << "\n"
+        << "  partitionBy: " << info.partitionBy << "\n"
+        << "  stateKey: " << info.stateKey << "\n"
+        << "  parallelism: " << info.parallelism << "\n"
+        << "  stateHost: {";
+
+    bool first = true;
+    for (const auto& entry : info.stateHost) {
+        if (!first) {
+            oss << ", ";
+        }
+        oss << entry.first << ": " << entry.second;
+        first = false;
+    }
+    oss << "}\n}";
+    return oss.str();
+}
+
+/*
+HERE is the logic of registering function state to the host.
+BEFORE COMPILE
+write funcStateRegMap: records function state functions and their partition info
+--- These two maps should never be changed after the initialization.
+INITIALIZING
+When stateful function is invoked first time. It would initialize the function
+state with parallelism 1
+Faasmctl stream.scale can change the parallelism:
+When parallelism is not initlized, it only register new parallelism
+Otherwise, it will increase the parallelism and repartition function state
+*/
+
+// We register the function state in the functionStateRegister map.
+void StateAwareScheduler::funcStateInitializer()
+{
+    maxParallelism = faabric::util::getSystemConfig().maxParallelism;
+}
+
+bool StateAwareScheduler::registerFunctionState(const std::string& userFunction,
+                                                const std::string& partitionBy,
+                                                const std::string& stateKey,
+                                                const HostMap& hostMap)
+{
+    SPDLOG_INFO("Registering function state {} with partitioning by {} and "
+                "state key {}",
+                userFunction,
+                partitionBy,
+                stateKey);
+
+    faabric::util::FullLock lock(scheduleMx);
+
+    if (partitionBy == "None" || stateKey == "None") {
+        funcStateRegMap[userFunction] = std::make_tuple("", "");
+    } else {
+        funcStateRegMap[userFunction] = std::make_tuple(partitionBy, stateKey);
+    }
+
+    // Initialize the function state with parallelism 1, if not initialized.
+    if (!functionParallelism.contains(userFunction)) {
+        initializeState(hostMap, userFunction);
+        return true;
+    }
+    return false;
 }
 
 HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
@@ -152,58 +208,27 @@ void StateAwareScheduler::initializeState(const HostMap& hostMap,
                                           std::string userFunc,
                                           int parallelism)
 {
-    SPDLOG_INFO("Initializing function state for {} with parallelism {}",
-                userFunc,
-                parallelism);
-    if (parallelism == 1) {
-        // Default parallelism is 1.
-        functionParallelism[userFunc] = 1;
-        functionCounter[userFunc] = 0;
-        // The default parallelism Id is 0
-        std::string funcParaId = userFunc + "_0";
-        int hostIdx = rbCounter++ % hostMap.size();
-        std::string host = getNthKey(hostMap, hostIdx);
-        stateHost[funcParaId] = host;
-        // If the State is partitionedState, register it.
-        std::string partitionBy = std::get<0>(funcStateRegMap[userFunc]);
-        std::string stateKey = std::get<1>(funcStateRegMap[userFunc]);
-        if (partitionBy != "" && stateKey != "") {
-            statePartitionBy[userFunc] = partitionBy;
-        }
-        // Register the state to the host.
-        registerStateToHost(funcParaId, host, partitionBy, stateKey);
-    } else {
-        // Otherwise initialize it. (We reset all the related stateinfo now)
-        functionParallelism[userFunc] = 0;
-        functionCounter[userFunc] = 0;
-        std::string partitionBy = std::get<0>(funcStateRegMap[userFunc]);
-        std::string stateKey = std::get<1>(funcStateRegMap[userFunc]);
-        if (partitionBy != "" && stateKey != "") {
-            statePartitionBy[userFunc] = partitionBy;
-        }
-        // Initialize the StateHost and stateHashRing
-        increaseFunctionParallelism(parallelism, userFunc, hostMap);
+    SPDLOG_INFO("Create func {} with parallelism {}", userFunc, parallelism);
+    if (parallelism != 1) {
+        SPDLOG_ERROR("Parallelism is not 1, it is not supported now");
+        return;
     }
-}
-
-// The BinPack's scheduler decision algorithm is very simple. It first sorts
-// hosts (i.e. bins) in a specific order (depending on the scheduling type),
-// and then starts filling bins from begining to end, until it runs out of
-// messages to schedule
-std::shared_ptr<SchedulingDecision> StateAwareScheduler::makeSchedulingDecision(
-  HostMap& hostMap,
-  const InFlightReqs& inFlightReqs,
-  std::shared_ptr<BatchExecuteRequest> req)
-{
-
-    auto decision = std::make_shared<SchedulingDecision>(req->appid(), 0);
-
-    SPDLOG_ERROR(
-      "makeSchedulingDecision function Not implemented in StateAwareScheduler");
-    throw std::runtime_error(
-      "makeSchedulingDecision function Not implemented in StateAwareScheduler");
-
-    return decision;
+    functionParallelism[userFunc] = 1;
+    functionCounter[userFunc] = 0;
+    // The default parallelism is 1 and parallelism Idx is 0
+    std::string funcParaId = userFunc + "_0";
+    // Assign state to a host.
+    int hostIdx = rbCounter++ % hostMap.size();
+    std::string host = getNthKey(hostMap, hostIdx);
+    stateHost[funcParaId] = host;
+    // If it is partitioned state, register it.
+    std::string partitionBy = std::get<0>(funcStateRegMap[userFunc]);
+    std::string stateKey = std::get<1>(funcStateRegMap[userFunc]);
+    if (partitionBy != "" && stateKey != "") {
+        statePartitionBy[userFunc] = partitionBy;
+    }
+    // Register the state to the host.
+    registerStateToHost(funcParaId, host, partitionBy, stateKey);
 }
 
 std::string StateAwareScheduler::scheduleMessage(
@@ -216,12 +241,9 @@ std::string StateAwareScheduler::scheduleMessage(
     std::string userFunc = msg->user() + "_" + msg->function();
     std::string host = "unknown";
     // For function-state function, assign near state
-    if (funcStateRegMap.contains(userFunc)) {
+    if (functionParallelism.contains(userFunc)) {
         // If function-state has not been initialized, initialize it.
         faabric::util::FullLock lock(scheduleMx);
-        if (!functionParallelism.contains(userFunc)) {
-            initializeState(hostMap, userFunc);
-        }
         // TODO - get parallelism is not thread safe now
         auto parallelismInfo = getHashAndParallelismIndex(userFunc, *msg);
         lock.unlock();
@@ -269,14 +291,14 @@ void StateAwareScheduler::increaseFunctionParallelism(
   const std::string& userFunction,
   const HostMap& hostMap)
 {
-    SPDLOG_INFO("Increasing {} parallelism for {}", numIncrease, userFunction);
+    SPDLOG_INFO("Increase {} parallelism for {}", numIncrease, userFunction);
     // Double check if the function exists
     if (functionParallelism.find(userFunction) == functionParallelism.end()) {
-        SPDLOG_ERROR("Function {} does not exist as function-state function",
-                     userFunction);
+        SPDLOG_ERROR("Function {} is not stateful function", userFunction);
         return;
     }
-    // Construct the userFunctionIdx for the new parallelism level
+
+    // Construct userFunctionIdx for new parallelism level
     for (int i = 0; i < numIncrease; i++) {
         int idx = functionParallelism[userFunction] + i;
         std::string userFunctionIdx = userFunction + "_" + std::to_string(idx);
@@ -336,10 +358,10 @@ void StateAwareScheduler::increaseFunctionParallelism(
     }
 
     functionParallelism[userFunction] += numIncrease;
-
     SPDLOG_INFO("New parallelism for {} is {}",
                 userFunction,
                 functionParallelism[userFunction]);
+
     // If the state is partitioned, update the Hash method.
     if (statePartitionBy.contains(userFunction)) {
         // Change the state hashing ring
@@ -393,7 +415,40 @@ bool StateAwareScheduler::repartitionParitionedState(
     return true;
 }
 
-void StateAwareScheduler::flushStateInfo()
+const std::map<std::string, FunctionStateInfo>
+StateAwareScheduler::getStateInfo()
+{
+    SPDLOG_DEBUG("Getting state information");
+    std::map<std::string, FunctionStateInfo> stateInfo;
+    for (const auto& [func, host] : funcStateRegMap) {
+        FunctionStateInfo info;
+        info.functionName = func;
+        info.partitionBy = std::get<0>(host);
+        info.stateKey = std::get<1>(host);
+        info.parallelism = functionParallelism[func];
+        // State Location Information
+        for (const auto& [userFuncPar, host] : stateHost) {
+            if (userFuncPar.find(func + "_") == std::string::npos) {
+                continue;
+            }
+            std::size_t pos = userFuncPar.rfind('_');
+            if (pos != std::string::npos && pos + 1 < userFuncPar.size()) {
+                // Extract the substring after the underscore.
+                std::string parIdxStr = userFuncPar.substr(pos + 1);
+                // Convert the substring to an integer.
+                int parIdx = std::stoi(parIdxStr);
+                info.stateHost[parIdx] = host;
+            } else {
+                SPDLOG_ERROR(
+                  "Invalid format when finding host of state parallelism.");
+            }
+        }
+        stateInfo[func] = std::move(info);
+    }
+    return stateInfo;
+}
+
+void StateAwareScheduler::resetScheduler()
 {
     SPDLOG_INFO("Flushing state information");
     rbCounter = 0;

@@ -14,7 +14,7 @@
       state.getKV(request.user(), request.key()));
 
 #define FS_ONLY_FROM_REQUEST(request)                                          \
-    auto fs = std::static_pointer_cast<FunctionState>(state.getOnlyFS(         \
+    auto fs = std::static_pointer_cast<FunctionState>(state.getFS(         \
       request.user(), request.func(), request.parallelismid()));
 
 namespace faabric::state {
@@ -144,16 +144,13 @@ std::unique_ptr<google::protobuf::Message> StateServer::recvPush(
     PARSE_MSG(faabric::StatePart, buffer.data(), buffer.size())
 
     // Update the KV store
-    SPDLOG_TRACE("Received push {}/{} ({}->{})",
-                 parsedMsg.user(),
-                 parsedMsg.key(),
-                 parsedMsg.offset(),
-                 parsedMsg.offset() + parsedMsg.data().size());
-
-    KV_FROM_REQUEST(parsedMsg)
-    kv->setChunk(parsedMsg.offset(),
-                 BYTES_CONST(parsedMsg.data().c_str()),
-                 parsedMsg.data().size());
+    SPDLOG_ERROR(
+      "Received push {}/{} ({}->{}), however pushing state is not supported ",
+      parsedMsg.user(),
+      parsedMsg.key(),
+      parsedMsg.offset(),
+      parsedMsg.offset() + parsedMsg.data().size());
+    throw std::runtime_error("Pushing state is not supported");
 
     auto response = std::make_unique<faabric::StateResponse>();
     return response;
@@ -256,36 +253,15 @@ std::unique_ptr<google::protobuf::Message> StateServer::recvFunctionPull(
 {
     PARSE_MSG(faabric::FunctionStateChunkRequest, buffer.data(), buffer.size())
 
-    SPDLOG_TRACE("Received pull {}/{}-{} ({}->{})",
-                 parsedMsg.user(),
-                 parsedMsg.func(),
-                 parsedMsg.parallelismid(),
-                 parsedMsg.offset(),
-                 parsedMsg.offset() + parsedMsg.chunksize());
-    // Write the response
-    FS_ONLY_FROM_REQUEST(parsedMsg)
-    // TODO - delete redis key and return 0
-    if (fs == nullptr || !fs->isMaster) {
-        SPDLOG_ERROR("Function state {}/{}-{} is not found or not master",
-                     parsedMsg.user(),
-                     parsedMsg.func(),
-                     parsedMsg.parallelismid());
-        throw std::runtime_error("StateServer receive size request, but state "
-                                 "is not found or not master");
-    }
-    uint64_t chunkOffset = parsedMsg.offset();
-    uint64_t chunkLen = parsedMsg.chunksize();
-    uint8_t* chunk = fs->getChunk(chunkOffset, chunkLen);
-
+    SPDLOG_ERROR(
+      "Received pull {}/{}-{} ({}->{}), however pulling state is not supported",
+      parsedMsg.user(),
+      parsedMsg.func(),
+      parsedMsg.parallelismid(),
+      parsedMsg.offset(),
+      parsedMsg.offset() + parsedMsg.chunksize());
+    throw std::runtime_error("Receieve pulling state is not supported");
     auto response = std::make_unique<faabric::FunctionStatePart>();
-    response->set_user(parsedMsg.user());
-    response->set_func(parsedMsg.func());
-    response->set_parallelismid(parsedMsg.parallelismid());
-    response->set_statesize(fs->size());
-    response->set_offset(chunkOffset);
-    // TODO: avoid copying here
-    response->set_data(chunk, chunkLen);
-
     return response;
 }
 
@@ -295,33 +271,14 @@ std::unique_ptr<google::protobuf::Message> StateServer::recvFunctionPush(
     PARSE_MSG(faabric::FunctionStatePart, buffer.data(), buffer.size())
 
     // Update the FS store
-    SPDLOG_TRACE("Received push {}/{}-{} ({}->{})",
-                 parsedMsg.user(),
-                 parsedMsg.func(),
-                 parsedMsg.parallelismid(),
-                 parsedMsg.offset(),
-                 parsedMsg.offset() + parsedMsg.data().size());
-
-    FS_ONLY_FROM_REQUEST(parsedMsg)
-    // This should be removed !
-    if (fs == nullptr) {
-        throw std::runtime_error("StateServer receive push request, but state "
-                                 "is not found or not master");
-    }
-    // TODO - delete redis key and return 0
-    if (parsedMsg.offset() == 0) {
-        SPDLOG_TRACE("Resizing to the function state from {} to {} ",
-                     fs->size(),
-                     parsedMsg.statesize());
-        fs->reSize(parsedMsg.statesize());
-    }
-
-    fs->setChunk(parsedMsg.offset(),
-                 BYTES_CONST(parsedMsg.data().c_str()),
-                 parsedMsg.data().size());
-    if (parsedMsg.unlock()) {
-        fs->unlockWrite();
-    }
+    SPDLOG_ERROR(
+      "Received push {}/{}-{} ({}->{}), however pushing state is not supported",
+      parsedMsg.user(),
+      parsedMsg.func(),
+      parsedMsg.parallelismid(),
+      parsedMsg.offset(),
+      parsedMsg.offset() + parsedMsg.data().size());
+    throw std::runtime_error("Receieve pushing state is not supported");
     auto response = std::make_unique<faabric::StateResponse>();
     return response;
 }
@@ -413,26 +370,24 @@ std::unique_ptr<google::protobuf::Message> StateServer::recvFunctionCreate(
                  parsedMsg.user(),
                  parsedMsg.func(),
                  parsedMsg.parallelismid());
+    
+
     auto fs = state.createFS(parsedMsg.user(),
                              parsedMsg.func(),
                              parsedMsg.parallelismid(),
-                             parsedMsg.pstatekey());
-    if (!fs->isMaster) {
-        throw std::runtime_error(
-          "StateServer receive create request, but created state "
-          "is not master");
-    }
+                             parsedMsg.isparition());
     // No information is needed by response
     auto response = std::make_unique<faabric::StateResponse>();
     return response;
 }
 
-std::unique_ptr<google::protobuf::Message> StateServer::recvFunctionRuntimeMetrics(
-  std::span<const uint8_t> buffer)
+std::unique_ptr<google::protobuf::Message>
+StateServer::recvFunctionRuntimeMetrics(std::span<const uint8_t> buffer)
 {
-  SPDLOG_ERROR("FunctionStateClient::getMetrics is not implemented");
-  throw std::runtime_error("FunctionStateClient::getMetrics is not implemented");
-  return nullptr;
+    SPDLOG_ERROR("FunctionStateClient::getMetrics is not implemented");
+    throw std::runtime_error(
+      "FunctionStateClient::getMetrics is not implemented");
+    return nullptr;
 }
 
 }

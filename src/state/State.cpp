@@ -11,6 +11,14 @@
 
 using namespace faabric::util;
 
+#define CHECK_USER_FUNC(user, func)                                            \
+    if (user.empty() || func.empty()) {                                        \
+        throw std::runtime_error(fmt::format(                                  \
+          "Attempting to access state with empty user or func ({}/{})",        \
+          user,                                                                \
+          func));                                                              \
+    }
+
 namespace faabric::state {
 State& getGlobalState()
 {
@@ -29,7 +37,6 @@ void State::forceClearAll(bool global)
         RedisStateKeyValue::clearAll(global);
     } else if (stateMode == "inmemory") {
         InMemoryStateKeyValue::clearAll(global);
-        FunctionState::clearAll(global);
     } else {
         throw std::runtime_error("Unrecognised state mode: " + stateMode);
     }
@@ -195,62 +202,35 @@ size_t State::getFunctionStateSize(const std::string& user,
                                    bool lock)
 {
 
-    if (user.empty() || func.empty()) {
-        throw std::runtime_error("Attempting to access state with empty user");
-    }
+    auto targetFs = doGetFS(user, func, parallelismId);
 
-    std::string lookupKey =
-      faabric::util::keyForFunction(user, func, parallelismId);
-
-    std::shared_ptr<FunctionState> targetFs = nullptr;
-    // See if we have the value locally. Only shared lock will be used here
-    {
-        faabric::util::SharedLock sharedLock(fsmapMutex);
-        if (fsMap.count(lookupKey) > 0 && fsMap[lookupKey]->isMaster) {
-            targetFs = fsMap[lookupKey];
-        }
+    if (lock) {
+        targetFs->lockWrite();
     }
-    // We don't want hold the fsMap lock when trying acquiring the lock for the
-    // function state. DeadLock might happens.
-    if (targetFs != nullptr) {
-        if (lock) {
-            targetFs->lockWrite();
-        }
-        return targetFs->size();
-    }
-    // Get from remote
-    return FunctionState::getStateSizeFromRemote(
-      user, func, parallelismId, thisIP, lock);
+    return targetFs->size();
 }
 
-std::shared_ptr<FunctionState> State::doGetFunctionState(
-  const std::string& user,
-  const std::string& func,
-  int32_t parallelismId)
+int State::readFuncState(const std::string& user,
+                         const std::string& func,
+                         int32_t parallelismId,
+                         char* buffer)
 {
-    if (user.empty() || func.empty()) {
-        throw std::runtime_error("Attempting to access state with empty user");
-    }
+    auto targetFs = doGetFS(user, func, parallelismId);
 
-    std::string lookupKey =
-      faabric::util::keyForFunction(user, func, parallelismId);
+    targetFs->get(reinterpret_cast<uint8_t*>(buffer));
+    return targetFs->size();
+}
 
-    std::shared_ptr<FunctionState> targetFs = nullptr;
-    // See if we have the value locally. Only shared lock will be used here
-    {
-        faabric::util::SharedLock sharedLock(fsmapMutex);
-        if (fsMap.count(lookupKey) > 0 && fsMap[lookupKey]->isMaster) {
-            targetFs = fsMap[lookupKey];
-        }
-    }
-    // We don't want hold the fsMap lock when trying acquiring the lock for the
-    // function state. DeadLock might happens.
-    if (targetFs == nullptr) {
-        SPDLOG_ERROR("Function state {} not found locally", lookupKey);
-        throw std::runtime_error("Function state not found locally");
-    }
+void State::setFuncState(const std::string& user,
+                         const std::string& func,
+                         int32_t parallelismId,
+                         char* buffer,
+                         int32_t bufferLen,
+                         bool unlock)
+{
+    auto targetFs = doGetFS(user, func, parallelismId);
 
-    return targetFs;
+    targetFs->set(reinterpret_cast<uint8_t*>(buffer), bufferLen, unlock);
 }
 
 int State::getIndivFuncStateSizeLock(const std::string& user,
@@ -260,7 +240,7 @@ int State::getIndivFuncStateSizeLock(const std::string& user,
                                      std::set<std::string>& keys,
                                      int acquireTimes)
 {
-    auto targetFs = doGetFunctionState(user, func, parallelismId);
+    auto targetFs = doGetFS(user, func, parallelismId);
 
     int size = targetFs->acquireIndivLocks(keys, buffer, acquireTimes);
     return size;
@@ -273,7 +253,7 @@ void State::readIndivFuncState(const std::string& user,
                                int bufferLength,
                                std::set<std::string>& keys)
 {
-    auto targetFs = doGetFunctionState(user, func, parallelismId);
+    auto targetFs = doGetFS(user, func, parallelismId);
 
     auto stateVec = targetFs->readPartitionState(keys);
     // Copy it to the buffer
@@ -292,134 +272,62 @@ void State::writeIndivFuncStateUnlock(const std::string& user,
                                       int32_t parallelismId,
                                       std::vector<uint8_t>& data)
 {
-    auto targetFs = doGetFunctionState(user, func, parallelismId);
+    auto targetFs = doGetFS(user, func, parallelismId);
 
-    targetFs->writeIndivStateUnlocks(data);
-}
-
-std::shared_ptr<FunctionState> State::getOnlyFS(const std::string& user,
-                                                const std::string& func,
-                                                int32_t parallelismId)
-{
-    if (user.empty() || func.empty()) {
-        throw std::runtime_error(fmt::format(
-          "Attempting to access state with empty user or key ({}/{})",
-          user,
-          func));
-    }
-
-    std::string lookupKey =
-      faabric::util::keyForFunction(user, func, parallelismId);
-
-    // Only use shared lock here
-    {
-        SharedLock sharedLock(fsmapMutex);
-        if (fsMap.count(lookupKey) > 0) {
-            return fsMap[lookupKey];
-        }
-    }
-
-    return nullptr;
-}
-
-std::shared_ptr<FunctionState> State::getFS(const std::string& user,
-                                            const std::string& func,
-                                            int32_t parallelismId,
-                                            size_t size)
-{
-    return doGetFS(user, func, parallelismId, false, size);
+    targetFs->writePartitionStateUnlocks(data);
 }
 
 std::shared_ptr<FunctionState> State::getFS(const std::string& user,
                                             const std::string& func,
                                             int32_t parallelismId)
 {
-    return doGetFS(user, func, parallelismId, true, 0);
+    return doGetFS(user, func, parallelismId);
 }
 
 std::shared_ptr<FunctionState> State::doGetFS(const std::string& user,
                                               const std::string& func,
-                                              int32_t parallelismId,
-                                              bool sizeless,
-                                              size_t size)
+                                              int32_t parallelismId)
 {
-    if (user.empty() || func.empty()) {
-        throw std::runtime_error(fmt::format(
-          "Attempting to access state with empty user or key ({}/{})",
-          user,
-          func));
-    }
+    CHECK_USER_FUNC(user, func);
 
     std::string lookupKey =
       faabric::util::keyForFunction(user, func, parallelismId);
 
     // See if we have locally
-    {
-        SharedLock sharedLock(fsmapMutex);
-        if (fsMap.count(lookupKey) > 0) {
-            return fsMap[lookupKey];
-        }
-    }
-
-    // Full lock
-    FullLock fullLock(fsmapMutex);
-
-    // Double check condition
-    if (fsMap.count(lookupKey) > 0) {
+    SharedLock sharedLock(fsmapMutex);
+    if (fsMap.count(lookupKey) > 0 && fsMap[lookupKey] != nullptr) {
         return fsMap[lookupKey];
     }
 
-    // Sanity check on size if not sizeless
-    if (!sizeless && size == 0) {
-        throw FunctionStateException(
-          "Must specify size for creating function-state " + lookupKey);
-    }
-
-    // Create new FS
-    // Passing IP here is crucial for testing
-    if (sizeless) {
-        // Currrently, sizeless is used when reparition
-        auto fs =
-          std::make_shared<FunctionState>(user, func, parallelismId, thisIP);
-        fsMap.emplace(lookupKey, std::move(fs));
-    } else {
-        auto fs = std::make_shared<FunctionState>(
-          user, func, parallelismId, thisIP, size);
-        fsMap.emplace(lookupKey, std::move(fs));
-    }
-
-    return fsMap[lookupKey];
+    SPDLOG_ERROR("Function state {} not found locally", lookupKey);
+    throw std::runtime_error("Function state not found locally");
 }
 
 std::shared_ptr<FunctionState> State::createFS(const std::string& user,
                                                const std::string& func,
                                                int32_t parallelismId,
-                                               const std::string& parStateKey)
+                                               const bool partitionable)
 {
-    if (user.empty() || func.empty()) {
-        throw std::runtime_error(
-          fmt::format("State::createFS: Attempting to access state with empty "
-                      "user or key ({}/{})",
-                      user,
-                      func));
-    }
+    CHECK_USER_FUNC(user, func);
+
     std::string lookupKey =
       faabric::util::keyForFunction(user, func, parallelismId);
+    SPDLOG_INFO(
+      "State::createFS: Creating function state {} for {}", lookupKey, thisIP);
 
     // If we have it locally, delete it and create new.
     FullLock fullLock(fsmapMutex);
     if (fsMap.count(lookupKey) > 0) {
         fsMap.erase(lookupKey);
     }
-    SPDLOG_DEBUG(
-      "State::createFS: Creating function state {} for {}", lookupKey, thisIP);
+
     auto fs =
-      std::make_shared<FunctionState>(user, func, parallelismId, thisIP);
-    if (!parStateKey.empty()) {
-        SPDLOG_DEBUG("State::createFS: Setting partition key {} for {}",
-                     parStateKey,
-                     lookupKey);
-        fs->setPartitionKey(parStateKey);
+      std::make_shared<FunctionState>(user, func, parallelismId);
+    if (partitionable) {
+        SPDLOG_INFO(
+          "State::createFS: Setting partition key {} is partitionable",
+          lookupKey);
+        fs->isPartitioned();
     }
     fsMap.emplace(lookupKey, std::move(fs));
     return fsMap[lookupKey];
@@ -429,13 +337,7 @@ void State::deleteFS(const std::string& user,
                      const std::string& func,
                      int32_t parallelismId)
 {
-    if (user.empty() || func.empty()) {
-        throw std::runtime_error(
-          fmt::format("State::createFS: Attempting to access state with empty "
-                      "user or key ({}/{})",
-                      user,
-                      func));
-    }
+    CHECK_USER_FUNC(user, func);
 
     std::string lookupKey =
       faabric::util::keyForFunction(user, func, parallelismId);

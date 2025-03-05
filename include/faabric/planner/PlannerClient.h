@@ -1,6 +1,7 @@
 #pragma once
 
 #include <faabric/batch-scheduler/SchedulingDecision.h>
+#include <faabric/planner/Planner.h>
 #include <faabric/planner/planner.pb.h>
 #include <faabric/snapshot/SnapshotClient.h>
 #include <faabric/transport/MessageEndpointClient.h>
@@ -9,14 +10,28 @@
 #include <future>
 #include <shared_mutex>
 
+namespace faabric::scheduler {
+
+class Scheduler;
+}
+
 namespace faabric::planner {
 
 typedef std::promise<std::shared_ptr<faabric::Message>> MessageResultPromise;
 typedef std::shared_ptr<MessageResultPromise> MessageResultPromisePtr;
+typedef std::tuple<
+  int,
+  bool,
+  std::vector<std::string>,
+  bool,
+  std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>>
+  HeartbeatInfo;
 
 /* The planner's implementation of group membership requires clients to send
  * keep-alive messages. Once started, this background thread will send these
  * messages
+ * We add the status report feature to this thread as well (the monitored
+ * cpu/ memory usage/ etc.)
  */
 class KeepAliveThread : public faabric::util::PeriodicBackgroundThread
 {
@@ -30,6 +45,8 @@ class KeepAliveThread : public faabric::util::PeriodicBackgroundThread
 
   private:
     std::shared_mutex keepAliveThreadMx;
+
+    faabric::scheduler::Scheduler* sch;
 };
 
 /*
@@ -67,7 +84,7 @@ class PlannerClient final : public faabric::transport::MessageEndpointClient
     std::vector<Host> getAvailableHosts();
 
     // Registering a host returns the keep-alive timeout for heartbeats
-    int registerHost(std::shared_ptr<RegisterHostRequest> req);
+    HeartbeatInfo registerHost(std::shared_ptr<RegisterHostRequest> req);
 
     void removeHost(std::shared_ptr<RemoveHostRequest> req);
 

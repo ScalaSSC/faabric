@@ -20,46 +20,27 @@ struct HashAndParallelismInfo
     int parallelismIdx;
 };
 
-class StateAwareScheduler final : public BatchScheduler
+struct FunctionStateInfo
+{
+    std::string functionName;
+    std::string partitionBy;
+    std::string stateKey;
+    int parallelism;
+    std::map<int, std::string> stateHost;
+};
+
+std::string to_string(const FunctionStateInfo& info);
+
+class StateAwareScheduler : public BatchScheduler
 {
   public:
-    StateAwareScheduler()
-    {
-        // Initialization code here
-        funcStateInitializer();
-    }
-
-    std::string scheduleMessage(const HostMap& hostMap,
-                                const std::unique_ptr<Message>& msg);
-
-    std::vector<std::string> scheduleMessagesBatch(
-      const HostMap& hostMap,
-      const std::vector<std::unique_ptr<faabric::Message>>& msgs);
-
+    /* Virtual functions which must be implemented. However, it is not used in
+     * StateAwareScheduler.
+     */
     std::shared_ptr<SchedulingDecision> makeSchedulingDecision(
       HostMap& hostMap,
       const InFlightReqs& inFlightReqs,
       std::shared_ptr<faabric::BatchExecuteRequest> req) override;
-
-    // the following functions are public only for tests.
-    void increaseFunctionParallelism(int numIncrease,
-                                     const std::string& userFunction,
-                                     const HostMap& hostMap);
-
-    bool repartitionParitionedState(
-      std::string userFunction,
-      std::shared_ptr<std::map<std::string, std::string>> oldStateHost);
-
-    void flushStateInfo();
-
-    const std::map<std::string, int>& getFunctionParallelismMap() const
-    {
-        return functionParallelism;
-    }
-
-    void registerFunctionState(const std::string& userFunction,
-                               const std::string& partitionBy,
-                               const std::string& stateKey);
 
   private:
     bool isFirstDecisionBetter(
@@ -72,23 +53,67 @@ class StateAwareScheduler final : public BatchScheduler
       std::shared_ptr<faabric::BatchExecuteRequest> req,
       const DecisionType& decisionType) override;
 
+  public:
+    // ------------------------------------------
+    // The following functions are implemented in StateAwareScheduler
+    // ------------------------------------------
+
+    StateAwareScheduler()
+    {
+        // Initialization code here
+        funcStateInitializer();
+    }
+
+    virtual ~StateAwareScheduler() = default;
+
+    virtual std::string scheduleMessage(const HostMap& hostMap,
+                                        const std::unique_ptr<Message>& msg);
+
+    std::vector<std::string> scheduleMessagesBatch(
+      const HostMap& hostMap,
+      const std::vector<std::unique_ptr<faabric::Message>>& msgs);
+
+    // the following functions are public only for tests.
+    void increaseFunctionParallelism(int numIncrease,
+                                     const std::string& userFunction,
+                                     const HostMap& hostMap);
+
+    bool repartitionParitionedState(
+      std::string userFunction,
+      std::shared_ptr<std::map<std::string, std::string>> oldStateHost);
+
+    virtual void resetScheduler();
+
+    const std::map<std::string, int>& getFunctionParallelismMap() const
+    {
+        return functionParallelism;
+    }
+
+    bool registerFunctionState(const std::string& userFunction,
+                               const std::string& partitionBy,
+                               const std::string& stateKey,
+                               const HostMap& hostMap);
+
+    const std::map<std::string, FunctionStateInfo> getStateInfo();
+
+  protected:
+    // scheduler lock
+    std::shared_mutex scheduleMx;
+
     // The counter used for round robin scheduling.
     int rbCounter = 0;
     std::atomic<unsigned int> atomicRbCounter{ 0 };
 
-    // scheduler lock
-    std::shared_mutex scheduleMx;
-
     /***
      * The following maps are used to store the state of the functions.
      */
-    // FunctionUser : Parallelism
+    // Function_User : Parallelism
     std::map<std::string, int> functionParallelism;
-    // FunctionUser : Counter. It is used for shuffle grouping.
+    // Function_User : Counter. It is used for shuffle grouping.
     std::map<std::string, int> functionCounter;
-    // FunctionUser : Host
+    // Function_User_ParallelismIndex : Host
     std::map<std::string, std::string> stateHost;
-    // FunctionUser : hashRing
+    // Function_User : hashRing
     std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>
       stateHashRing;
     // Only partitioned stateful function will be registered here.
@@ -100,6 +125,7 @@ class StateAwareScheduler final : public BatchScheduler
     // TODO - This can be detected by state server and planner, but logic will
     // be extreamly complex. (How to create new function state, BALABALA)
     // Key is User-function : Value is <parititonInputKey, partitionStateKey>
+    // It is only used for initialization.
     std::map<std::string, std::tuple<std::string, std::string>> funcStateRegMap;
 
     void initializeState(const HostMap& hostMap,

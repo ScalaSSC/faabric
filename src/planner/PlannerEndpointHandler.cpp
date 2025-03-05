@@ -412,23 +412,19 @@ void PlannerEndpointHandler::onRequest(
                         value);
             if (parameter == "max_inflight_reqs") {
                 maxInflightApps = value;
-            }
-            else if (parameter == "max_executors"){
+            } else if (parameter == "max_executors") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
-            } 
-            else if (parameter == "is_repartition"){
+            } else if (parameter == "is_repartition") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
-            }
-            else if (parameter == "dispatch_period"){
-                faabric::planner::getPlanner().resetParameter(parameter, value, true);
-            }
-            else if (parameter == "planner_call_interval"){
+            } else if (parameter == "dispatch_period") {
+                faabric::planner::getPlanner().resetParameter(
+                  parameter, value, true);
+            } else if (parameter == "planner_call_interval") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
-            }
-            else if (parameter == "is_outputting"){
-                faabric::planner::getPlanner().resetParameter(parameter, value, true);
-            }
-            else {
+            } else if (parameter == "is_outputting") {
+                faabric::planner::getPlanner().resetParameter(
+                  parameter, value, true);
+            } else {
                 SPDLOG_ERROR("Unrecognized parameter {}", parameter);
                 response.result(beast::http::status::bad_request);
                 response.body() = std::string("Unrecognized parameter");
@@ -450,21 +446,13 @@ void PlannerEndpointHandler::onRequest(
             std::string function = rawReq.function();
             std::string attribute = rawReq.attribute();
             std::string stateKey = rawReq.statekey();
-            
-            std::shared_ptr<faabric::batch_scheduler::BatchScheduler>
-              batchScheduler = faabric::batch_scheduler::getBatchScheduler();
-            // Try to cast it to a StateAwareBatchScheduler
-            std::shared_ptr<faabric::batch_scheduler::StateAwareScheduler>
-              stateAwareScheduler = std::dynamic_pointer_cast<
-                faabric::batch_scheduler::StateAwareScheduler>(batchScheduler);
-            if (stateAwareScheduler) {
-                stateAwareScheduler->registerFunctionState(function, attribute, stateKey);
-            }
-            else {
-                SPDLOG_ERROR(
-                  "Failed to cast BatchScheduler to StateAwareBatchScheduler");
+            bool registerResult =
+              faabric::planner::getPlanner().registerFuncState(
+                function, attribute, stateKey);
+            if (!registerResult) {
+                SPDLOG_ERROR("Failed to register function state");
                 response.result(beast::http::status::internal_server_error);
-                response.body() = std::string("Failed to get StateAwareScheduler");
+                response.body() = std::string("Failed to register state");
                 return ctx.sendFunction(std::move(response));
             }
             return ctx.sendFunction(std::move(response));

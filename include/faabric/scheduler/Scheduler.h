@@ -1,5 +1,6 @@
 #pragma once
 
+#include <faabric/batch-scheduler/DecentralizedScheduler.h>
 #include <faabric/executor/Executor.h>
 #include <faabric/planner/PlannerClient.h>
 #include <faabric/proto/faabric.pb.h>
@@ -81,14 +82,15 @@ class Scheduler
 
     void executeBatch(std::shared_ptr<faabric::BatchExecuteRequest> req);
 
-    void executeBatchLazy(std::shared_ptr<faabric::BatchExecuteRequest> req);
+    void executeBatchAsyn(std::shared_ptr<faabric::BatchExecuteRequest> req);
 
-    void enqueueMessageBatch(std::shared_ptr<faabric::MessageBatch> msgs);
+    void enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs);
 
     // Check the waiting queue peroiodically.
     void batchTimerCheck();
 
-    void enqueueChainedCalls(std::vector<std::unique_ptr<faabric::Message>> msgs);
+    void enqueueChainedCalls(
+      std::vector<std::unique_ptr<faabric::Message>> msgs);
 
     void enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> req);
 
@@ -102,7 +104,7 @@ class Scheduler
       faabric::util::FullLock& lock);
 
     void resetParameter(std::string key, int32_t value);
-    
+
     void resetBatchsize(int32_t newSize);
 
     void reset();
@@ -167,6 +169,17 @@ class Scheduler
     std::shared_ptr<faabric::PendingMigration> checkForMigrationOpportunities(
       faabric::Message& msg,
       int overwriteNewGroupId = 0);
+
+    // ----------------------------------
+    // Status Collection
+    // ----------------------------------
+    int getMonitoredInfoTest();
+
+    void updateHosts(const std::vector<std::string>& hosts);
+
+    void updateStatesInfo(
+      const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+        statesInfo);
 
   private:
     std::string thisHost;
@@ -233,6 +246,29 @@ class Scheduler
 
     long lastPlannerCallCheck = 0;
     int plannerCallInterval = 20;
+
+    // ----- Scheduling Info -----
+    int dispatchPeriod = 20; // ms
+
+    std::shared_mutex scheduledMsgsMapMx;
+
+    std::map<std::string, std::list<std::unique_ptr<Message>>> scheduledMsgsMap;
+
+    faabric::batch_scheduler::DecentralizedScheduler decentralScheduler;
+
+    std::map<std::string, std::string> registeredHostsMap;
+
+    faabric::batch_scheduler::HostMap hostMap;
+
+    bool stopThreadTimer = false;
+
+    std::thread dispatchChainedMsgsThread;
+
+    void enqueueSchedMsgs(
+      std::vector<std::string> hosts,
+      std::vector<std::unique_ptr<faabric::Message>> msgs);
+
+    void dispatchChainedMsgs();
 };
 
 }

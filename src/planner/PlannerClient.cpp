@@ -1,6 +1,7 @@
 #include <faabric/planner/PlannerApi.h>
 #include <faabric/planner/PlannerClient.h>
 #include <faabric/planner/planner.pb.h>
+#include <faabric/scheduler/Scheduler.h>
 #include <faabric/snapshot/SnapshotClient.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/transport/common.h>
@@ -26,13 +27,31 @@ void KeepAliveThread::doWork()
 
     faabric::util::SharedLock lock(keepAliveThreadMx);
 
-    cli.registerHost(thisHostReq);
+    if (sch != nullptr) {
+        // int status = sch->getMonitoredInfoTest();
+        // SPDLOG_DEBUG("Keep-alive thread status: {}", status);
+    }
+
+    auto [time, hostSync, hostMap, statesSync, statesInfo] =
+      cli.registerHost(thisHostReq);
+
+    if (hostSync) {
+        // Update local registered hosts map
+        sch->updateHosts(hostMap);
+    }
+
+    if (statesSync) {
+        // Update local function states info
+        sch->updateStatesInfo(statesInfo);
+    }
 }
 
 void KeepAliveThread::setRequest(
   std::shared_ptr<RegisterHostRequest> thisHostReqIn)
 {
     faabric::util::FullLock lock(keepAliveThreadMx);
+
+    sch = &faabric::scheduler::getScheduler();
 
     thisHostReq = thisHostReqIn;
 
@@ -106,8 +125,13 @@ std::vector<faabric::planner::Host> PlannerClient::getAvailableHosts()
     return availableHosts;
 }
 
-int PlannerClient::registerHost(std::shared_ptr<RegisterHostRequest> req)
+HeartbeatInfo PlannerClient::registerHost(
+  std::shared_ptr<RegisterHostRequest> req)
 {
+    // I temporarily deleted the following line since I am not sure whether
+    // the (resp.config().hosttimeout() = 0) error is because cache is cleaned.
+    // faabric::util::UniqueLock lock(plannerCacheMx);
+
     RegisterHostResponse resp;
     syncSend(PlannerCalls::RegisterHost, req.get(), &resp);
 
@@ -115,11 +139,51 @@ int PlannerClient::registerHost(std::shared_ptr<RegisterHostRequest> req)
         throw std::runtime_error("Error registering host with planner!");
     }
 
+    bool hostSync = resp.hostsync();
+    std::vector<std::string> tempRegisteredHosts;
+
+    // Retrieve the registered hosts
+    if (hostSync) {
+        auto hostsInfo = resp.registeredhosts();
+        for (const auto& hostInfo : hostsInfo) {
+            tempRegisteredHosts.push_back(hostInfo.ip());
+        }
+    }
+
+    bool statesSync = resp.statesync();
+    std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>
+      tempStatesInfoMap;
+    // Retrieve the states infomation
+    if (statesSync) {
+        auto statesInfo = resp.statesinfo();
+        for (const auto& stateInfo : statesInfo) {
+            faabric::batch_scheduler::FunctionStateInfo info;
+            info.functionName = stateInfo.functionname();
+            info.partitionBy = stateInfo.partitionby();
+            info.stateKey = stateInfo.statekey();
+            info.parallelism = stateInfo.parallelism();
+            for (const auto& entry : stateInfo.statehost()) {
+                info.stateHost.emplace(entry.first, entry.second);
+            }
+            tempStatesInfoMap.insert({ stateInfo.functionname(), info });
+
+            SPDLOG_DEBUG("Received state info: {}",
+                         faabric::batch_scheduler::to_string(info));
+        }
+    }
+
     // Sanity check
+    // SPDLOG_DEBUG("Host timeout: {}", resp.config().hosttimeout());
+    // SPDLOG_DEBUG("RegisterHostResponse: {}", resp.DebugString());
+
     assert(resp.config().hosttimeout() > 0);
 
     // Return the planner's timeout to set the keep-alive heartbeat
-    return resp.config().hosttimeout();
+    return std::make_tuple(resp.config().hosttimeout(),
+                           hostSync,
+                           tempRegisteredHosts,
+                           statesSync,
+                           tempStatesInfoMap);
 }
 
 void PlannerClient::removeHost(std::shared_ptr<RemoveHostRequest> req)

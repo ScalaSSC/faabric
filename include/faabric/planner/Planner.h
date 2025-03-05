@@ -9,6 +9,7 @@
 #include <faabric/proto/faabric.pb.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/util/queue.h>
+#include <utility>
 
 #include <shared_mutex>
 
@@ -20,6 +21,8 @@ enum FlushType
     Executors = 2,
     SchedulingState = 3,
 };
+
+typedef std::map<std::string, std::shared_ptr<Host>> HostPtrMap;
 
 /* The planner is a standalone component that has a global view of the state
  * of a distributed faabric deployment.
@@ -54,6 +57,9 @@ class Planner
     std::vector<std::shared_ptr<Host>> getAvailableHosts();
 
     bool registerHost(const Host& hostIn, bool overwrite);
+
+    // Return wheter the host map has been updated and the newest host map
+    const std::pair<bool, HostPtrMap&> getRegisteredHost(std::string hostIp);
 
     // Best effort host removal. Don't fail if we can't
     void removeHost(const Host& hostIn);
@@ -102,9 +108,15 @@ class Planner
     void enqueueMessageBatch(
       std::vector<std::string> hosts,
       std::vector<std::unique_ptr<faabric::Message>> msgs);
+
     // ----------
     // Function State public API
     // ----------
+
+    bool registerFuncState(const std::string& userFunction,
+                           const std::string& partitionBy,
+                           const std::string& stateKey);
+
     bool updateFuncParallelism(const std::string& userFunction,
                                int changedParallelism);
 
@@ -115,6 +127,11 @@ class Planner
     bool resetParameter(const std::string& key,
                         const int32_t value,
                         bool plannerParameter = false);
+
+    const std::pair<
+      bool,
+      std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>>
+    retrieveStateInfo(std::string hostIp);
 
     // ----------
     // Metrics public API
@@ -184,6 +201,7 @@ class Planner
     void dequeueScheduledMsgs();
 
     bool isOutputting = false;
+
 };
 
 Planner& getPlanner();

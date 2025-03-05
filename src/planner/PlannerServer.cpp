@@ -122,6 +122,9 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvRegisterHost(
 
     auto response = std::make_unique<faabric::planner::RegisterHostResponse>();
     *response->mutable_config() = planner.getConfig();
+    // Prepare host update and state update flags
+    response->set_hostsync(false);
+    response->set_statesync(false);
 
     // Set response status
     ResponseStatus status;
@@ -131,6 +134,33 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvRegisterHost(
         status.set_status(ResponseStatus_Status_ERROR);
     }
     *response->mutable_status() = status;
+
+    // Add registered host information
+    auto [hostSync, hostPtrMap] =
+      planner.getRegisteredHost(parsedMsg.host().ip());
+    if (hostSync) {
+        for (const auto& [host, hostPtr] : hostPtrMap) {
+            response->add_registeredhosts()->set_ip(host);
+        }
+        response->set_hostsync(true);
+    }
+
+    // Add state location information
+    auto [stateSync, registStatesInfo] =
+      planner.retrieveStateInfo(parsedMsg.host().ip());
+    if (stateSync) {
+        for (const auto& [func, info] : registStatesInfo) {
+            auto stateInfo = response->add_statesinfo();
+            stateInfo->set_functionname(info.functionName);
+            stateInfo->set_partitionby(info.partitionBy);
+            stateInfo->set_statekey(info.stateKey);
+            stateInfo->set_parallelism(info.parallelism);
+            for (const auto& [idx, host] : info.stateHost) {
+                stateInfo->mutable_statehost()->insert({ idx, host });
+            }
+        }
+        response->set_statesync(true);
+    }
 
     return response;
 }
@@ -150,7 +180,8 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvRemoveHost(
 void PlannerServer::recvSetMessageResult(std::span<const uint8_t> buffer)
 {
     SPDLOG_ERROR("SetMessageResult not implemented in PlannerServer");
-    throw std::runtime_error("SetMessageResult not implemented in PlannerServer");
+    throw std::runtime_error(
+      "SetMessageResult not implemented in PlannerServer");
 }
 
 void PlannerServer::recvSetMessageResultBatch(std::span<const uint8_t> buffer)
@@ -249,14 +280,9 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvCallBatch(
 std::unique_ptr<google::protobuf::Message> PlannerServer::recvEnqueueBatch(
   std::span<const uint8_t> buffer)
 {
-    PARSE_MSG(BatchExecuteRequest, buffer.data(), buffer.size());
-    auto req = std::make_shared<faabric::BatchExecuteRequest>(parsedMsg);
-
-    // This request will only be called by chained call. Mark it.
-    planner.scheduleMessages(req, true);
-
-    faabric::EmptyResponse resp;
-    return std::make_unique<faabric::EmptyResponse>();
+    SPDLOG_ERROR("EnqueueBatch not implemented in DecentralizedPlannerServer");
+    throw std::runtime_error("EnqueueBatch not implemented in PlannerServer");
+    return nullptr;
 }
 
 }

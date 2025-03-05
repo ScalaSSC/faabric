@@ -122,7 +122,7 @@ void FunctionCallServer::recvExecuteFunctionsLazy(
           faabric::util::getSystemConfig().endpointHost);
     }
 
-    scheduler.executeBatchLazy(
+    scheduler.executeBatchAsyn(
       std::make_shared<faabric::BatchExecuteRequest>(parsedMsg));
 }
 
@@ -135,7 +135,7 @@ void FunctionCallServer::recvExecuteFunctionsBatch(
                  parsedMsg.messages_size());
 
     scheduler.enqueueMessageBatch(
-      std::make_shared<faabric::MessageBatch>(parsedMsg));
+      std::make_unique<faabric::MessageBatch>(parsedMsg));
 }
 
 void FunctionCallServer::recvSetMessageResult(std::span<const uint8_t> buffer)

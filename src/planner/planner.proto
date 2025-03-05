@@ -100,6 +100,20 @@ message Host {
     int32 usedSlots = 3;
     // Host register timestamp as epoch time in ms
     Timestamp registerTs = 4;
+    bool hostSync = 5;
+    bool stateSync = 6;
+}
+
+message HostInfo {
+    string ip = 1;
+}
+
+message FunctionStateInfo {
+  string functionName = 1;
+  string partitionBy = 2;
+  string stateKey = 3;
+  int32 parallelism = 4;
+  map<int32, string> stateHost = 5;
 }
 
 message PingResponse {
@@ -115,6 +129,10 @@ message RegisterHostResponse {
     ResponseStatus status = 1;
     PlannerConfig config = 2;
     int32 hostId = 3;
+    bool hostSync = 4;
+    repeated HostInfo registeredHosts = 5;
+    bool stateSync = 6;
+    repeated FunctionStateInfo statesInfo = 7;
 }
 
 message RemoveHostRequest {

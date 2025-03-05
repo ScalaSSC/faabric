@@ -154,6 +154,8 @@ message Message {
     map<string, int32> intExecGraphDetails = 37;
     map<string, string> execGraphDetails = 38;
 
+    // Chained Call numbers
+    int32 chainedMsgNum = 87;
     // State
     // Message Type : 0 stateless/ 1 function state / 2 partitioned state
     int32 messageType = 88;

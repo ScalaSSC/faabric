@@ -110,6 +110,8 @@ bool Planner::reset()
 
     flushHosts();
 
+    faabric::util::FullLock lock(plannerMx);
+
     return true;
 }
 
@@ -140,6 +142,9 @@ void Planner::flushHosts()
 
     state.hostMap.clear();
     state.batchSchedHostMap.clear();
+    for (const auto& [ip, host] : state.hostMap) {
+        host->set_hostsync(true);
+    }
 }
 
 void Planner::flushExecutors()
@@ -147,11 +152,13 @@ void Planner::flushExecutors()
     // Flush Aware Scheduler State
     // If preload the parallelism desision, we change the parallelism here
     if (stateAwareScheduler) {
-        stateAwareScheduler->flushStateInfo();
+        stateAwareScheduler->resetScheduler();
     }
 
     auto availableHosts = getAvailableHosts();
-
+    for (const auto& [ip, host] : state.hostMap) {
+        host->set_statesync(true);
+    }
     for (const auto& host : availableHosts) {
         SPDLOG_INFO("Planner sending EXECUTOR flush to {}", host->ip());
         faabric::scheduler::getFunctionCallClient(host->ip())->sendFlush();
@@ -166,7 +173,6 @@ void Planner::flushSchedulingState()
     state.appResults.clear();
     state.appResultWaiters.clear();
     state.numMigrations = 0;
-
     state.inFlightApps.clear();
 }
 
@@ -225,9 +231,17 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
         // the map
         SPDLOG_INFO(
           "Registering host {} with {} slots", hostIn.ip(), hostIn.slots());
+        auto regHost = std::make_shared<Host>(hostIn);
+        regHost->set_hostsync(true);
+        regHost->set_statesync(true);
         state.hostMap.emplace(
           std::make_pair<std::string, std::shared_ptr<Host>>(
-            (std::string)hostIn.ip(), std::make_shared<Host>(hostIn)));
+            (std::string)hostIn.ip(), std::move(regHost)));
+        // Update the host map to decentralized schedulers.
+        for (const auto& [ip, host] : state.hostMap) {
+            host->set_hostsync(true);
+        }
+
     } else if (it != state.hostMap.end() && overwrite) {
         // We allow overwritting the host state by sending another register
         // request with same IP but different host resources. This is useful
@@ -253,6 +267,42 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
 
     state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
     return true;
+}
+
+const std::
+  pair<bool, std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>>
+  Planner::retrieveStateInfo(std::string hostIp)
+{
+    faabric::util::SharedLock lock(plannerMx);
+
+    if (!stateAwareScheduler) {
+        return { false, {} };
+    }
+
+    const auto it = state.hostMap.find(hostIp);
+    if (it != state.hostMap.end()) {
+        auto host = it->second;
+        if (host->statesync()) {
+            host->set_statesync(false);
+            return { true, stateAwareScheduler->getStateInfo() };
+        }
+    }
+
+    return { false, {} };
+}
+
+const std::pair<bool, HostPtrMap&> Planner::getRegisteredHost(
+  std::string hostIp)
+{
+    faabric::util::SharedLock lock(plannerMx);
+
+    auto it = state.hostMap.find(hostIp);
+    if (it != state.hostMap.end() && it->second->hostsync()) {
+        it->second->set_hostsync(false);
+        return { true, state.hostMap };
+    }
+
+    return { false, state.hostMap };
 }
 
 void Planner::removeHost(const Host& hostIn)
@@ -312,6 +362,8 @@ void Planner::setMessageResultBatch(
         state.appResults[appId][msgId] =
           std::make_shared<faabric::Message>(msg);
 
+        int chainedMsgNum = msg.chainedmsgnum();
+        state.inFlightApps[appId] += chainedMsgNum;
         int inFlightAppCount = --state.inFlightApps[appId];
         if (inFlightAppCount <= 0) {
             state.inFlightApps.erase(appId);
@@ -462,6 +514,22 @@ std::shared_ptr<faabric::BatchExecuteRequestStatus> Planner::getBatchResults(
     return berStatus;
 }
 
+bool Planner::registerFuncState(const std::string& userFunction,
+                                const std::string& partitionBy,
+                                const std::string& stateKey)
+{
+    SPDLOG_DEBUG("Planner received request to register function state for {}",
+                 userFunction);
+    faabric::util::FullLock lock(plannerStateMx);
+    bool registerResult = stateAwareScheduler->registerFunctionState(
+      userFunction, partitionBy, stateKey, state.batchSchedHostMap);
+
+    for (const auto& [ip, host] : state.hostMap) {
+        host->set_statesync(true);
+    }
+    return registerResult;
+}
+
 std::shared_ptr<faabric::batch_scheduler::SchedulingDecision>
 Planner::getSchedulingDecision(std::shared_ptr<BatchExecuteRequest> req)
 {
@@ -504,6 +572,12 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
     SPDLOG_DEBUG("Planner is Scheduling {} messages", req->messages_size());
     auto currentTime = faabric::util::getGlobalClock().epochMicros();
 
+    if (isChained) {
+        SPDLOG_ERROR("Decentralized Scheduler schedule chained calls");
+        throw std::runtime_error("Chained call scheduling is not supported "
+                                 "in centralized schedulere");
+    }
+
     // When outputing result, we doesn't allow any schedule message operation.
     RETURN_IF_OUTPUTTING
     // First loop: handle state without creating a shared_ptr
@@ -525,22 +599,13 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
             SPDLOG_ERROR("ChainedId is not equal to AppId");
             throw std::runtime_error("ChainedId is not equal to AppId");
         }
-        if (isChained) {
-            if (!state.inFlightApps.contains(appid)) {
-                SPDLOG_ERROR("app Id {} is not running", appid);
 
-                // We don't schedule it if the chainedId is not running
-                req->mutable_messages()->DeleteSubrange(i, 1);
-                continue;
-            }
-        } else {
-            if (state.inFlightApps.contains(appid)) {
-                SPDLOG_ERROR("app Id {} is already running", appid);
-
-                // Flush the old chainedId
-                state.inFlightApps[appid] = 0;
-            }
+        if (state.inFlightApps.contains(appid)) {
+            SPDLOG_ERROR("app Id {} is already running", appid);
+            // Flush the old chainedId
+            state.inFlightApps[appid] = 0;
         }
+
         state.inFlightApps[appid]++;
         i++; // Only increment i if a message was not removed
     }
@@ -577,7 +642,7 @@ void Planner::enqueueMessageBatch(
 void Planner::dequeueScheduledMsgs()
 {
     while (!stopThreadTimer) {
-                // Sleep for a while to batch the scheduled requests
+        // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
         CONTINUE_IF_OUTPUTTING
@@ -607,10 +672,6 @@ void Planner::dequeueScheduledMsgs()
         // Parallel execution of function calls for each host
         std::vector<std::thread> threads;
         for (auto& [hostIp, msgs] : msgsCallMap) {
-            // Single thread method
-            // faabric::scheduler::getFunctionCallClient(hostIp)
-            //   ->executeFunctionsBatch(std::move(msgs));
-            // Multi-thread method (concurrent execution)
             threads.emplace_back(
               [hostIp](
                 std::list<std::unique_ptr<faabric::Message>> msgsIn) mutable {
@@ -661,6 +722,10 @@ bool Planner::updateFuncParallelism(const std::string& userFunction,
     }
     stateAwareScheduler->increaseFunctionParallelism(
       changedParallelism, userFunction, state.batchSchedHostMap);
+
+    for (const auto& [ip, host] : state.hostMap) {
+        host->set_statesync(true);
+    }
     return true;
 }
 
@@ -706,8 +771,7 @@ bool Planner::resetParameter(const std::string& key,
         if (key == "dispatch_period") {
             SPDLOG_INFO("Planner reset dispatchPeriod to {}", value);
             dispatchPeriod = value;
-        }
-        else if (key == "is_outputting"){
+        } else if (key == "is_outputting") {
             SPDLOG_INFO("Planner reset isOutputting to {}", value == 1);
             isOutputting = value == 1;
         }

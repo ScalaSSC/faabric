@@ -12,14 +12,7 @@ class FunctionStateRegistry
 
     std::string getMasterIP(const std::string& user,
                             const std::string& func,
-                            int parallelismId,
-                            const std::string& hostIP,
-                            bool claim);
-
-    std::string getMasterIPForOtherMaster(const std::string& userIn,
-                                          const std::string& funcIn,
-                                          int parallelismIdIn,
-                                          const std::string& hostIP);
+                            int parallelismId);
 
     void clear();
 

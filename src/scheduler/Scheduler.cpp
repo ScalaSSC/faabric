@@ -25,7 +25,20 @@
 using namespace faabric::util;
 using namespace faabric::snapshot;
 
+constexpr int DEFAULT_SLOT_NUM = 100;
+
 namespace faabric::scheduler {
+
+static faabric::batch_scheduler::HostMap convertHostMap(
+  const std::map<std::string, std::string>& registeredHostsMap)
+{
+    faabric::batch_scheduler::HostMap hostMap;
+    for (const auto& [ip, hostId] : registeredHostsMap) {
+        hostMap[ip] = std::make_shared<faabric::batch_scheduler::HostState>(
+          ip, DEFAULT_SLOT_NUM, 0);
+    }
+    return hostMap;
+}
 
 Scheduler& getScheduler()
 {
@@ -43,6 +56,8 @@ Scheduler::Scheduler()
     // Start the reaper thread
     reaperThread.start(conf.reaperIntervalSeconds);
     batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
+    dispatchChainedMsgsThread =
+      std::thread(&Scheduler::dispatchChainedMsgs, this);
 }
 
 Scheduler::~Scheduler()
@@ -54,6 +69,10 @@ Scheduler::~Scheduler()
     stopBatchTimer = true;
     if (batchTimerThread.joinable()) {
         batchTimerThread.join();
+    }
+    stopThreadTimer = true;
+    if (dispatchChainedMsgsThread.joinable()) {
+        dispatchChainedMsgsThread.join();
     }
 }
 
@@ -81,7 +100,9 @@ void Scheduler::addHostToGlobalSet(
         }
     }
 
-    int plannerTimeout = faabric::planner::getPlannerClient().registerHost(req);
+    auto registerHostResult =
+      faabric::planner::getPlannerClient().registerHost(req);
+    int plannerTimeout = std::get<0>(registerHostResult);
 
     // Once the host is registered, set-up a periodic thread to send a heart-
     // beat to the planner. Note that this method may be called multiple times
@@ -136,6 +157,11 @@ void Scheduler::reset()
         batchTimerThread.join();
     }
 
+    stopThreadTimer = true;
+    if (dispatchChainedMsgsThread.joinable()) {
+        dispatchChainedMsgsThread.join();
+    }
+
     // Shut down, then clear executors
     for (auto& ep : executors) {
         for (auto& e : ep.second) {
@@ -153,6 +179,7 @@ void Scheduler::reset()
     faabric::planner::getPlannerClient().clearCache();
 
     faabric::util::FullLock lock(mx);
+    faabric::util::FullLock msgMapLock(scheduledMsgsMapMx);
 
     // Ensure host is set correctly
     thisHost = faabric::util::getSystemConfig().endpointHost;
@@ -170,10 +197,19 @@ void Scheduler::reset()
     partitionedWaitingQueues.clear();
     chainedCallMsgs.clear();
     setResultMsgs.clear();
+    scheduledMsgsMap.clear();
+
+    registeredHostsMap.clear();
+    hostMap.clear();
 
     stopBatchTimer = false;
     batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
 
+    stopThreadTimer = false;
+    dispatchChainedMsgsThread =
+      std::thread(&Scheduler::dispatchChainedMsgs, this);
+
+    decentralScheduler.resetScheduler();
 }
 
 void Scheduler::shutdown()
@@ -332,7 +368,7 @@ void Scheduler::executeBatch(std::shared_ptr<faabric::BatchExecuteRequest> req)
     }
 }
 
-void Scheduler::enqueueMessageBatch(std::shared_ptr<faabric::MessageBatch> msgs)
+void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
 {
     faabric::util::FullLock lock(mx);
 
@@ -368,7 +404,7 @@ void Scheduler::enqueueMessageBatch(std::shared_ptr<faabric::MessageBatch> msgs)
     }
 }
 
-void Scheduler::executeBatchLazy(
+void Scheduler::executeBatchAsyn(
   std::shared_ptr<faabric::BatchExecuteRequest> req)
 {
     faabric::util::FullLock lock(mx);
@@ -564,8 +600,11 @@ void Scheduler::enqueueChainedCalls(
     msgs.clear();
 }
 
-void Scheduler::enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> req){
-    SPDLOG_DEBUG("Enqueueing set results for {} messages", req->messages_size());
+void Scheduler::enqueueSetResults(
+  std::shared_ptr<faabric::BatchExecuteRequest> req)
+{
+    SPDLOG_DEBUG("Enqueueing set results for {} messages",
+                 req->messages_size());
     faabric::util::FullLock lock(mx);
 
     for (int i = 0; i < req->messages_size(); i++) {
@@ -574,7 +613,6 @@ void Scheduler::enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> 
     }
 }
 
-
 void Scheduler::batchTimerCheck()
 {
     while (!stopBatchTimer) {
@@ -582,6 +620,11 @@ void Scheduler::batchTimerCheck()
           std::chrono::milliseconds(conf.batchCheckInterval));
 
         faabric::util::FullLock lock(mx);
+
+        if (stopBatchTimer) {
+            break;
+        }
+
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
             if (waitingBatch.batchQueue.size() == 0) {
                 continue;
@@ -612,18 +655,6 @@ void Scheduler::batchTimerCheck()
         lastPlannerCallCheck = currentMillis;
         auto& plannerCli = faabric::planner::getPlannerClient();
 
-        // Check the chained calls
-        if (!chainedCallMsgs.empty()) {
-            auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
-            for (auto& msg : chainedCallMsgs) {
-                auto* message = req->add_messages();
-                *message = std::move(*msg);
-            }
-            SPDLOG_DEBUG("Chaining call batch size: {}", req->messages_size());
-            plannerCli.enqueueFunctions(req);
-            chainedCallMsgs.clear();
-        }
-
         if (!setResultMsgs.empty()) {
             auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
             for (auto& msg : setResultMsgs) {
@@ -633,6 +664,97 @@ void Scheduler::batchTimerCheck()
             SPDLOG_DEBUG("Set result batch size: {}", req->messages_size());
             plannerCli.setMessageResultBatch(req);
             setResultMsgs.clear();
+        }
+    }
+}
+
+// It should be the same to void Planner::enqueueMessageBatch
+void Scheduler::enqueueSchedMsgs(
+  std::vector<std::string> hosts,
+  std::vector<std::unique_ptr<faabric::Message>> msgs)
+{
+    auto currentTime = faabric::util::getGlobalClock().epochMicros();
+    faabric::util::FullLock lock(scheduledMsgsMapMx);
+    for (int i = 0; i < msgs.size(); i++) {
+        auto msg = std::move(msgs[i]);
+        auto host = hosts[i];
+        msg->set_plannerqueuetime(currentTime);
+        msg->set_plannerpoptime(currentTime);
+        scheduledMsgsMap[host].push_back(std::move(msg));
+    }
+}
+
+void Scheduler::dispatchChainedMsgs()
+{
+    while (!stopThreadTimer) {
+        // Sleep for a while to batch the scheduled requests
+        std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
+        // Lock only for copying and clearing `scheduledMsgsMap`
+
+        faabric::util::FullLock mxLock(mx);
+        if (stopThreadTimer) {
+            break;
+        }
+
+        // Schedule the chained calls
+        if (!chainedCallMsgs.empty()) {
+            auto hosts = decentralScheduler.scheduleMessagesBatch(
+              hostMap, chainedCallMsgs);
+            enqueueSchedMsgs(hosts, std::move(chainedCallMsgs));
+        }
+        mxLock.unlock();
+
+        faabric::util::FullLock lock(scheduledMsgsMapMx);
+        if (scheduledMsgsMap.empty()) {
+            lock.unlock();
+            continue;
+        }
+
+        // Create a local filtered copy of scheduledRequestsMap
+        auto currentTime = faabric::util::getGlobalClock().epochMicros();
+        std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>
+          msgsCallMap;
+        for (auto& [hostIp, msgsList] : scheduledMsgsMap) {
+            if (msgsList.empty()) {
+                continue;
+            }
+            for (auto& msg : msgsList) {
+                msg->set_plannerdispatchtime(currentTime);
+            }
+            msgsCallMap[hostIp] = std::move(msgsList); // Move ownership
+        }
+        scheduledMsgsMap.clear();
+        lock.unlock();
+
+        // Parallel execution of function calls for each host
+        std::vector<std::thread> threads;
+        for (auto& [hostIp, msgs] : msgsCallMap) {
+            // If locally, we put the messages into a batch directly
+            if (hostIp == thisHost) {
+                auto batchMsgs = std::make_unique<faabric::MessageBatch>();
+                SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
+                             thisHost,
+                             msgs.size());
+                for (auto& msg : msgs) {
+                    batchMsgs->add_messages()->CopyFrom(*msg);
+                }
+                enqueueMessageBatch(std::move(batchMsgs));
+                continue;
+            }
+            // Otherwise, we send the messages to the remote host
+            threads.emplace_back(
+              [hostIp](
+                std::list<std::unique_ptr<faabric::Message>> msgsIn) mutable {
+                  faabric::scheduler::getFunctionCallClient(hostIp)
+                    ->executeFunctionsBatch(std::move(msgsIn));
+              },
+              std::move(msgs));
+        }
+        // Join all threads to ensure they complete before next iteration
+        for (auto& t : threads) {
+            if (t.joinable()) {
+                t.join();
+            }
         }
     }
 }
@@ -648,9 +770,9 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         SPDLOG_INFO("Reset maxExecutors parameter to : {}", maxExecutors);
     } else if (key == "planner_call_interval") {
         plannerCallInterval = value;
-        SPDLOG_INFO("Reset plannerCallInterval parameter to : {}", plannerCallInterval);
-    }
-    else {
+        SPDLOG_INFO("Reset plannerCallInterval parameter to : {}",
+                    plannerCallInterval);
+    } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }
@@ -888,4 +1010,38 @@ Scheduler::checkForMigrationOpportunities(faabric::Message& msg,
 
     return migration;
 }
+
+// ----------------------------------
+// Status Collection
+// ----------------------------------
+int Scheduler::getMonitoredInfoTest()
+{
+    return 0;
+}
+
+void Scheduler::updateHosts(const std::vector<std::string>& hosts)
+{
+    faabric::util::FullLock lock(mx);
+    registeredHostsMap.clear();
+    for (const auto& host : hosts) {
+        registeredHostsMap.emplace(host, host);
+    }
+
+    for (const auto& entry : registeredHostsMap) {
+        SPDLOG_INFO("Local registered host map Key: {}, Value: {}",
+                    entry.first,
+                    entry.second);
+    }
+
+    hostMap = convertHostMap(registeredHostsMap);
+}
+
+void Scheduler::updateStatesInfo(
+  const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+    statesInfo)
+{
+    faabric::util::FullLock lock(mx);
+    decentralScheduler.syncStatesInfo(statesInfo);
+}
+
 }
