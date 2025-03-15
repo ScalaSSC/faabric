@@ -40,10 +40,10 @@ void KeepAliveThread::doWork()
         sch->updateHosts(hostMap);
     }
 
-    if (statesSync) {
-        // Update local function states info
-        sch->updateStatesInfo(statesInfo);
-    }
+    // if (statesSync) {
+    //     // Update local function states info
+    //     sch->updateStatesInfo(statesInfo);
+    // }
 }
 
 void KeepAliveThread::setRequest(
@@ -150,31 +150,9 @@ HeartbeatInfo PlannerClient::registerHost(
         }
     }
 
-    bool statesSync = resp.statesync();
+    bool statesSync = false;
     std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>
       tempStatesInfoMap;
-    // Retrieve the states infomation
-    if (statesSync) {
-        auto statesInfo = resp.statesinfo();
-        for (const auto& stateInfo : statesInfo) {
-            faabric::batch_scheduler::FunctionStateInfo info;
-            info.functionName = stateInfo.functionname();
-            info.partitionBy = stateInfo.partitionby();
-            info.stateKey = stateInfo.statekey();
-            info.parallelism = stateInfo.parallelism();
-            for (const auto& entry : stateInfo.statehost()) {
-                info.stateHost.emplace(entry.first, entry.second);
-            }
-            tempStatesInfoMap.insert({ stateInfo.functionname(), info });
-
-            SPDLOG_DEBUG("Received state info: {}",
-                         faabric::batch_scheduler::to_string(info));
-        }
-    }
-
-    // Sanity check
-    // SPDLOG_DEBUG("Host timeout: {}", resp.config().hosttimeout());
-    // SPDLOG_DEBUG("RegisterHostResponse: {}", resp.DebugString());
 
     assert(resp.config().hosttimeout() > 0);
 

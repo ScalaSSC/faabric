@@ -30,20 +30,8 @@ void FunctionCallServer::doAsyncRecv(transport::Message& message)
             recvExecuteFunctionsBatch(message.udata());
             break;
         }
-        case faabric::scheduler::FunctionCalls::ExecuteFunctionsLazy: {
-            recvExecuteFunctionsLazy(message.udata());
-            break;
-        }
         case faabric::scheduler::FunctionCalls::SetMessageResult: {
             recvSetMessageResult(message.udata());
-            break;
-        }
-        case faabric::scheduler::FunctionCalls::ResetBatchsize: {
-            recvResetBatchsize(message.udata());
-            break;
-        }
-        case faabric::scheduler::FunctionCalls::ResetMaxReplicas: {
-            recvResetMaxReplicas(message.udata());
             break;
         }
         case faabric::scheduler::FunctionCalls::ResetParameter: {
@@ -64,6 +52,9 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
     switch (header) {
         case faabric::scheduler::FunctionCalls::Flush: {
             return recvFlush(message.udata());
+        }
+        case faabric::scheduler::FunctionCalls::SyncStatesInfo: {
+            return recvSyncStatesInfo(message.udata());
         }
         default: {
             throw std::runtime_error(
@@ -90,40 +81,43 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::recvFlush(
     return std::make_unique<faabric::EmptyResponse>();
 }
 
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
+{
+    SPDLOG_INFO("Syncing state info to host {}",
+                faabric::util::getSystemConfig().endpointHost);
+
+    PARSE_MSG(planner::SyncStatesInfoRequest, buffer.data(), buffer.size())
+    std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>
+      tempStatesInfoMap;
+
+    auto statesInfo = parsedMsg.statesinfo();
+    for (const auto& stateInfo : statesInfo) {
+        faabric::batch_scheduler::FunctionStateInfo info;
+        info.functionName = stateInfo.functionname();
+        info.partitionBy = stateInfo.partitionby();
+        info.stateKey = stateInfo.statekey();
+        info.parallelism = stateInfo.parallelism();
+        for (const auto& entry : stateInfo.statehost()) {
+            info.stateHost.emplace(entry.first, entry.second);
+        }
+        tempStatesInfoMap.insert({ stateInfo.functionname(), info });
+
+        SPDLOG_DEBUG("Received state info: {}",
+                     faabric::batch_scheduler::to_string(info));
+    }
+
+    scheduler.updateStatesInfo(tempStatesInfoMap);
+
+    return std::make_unique<planner::SyncStatesInfoResponse>();
+}
+
 void FunctionCallServer::recvExecuteFunctions(std::span<const uint8_t> buffer)
 {
     PARSE_MSG(faabric::BatchExecuteRequest, buffer.data(), buffer.size())
 
-    // This host has now been told to execute these functions no matter what
-    for (int i = 0; i < parsedMsg.messages_size(); i++) {
-        parsedMsg.mutable_messages()->at(i).set_starttimestamp(
-          faabric::util::getGlobalClock().epochMillis());
-        parsedMsg.mutable_messages()->at(i).set_executedhost(
-          faabric::util::getSystemConfig().endpointHost);
-    }
-
-    scheduler.executeBatch(
-      std::make_shared<faabric::BatchExecuteRequest>(parsedMsg));
-}
-
-void FunctionCallServer::recvExecuteFunctionsLazy(
-  std::span<const uint8_t> buffer)
-{
-    PARSE_MSG(faabric::BatchExecuteRequest, buffer.data(), buffer.size())
-
-    // TODO - we can set the queue time here
-    // This host has now been told to execute these functions no matter what
-    // For WAMR, start time stamp is twice. It will be set again in
-    // WasmModlue.cpp
-    for (int i = 0; i < parsedMsg.messages_size(); i++) {
-        parsedMsg.mutable_messages()->at(i).set_starttimestamp(
-          faabric::util::getGlobalClock().epochMillis());
-        parsedMsg.mutable_messages()->at(i).set_executedhost(
-          faabric::util::getSystemConfig().endpointHost);
-    }
-
-    scheduler.executeBatchAsyn(
-      std::make_shared<faabric::BatchExecuteRequest>(parsedMsg));
+    SPDLOG_ERROR("recvExecuteFunctions is not supported");
+    throw std::runtime_error("recvExecuteFunctions is not supported");
 }
 
 void FunctionCallServer::recvExecuteFunctionsBatch(
@@ -145,24 +139,6 @@ void FunctionCallServer::recvSetMessageResult(std::span<const uint8_t> buffer)
       std::make_shared<faabric::Message>(parsedMsg));
 }
 
-void FunctionCallServer::recvResetBatchsize(std::span<const uint8_t> buffer)
-{
-    PARSE_MSG(
-      faabric::planner::BatchResetRequest, buffer.data(), buffer.size());
-    int32_t batchSize = parsedMsg.batchsize();
-    SPDLOG_INFO("Resetting batch size to {}", batchSize);
-    faabric::scheduler::getScheduler().resetBatchsize(batchSize);
-}
-
-void FunctionCallServer::recvResetMaxReplicas(std::span<const uint8_t> buffer)
-{
-    PARSE_MSG(
-      faabric::planner::MaxReplicasRequest, buffer.data(), buffer.size());
-    int32_t maxReplicas = parsedMsg.maxnum();
-    SPDLOG_INFO("Resetting max replicas to {}", maxReplicas);
-    faabric::scheduler::getScheduler().resetMaxReplicas(maxReplicas);
-}
-
 void FunctionCallServer::recvResetParameter(std::span<const uint8_t> buffer)
 {
     PARSE_MSG(faabric::planner::ResetStreamParameterRequest,
@@ -177,7 +153,12 @@ void FunctionCallServer::recvResetParameter(std::span<const uint8_t> buffer)
         faabric::scheduler::getScheduler().resetParameter(key, value);
     } else if (key == "planner_call_interval") {
         faabric::scheduler::getScheduler().resetParameter(key, value);
-    } else {
+    } else if (key == "batch_size"){
+        faabric::scheduler::getScheduler().resetParameter(key, value);
+    } else if (key == "max_replicas"){
+        faabric::scheduler::getScheduler().resetParameter(key, value);
+    }
+    else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }

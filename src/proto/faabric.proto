@@ -55,8 +55,6 @@ message BatchExecuteRequest {
     // single host
     bool singleHostHint = 11;
 
-    // This Hint is only used when batching execute requests (used by executor)
-    string lockHint = 12;
 }
 
 message MessageBatch{

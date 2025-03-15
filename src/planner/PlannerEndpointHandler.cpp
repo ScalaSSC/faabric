@@ -171,30 +171,9 @@ void PlannerEndpointHandler::onRequest(
         }
         case faabric::planner::HttpMessage_Type_GET_IN_FLIGHT_APPS: {
             SPDLOG_DEBUG("Planner received GET_IN_FLIGHT_APPS request");
-
-            // Get in-flight apps
-            auto inFlightApps =
-              faabric::planner::getPlanner().getInFlightReqs();
-
-            // Prepare response
-            faabric::planner::GetInFlightAppsResponse inFlightAppsResponse;
-            for (const auto& [appId, inFlightPair] : inFlightApps) {
-                auto decision = inFlightPair.second;
-                auto* inFlightAppResp = inFlightAppsResponse.add_apps();
-                inFlightAppResp->set_appid(appId);
-                for (const auto& hostIp : decision->hosts) {
-                    inFlightAppResp->add_hostips(hostIp);
-                }
-            }
-
-            // Also include the total number of migrations to-date
-            int numMigrations =
-              faabric::planner::getPlanner().getNumMigrations();
-            inFlightAppsResponse.set_nummigrations(numMigrations);
-
-            response.result(beast::http::status::ok);
-            response.body() =
-              faabric::util::messageToJson(inFlightAppsResponse);
+            SPDLOG_ERROR("GET_IN_FLIGHT_APPS not implemented");
+            response.result(beast::http::status::internal_server_error);
+            response.body() = std::string("Not implemented");
             return ctx.sendFunction(std::move(response));
         }
         case faabric::planner::HttpMessage_Type_EXECUTE_BATCH: {
@@ -265,45 +244,10 @@ void PlannerEndpointHandler::onRequest(
             return ctx.sendFunction(std::move(response));
         }
         case faabric::planner::HttpMessage_Type_PRELOAD_SCHEDULING_DECISION: {
-            // foo bar
-            // in: BatchExecuteRequest
-            // out: none
             SPDLOG_DEBUG(
               "Planner received PRELOAD_SCHEDULING_DECISION request");
-            faabric::BatchExecuteRequest ber;
-            try {
-                faabric::util::jsonToMessage(msg.payloadjson(), &ber);
-            } catch (faabric::util::JsonSerialisationException e) {
-                response.result(beast::http::status::bad_request);
-                response.body() = std::string("Bad JSON in request body");
-                return ctx.sendFunction(std::move(response));
-            }
-
-            // For this method, we build the SchedulingDecision from a specially
-            // crafter BER. In particular, we only need to read the BER's
-            // app ID, and the `executedHost` parameter of each message in the
-            // BER.
-            auto decision =
-              std::make_shared<batch_scheduler::SchedulingDecision>(
-                ber.appid(), ber.groupid());
-            for (int i = 0; i < ber.messages_size(); i++) {
-                // Setting the right group idx here is key as it is the only
-                // message parameter that we can emulate in advance (i.e. we
-                // can not guess message ids in advance)
-                decision->addMessage(ber.messages(i).executedhost(),
-                                     ber.messages(i).id(),
-                                     ber.messages(i).appidx(),
-                                     ber.messages(i).groupidx());
-            }
-
-            // Pre-load the scheduling decision in the planner
-            faabric::planner::getPlanner().preloadSchedulingDecision(
-              decision->appId, decision);
-
-            // Prepare the response
-            response.result(beast::http::status::ok);
-            response.body() = std::string("Decision pre-loaded to planner");
-
+            response.result(beast::http::status::bad_request);
+            response.body() = std::string("Not implemented");
             return ctx.sendFunction(std::move(response));
         }
         case faabric::planner::HttpMessage_Type_GET_FUNCTION_METRICS: {
@@ -321,78 +265,23 @@ void PlannerEndpointHandler::onRequest(
                 response.body() = std::string("Bad JSON in body's payload");
                 return ctx.sendFunction(std::move(response));
             }
+
             std::string user = rawReq.user();
             std::string func = rawReq.function();
             std::string userFunc = user + "_" + func;
-            int newParallelism = rawReq.parallelism();
-            SPDLOG_DEBUG("Scaling function {} for user {} to parallelism {}",
-                         func,
-                         user,
-                         newParallelism);
-            auto batchScheduler = faabric::batch_scheduler::getBatchScheduler();
-            std::shared_ptr<faabric::batch_scheduler::StateAwareScheduler>
-              stateAwareScheduler = std::dynamic_pointer_cast<
-                faabric::batch_scheduler::StateAwareScheduler>(batchScheduler);
-            if (!stateAwareScheduler) {
-                SPDLOG_ERROR(
-                  "Failed to cast BatchScheduler to StateAwareBatchScheduler");
-                response.result(beast::http::status::internal_server_error);
-                response.body() =
-                  std::string("Failed to get StateAwareScheduler");
-                return ctx.sendFunction(std::move(response));
-            }
-            auto parallelismMap =
-              stateAwareScheduler->getFunctionParallelismMap();
-            if (!parallelismMap.contains(userFunc)) {
-                SPDLOG_ERROR("Function {} not found in parallelism map",
-                             userFunc);
-                response.result(beast::http::status::internal_server_error);
-                response.body() = std::string("Function not found in map");
-                return ctx.sendFunction(std::move(response));
-            }
-            int incParallelism = newParallelism - parallelismMap.at(userFunc);
-            if (incParallelism <= 0) {
-                SPDLOG_ERROR("Invalid parallelism increment {}",
-                             incParallelism);
-                response.result(beast::http::status::bad_request);
-                response.body() = std::string("Invalid parallelism increment");
-                return ctx.sendFunction(std::move(response));
-            }
-            faabric::planner::getPlanner().updateFuncParallelism(
-              userFunc, incParallelism);
+            int newPar = rawReq.parallelism();
+            bool init = rawReq.initialize();
+            SPDLOG_DEBUG(
+              "Scaling function {} to parallelism {} with {} initialization",
+              userFunc,
+              newPar,
+              init);
+
+            faabric::planner::getPlanner().updateFuncPar(
+              userFunc, newPar, init);
 
             response.result(beast::http::status::ok);
             response.body() = std::string("Parallelism updated successfully");
-            return ctx.sendFunction(std::move(response));
-        }
-        case faabric::planner::HttpMessage_Type_RESET_BATCH_SIZE: {
-            SPDLOG_DEBUG("Planner received RESET_BATCH_SIZE request");
-            faabric::planner::BatchResetRequest rawReq;
-            try {
-                faabric::util::jsonToMessage(msg.payloadjson(), &rawReq);
-            } catch (faabric::util::JsonSerialisationException e) {
-                response.result(beast::http::status::bad_request);
-                response.body() = std::string("Bad JSON in body's payload");
-                return ctx.sendFunction(std::move(response));
-            }
-            int32_t batchsize = rawReq.batchsize();
-            faabric::planner::getPlanner().resetBatchsize(batchsize);
-
-            return ctx.sendFunction(std::move(response));
-        }
-        case faabric::planner::HttpMessage_Type_RESET_REPLICAS_LIMIT: {
-            SPDLOG_DEBUG("Planner received RESET_REPLICAS_LIMIT request");
-            faabric::planner::MaxReplicasRequest rawReq;
-            try {
-                faabric::util::jsonToMessage(msg.payloadjson(), &rawReq);
-            } catch (faabric::util::JsonSerialisationException e) {
-                response.result(beast::http::status::bad_request);
-                response.body() = std::string("Bad JSON in body's payload");
-                return ctx.sendFunction(std::move(response));
-            }
-            int32_t maxReplicas = rawReq.maxnum();
-            faabric::planner::getPlanner().resetMaxReplicas(maxReplicas);
-
             return ctx.sendFunction(std::move(response));
         }
         case faabric::planner::HttpMessage_Type_RESET_STREAM_PARAMETER: {
@@ -419,6 +308,10 @@ void PlannerEndpointHandler::onRequest(
             } else if (parameter == "dispatch_period") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
+            } else if (parameter == "batch_size") {
+                faabric::planner::getPlanner().resetParameter(parameter, value);
+            } else if (parameter == "max_replicas") {
+                faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "planner_call_interval") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "is_outputting") {

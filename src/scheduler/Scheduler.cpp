@@ -18,6 +18,7 @@
 #include <faabric/util/locks.h>
 #include <faabric/util/logging.h>
 #include <faabric/util/snapshot.h>
+#include <faabric/util/string_tools.h>
 #include <faabric/util/testing.h>
 
 #include <unordered_set>
@@ -312,70 +313,28 @@ long Scheduler::getFunctionExecutorCount(const faabric::Message& msg)
     return executors[funcStr].size();
 }
 
-void Scheduler::executeBatch(std::shared_ptr<faabric::BatchExecuteRequest> req)
-{
-    faabric::util::FullLock lock(mx);
-
-    bool isThreads = req->type() == faabric::BatchExecuteRequest::THREADS;
-    auto funcStr = faabric::util::funcParToString(req->messages(0), false);
-    int nMessages = req->messages_size();
-
-    // Records for tests - copy messages before execution to avoid races
-    if (faabric::util::isTestMode()) {
-        for (int i = 0; i < nMessages; i++) {
-            recordedMessages.emplace_back(req->messages().at(i));
-        }
-    }
-
-    // For threads we only need one executor, for anything else we want
-    // one Executor per function in flight.
-    if (isThreads) {
-        // Threads use the existing executor. We assume there's only
-        // one running at a time.
-        std::vector<std::shared_ptr<faabric::executor::Executor>>&
-          thisExecutors = executors[funcStr];
-
-        std::shared_ptr<faabric::executor::Executor> e = nullptr;
-        if (thisExecutors.empty()) {
-            // Create executor if not exists
-            e = claimExecutor(*req->mutable_messages(0), lock);
-        } else if (thisExecutors.size() == 1) {
-            // Use existing executor if exists
-            e = thisExecutors.back();
-        } else {
-            SPDLOG_ERROR("Found {} executors for threaded function {}",
-                         thisExecutors.size(),
-                         funcStr);
-            throw std::runtime_error(
-              "Expected only one executor for threaded function");
-        }
-
-        assert(e != nullptr);
-
-        // Execute the tasks
-        std::vector<int> thisHostIdxs(req->messages_size());
-        std::iota(thisHostIdxs.begin(), thisHostIdxs.end(), 0);
-        e->executeTasks(thisHostIdxs, req);
-    } else {
-        // Non-threads require one executor per task
-        for (int i = 0; i < nMessages; i++) {
-            faabric::Message& localMsg = req->mutable_messages()->at(i);
-
-            std::shared_ptr<faabric::executor::Executor> e =
-              claimExecutor(localMsg, lock);
-            e->executeTasks({ i }, req);
-        }
-    }
-}
-
+// Enqueue the request messages from remote into local unprocess queue for
+// further processing.
 void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
 {
-    faabric::util::FullLock lock(mx);
+    // SPDLOG_DEBUG("enqueueMessageBatch:: Enqueueing message batch for {} "
+    //              "messages and is update state {}",
+    //              msgs->messages_size(),
+    //              isUpdateState);
 
+    if (isUpdateState) {
+        UnschedMsgs.enqueue(std::move(msgs));
+    }
+
+    // faabric::util::FullLock lock(mx);
+    // SPDLOG_DEBUG("enqueueMessageBatch:: lock acquired");
+
+    int nMessages = msgs->messages_size();
     auto current = faabric::util::getGlobalClock().epochMicros();
     auto currentMillis = faabric::util::getGlobalClock().epochMillis();
     auto endPoint = faabric::util::getSystemConfig().endpointHost;
-    for (int i = 0; i < msgs->messages_size(); i++) {
+
+    for (int i = 0; i < nMessages; i++) {
         faabric::Message& msg = msgs->mutable_messages()->at(i);
         std::string waitingQueueName = msg.user() + "_" + msg.function() + "_" +
                                        std::to_string(msg.parallelismid());
@@ -383,169 +342,66 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
         msg.set_starttimestamp(currentMillis);
         msg.set_executedhost(endPoint);
 
-        size_t hash = msg.hash();
+        // Add messages to the waiting queue
+        // SPDLOG_DEBUG("Enqueueing messages for {}", waitingQueueName);
         int messageType = msg.messagetype();
-        if (isRepartition && messageType == 2) {
+        if (messageType == 2) {
+            size_t hash = msg.hash();
             if (!partitionedWaitingQueues.contains(waitingQueueName)) {
-                faabric::util::PartitionedStateMessageQueue tempWaitingQueue(
-                  maxReplicas, executeBatchsize);
-                partitionedWaitingQueues.emplace(waitingQueueName,
-                                                 tempWaitingQueue);
+                partitionedWaitingQueues.emplace(
+                  waitingQueueName,
+                  std::make_unique<faabric::util::PartitionedStateMessageQueue>(
+                    waitingQueueName, maxReplicas, executeBatchsize));
             }
             partitionedWaitingQueues.at(waitingQueueName)
-              .addMessage(hash,
-                          std::make_shared<faabric::Message>(std::move(msg)));
+              ->addMessage(hash,
+                           std::make_unique<faabric::Message>(std::move(msg)));
         } else {
             auto [iterator, inserted] =
-              waitingQueues.emplace(waitingQueueName, waitingQueueName);
-            iterator->second.insertMsg(
-              std::make_shared<faabric::Message>(std::move(msg)));
-        }
-    }
-}
-
-void Scheduler::executeBatchAsyn(
-  std::shared_ptr<faabric::BatchExecuteRequest> req)
-{
-    faabric::util::FullLock lock(mx);
-
-    bool isThreads = req->type() == faabric::BatchExecuteRequest::THREADS;
-    int nMessages = req->messages_size();
-
-    // Records for tests - copy messages before execution to avoid races
-    if (faabric::util::isTestMode()) {
-        for (int i = 0; i < nMessages; i++) {
-            recordedMessages.emplace_back(req->messages().at(i));
+              waitingQueues.emplace(waitingQueueName,
+                                    std::make_unique<faabric::util::BatchQueue>(
+                                      waitingQueueName, executeBatchsize));
+            iterator->second->addMessage(
+              std::make_unique<faabric::Message>(std::move(msg)));
         }
     }
 
-    // We don't support THREADS now, Since, I don't know how it works :).
-    if (isThreads) {
-        SPDLOG_ERROR("THREADS is not supported in callBatchFunctions");
-        throw std::runtime_error(
-          "THREADS is not supported in callBatchFunctions");
-    }
-
-    // A request only contains the same function with same parallelism(first
-    // tier partition)
-    auto firstMsg =
-      std::make_shared<faabric::Message>(*req->mutable_messages(0));
-    std::string userFuncPar = firstMsg->user() + "_" + firstMsg->function() +
-                              "_" + std::to_string(firstMsg->parallelismid());
-    for (size_t i = 0; i < nMessages; i++) {
-        std::string waitingQueueName = userFuncPar;
-        std::shared_ptr<faabric::Message> tempMsg =
-          std::make_shared<faabric::Message>(*req->mutable_messages(i));
-        // Set the queue start time here.
-        tempMsg->set_workerqueuetime(
-          faabric::util::getGlobalClock().epochMicros());
-
-        // TODO - Refine the hashing key, after mod by first tier, second tier
-        // keys are shown in some pattern.
-        // Statistic the Hashing key distribution.
-        size_t hash = tempMsg->hash();
-        int messageType = tempMsg->messagetype();
-        if (isRepartition && messageType == 2) {
-            if (!partitionedWaitingQueues.contains(waitingQueueName)) {
-                faabric::util::PartitionedStateMessageQueue tempWaitingQueue(
-                  maxReplicas, executeBatchsize);
-                partitionedWaitingQueues.emplace(waitingQueueName,
-                                                 tempWaitingQueue);
-            }
-            partitionedWaitingQueues.at(waitingQueueName)
-              .addMessage(hash, std::move(tempMsg));
-        } else {
-            auto [iterator, inserted] =
-              waitingQueues.emplace(waitingQueueName, waitingQueueName);
-            iterator->second.insertMsg(std::move(tempMsg));
-        }
-    }
+    // lock.unlock();
+    // SPDLOG_DEBUG("enqueueMessageBatch:: unlocked");
 }
 
 void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
-                                     BatchQueue& waitingBatch,
+                                     util::BatchQueueBase& waitingQueue,
                                      faabric::util::FullLock& lock)
 {
-    auto fisrtMsg = waitingBatch.batchQueue.front();
-    std::string funcStr = faabric::util::funcParToString(*fisrtMsg, false);
+    auto firstMsg = waitingQueue.queueFront();
+    std::string user = firstMsg->user();
+    std::string func = firstMsg->function();
+    std::string funcStr = faabric::util::funcParToString(*firstMsg, false);
+
     // Check if the executor is available.
     if (!executorAvailable(funcStr)) {
         return;
     }
-    // Generate new BatchExecuteRequest
-    auto newReq = faabric::util::batchExecFactory();
-    newReq->set_user(fisrtMsg->user());
-    newReq->set_function(fisrtMsg->function());
-    while (!waitingBatch.batchQueue.empty()) {
-        auto* message = newReq->add_messages();
-        *message = std::move(*waitingBatch.batchQueue.front());
-        message->set_workerpoptime(
-          faabric::util::getGlobalClock().epochMicros());
-        waitingBatch.batchQueue.pop();
-        // If the batch size is reached, execute it.
-        if (newReq->messages_size() >= executeBatchsize ||
-            waitingBatch.batchQueue.empty()) {
-            // Claim new Executor, we can bound the first msg here, since claim
-            // only needs the user and function of Message.
-            faabric::Message& localMsg = newReq->mutable_messages()->at(0);
-            // Record the time for claim executor.
-            auto timeFlag1 = faabric::util::getGlobalClock().epochMicros();
-            std::shared_ptr<faabric::executor::Executor> e =
-              claimExecutor(localMsg, lock);
-            auto timeFlag2 = faabric::util::getGlobalClock().epochMicros();
-            int elapsed = static_cast<int>(timeFlag2 - timeFlag1);
-            for (int i = 0; i < newReq->messages_size(); i++) {
-                newReq->mutable_messages()->at(i).set_executorpreparetime(
-                  elapsed);
-            }
 
-            SPDLOG_DEBUG("Claimed executor {} for {} with message size {}",
-                         e->id,
-                         userFuncPar,
-                         newReq->messages_size());
-            // Execute the tasks for Paritioned State
-            if (localMsg.messagetype() == 2) {
-                std::string lockHint =
-                  std::to_string(waitingBatch.lockVersion) + "/" +
-                  std::to_string(waitingBatch.rangeStart) + "/" +
-                  std::to_string(waitingBatch.rangeEnd);
-                newReq->set_lockhint(lockHint);
-            }
-            e->executeBatchTasks(newReq);
-            // Check if the executor is available.
-            if (!executorAvailable(funcStr)) {
-                break;
-            }
-            // Reset the newReq
-            newReq = faabric::util::batchExecFactory();
-            newReq->set_user(fisrtMsg->user());
-            newReq->set_function(fisrtMsg->function());
+    // Generate new BatchExecuteRequest (A request contains multiple requests)
+    auto newReq = faabric::util::batchExecFactory();
+    newReq->set_user(user);
+    newReq->set_function(func);
+
+    // Execute Batch Requests until the queue is empty or no available executor.
+    while (waitingQueue.getMessagesCount() != 0) {
+        // The state lock is obtained before the requets are dequeued.
+        auto stateLock =
+          std::make_unique<faabric::util::SharedLock>(stateUpdateMx);
+
+        // Double Check
+        if (waitingQueue.getMessagesCount() == 0) {
+            stateLock->unlock();
+            break;
         }
-    }
-    // Reset the lastTime. It will be updated when inserted next time.
-    // We reset here just in case.
-    if (waitingBatch.batchQueue.empty()) {
-        waitingBatch.resetlastTime();
-    }
-}
 
-void Scheduler::executeBatchForPartitionQueue(
-  const std::string& userFuncPar,
-  faabric::util::PartitionedStateMessageQueue& waitingBatch,
-  faabric::util::FullLock& lock)
-{
-    auto fisrtMsg = waitingBatch.front();
-    std::string funcStr = faabric::util::funcParToString(*fisrtMsg, false);
-    // Check if the executor is available.
-    if (!executorAvailable(funcStr)) {
-        return;
-    }
-    // Generate new BatchExecuteRequest
-    auto newReq = faabric::util::batchExecFactory();
-    newReq->set_user(fisrtMsg->user());
-    newReq->set_function(fisrtMsg->function());
-    while (waitingBatch.getMessagesCount() != 0) {
-        auto msgVec = waitingBatch.getMessages();
+        auto msgVec = waitingQueue.getMessages();
         for (auto& msgPointer : msgVec) {
             auto* message = newReq->add_messages();
             *message = std::move(*msgPointer);
@@ -555,7 +411,6 @@ void Scheduler::executeBatchForPartitionQueue(
         // Claim new Executor, we can bound the first msg here, since claim
         // only needs the user and function of Message.
         faabric::Message& localMsg = newReq->mutable_messages()->at(0);
-        // Record the time for claim executor.
         auto timeFlag1 = faabric::util::getGlobalClock().epochMicros();
         std::shared_ptr<faabric::executor::Executor> e =
           claimExecutor(localMsg, lock);
@@ -568,21 +423,20 @@ void Scheduler::executeBatchForPartitionQueue(
                      e->id,
                      userFuncPar,
                      newReq->messages_size());
-        // Execute the tasks for Paritioned State
-        e->executeBatchTasks(newReq);
-        // Check if the executor is available.
+        // Execute the BatchRequest
+        e->executeBatchTasks(newReq, std::move(stateLock));
+        // Quit if no executor is available. Otherwise, execute the next batch.
         if (!executorAvailable(funcStr)) {
             break;
         }
         // Reset the newReq
         newReq = faabric::util::batchExecFactory();
-        newReq->set_user(fisrtMsg->user());
-        newReq->set_function(fisrtMsg->function());
+        newReq->set_user(user);
+        newReq->set_function(func);
     }
-    // Reset the lastTime. It will be updated when inserted next time.
-    // We reset here just in case.
-    if (waitingBatch.getMessagesCount() == 0) {
-        waitingBatch.resetlastTime();
+
+    if (waitingQueue.getMessagesCount() == 0) {
+        waitingQueue.resetLastTime();
     }
 }
 
@@ -591,6 +445,7 @@ void Scheduler::enqueueChainedCalls(
 {
     SPDLOG_DEBUG("Enqueueing chained calls for {} messages", msgs.size());
     faabric::util::FullLock lock(mx);
+    // SPDLOG_DEBUG("enqueueChainedCalls:: lock acquired");
 
     for (auto& msg : msgs) {
         if (msg) {
@@ -625,27 +480,45 @@ void Scheduler::batchTimerCheck()
             break;
         }
 
+        // If we have some unScheduled messages, schedule them.
+        while (!UnschedMsgs.empty()) {
+            // SPDLOG_DEBUG("Processing unscheduled messages");
+            auto msgs = UnschedMsgs.dequeue()->messages();
+            std::vector<std::unique_ptr<faabric::Message>> msgsVec;
+            msgsVec.reserve(msgs.size());
+            for (auto& msg : msgs) {
+                msgsVec.push_back(std::make_unique<faabric::Message>(msg));
+            }
+            auto hosts =
+              decentralScheduler.scheduleMessagesBatch(hostMap, msgsVec);
+            enqueueSchedMsgs(hosts, std::move(msgsVec));
+        }
+
+        // SPDLOG_DEBUG(
+        //   "batchTimerCheck: Checking waiting queues for batch execution");
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
-            if (waitingBatch.batchQueue.size() == 0) {
+            if (waitingBatch->getMessagesCount() == 0) {
                 continue;
             }
-            if (waitingBatch.batchQueue.size() >= executeBatchsize ||
-                waitingBatch.getTimeInterval() >= conf.batchInterval) {
-                executeBatchForQueue(userFuncPar, waitingBatch, lock);
+            if (waitingBatch->getMessagesCount() >= executeBatchsize ||
+                waitingBatch->getTimeInterval() >= conf.batchInterval) {
+                executeBatchForQueue(userFuncPar, *waitingBatch, lock);
             }
         }
 
         // if Repartitioned, parititioned state functions are in the
         // partitionedWaitingQueues.
         for (auto& [userFuncPar, waitingBatch] : partitionedWaitingQueues) {
-            if (waitingBatch.getMessagesCount() == 0) {
+            if (waitingBatch->getMessagesCount() == 0) {
                 continue;
             }
-            if (waitingBatch.getMessagesCount() >= executeBatchsize ||
-                waitingBatch.getTimeInterval() >= conf.batchInterval) {
-                executeBatchForPartitionQueue(userFuncPar, waitingBatch, lock);
+            if (waitingBatch->getMessagesCount() >= executeBatchsize ||
+                waitingBatch->getTimeInterval() >= conf.batchInterval) {
+                executeBatchForQueue(userFuncPar, *waitingBatch, lock);
             }
         }
+
+        // SPDLOG_DEBUG("batchTimerCheck: send message results back");
 
         auto currentMillis = faabric::util::getGlobalClock().epochMillis();
 
@@ -665,10 +538,11 @@ void Scheduler::batchTimerCheck()
             plannerCli.setMessageResultBatch(req);
             setResultMsgs.clear();
         }
+
+        // SPDLOG_DEBUG("batchTimerCheck: finished");
     }
 }
 
-// It should be the same to void Planner::enqueueMessageBatch
 void Scheduler::enqueueSchedMsgs(
   std::vector<std::string> hosts,
   std::vector<std::unique_ptr<faabric::Message>> msgs)
@@ -691,10 +565,16 @@ void Scheduler::dispatchChainedMsgs()
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
 
+        // SPDLOG_DEBUG("dispatchChainedMsgs:: Dispatching chained messages");
+
         faabric::util::FullLock mxLock(mx);
+        // SPDLOG_DEBUG("dispatchChainedMsgs:: lock acquired");
+
         if (stopThreadTimer) {
             break;
         }
+
+        // SPDLOG_DEBUG("dispatchChainedMsgs:: flag1");
 
         // Schedule the chained calls
         if (!chainedCallMsgs.empty()) {
@@ -702,13 +582,15 @@ void Scheduler::dispatchChainedMsgs()
               hostMap, chainedCallMsgs);
             enqueueSchedMsgs(hosts, std::move(chainedCallMsgs));
         }
-        mxLock.unlock();
+
+        // SPDLOG_DEBUG("dispatchChainedMsgs:: flag2");
 
         faabric::util::FullLock lock(scheduledMsgsMapMx);
         if (scheduledMsgsMap.empty()) {
             lock.unlock();
             continue;
         }
+        // SPDLOG_DEBUG("dispatchChainedMsgs:: flag3");
 
         // Create a local filtered copy of scheduledRequestsMap
         auto currentTime = faabric::util::getGlobalClock().epochMicros();
@@ -724,11 +606,15 @@ void Scheduler::dispatchChainedMsgs()
             msgsCallMap[hostIp] = std::move(msgsList); // Move ownership
         }
         scheduledMsgsMap.clear();
-        lock.unlock();
+        // SPDLOG_DEBUG("dispatchChainedMsgs:: flag4");
 
         // Parallel execution of function calls for each host
         std::vector<std::thread> threads;
         for (auto& [hostIp, msgs] : msgsCallMap) {
+            // SPDLOG_DEBUG the hosts and messages
+            SPDLOG_DEBUG("Dispatching messages to host {} with message size {}",
+                         hostIp,
+                         msgs.size());
             // If locally, we put the messages into a batch directly
             if (hostIp == thisHost) {
                 auto batchMsgs = std::make_unique<faabric::MessageBatch>();
@@ -738,7 +624,10 @@ void Scheduler::dispatchChainedMsgs()
                 for (auto& msg : msgs) {
                     batchMsgs->add_messages()->CopyFrom(*msg);
                 }
-                enqueueMessageBatch(std::move(batchMsgs));
+                threads.emplace_back(
+                  [this, batch = std::move(batchMsgs)]() mutable {
+                      enqueueMessageBatch(std::move(batch));
+                  });
                 continue;
             }
             // Otherwise, we send the messages to the remote host
@@ -756,32 +645,31 @@ void Scheduler::dispatchChainedMsgs()
                 t.join();
             }
         }
+        // SPDLOG_DEBUG("dispatchChainedMsgs:: flag5");
     }
 }
 
 void Scheduler::resetParameter(std::string key, int32_t value)
 {
     faabric::util::FullLock lock(mx);
-    if (key == "is_repartition") {
-        isRepartition = value == 1;
-        SPDLOG_INFO("Reset isRepartition parameter to : {}", isRepartition);
-    } else if (key == "max_executors") {
+    if (key == "max_executors") {
         maxExecutors = value;
         SPDLOG_INFO("Reset maxExecutors parameter to : {}", maxExecutors);
     } else if (key == "planner_call_interval") {
         plannerCallInterval = value;
         SPDLOG_INFO("Reset plannerCallInterval parameter to : {}",
                     plannerCallInterval);
+    } else if (key == "max_replicas") {
+        maxReplicas = value;
+        SPDLOG_INFO("Reset maxReplicas parameter to : {}", maxReplicas);
+    } else if (key == "batch_size") {
+        executeBatchsize = value;
+        SPDLOG_INFO("Reset executeBatchsize parameter to : {}",
+                    executeBatchsize);
     } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }
-}
-
-void Scheduler::resetBatchsize(int32_t newSize)
-{
-    faabric::util::FullLock lock(mx);
-    executeBatchsize = newSize;
 }
 
 void Scheduler::clearRecordedMessages()
@@ -794,12 +682,6 @@ std::vector<faabric::Message> Scheduler::getRecordedMessages()
 {
     faabric::util::SharedLock lock(mx);
     return recordedMessages;
-}
-
-void Scheduler::resetMaxReplicas(int32_t newMaxReplicas)
-{
-    faabric::util::FullLock lock(mx);
-    maxReplicas = newMaxReplicas;
 }
 
 bool Scheduler::executorAvailable(const std::string& funcStr)
@@ -842,7 +724,6 @@ std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
 
     auto factory = faabric::executor::getExecutorFactory();
 
-    // auto timeFlag1 = faabric::util::getGlobalClock().epochMicros();
     std::shared_ptr<faabric::executor::Executor> claimed = nullptr;
     for (auto& e : thisExecutors) {
         if (e->tryClaim()) {
@@ -874,12 +755,6 @@ std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
         // Claim it
         claimed->tryClaim();
     }
-    // auto timeFlag2 = faabric::util::getGlobalClock().epochMicros();
-    // int elapsed = static_cast<int>(timeFlag2 - timeFlag1);
-    // SPDLOG_DEBUG("Claimed executor {} for {} in {}us",
-    //             claimed->id,
-    //             funcStr,
-    //             elapsed);
     assert(claimed != nullptr);
     return claimed;
 }
@@ -1040,8 +915,83 @@ void Scheduler::updateStatesInfo(
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
     statesInfo)
 {
+    SPDLOG_INFO("updateStatesInfo: Update states info starts");
+    // To update states, we must ensure that no executors are running.
+    // Otherwise, it might cannot update the states correctly.
     faabric::util::FullLock lock(mx);
+    faabric::util::FullLock stateLock(stateUpdateMx);
+
+    isUpdateState = true;
+
+    // Update the states info in decentralized scheduler
     decentralScheduler.syncStatesInfo(statesInfo);
+    // Update the states stored in local storage
+    // TODO - Currently we delete all the states, and creates new states. We
+    // should migration the states further.
+    auto& stateServer = faabric::state::getGlobalState();
+    stateServer.forceClearAll(true);
+
+    SPDLOG_INFO(
+      "updateStatesInfo: states update complete, reallocate states now");
+
+    std::string thisHost = faabric::util::getSystemConfig().endpointHost;
+    // Intialize new allocated state
+    for (const auto& [stateKey, stateInfo] : statesInfo) {
+        for (const auto& [id, ip] : stateInfo.stateHost) {
+            if (ip != thisHost) {
+                continue;
+            }
+            auto [user, func] = faabric::util::splitUserFunc(stateKey);
+            bool isPartitionable =
+              stateInfo.partitionBy != "" && stateInfo.partitionBy != "None";
+
+            // Create the state locally if the state is on this host
+            stateServer.createFS(user, func, id, isPartitionable);
+        }
+    }
+
+    SPDLOG_INFO("updateStatesInfo: states reallocation complete, reschedule "
+                "requests now");
+
+    // Reschedule all the messages in unprocessed queue and scheduled queue.
+    std::vector<std::unique_ptr<faabric::Message>> rescheduleMsgs;
+    SPDLOG_DEBUG("updateStatesInfo: Flag 1");
+    for (auto& [queueKey, queuePtr] : waitingQueues) {
+        if (queuePtr->getMessagesCount() == 0) {
+            continue;
+        }
+        auto messages = queuePtr->drainMessages();
+        for (auto& msg : messages) {
+            rescheduleMsgs.emplace_back(std::move(msg));
+        }
+    }
+    SPDLOG_DEBUG("updateStatesInfo: Flag 2");
+    for (auto& [queueKey, queuePtr] : partitionedWaitingQueues) {
+        if (queuePtr->getMessagesCount() == 0) {
+            continue;
+        }
+        auto messages = queuePtr->drainMessages();
+        for (auto& msg : messages) {
+            rescheduleMsgs.emplace_back(std::move(msg));
+        }
+    }
+    SPDLOG_DEBUG("updateStatesInfo: Flag 3");
+
+    // Reschedule the scheduled messages in scheduledMsgsMap
+    for (auto& [hostIp, msgs] : scheduledMsgsMap) {
+        for (auto& msg : msgs) {
+            rescheduleMsgs.emplace_back(std::move(msg));
+        }
+        scheduledMsgsMap.erase(hostIp);
+    }
+    // Reschedule the messages
+    if (!rescheduleMsgs.empty()) {
+        auto hosts =
+          decentralScheduler.scheduleMessagesBatch(hostMap, rescheduleMsgs);
+        enqueueSchedMsgs(hosts, std::move(rescheduleMsgs));
+    }
+    isUpdateState = false;
+    SPDLOG_INFO("updateStatesInfo: reschedule complete");
 }
 
 }

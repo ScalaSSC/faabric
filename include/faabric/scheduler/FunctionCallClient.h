@@ -47,17 +47,14 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
 
     void setMessageResult(std::shared_ptr<faabric::Message> msg);
 
-    void resetBatchSize(
-      std::shared_ptr<faabric::planner::BatchResetRequest> req);
-
-    void resetMaxReplicas(
-      std::shared_ptr<faabric::planner::MaxReplicasRequest> req);
-
     void resetParameter(
       std::shared_ptr<faabric::planner::ResetStreamParameterRequest> req);
 
     void executeFunctionsBatch(
       std::list<std::unique_ptr<faabric::Message>>&& reqs);
+
+    void syncStateInfo(
+      std::shared_ptr<faabric::planner::SyncStatesInfoRequest> info);
 };
 
 // -----------------------------------

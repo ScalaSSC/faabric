@@ -28,11 +28,10 @@ class Executor
     // Must be marked virtual to permit proper calling of subclass destructors
     virtual ~Executor();
 
-    void executeTasks(std::vector<int> msgIdxs,
-                      std::shared_ptr<faabric::BatchExecuteRequest> req);
-
     // Execute all the messages in this request in one invocation.
-    void executeBatchTasks(std::shared_ptr<faabric::BatchExecuteRequest> req);
+    void executeBatchTasks(
+      std::shared_ptr<faabric::BatchExecuteRequest> req,
+      std::unique_ptr<std::shared_lock<std::shared_mutex>> stateLock);
 
     virtual void shutdown();
 
@@ -117,7 +116,9 @@ class Executor
     std::vector<std::shared_ptr<std::jthread>> threadPoolThreads;
     std::set<int> availablePoolThreads;
 
-    std::vector<faabric::util::Queue<ExecutorTask>> threadTaskQueues;
+    std::vector<faabric::util::Queue<
+      std::tuple<ExecutorTask, std::unique_ptr<faabric::util::SharedLock>>>>
+      threadTaskQueues;
 
     void threadPoolThread(std::stop_token st, int threadPoolIdx);
 };

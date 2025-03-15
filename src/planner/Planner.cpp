@@ -22,6 +22,8 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace faabric::planner {
 
@@ -108,9 +110,9 @@ bool Planner::reset()
 
     flushSchedulingState();
 
-    flushHosts();
+    flushExecutors();
 
-    faabric::util::FullLock lock(plannerMx);
+    flushHosts();
 
     return true;
 }
@@ -149,16 +151,13 @@ void Planner::flushHosts()
 
 void Planner::flushExecutors()
 {
-    // Flush Aware Scheduler State
-    // If preload the parallelism desision, we change the parallelism here
+    faabric::util::FullLock lock(plannerMx);
+
     if (stateAwareScheduler) {
         stateAwareScheduler->resetScheduler();
     }
 
-    auto availableHosts = getAvailableHosts();
-    for (const auto& [ip, host] : state.hostMap) {
-        host->set_statesync(true);
-    }
+    auto availableHosts = getAvailableHosts(true);
     for (const auto& host : availableHosts) {
         SPDLOG_INFO("Planner sending EXECUTOR flush to {}", host->ip());
         faabric::scheduler::getFunctionCallClient(host->ip())->sendFlush();
@@ -176,13 +175,16 @@ void Planner::flushSchedulingState()
     state.inFlightApps.clear();
 }
 
-std::vector<std::shared_ptr<Host>> Planner::getAvailableHosts()
+std::vector<std::shared_ptr<Host>> Planner::getAvailableHosts(bool locked)
 {
     SPDLOG_DEBUG("Planner received request to get available hosts");
 
     // Acquire a full lock because we will also remove the hosts that have
     // timed out
-    faabric::util::FullLock lock(plannerMx);
+    std::unique_ptr<faabric::util::FullLock> lock;
+    if (!locked) {
+        lock = std::make_unique<faabric::util::FullLock>(plannerMx);
+    }
 
     std::vector<std::string> hostsToRemove;
     std::vector<std::shared_ptr<Host>> availableHosts;
@@ -233,7 +235,6 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
           "Registering host {} with {} slots", hostIn.ip(), hostIn.slots());
         auto regHost = std::make_shared<Host>(hostIn);
         regHost->set_hostsync(true);
-        regHost->set_statesync(true);
         state.hostMap.emplace(
           std::make_pair<std::string, std::shared_ptr<Host>>(
             (std::string)hostIn.ip(), std::move(regHost)));
@@ -267,28 +268,6 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
 
     state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
     return true;
-}
-
-const std::
-  pair<bool, std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>>
-  Planner::retrieveStateInfo(std::string hostIp)
-{
-    faabric::util::SharedLock lock(plannerMx);
-
-    if (!stateAwareScheduler) {
-        return { false, {} };
-    }
-
-    const auto it = state.hostMap.find(hostIp);
-    if (it != state.hostMap.end()) {
-        auto host = it->second;
-        if (host->statesync()) {
-            host->set_statesync(false);
-            return { true, stateAwareScheduler->getStateInfo() };
-        }
-    }
-
-    return { false, {} };
 }
 
 const std::pair<bool, HostPtrMap&> Planner::getRegisteredHost(
@@ -338,9 +317,11 @@ void Planner::setMessageResultBatch(
 {
     SPDLOG_DEBUG("Planner received message result batch with {} messages",
                  batchMsg->messages_size());
+
     // When outputing result, we doesn't allow any set result operation.
     RETURN_IF_OUTPUTTING
-    faabric::util::FullLock lock(plannerStateMx);
+    faabric::util::FullLock reqStatusLock(state.reqStatusMx);
+
     // Check again
     RETURN_IF_OUTPUTTING
     SPDLOG_DEBUG("InFlightApps size before set: {}", state.inFlightApps.size());
@@ -370,111 +351,6 @@ void Planner::setMessageResultBatch(
         }
     }
     SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
-}
-
-std::shared_ptr<faabric::Message> Planner::getMessageResult(
-  std::shared_ptr<faabric::Message> msg)
-{
-    int appId = msg->appid();
-    int msgId = msg->id();
-
-    {
-        faabric::util::SharedLock lock(plannerMx);
-
-        // We debug and not error these messages as they happen frequently
-        // when polling for results
-        if (state.appResults.find(appId) == state.appResults.end()) {
-            SPDLOG_DEBUG("App {} not registered in app results", appId);
-        } else if (state.appResults[appId].find(msgId) ==
-                   state.appResults[appId].end()) {
-            SPDLOG_DEBUG("Msg {} not registered in app results (app id: {})",
-                         msgId,
-                         appId);
-        } else {
-            return state.appResults[appId][msgId];
-        }
-    }
-
-    // If we are here, it means that we have not found the message result, so
-    // we register the calling-host's interest if the calling-host has
-    // provided a main host. The main host is set when dispatching a message
-    // within faabric, but not when sending an HTTP request
-    if (!msg->mainhost().empty()) {
-        faabric::util::FullLock lock(plannerMx);
-
-        // Check again if the result is not set, as it could have been set
-        // between releasing the shared lock and acquiring the full lock
-        if (state.appResults.contains(appId) &&
-            state.appResults[appId].contains(msgId)) {
-            return state.appResults[appId][msgId];
-        }
-
-        // Definately the message result is not set, so we add the host to the
-        // waiters list
-        SPDLOG_DEBUG("Adding host {} on the waiting list for message {}",
-                     msg->mainhost(),
-                     msgId);
-        state.appResultWaiters[msgId].push_back(msg->mainhost());
-    }
-
-    return nullptr;
-}
-
-void Planner::preloadSchedulingDecision(
-  int32_t appId,
-  std::shared_ptr<batch_scheduler::SchedulingDecision> decision)
-{
-    faabric::util::FullLock lock(plannerMx);
-
-    if (state.preloadedSchedulingDecisions.contains(appId)) {
-        SPDLOG_ERROR(
-          "ERROR: preloaded scheduling decisions already contain app {}",
-          appId);
-        return;
-    }
-
-    SPDLOG_INFO("Pre-loading scheduling decision for app {}", appId);
-    state.preloadedSchedulingDecisions[appId] = decision;
-}
-
-std::shared_ptr<batch_scheduler::SchedulingDecision>
-Planner::getPreloadedSchedulingDecision(
-  int32_t appId,
-  std::shared_ptr<BatchExecuteRequest> ber)
-{
-    SPDLOG_DEBUG("Requesting pre-loaded scheduling decision for app {}", appId);
-    // WARNING: this method is currently only called from the main Planner
-    // entrypoint (callBatch) which has a FullLock, thus we don't need to
-    // acquire a (SharedLock) here. In general, we would need a read-lock
-    // to read the dict from the planner's state
-    auto decision = state.preloadedSchedulingDecisions.at(appId);
-    assert(decision != nullptr);
-
-    // Only include in the returned scheduling decision the group indexes that
-    // are in this BER. This can happen when consuming a preloaded decision
-    // in two steps (e.g. for MPI)
-    std::shared_ptr<batch_scheduler::SchedulingDecision> filteredDecision =
-      std::make_shared<batch_scheduler::SchedulingDecision>(decision->appId,
-                                                            decision->groupId);
-    for (const auto& msg : ber->messages()) {
-        int groupIdx = msg.groupidx();
-        int idxInDecision = std::distance(decision->groupIdxs.begin(),
-                                          std::find(decision->groupIdxs.begin(),
-                                                    decision->groupIdxs.end(),
-                                                    groupIdx));
-        assert(idxInDecision < decision->groupIdxs.size());
-
-        // Add the schedulign for this group idx to the filtered decision.
-        // Make sure we also maintain the message IDs that come from the BER
-        // (as we can not possibly predict them in the preloaded decision)
-        filteredDecision->addMessage(decision->hosts.at(idxInDecision),
-                                     msg.id(),
-                                     decision->appIdxs.at(idxInDecision),
-                                     decision->groupIdxs.at(idxInDecision));
-    }
-    assert(filteredDecision->hosts.size() == ber->messages_size());
-
-    return filteredDecision;
 }
 
 std::shared_ptr<faabric::BatchExecuteRequestStatus> Planner::getBatchResults(
@@ -514,22 +390,6 @@ std::shared_ptr<faabric::BatchExecuteRequestStatus> Planner::getBatchResults(
     return berStatus;
 }
 
-bool Planner::registerFuncState(const std::string& userFunction,
-                                const std::string& partitionBy,
-                                const std::string& stateKey)
-{
-    SPDLOG_DEBUG("Planner received request to register function state for {}",
-                 userFunction);
-    faabric::util::FullLock lock(plannerStateMx);
-    bool registerResult = stateAwareScheduler->registerFunctionState(
-      userFunction, partitionBy, stateKey, state.batchSchedHostMap);
-
-    for (const auto& [ip, host] : state.hostMap) {
-        host->set_statesync(true);
-    }
-    return registerResult;
-}
-
 std::shared_ptr<faabric::batch_scheduler::SchedulingDecision>
 Planner::getSchedulingDecision(std::shared_ptr<BatchExecuteRequest> req)
 {
@@ -545,27 +405,26 @@ Planner::getSchedulingDecision(std::shared_ptr<BatchExecuteRequest> req)
     return state.inFlightReqs.at(appId).second;
 }
 
-faabric::batch_scheduler::InFlightReqs Planner::getInFlightReqs()
-{
-    faabric::util::SharedLock lock(plannerMx);
-
-    // Deliberately deep copy here
-    faabric::batch_scheduler::InFlightReqs inFlightReqsCopy;
-    for (const auto& [appId, inFlightPair] : state.inFlightReqs) {
-        inFlightReqsCopy[appId] = std::make_pair(
-          std::make_shared<BatchExecuteRequest>(*inFlightPair.first),
-          std::make_shared<faabric::batch_scheduler::SchedulingDecision>(
-            *inFlightPair.second));
-    }
-
-    return inFlightReqsCopy;
-}
-
 int Planner::getNumMigrations()
 {
     return state.numMigrations.load(std::memory_order_acquire);
 }
 
+bool Planner::registerFuncState(const std::string& userFunction,
+                                const std::string& partitionBy,
+                                const std::string& stateKey)
+{
+    SPDLOG_DEBUG("Planner received request to register function state for {}",
+                 userFunction);
+    faabric::util::FullLock lock(plannerMx);
+    bool registerResult = stateAwareScheduler->registerFunctionState(
+      userFunction, partitionBy, stateKey, state.batchSchedHostMap);
+
+    return registerResult;
+}
+
+// Schedule Messages should not called when reschedule state, outputting the
+// result.
 void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
                                bool isChained)
 {
@@ -573,21 +432,21 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
     auto currentTime = faabric::util::getGlobalClock().epochMicros();
 
     if (isChained) {
-        SPDLOG_ERROR("Decentralized Scheduler schedule chained calls");
-        throw std::runtime_error("Chained call scheduling is not supported "
-                                 "in centralized schedulere");
+        SPDLOG_ERROR(
+          "Chained call should be scheduled by decentralized scheduler");
+        throw std::runtime_error(
+          "Chained call should be scheduled by decentralized scheduler");
     }
 
     // When outputing result, we doesn't allow any schedule message operation.
     RETURN_IF_OUTPUTTING
     // First loop: handle state without creating a shared_ptr
-    faabric::util::FullLock lock(plannerStateMx);
+    faabric::util::FullLock lock(plannerMx);
     // check again
     RETURN_IF_OUTPUTTING
     int i = 0;
     while (i < req->messages_size()) {
         auto* message = req->mutable_messages(i); // Use a pointer directly
-
         // Record planner enqueue time
         message->set_plannerqueuetime(currentTime);
 
@@ -599,17 +458,19 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
             SPDLOG_ERROR("ChainedId is not equal to AppId");
             throw std::runtime_error("ChainedId is not equal to AppId");
         }
+        {
+            faabric::util::FullLock reqStatusLock(state.reqStatusMx);
+            if (state.inFlightApps.contains(appid)) {
+                SPDLOG_ERROR("app Id {} is already running", appid);
+                // Flush the old chainedId
+                state.inFlightApps[appid] = 0;
+            }
 
-        if (state.inFlightApps.contains(appid)) {
-            SPDLOG_ERROR("app Id {} is already running", appid);
-            // Flush the old chainedId
-            state.inFlightApps[appid] = 0;
+            state.inFlightApps[appid]++;
         }
 
-        state.inFlightApps[appid]++;
         i++; // Only increment i if a message was not removed
     }
-    lock.unlock();
 
     // Second loop: prepare messages and transfer ownership
     std::vector<std::unique_ptr<faabric::Message>> messages;
@@ -622,15 +483,14 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
     auto hosts = stateAwareScheduler->scheduleMessagesBatch(
       state.batchSchedHostMap, messages);
 
-    enqueueMessageBatch(hosts, std::move(messages)); // Move ownership
+    doEnqueueSchedMessages(hosts, std::move(messages)); // Move ownership
 }
 
-void Planner::enqueueMessageBatch(
+void Planner::doEnqueueSchedMessages(
   std::vector<std::string> hosts,
   std::vector<std::unique_ptr<faabric::Message>> msgs)
 {
     auto currentTime = faabric::util::getGlobalClock().epochMicros();
-    faabric::util::FullLock lock(state.scheduledMsgsMapMx);
     for (int i = 0; i < msgs.size(); i++) {
         auto msg = std::move(msgs[i]);
         auto host = hosts[i];
@@ -646,7 +506,7 @@ void Planner::dequeueScheduledMsgs()
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
         CONTINUE_IF_OUTPUTTING
-        faabric::util::FullLock lock(state.scheduledMsgsMapMx);
+        faabric::util::FullLock lock(plannerMx);
         CONTINUE_IF_OUTPUTTING
         if (state.scheduledMsgsMap.empty()) {
             lock.unlock();
@@ -667,7 +527,6 @@ void Planner::dequeueScheduledMsgs()
             msgsCallMap[hostIp] = std::move(msgsList); // Move ownership
         }
         state.scheduledMsgsMap.clear();
-        lock.unlock();
 
         // Parallel execution of function calls for each host
         std::vector<std::thread> threads;
@@ -691,7 +550,7 @@ void Planner::dequeueScheduledMsgs()
 
 int Planner::getInFlightAppsSize()
 {
-    faabric::util::SharedLock lock(plannerStateMx);
+    faabric::util::SharedLock reqStatusLock(state.reqStatusMx);
     SPDLOG_DEBUG("Getting in-flight apps size: {}", state.inFlightApps.size());
     return state.inFlightApps.size();
 }
@@ -708,64 +567,106 @@ std::map<std::string, FunctionMetrics> Planner::collectMetrics()
     return metricsStats;
 }
 
-bool Planner::updateFuncParallelism(const std::string& userFunction,
-                                    int changedParallelism)
+// updateFuncPar calls doDistributeStatesInfo and doRescheduleMessages
+bool Planner::updateFuncPar(const std::string& userFunc, int newPar, bool init)
 {
-    SPDLOG_DEBUG("Planner received request to changed parallelism for {} by {}",
-                 userFunction,
-                 changedParallelism);
+    SPDLOG_INFO("Planner received request to changed parallelism for {} by {}",
+                 userFunc,
+                 newPar);
     faabric::util::FullLock lock(plannerMx);
 
-    if (!stateAwareScheduler) {
-        SPDLOG_ERROR("State-aware scheduler is not enabled");
-        return false;
-    }
-    stateAwareScheduler->increaseFunctionParallelism(
-      changedParallelism, userFunction, state.batchSchedHostMap);
+    isUpdateState = true;
 
+    stateAwareScheduler->updateFuncStatePar(
+      userFunc, newPar, state.batchSchedHostMap);
+
+    if (init) {
+        doDistributeStatesInfo();
+        // Rescheduling the scheduled messages in scheduledMsgsMap
+        doRescheduleMessages();
+    }
+
+    isUpdateState = false;
+    return true;
+}
+
+void Planner::doDistributeStatesInfo()
+{
+    SPDLOG_INFO("Planner distribute state info");
+
+    // Prepare state info sync request
+    auto registStatesInfo = stateAwareScheduler->getStateInfo();
+    auto req = std::make_shared<faabric::planner::SyncStatesInfoRequest>();
+    for (const auto& [func, info] : registStatesInfo) {
+        auto stateInfo = req->add_statesinfo();
+        stateInfo->set_functionname(info.functionName);
+        stateInfo->set_partitionby(info.partitionBy);
+        stateInfo->set_statekey(info.stateKey);
+        stateInfo->set_parallelism(info.parallelism);
+        for (const auto& [idx, host] : info.stateHost) {
+            stateInfo->mutable_statehost()->insert({ idx, host });
+        }
+    }
+
+    SPDLOG_INFO("Syncing state info to {} hosts", state.hostMap.size());
+    std::vector<std::thread> threads;
     for (const auto& [ip, host] : state.hostMap) {
-        host->set_statesync(true);
+        threads.emplace_back([&, ip]() {
+            try {
+                faabric::scheduler::getFunctionCallClient(ip)->syncStateInfo(
+                  req);
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR(
+                  "Failed to sync state info to host {}: {}", ip, e.what());
+                throw e;
+            }
+        });
     }
-    return true;
+
+    // Wait for all threads to complete
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
 }
 
-bool Planner::resetBatchsize(int32_t newSize)
+void Planner::doRescheduleMessages()
 {
-    auto availableHosts = getAvailableHosts();
-    faabric::planner::BatchResetRequest req;
-    req.set_batchsize(newSize);
+    SPDLOG_DEBUG("Planner reschedule messages");
 
-    for (const auto& host : availableHosts) {
-        SPDLOG_INFO(
-          "Planner resize the batchsize {} to {}", host->ip(), newSize);
-        faabric::scheduler::getFunctionCallClient(host->ip())
-          ->resetBatchSize(
-            std::make_shared<faabric::planner::BatchResetRequest>(req));
+    // Gather all messages from scheduledMsgsMap into a vector.
+    std::vector<std::unique_ptr<faabric::Message>> messages;
+    for (auto& [host, msgList] : state.scheduledMsgsMap) {
+        // Move each message into our vector.
+        for (auto& msg : msgList) {
+            messages.push_back(std::move(msg));
+        }
+        msgList.clear();
+    }
+    state.scheduledMsgsMap.clear();
+
+    if (messages.empty()) {
+        SPDLOG_DEBUG("No messages to reschedule.");
+        return;
     }
 
-    return true;
-}
+    // Recalculate scheduling decisions using the updated batch scheduler host
+    // map.
+    auto newHosts = stateAwareScheduler->scheduleMessagesBatch(
+      state.batchSchedHostMap, messages);
 
-bool Planner::resetMaxReplicas(int32_t maxReplicas)
-{
-    auto availableHosts = getAvailableHosts();
-    faabric::planner::MaxReplicasRequest req;
-    req.set_maxnum(maxReplicas);
-
-    for (const auto& host : availableHosts) {
-        SPDLOG_INFO("Planner max replicas {} to {}", host->ip(), maxReplicas);
-        faabric::scheduler::getFunctionCallClient(host->ip())
-          ->resetMaxReplicas(
-            std::make_shared<faabric::planner::MaxReplicasRequest>(req));
-    }
-
-    return true;
+    // Re-enqueue the messages: this sets a new planner pop time and assigns
+    // them to the new hosts.
+    doEnqueueSchedMessages(newHosts, std::move(messages));
 }
 
 bool Planner::resetParameter(const std::string& key,
                              const int32_t value,
                              bool plannerParameter)
 {
+    faabric::util::FullLock lock(plannerMx);
+
     // Reset the parameter of planner
     if (plannerParameter) {
         if (key == "dispatch_period") {
@@ -778,7 +679,7 @@ bool Planner::resetParameter(const std::string& key,
         return true;
     }
     // Reset the parameter of the worker hosts
-    auto availableHosts = getAvailableHosts();
+    auto availableHosts = getAvailableHosts(true);
     faabric::planner::ResetStreamParameterRequest req;
     req.set_parameter(key);
     req.set_value(value);
@@ -797,7 +698,7 @@ bool Planner::resetParameter(const std::string& key,
 
 void Planner::outputAppResultsToJson()
 {
-    faabric::util::FullLock lock(plannerStateMx);
+    faabric::util::FullLock lock(plannerMx);
     isOutputting = true;
     // We have to unlock, since the output operation may take a long time
     lock.unlock();

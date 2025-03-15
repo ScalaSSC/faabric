@@ -42,6 +42,19 @@ class StateAwareScheduler : public BatchScheduler
       const InFlightReqs& inFlightReqs,
       std::shared_ptr<faabric::BatchExecuteRequest> req) override;
 
+    bool updateFuncStatePar(const std::string& userFunction,
+                            int newPar,
+                            const HostMap& hostMap);
+
+    // the following functions are public only for tests.
+    void increaseFuncStatePar(const std::string& userFunction,
+                              int numIncrease,
+                              const HostMap& hostMap);
+    
+    void reduceFuncStatePar(const std::string& userFunction,
+                            int numDecrease,
+                            const HostMap& hostMap);
+
   private:
     bool isFirstDecisionBetter(
       std::shared_ptr<SchedulingDecision> decisionA,
@@ -72,11 +85,6 @@ class StateAwareScheduler : public BatchScheduler
     std::vector<std::string> scheduleMessagesBatch(
       const HostMap& hostMap,
       const std::vector<std::unique_ptr<faabric::Message>>& msgs);
-
-    // the following functions are public only for tests.
-    void increaseFunctionParallelism(int numIncrease,
-                                     const std::string& userFunction,
-                                     const HostMap& hostMap);
 
     bool repartitionParitionedState(
       std::string userFunction,
@@ -128,9 +136,9 @@ class StateAwareScheduler : public BatchScheduler
     // It is only used for initialization.
     std::map<std::string, std::tuple<std::string, std::string>> funcStateRegMap;
 
-    void initializeState(const HostMap& hostMap,
-                         std::string userFunc,
-                         int parallelism = 1);
+    void registerState(const HostMap& hostMap,
+                       std::string userFunc,
+                       int parallelism = 1);
 
     void funcStateInitializer();
 

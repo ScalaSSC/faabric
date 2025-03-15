@@ -35,5 +35,7 @@ std::string vectorToString(std::vector<T> vec)
     return ss.str();
 }
 
+std::pair<std::string, std::string> splitUserFunc(const std::string& input);
+
 std::tuple<std::string, std::string, std::string> splitUserFuncPar(const std::string& input);
 }

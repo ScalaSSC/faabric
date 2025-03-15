@@ -321,8 +321,7 @@ std::shared_ptr<FunctionState> State::createFS(const std::string& user,
         fsMap.erase(lookupKey);
     }
 
-    auto fs =
-      std::make_shared<FunctionState>(user, func, parallelismId);
+    auto fs = std::make_shared<FunctionState>(user, func, parallelismId);
     if (partitionable) {
         SPDLOG_INFO(
           "State::createFS: Setting partition key {} is partitionable",

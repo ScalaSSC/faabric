@@ -88,9 +88,6 @@ void FunctionCallClient::executeFunctions(
     if (faabric::util::isMockMode()) {
         faabric::util::UniqueLock lock(mockMutex);
         batchMessages.emplace_back(host, req);
-    } else if (faabric::util::getSystemConfig().batchProcess == "on") {
-        asyncSend(faabric::scheduler::FunctionCalls::ExecuteFunctionsLazy,
-                  req.get());
     } else {
         asyncSend(faabric::scheduler::FunctionCalls::ExecuteFunctions,
                   req.get());
@@ -108,18 +105,6 @@ void FunctionCallClient::setMessageResult(std::shared_ptr<faabric::Message> msg)
     }
 }
 
-void FunctionCallClient::resetBatchSize(
-  std::shared_ptr<faabric::planner::BatchResetRequest> req)
-{
-    asyncSend(faabric::scheduler::FunctionCalls::ResetBatchsize, req.get());
-}
-
-void FunctionCallClient::resetMaxReplicas(
-  std::shared_ptr<faabric::planner::MaxReplicasRequest> req)
-{
-    asyncSend(faabric::scheduler::FunctionCalls::ResetMaxReplicas, req.get());
-}
-
 void FunctionCallClient::resetParameter(
   std::shared_ptr<faabric::planner::ResetStreamParameterRequest> req)
 {
@@ -131,12 +116,24 @@ void FunctionCallClient::executeFunctionsBatch(
 {
     // Formulate a batch execute request Batch
     auto batchMsgsList = std::make_shared<faabric::MessageBatch>();
-    SPDLOG_DEBUG("Batch execute call {} with Batch size: {}", host, msgs.size());
+    SPDLOG_DEBUG(
+      "Batch execute call {} with Batch size: {}", host, msgs.size());
     for (auto& msg : msgs) {
         batchMsgsList->add_messages()->CopyFrom(*msg);
     }
     asyncSend(faabric::scheduler::FunctionCalls::ExecuteFunctionsBatch,
               batchMsgsList.get());
+}
+
+// -----------------------------------
+// Decentralized Scheduler Information Sync
+// -----------------------------------
+
+void FunctionCallClient::syncStateInfo(
+  std::shared_ptr<faabric::planner::SyncStatesInfoRequest> req)
+{
+    faabric::planner::SyncStatesInfoResponse resp;
+    syncSend(faabric::scheduler::FunctionCalls::SyncStatesInfo, req.get(), &resp);
 }
 
 // -----------------------------------

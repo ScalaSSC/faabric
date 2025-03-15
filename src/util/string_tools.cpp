@@ -57,6 +57,19 @@ bool stringIsInt(const std::string& input)
            input.find_first_not_of("0123456789") == std::string::npos;
 }
 
+std::pair<std::string, std::string> splitUserFunc(const std::string& input)
+{
+    size_t pos = input.find('_');
+    if (pos != std::string::npos) {
+        std::string user = input.substr(0, pos);
+        std::string function = input.substr(pos + 1);
+        return { user, function };
+    } else {
+        // If no underscore is found, return empty strings (or handle as needed)
+        return { "", "" };
+    }
+}
+
 /**
  * Partition a stream_function_state_0 into user, name and parallelismIdx
  *

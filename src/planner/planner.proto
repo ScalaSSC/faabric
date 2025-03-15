@@ -47,8 +47,6 @@ message HttpMessage {
         PRELOAD_SCHEDULING_DECISION = 12;
         GET_FUNCTION_METRICS = 13;
         SCALE_FUNCTION_PARALLELISM = 14;
-        RESET_BATCH_SIZE = 15;
-        RESET_REPLICAS_LIMIT = 16;
         RESET_STREAM_PARAMETER = 17;
         REGISTER_FUNCTION_STATE = 18;
         OUTPUT_RESULT = 19;
@@ -101,7 +99,6 @@ message Host {
     // Host register timestamp as epoch time in ms
     Timestamp registerTs = 4;
     bool hostSync = 5;
-    bool stateSync = 6;
 }
 
 message HostInfo {
@@ -133,6 +130,14 @@ message RegisterHostResponse {
     repeated HostInfo registeredHosts = 5;
     bool stateSync = 6;
     repeated FunctionStateInfo statesInfo = 7;
+}
+
+message SyncStatesInfoRequest {
+    repeated FunctionStateInfo statesInfo = 1;
+}
+
+message SyncStatesInfoResponse {
+    bool success = 1;
 }
 
 message RemoveHostRequest {
@@ -174,6 +179,7 @@ message FunctionScaleRequest{
     string user = 1;
     string function = 2;
     int32 parallelism = 3;
+    bool initialize = 4;
 }
 
 message BatchResetRequest{

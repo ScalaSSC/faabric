@@ -156,10 +156,10 @@ class FixedCapacityQueue
 {
   public:
     FixedCapacityQueue(int capacity)
-      : mq(capacity){};
+      : mq(capacity) {};
 
     FixedCapacityQueue()
-      : mq(DEFAULT_QUEUE_SIZE){};
+      : mq(DEFAULT_QUEUE_SIZE) {};
 
     void enqueue(T value, long timeoutMs = DEFAULT_QUEUE_TIMEOUT_MS)
     {
@@ -337,36 +337,191 @@ class ThreadSafeQueue
     std::condition_variable m_cond_var;
 };
 
-class PartitionedStateMessageQueue
+class BatchQueueBase
 {
   public:
-    PartitionedStateMessageQueue(int functionReplica, int batchSize)
-      : functionReplica(functionReplica)
-      , batchSize(batchSize)
+    virtual ~BatchQueueBase() = default;
+
+    // Get the front message; assume locked indicates whether the caller already
+    // holds the lock.
+    virtual faabric::Message* queueFront(bool locked = false) = 0;
+
+    // Add a message. (You can define overloads if necessary.)
+    virtual void addMessage(std::unique_ptr<faabric::Message> msg) = 0;
+
+    // Retrieve a batch of messages.
+    virtual std::vector<std::unique_ptr<faabric::Message>> getMessages() = 0;
+
+    // Get the current number of messages.
+    virtual int getMessagesCount() = 0;
+
+    // Reset timing.
+    virtual void resetLastTime(bool locked = false) = 0;
+
+    // Get the time interval.
+    virtual int getTimeInterval() = 0;
+};
+
+/*
+ * A queue stores the uninvoked requests.
+ */
+class BatchQueue : public BatchQueueBase
+{
+  protected:
+    std::string userFuncPar;
+    const int batchSize;
+    std::queue<std::unique_ptr<faabric::Message>> batchQueue;
+    int messagesCount = 0;
+    std::mutex m_mutex;
+    long lastTime;
+
+  public:
+    BatchQueue(const std::string& userFuncParIn, int batchSizein)
+      : userFuncPar(userFuncParIn)
+      , batchSize(batchSizein)
     {
-        // Last time is the lastest time bewtween earliest insert time and the
-        // lastest invoke time.
+        // Initialize lastTime with the current global clock time.
         lastTime = faabric::util::getGlobalClock().epochMillis();
-    };
-
-    std::shared_ptr<faabric::Message> front()
-    {
-        if (messagesCount == 0) {
-            throw std::runtime_error("Queue is empty");
-        }
-
-        return messagesQueue.begin()->second.begin()->second.front();
     }
 
-    void addMessage(size_t hash, std::shared_ptr<faabric::Message> msg)
+    virtual faabric::Message* queueFront(bool locked = false)
     {
+        auto getFront = [&]() -> faabric::Message* {
+            if (messagesCount == 0)
+                throw std::runtime_error("Queue is empty");
+            return batchQueue.front().get();
+        };
+
+        return locked ? getFront() : [&]() {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return getFront();
+        }();
+    }
+
+    virtual void addMessage(std::unique_ptr<faabric::Message> msg)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // If the queue is empty, which means insert the first msg, reset the
+        // invoke time.
+        if (batchQueue.empty()) {
+            resetLastTime(true);
+        }
+        batchQueue.push(std::move(msg));
+        messagesCount++;
+    }
+
+    virtual std::vector<std::unique_ptr<faabric::Message>> getMessages()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::unique_ptr<faabric::Message>> returnMessages;
+        if (messagesCount == 0) {
+            return returnMessages;
+        }
+
+        while (returnMessages.size() < batchSize) {
+            if (batchQueue.empty()) {
+                break;
+            }
+            returnMessages.push_back(std::move(batchQueue.front()));
+            batchQueue.pop();
+            messagesCount--;
+        }
+        return returnMessages;
+    }
+
+    virtual std::vector<std::unique_ptr<faabric::Message>> drainMessages()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::unique_ptr<faabric::Message>> drained;
+        while (!batchQueue.empty()) {
+            drained.push_back(std::move(batchQueue.front()));
+            batchQueue.pop();
+        }
+        messagesCount = 0;
+        return drained;
+    }
+
+    int getMessagesCount()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return messagesCount;
+    }
+
+    int getTimeInterval()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return faabric::util::getGlobalClock().epochMillis() - lastTime;
+    }
+
+    void resetLastTime(bool locked = false)
+    {
+        if (!locked) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            lastTime = faabric::util::getGlobalClock().epochMillis();
+        } else {
+            lastTime = faabric::util::getGlobalClock().epochMillis();
+        }
+    }
+};
+
+class PartitionedStateMessageQueue : public BatchQueue
+{
+  private:
+    // Const Variables
+    const int functionReplica;
+
+    // MAP<BatchNum, MAP<Hash, Messages>>
+    std::map<int,
+             std::map<size_t, std::queue<std::unique_ptr<faabric::Message>>>>
+      messagesQueue;
+    // MAP<Hash, QUEUE<BatchNum>>
+    std::map<size_t, std::queue<int>> hashToBatchNumTable;
+
+    // The batchNum used and planned for enqueue Messages.
+    int enqueueBatchNum = 0;
+    int enqueueBatchSize = 0;
+
+  public:
+    PartitionedStateMessageQueue(const std::string& userFuncParIn,
+                                 int functionReplica,
+                                 int batchSizein)
+      : BatchQueue(userFuncParIn, batchSizein)
+      , functionReplica(functionReplica)
+    {}
+
+    faabric::Message* queueFront(bool locked = false) override
+    {
+        auto getFront = [&]() -> faabric::Message* {
+            if (messagesCount == 0)
+                throw std::runtime_error("Queue is empty");
+            return messagesQueue.begin()->second.begin()->second.front().get();
+        };
+
+        return locked ? getFront() : [&]() {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return getFront();
+        }();
+    }
+
+    void addMessage(std::unique_ptr<faabric::Message> msg) override
+    {
+        SPDLOG_ERROR("PartitionedStateMessageQueue::addMessage without hash is "
+                     "not supported");
+        throw std::runtime_error("PartitionedStateMessageQueue::addMessage "
+                                 "without hash is not supported");
+    }
+
+    void addMessage(size_t hash, std::unique_ptr<faabric::Message> msg)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
         // If the queue is empty, which means insert the first msg, reset the
         // invoke time.
         if (messagesCount == 0) {
-            resetlastTime();
+            resetLastTime(true);
         }
         // Record the message inside the queue and index table.
-        messagesQueue[enqueueBatchNum][hash].push(msg);
+        messagesQueue[enqueueBatchNum][hash].push(std::move(msg));
         hashToBatchNumTable[hash].push(enqueueBatchNum);
 
         messagesCount++;
@@ -377,9 +532,11 @@ class PartitionedStateMessageQueue
         }
     }
 
-    std::vector<std::shared_ptr<faabric::Message>> getMessages()
+    std::vector<std::unique_ptr<faabric::Message>> getMessages() override
     {
-        std::vector<std::shared_ptr<faabric::Message>> returnMessages;
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        std::vector<std::unique_ptr<faabric::Message>> returnMessages;
         if (messagesCount == 0) {
             return returnMessages;
         }
@@ -387,7 +544,7 @@ class PartitionedStateMessageQueue
         size_t previousHash;
 
         while (returnMessages.size() < batchSize) {
-            std::shared_ptr<faabric::Message> currentMessage = nullptr;
+            std::unique_ptr<faabric::Message> currentMessage = nullptr;
             int dequeueBatchNum = messagesQueue.begin()->first;
 
             size_t currentHash = 0;
@@ -409,8 +566,8 @@ class PartitionedStateMessageQueue
                 currentEnqueueBatchNum = messagesQueue.begin()->first;
                 currentHash =
                   messagesQueue[currentEnqueueBatchNum].begin()->first;
-                currentMessage =
-                  messagesQueue[currentEnqueueBatchNum][currentHash].front();
+                currentMessage = std::move(
+                  messagesQueue[currentEnqueueBatchNum][currentHash].front());
             }
             // If other messages shared with the same hash with in the batchNum
             // range, get them all.
@@ -418,8 +575,8 @@ class PartitionedStateMessageQueue
                 currentEnqueueBatchNum =
                   hashToBatchNumTable[previousHash].front();
                 currentHash = previousHash;
-                currentMessage =
-                  messagesQueue[currentEnqueueBatchNum][previousHash].front();
+                currentMessage = std::move(
+                  messagesQueue[currentEnqueueBatchNum][previousHash].front());
             }
 
             // Clear the Queue and Table.
@@ -433,7 +590,7 @@ class PartitionedStateMessageQueue
             hashToBatchNumTable[currentHash].pop();
 
             messagesCount--;
-            returnMessages.push_back(currentMessage);
+            returnMessages.push_back(std::move(currentMessage));
 
             if (messagesCount == 0) {
                 // If the message queue cannot reach the batchSize, update the
@@ -452,36 +609,29 @@ class PartitionedStateMessageQueue
         return returnMessages;
     }
 
-    int getMessagesCount() { return messagesCount; }
-
-    int getTimeInterval()
+    std::vector<std::unique_ptr<faabric::Message>> drainMessages() override
     {
-        return faabric::util::getGlobalClock().epochMillis() - lastTime;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::unique_ptr<faabric::Message>> drained;
+
+        for (auto& [batchNum, hashMap] : messagesQueue) {
+            for (auto& [hash, msgQueue] : hashMap) {
+                while (!msgQueue.empty()) {
+                    drained.push_back(std::move(msgQueue.front()));
+                    msgQueue.pop();
+                }
+            }
+        }
+
+        // Clear the maps and reset the enqueue counters.
+        messagesQueue.clear();
+        hashToBatchNumTable.clear();
+        messagesCount = 0;
+        enqueueBatchNum = 0;
+        enqueueBatchSize = 0;
+
+        return drained;
     }
-    void resetlastTime()
-    {
-        lastTime = faabric::util::getGlobalClock().epochMillis();
-    }
-
-  private:
-    // Const Variables
-    const int functionReplica;
-    const int batchSize;
-    long lastTime;
-
-    // MAP<BatchNum, MAP<Hash, Messages>>
-    std::map<int,
-             std::map<size_t, std::queue<std::shared_ptr<faabric::Message>>>>
-      messagesQueue;
-    // MAP<Hash, QUEUE<BatchNum>>
-    std::map<size_t, std::queue<int>> hashToBatchNumTable;
-
-    // The batchNum used and planned for enqueue Messages.
-    int enqueueBatchNum = 0;
-    int enqueueBatchSize = 0;
-
-    // The number of messages in the queue.
-    int messagesCount = 0;
 };
 
 }

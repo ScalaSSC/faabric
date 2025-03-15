@@ -22,6 +22,13 @@ struct PlannerState
     std::map<std::string, std::shared_ptr<Host>> hostMap;
 
     faabric::batch_scheduler::HostMap batchSchedHostMap;
+
+    // It is used to lock modification for inFlightApps and appResults.
+    std::shared_mutex reqStatusMx;
+    
+    // MAP<appId, in_flight_counting> Map of inflight requests.
+    std::map<int, int> inFlightApps;
+
     // Double-map holding the message results. The first key is the app id. For
     // each app id, we keep a map of the message id, and the actual message
     // result
@@ -41,9 +48,6 @@ struct PlannerState
 
     // Helper coutner of the total number of migrations
     std::atomic<int> numMigrations = 0;
-
-    // MAP<appId, in_flight_counting> Map of inflight requests.
-    std::map<int, int> inFlightApps;
 
     std::shared_mutex scheduledMsgsMapMx;
     std::map<std::string, std::list<std::unique_ptr<Message>>>

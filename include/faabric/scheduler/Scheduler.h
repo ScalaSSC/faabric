@@ -32,57 +32,12 @@ class SchedulerReaperThread : public faabric::util::PeriodicBackgroundThread
     void doWork() override;
 };
 
-/*
- * A queue stores the uninvoked requests.
- */
-class BatchQueue
-{
-  public:
-    BatchQueue(std::string userFuncParIn)
-    {
-        userFuncPar = userFuncParIn;
-        // Last time is the lastest time bewtween earliest insert time and the
-        // lastest invoke time.
-        lastTime = faabric::util::getGlobalClock().epochMillis();
-    }
-    std::string userFuncPar;
-    long lastTime;
-    std::queue<std::shared_ptr<faabric::Message>> batchQueue;
-
-    // Attributes for partitioned stateful
-    int lockVersion;
-    int rangeStart;
-    int rangeEnd;
-
-    void insertMsg(std::shared_ptr<faabric::Message> msg)
-    {
-        // If the queue is empty, which means insert the first msg, reset the
-        // invoke time.
-        if (batchQueue.size() == 0) {
-            resetlastTime();
-        }
-        batchQueue.push(msg);
-    }
-    int getTimeInterval()
-    {
-        return faabric::util::getGlobalClock().epochMillis() - lastTime;
-    }
-    void resetlastTime()
-    {
-        lastTime = faabric::util::getGlobalClock().epochMillis();
-    }
-};
-
 class Scheduler
 {
   public:
     Scheduler();
 
     ~Scheduler();
-
-    void executeBatch(std::shared_ptr<faabric::BatchExecuteRequest> req);
-
-    void executeBatchAsyn(std::shared_ptr<faabric::BatchExecuteRequest> req);
 
     void enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs);
 
@@ -95,17 +50,10 @@ class Scheduler
     void enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> req);
 
     void executeBatchForQueue(const std::string& userFuncPar,
-                              BatchQueue& waitingBatch,
+                              util::BatchQueueBase& waitingQueue,
                               faabric::util::FullLock& lock);
 
-    void executeBatchForPartitionQueue(
-      const std::string& userFuncPar,
-      faabric::util::PartitionedStateMessageQueue& waitingBatch,
-      faabric::util::FullLock& lock);
-
     void resetParameter(std::string key, int32_t value);
-
-    void resetBatchsize(int32_t newSize);
 
     void reset();
 
@@ -154,8 +102,6 @@ class Scheduler
 
     void setThisHostResources(faabric::HostResources& res);
 
-    void resetMaxReplicas(int32_t newMaxReplicas);
-
     // ----------------------------------
     // Testing
     // ----------------------------------
@@ -196,8 +142,6 @@ class Scheduler
     // Maximum number of concurrent executors in the worker
     int maxExecutors = 40;
 
-    bool isRepartition = true;
-
     int executeBatchsize;
 
     // ---- Executors ----
@@ -231,15 +175,18 @@ class Scheduler
     faabric::transport::PointToPointBroker& broker;
 
     // A queue stores the uninvoked requests: MAP<UserFuncPar, Queue>
-    std::map<std::string, BatchQueue> waitingQueues;
+    std::map<std::string, std::unique_ptr<faabric::util::BatchQueue>>
+      waitingQueues;
+
+    // MAP<UserFuncPar, Queue>
+    std::map<std::string,
+             std::unique_ptr<faabric::util::PartitionedStateMessageQueue>>
+      partitionedWaitingQueues;
 
     std::vector<std::unique_ptr<faabric::Message>> chainedCallMsgs;
 
     std::vector<std::unique_ptr<faabric::Message>> setResultMsgs;
 
-    // MAP<UserFuncPar, Queue>,
-    std::map<std::string, faabric::util::PartitionedStateMessageQueue>
-      partitionedWaitingQueues;
     // ---- Batch Execution ----
     std::thread batchTimerThread;
     bool stopBatchTimer = false;
@@ -250,8 +197,12 @@ class Scheduler
     // ----- Scheduling Info -----
     int dispatchPeriod = 20; // ms
 
-    std::shared_mutex scheduledMsgsMapMx;
+    // stateUpdateMx is used to prevent central scheduler update state when
+    // the executor is running.
+    std::shared_mutex stateUpdateMx;
 
+    // scheduledMsgsMapMx is used for scheduledMsgsMap
+    std::shared_mutex scheduledMsgsMapMx;
     std::map<std::string, std::list<std::unique_ptr<Message>>> scheduledMsgsMap;
 
     faabric::batch_scheduler::DecentralizedScheduler decentralScheduler;
@@ -264,9 +215,12 @@ class Scheduler
 
     std::thread dispatchChainedMsgsThread;
 
-    void enqueueSchedMsgs(
-      std::vector<std::string> hosts,
-      std::vector<std::unique_ptr<faabric::Message>> msgs);
+    bool isUpdateState = false;
+
+    util::ThreadSafeQueue<std::unique_ptr<faabric::MessageBatch>> UnschedMsgs;
+
+    void enqueueSchedMsgs(std::vector<std::string> hosts,
+                          std::vector<std::unique_ptr<faabric::Message>> msgs);
 
     void dispatchChainedMsgs();
 };

@@ -54,7 +54,7 @@ class Planner
     // Host membership public API
     // ----------
 
-    std::vector<std::shared_ptr<Host>> getAvailableHosts();
+    std::vector<std::shared_ptr<Host>> getAvailableHosts(bool locked = false);
 
     bool registerHost(const Host& hostIn, bool overwrite);
 
@@ -71,19 +71,7 @@ class Planner
     // Setters/getters for individual message results
 
     void setMessageResultBatch(
-      std::shared_ptr<faabric::BatchExecuteRequest> batchMsg);
-
-    std::shared_ptr<faabric::Message> getMessageResult(
-      std::shared_ptr<faabric::Message> msg);
-
-    // Setter/Getter to bypass the planner's scheduling for a specific app
-    void preloadSchedulingDecision(
-      int appId,
-      std::shared_ptr<batch_scheduler::SchedulingDecision> decision);
-
-    std::shared_ptr<batch_scheduler::SchedulingDecision>
-    getPreloadedSchedulingDecision(int32_t appId,
-                                   std::shared_ptr<BatchExecuteRequest> ber);
+      std::shared_ptr<faabric::BatchExecuteRequest> batchMsg);      
 
     // Get all the results recorded for one batch
     std::shared_ptr<faabric::BatchExecuteRequestStatus> getBatchResults(
@@ -91,8 +79,6 @@ class Planner
 
     std::shared_ptr<faabric::batch_scheduler::SchedulingDecision>
     getSchedulingDecision(std::shared_ptr<BatchExecuteRequest> req);
-
-    faabric::batch_scheduler::InFlightReqs getInFlightReqs();
 
     int getInFlightAppsSize();
 
@@ -105,7 +91,7 @@ class Planner
     void scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
                           bool isChained = false);
 
-    void enqueueMessageBatch(
+    void doEnqueueSchedMessages(
       std::vector<std::string> hosts,
       std::vector<std::unique_ptr<faabric::Message>> msgs);
 
@@ -117,21 +103,13 @@ class Planner
                            const std::string& partitionBy,
                            const std::string& stateKey);
 
-    bool updateFuncParallelism(const std::string& userFunction,
-                               int changedParallelism);
-
-    bool resetBatchsize(int32_t newSize);
-
-    bool resetMaxReplicas(int32_t newMaxReplicas);
+    bool updateFuncPar(const std::string& userFunc,
+                       int newPar,
+                       bool init = false);
 
     bool resetParameter(const std::string& key,
                         const int32_t value,
                         bool plannerParameter = false);
-
-    const std::pair<
-      bool,
-      std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>>
-    retrieveStateInfo(std::string hostIp);
 
     // ----------
     // Metrics public API
@@ -149,8 +127,11 @@ class Planner
 
     // There's a singleton instance of the planner running, but it must allow
     // concurrent requests
+    // Two mutex are used where plannerMx is used for message info collect, e.g.
+    // inFlightReqs, message results, etc.
     std::shared_mutex plannerMx;
-    std::shared_mutex plannerStateMx;
+    // plannerStateMx is used for function scheduling.
+    // std::shared_mutex plannerStateMx;
 
     PlannerState state;
     PlannerConfig config;
@@ -195,6 +176,7 @@ class Planner
     // ----------
     // Request scheduling private API
     // ----------
+    bool isUpdateState = false;
 
     int dispatchPeriod = 20; // ms
 
@@ -202,6 +184,9 @@ class Planner
 
     bool isOutputting = false;
 
+    void doDistributeStatesInfo();
+
+    void doRescheduleMessages();
 };
 
 Planner& getPlanner();

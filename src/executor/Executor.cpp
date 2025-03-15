@@ -86,7 +86,9 @@ void Executor::shutdown()
 
         // Send a kill message
         SPDLOG_TRACE("Executor {} killing thread pool {}", id, i);
-        threadTaskQueues[i].enqueue(ExecutorTask(POOL_SHUTDOWN, nullptr));
+        threadTaskQueues[i].enqueue(
+          std::make_tuple(ExecutorTask(POOL_SHUTDOWN, nullptr),
+                          std::unique_ptr<faabric::util::SharedLock>()));
 
         // Wait for thread to terminate
         if (threadPoolThreads[i]->joinable()) {
@@ -108,116 +110,9 @@ Executor::~Executor()
     }
 }
 
-// TODO(thread-opt): get rid of this method here and move to
-// PlannerClient::callFunctions()
-void Executor::executeTasks(std::vector<int> msgIdxs,
-                            std::shared_ptr<faabric::BatchExecuteRequest> req)
-{
-    const std::string funcStr = faabric::util::funcToString(req);
-    SPDLOG_TRACE("{} executing {}/{} tasks of {}",
-                 id,
-                 msgIdxs.size(),
-                 req->messages_size(),
-                 funcStr);
-
-    // Note that this lock is specific to this executor, so will only block
-    // when multiple threads are trying to schedule tasks. This will only
-    // happen when child threads of the same function are competing to
-    // schedule more threads, hence is rare so we can afford to be
-    // conservative here.
-    faabric::util::UniqueLock lock(threadsMutex);
-
-    // Update the last-executed time for this executor
-    lastExec = faabric::util::startTimer();
-
-    auto& firstMsg = req->mutable_messages()->at(0);
-    std::string thisHost = faabric::util::getSystemConfig().endpointHost;
-
-    bool isThreads = req->type() == faabric::BatchExecuteRequest::THREADS;
-    bool isSingleHost = req->singlehost();
-    std::string snapshotKey = firstMsg.snapshotkey();
-
-    // Threads on a single host don't need to do anything with snapshots, as
-    // they all share a single executor. Threads not on a single host need to
-    // restore from the main thread snapshot. Non-threads need to restore from
-    // a snapshot if they are given a snapshot key.
-    if (isThreads && !isSingleHost) {
-        // Check we get a valid memory view
-        std::span<uint8_t> memView = getMemoryView();
-        if (memView.empty()) {
-            SPDLOG_ERROR("Can't execute threads for {}, empty memory view",
-                         funcStr);
-            throw std::runtime_error("Empty memory view for threaded function");
-        }
-
-        // Restore threads from main thread snapshot
-        std::string snapKey = faabric::util::getMainThreadSnapshotKey(firstMsg);
-        SPDLOG_DEBUG(
-          "Restoring threads of {} from snapshot {}", funcStr, snapKey);
-        restore(snapKey);
-
-        // Get updated memory view and start global tracking of memory
-        memView = getMemoryView();
-        tracker->startTracking(memView);
-
-        // Prepare list of lists for dirty pages from each thread
-        threadLocalDirtyRegions.resize(req->messages_size());
-    } else if (!isThreads && !firstMsg.snapshotkey().empty()) {
-        // Restore from snapshot if provided
-        std::string snapshotKey = firstMsg.snapshotkey();
-        SPDLOG_DEBUG("Restoring {} from snapshot {}", funcStr, snapshotKey);
-        restore(snapshotKey);
-    } else {
-        SPDLOG_TRACE("Not restoring {}. threads={}, key={}",
-                     funcStr,
-                     isThreads,
-                     snapshotKey);
-    }
-
-    // Initialise batch counter
-    if (isThreads) {
-        threadBatchCounter.fetch_add(msgIdxs.size(), std::memory_order_release);
-    } else {
-        batchCounter.fetch_add(msgIdxs.size(), std::memory_order_release);
-    }
-
-    // Iterate through and invoke tasks. By default, we allocate tasks
-    // one-to-one with thread pool threads. Only once the pool is exhausted
-    // do we start overloading
-    for (int msgIdx : msgIdxs) {
-        [[maybe_unused]] const faabric::Message& msg =
-          req->messages().at(msgIdx);
-
-        if (availablePoolThreads.empty()) {
-            SPDLOG_ERROR("No available thread pool threads (size: {})",
-                         threadPoolSize);
-            throw std::runtime_error("No available thread pool threads!");
-        }
-
-        // Take next from those that are available
-        int threadPoolIdx = *availablePoolThreads.begin();
-        availablePoolThreads.erase(threadPoolIdx);
-
-        SPDLOG_TRACE(
-          "Assigned app index {} to thread {}", msg.appidx(), threadPoolIdx);
-
-        // Enqueue the task
-        threadTaskQueues[threadPoolIdx].enqueue(ExecutorTask(msgIdx, req));
-
-        // Lazily create the thread
-        if (threadPoolThreads.at(threadPoolIdx) == nullptr) {
-            threadPoolThreads.at(threadPoolIdx) =
-              std::make_shared<std::jthread>(
-                std::bind_front(&Executor::threadPoolThread, this),
-                threadPoolIdx);
-        }
-    }
-}
-
-// TODO(thread-opt): get rid of this method here and move to
-// PlannerClient::callFunctions()
 void Executor::executeBatchTasks(
-  std::shared_ptr<faabric::BatchExecuteRequest> req)
+  std::shared_ptr<faabric::BatchExecuteRequest> req,
+  std::unique_ptr<std::shared_lock<std::shared_mutex>> stateLock)
 {
     const std::string funcStr = faabric::util::funcToString(req);
     auto& firstMsg = req->mutable_messages()->at(0);
@@ -278,8 +173,11 @@ void Executor::executeBatchTasks(
     SPDLOG_TRACE("Assigned current batch functions to thread {}",
                  threadPoolIdx);
 
+    auto task = ExecutorTask(STREAM_BATCH, req);
+    std::tuple<ExecutorTask, std::unique_ptr<faabric::util::SharedLock>>
+      queueItem(std::move(task), std::move(stateLock));
     // Enqueue the task
-    threadTaskQueues[threadPoolIdx].enqueue(ExecutorTask(STREAM_BATCH, req));
+    threadTaskQueues[threadPoolIdx].enqueue(std::move(queueItem));
 
     // Lazily create the thread
     if (threadPoolThreads.at(threadPoolIdx) == nullptr) {
@@ -392,9 +290,13 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
         SPDLOG_TRACE("Thread starting loop {}:{}", id, threadPoolIdx);
 
         ExecutorTask task;
+        std::unique_ptr<faabric::util::SharedLock> stateLock;
 
         try {
-            task = threadTaskQueues[threadPoolIdx].dequeue(conf.boundTimeout);
+            auto dequeuedItem =
+              threadTaskQueues[threadPoolIdx].dequeue(conf.boundTimeout);
+            task = std::move(std::get<0>(dequeuedItem));
+            stateLock = std::move(std::get<1>(dequeuedItem));
         } catch (faabric::util::QueueTimeoutException& ex) {
             SPDLOG_TRACE(
               "Thread {}:{} got no messages in timeout {}ms, looping",
@@ -426,16 +328,22 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             try {
                 returnValue =
                   executeTask(threadPoolIdx, task.messageIndex, task.req);
+                if (stateLock) {
+                    stateLock->unlock();
+                }
             } catch (const std::exception& ex) {
                 returnValue = 1;
-
                 std::string errorMessage =
                   fmt::format("Task threw exception. What: {}", ex.what());
                 SPDLOG_ERROR(errorMessage);
+                if (stateLock) {
+                    stateLock->unlock();
+                }
                 for (int i = 0; i < task.req->messages_size(); i++) {
                     task.req->mutable_messages()->at(i).set_outputdata(
                       errorMessage);
                 }
+                throw ex;
             }
             // Unset context
             ExecutorContext::unset();
@@ -475,195 +383,6 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             faabric::scheduler::getScheduler().enqueueSetResults(
               std::move(task.req));
             continue;
-        }
-
-        assert(task.req->messages_size() >= task.messageIndex + 1);
-        faabric::Message& msg =
-          task.req->mutable_messages()->at(task.messageIndex);
-
-        // Start dirty tracking if executing threads across hosts
-        bool isThreads =
-          task.req->type() == faabric::BatchExecuteRequest::THREADS;
-        bool doDirtyTracking = isThreads && !task.req->singlehost();
-        if (doDirtyTracking) {
-            // If tracking is thread local, start here as it will happen for
-            // each thread
-            tracker->startThreadLocalTracking(getMemoryView());
-        }
-
-        // Check ptp group
-        std::shared_ptr<faabric::transport::PointToPointGroup> group = nullptr;
-        if (msg.groupid() > 0) {
-            group =
-              faabric::transport::PointToPointGroup::getGroup(msg.groupid());
-        }
-
-        // If the to-be-executed message is a migrated message, we need to
-        // execute the post-migration hook to sync with non-migrated messages
-        // in the same group
-        bool isMigration =
-          task.req->type() == faabric::BatchExecuteRequest::MIGRATION;
-        if (isMigration) {
-            faabric::transport::getPointToPointBroker().postMigrationHook(
-              msg.groupid(), msg.groupidx());
-        }
-
-        SPDLOG_TRACE("Thread {}:{} executing task {} ({}, thread={}, group={})",
-                     id,
-                     threadPoolIdx,
-                     task.messageIndex,
-                     msg.id(),
-                     isThreads,
-                     msg.groupid());
-
-        // Set up context
-        ExecutorContext::set(this, task.req, task.messageIndex);
-
-        // Execute the task
-        int32_t returnValue;
-        try {
-            returnValue =
-              executeTask(threadPoolIdx, task.messageIndex, task.req);
-        } catch (const faabric::util::FunctionMigratedException& ex) {
-            SPDLOG_DEBUG(
-              "Task {} migrated, shutting down executor {}", msg.id(), id);
-
-            // Note that when a task has been migrated, we need to perform all
-            // the normal executor shutdown, and we set a special return value
-            returnValue = MIGRATED_FUNCTION_RETURN_VALUE;
-
-            // MPI migration
-            if (msg.ismpi()) {
-                auto& mpiWorld = faabric::mpi::getMpiWorldRegistry().getWorld(
-                  msg.mpiworldid());
-                mpiWorld.destroy();
-            }
-        } catch (const std::exception& ex) {
-            returnValue = 1;
-
-            std::string errorMessage = fmt::format(
-              "Task {} threw exception. What: {}", msg.id(), ex.what());
-            SPDLOG_ERROR(errorMessage);
-            msg.set_outputdata(errorMessage);
-        }
-
-        // Unset context
-        ExecutorContext::unset();
-
-        // Handle thread-local diffing for every thread
-        if (doDirtyTracking) {
-            // Stop dirty tracking
-            std::span<uint8_t> memView = getMemoryView();
-            tracker->stopThreadLocalTracking(memView);
-
-            // Add this thread's changes to executor-wide list of dirty regions
-            auto thisThreadDirtyRegions =
-              tracker->getThreadLocalDirtyPages(memView);
-
-            // Record this thread's dirty regions
-            threadLocalDirtyRegions[task.messageIndex] = thisThreadDirtyRegions;
-        }
-
-        // Set the return value
-        msg.set_returnvalue(returnValue);
-
-        // Decrement the task count. If we are the last thread in a batch of
-        // we can either be in the main host, in which case there's still the
-        // main thread in the same Executor, or in a remote host, in which case
-        // we need to only release the Executor after we are done. If we
-        // are the main thread, we will always reset and release the executor
-        std::atomic_thread_fence(std::memory_order_release);
-        int oldTaskCount = 0;
-        bool isLastThreadInBatch = false;
-        bool isLastThreadInExecutor = false;
-        if (isThreads) {
-            oldTaskCount = threadBatchCounter.fetch_sub(1);
-            isLastThreadInBatch = oldTaskCount == 1;
-            isLastThreadInExecutor =
-              batchCounter.load(std::memory_order_release) == 0;
-        } else {
-            oldTaskCount = batchCounter.fetch_sub(1);
-            isLastThreadInExecutor = oldTaskCount == 1;
-        }
-        assert(oldTaskCount >= 1);
-
-        SPDLOG_TRACE("Task {} finished by thread {}:{} ({} left)",
-                     faabric::util::funcToString(msg, true),
-                     id,
-                     threadPoolIdx,
-                     oldTaskCount - 1);
-
-        // Handle last-in-batch dirty tracking if we are last thread in a
-        // not-single-host execution, and are not on the main host (on the
-        // main host we still have the zero-th thread executing)
-        auto mainThreadSnapKey = faabric::util::getMainThreadSnapshotKey(msg);
-        std::vector<faabric::util::SnapshotDiff> diffs;
-        // FIXME: thread 0 locally is not part of this batch, but is still
-        // in the same executor
-        bool isRemoteThread =
-          task.req->messages(0).mainhost() != conf.endpointHost;
-        if (isLastThreadInBatch && doDirtyTracking && isRemoteThread) {
-            diffs = mergeDirtyRegions(msg);
-        }
-
-        // If this is not a threads request and last in its batch, it may be
-        // the main function (thread) in a threaded application, in which case
-        // we want to stop any tracking and delete the main thread snapshot
-        /* FIXME: remove me
-        if (!isThreads && isLastThreadInExecutor) {
-            // Stop tracking memory
-            std::span<uint8_t> memView = getMemoryView();
-            if (!memView.empty()) {
-                tracker->stopTracking(memView);
-                tracker->stopThreadLocalTracking(memView);
-
-                // Delete the main thread snapshot (implicitly does nothing if
-                // doesn't exist)
-                // TODO(thread-opt): cleanup snapshots (from planner maybe?)
-                // deleteMainThreadSnapshot(msg);
-            }
-        }
-        */
-
-        // If this batch is finished, reset the executor and release its
-        // claim. Note that we have to release the claim _after_ resetting,
-        // otherwise the executor won't be ready for reuse
-        if (isLastThreadInExecutor) {
-            // Threads skip the reset as they will be restored from their
-            // respective snapshot on the next execution.
-            if (isThreads) {
-                SPDLOG_TRACE("Skipping reset for {} ({})",
-                             faabric::util::funcToString(msg, true),
-                             msg.appidx());
-            } else {
-                reset(msg);
-            }
-
-            releaseClaim();
-        }
-
-        // Return this thread index to the pool available for scheduling
-        {
-            faabric::util::UniqueLock lock(threadsMutex);
-            availablePoolThreads.insert(threadPoolIdx);
-        }
-
-        // Finally set the result of the task, this will allow anything
-        // waiting on its result to continue execution, therefore must be
-        // done once the executor has been reset, otherwise the executor may
-        // not be reused for a repeat invocation.
-        if (isThreads) {
-            // Set non-final thread result
-            if (isLastThreadInBatch) {
-                // Include diffs if this is the last one
-                setThreadResult(msg, returnValue, mainThreadSnapKey, diffs);
-            } else {
-                setThreadResult(msg, returnValue, "", {});
-            }
-        } else {
-            // Set normal function result
-            faabric::planner::getPlannerClient().setMessageResult(
-              std::make_shared<faabric::Message>(msg));
         }
     }
 }
@@ -752,7 +471,9 @@ void Executor::restore(const std::string& snapshotKey)
 
 void Executor::addChainedMessage(const faabric::Message& msg)
 {
+    SPDLOG_DEBUG("Adding chained message {} to executor", msg.id());
     faabric::util::UniqueLock lock(threadsMutex);
+    SPDLOG_DEBUG("LOCKED obtained by addChainedMessage");
 
     auto it = chainedMessages.find(msg.id());
     if (it != chainedMessages.end()) {

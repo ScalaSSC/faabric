@@ -133,7 +133,7 @@ bool StateAwareScheduler::registerFunctionState(const std::string& userFunction,
 
     // Initialize the function state with parallelism 1, if not initialized.
     if (!functionParallelism.contains(userFunction)) {
-        initializeState(hostMap, userFunction);
+        registerState(hostMap, userFunction);
         return true;
     }
     return false;
@@ -179,34 +179,35 @@ HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
                functionParallelism[userFunction] };
 }
 
-bool registerStateToHost(const std::string& userFunctionParIdx,
-                         const std::string& host,
-                         const std::string& partitionBy,
-                         const std::string stateKey)
+// Now, we only register the state to the Redis.
+bool registerStateToRedis(const std::string& userFunctionParIdx,
+                          const std::string& host)
 {
     SPDLOG_INFO(
-      "Registering state {} to host {}, partition by: {} and stateKey : {}",
-      userFunctionParIdx,
-      host,
-      partitionBy,
-      stateKey);
+      "Registering state {} to host {} on Redis", userFunctionParIdx, host);
     // Update Redis Information
     redis::Redis& redis = redis::Redis::getState();
     std::string mainKey = MAIN_KEY_PREFIX + userFunctionParIdx;
     std::vector<uint8_t> mainIPBytes = faabric::util::stringToBytes(host);
     redis.set(mainKey, mainIPBytes);
-    // Send Create information in the host.
-    auto [user, function, parallelismId] =
-      faabric::util::splitUserFuncPar(userFunctionParIdx);
-    state::FunctionStateClient cli(
-      user, function, std::stoi(parallelismId), host);
-    cli.createState(stateKey);
     return true;
 }
 
-void StateAwareScheduler::initializeState(const HostMap& hostMap,
-                                          std::string userFunc,
-                                          int parallelism)
+void deleteStateFromRedis(const std::string& userFunctionParIdx)
+{
+    SPDLOG_INFO("Deleting state {} from Redis", userFunctionParIdx);
+    // Get the Redis instance
+    redis::Redis& redis = redis::Redis::getState();
+    // Construct the key using the same prefix as for registration
+    std::string mainKey = MAIN_KEY_PREFIX + userFunctionParIdx;
+    // Delete the key from Redis.
+    // Assuming redis.del returns a bool indicating success.
+    redis.del(mainKey);
+}
+
+void StateAwareScheduler::registerState(const HostMap& hostMap,
+                                        std::string userFunc,
+                                        int parallelism)
 {
     SPDLOG_INFO("Create func {} with parallelism {}", userFunc, parallelism);
     if (parallelism != 1) {
@@ -228,7 +229,7 @@ void StateAwareScheduler::initializeState(const HostMap& hostMap,
         statePartitionBy[userFunc] = partitionBy;
     }
     // Register the state to the host.
-    registerStateToHost(funcParaId, host, partitionBy, stateKey);
+    registerStateToRedis(funcParaId, host);
 }
 
 std::string StateAwareScheduler::scheduleMessage(
@@ -284,19 +285,39 @@ std::vector<std::string> StateAwareScheduler::scheduleMessagesBatch(
     return hosts;
 }
 
-// TODO - change it to increase or decrease function parallelism. It should
-// return the old stateHost instead of the true/false
-void StateAwareScheduler::increaseFunctionParallelism(
-  int numIncrease,
-  const std::string& userFunction,
-  const HostMap& hostMap)
+bool StateAwareScheduler::updateFuncStatePar(const std::string& userFunction,
+                                             int newPar,
+                                             const HostMap& hostMap)
 {
-    SPDLOG_INFO("Increase {} parallelism for {}", numIncrease, userFunction);
-    // Double check if the function exists
+    SPDLOG_INFO("Scheduler update {} parallelism to {}", userFunction, newPar);
+
     if (functionParallelism.find(userFunction) == functionParallelism.end()) {
         SPDLOG_ERROR("Function {} is not stateful function", userFunction);
-        return;
+        return false;
     }
+
+    if (newPar > functionParallelism[userFunction]) {
+        increaseFuncStatePar(
+          userFunction, newPar - functionParallelism[userFunction], hostMap);
+        return true;
+    }
+
+    if (newPar < functionParallelism[userFunction]) {
+        reduceFuncStatePar(
+          userFunction, functionParallelism[userFunction] - newPar, hostMap);
+        return false;
+    }
+
+    return false;
+}
+
+// TODO - change it to increase or decrease function parallelism. It should
+// return the old stateHost instead of the true/false
+void StateAwareScheduler::increaseFuncStatePar(const std::string& userFunction,
+                                               int numIncrease,
+                                               const HostMap& hostMap)
+{
+    SPDLOG_INFO("Increase {} parallelism for {}", numIncrease, userFunction);
 
     // Construct userFunctionIdx for new parallelism level
     for (int i = 0; i < numIncrease; i++) {
@@ -351,10 +372,7 @@ void StateAwareScheduler::increaseFunctionParallelism(
         // Step 4: Update Redis Information and register the state
         std::string partitionBy = std::get<0>(funcStateRegMap[userFunction]);
         std::string stateKey = std::get<1>(funcStateRegMap[userFunction]);
-        registerStateToHost(userFunction + "_" + std::to_string(idx),
-                            minHost,
-                            partitionBy,
-                            stateKey);
+        registerStateToRedis(userFunction + "_" + std::to_string(idx), minHost);
     }
 
     functionParallelism[userFunction] += numIncrease;
@@ -362,6 +380,40 @@ void StateAwareScheduler::increaseFunctionParallelism(
                 userFunction,
                 functionParallelism[userFunction]);
 
+    // If the state is partitioned, update the Hash method.
+    if (statePartitionBy.contains(userFunction)) {
+        // Change the state hashing ring
+        stateHashRing[userFunction] =
+          std::make_shared<faabric::util::ConsistentHashRing>(
+            functionParallelism[userFunction]);
+    }
+}
+
+void StateAwareScheduler::reduceFuncStatePar(const std::string& userFunction,
+                                             int numDecrease,
+                                             const HostMap& hostMap)
+{
+    SPDLOG_INFO("Reduce {} parallelism for {}", numDecrease, userFunction);
+
+    int currentPar = functionParallelism[userFunction];
+    int startIdx = currentPar - numDecrease;
+    int endIdx = currentPar; // Exclusive
+
+    for (int idx = startIdx; idx < endIdx; ++idx) {
+        std::string userFunctionIdx = userFunction + "_" + std::to_string(idx);
+        auto it = stateHost.find(userFunctionIdx);
+        if (it != stateHost.end()) {
+            stateHost.erase(it);
+            deleteStateFromRedis(userFunctionIdx);
+        } else {
+            SPDLOG_WARN("No stateHost mapping found for {}", userFunctionIdx);
+        }
+    }
+
+    functionParallelism[userFunction] -= numDecrease;
+    SPDLOG_INFO("New parallelism for {} is {}",
+                userFunction,
+                functionParallelism[userFunction]);
     // If the state is partitioned, update the Hash method.
     if (statePartitionBy.contains(userFunction)) {
         // Change the state hashing ring

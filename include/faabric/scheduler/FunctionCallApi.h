@@ -8,9 +8,8 @@ enum FunctionCalls
     Flush = 2,
     SetMessageResult = 3,
     ExecuteFunctionsLazy = 4,
-    ResetBatchsize = 5,
-    ResetMaxReplicas = 6,
-    ResetParameter = 7,
-    ExecuteFunctionsBatch = 8,
+    ResetParameter = 5,
+    ExecuteFunctionsBatch = 6,
+    SyncStatesInfo = 7,
 };
 }

@@ -124,7 +124,6 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvRegisterHost(
     *response->mutable_config() = planner.getConfig();
     // Prepare host update and state update flags
     response->set_hostsync(false);
-    response->set_statesync(false);
 
     // Set response status
     ResponseStatus status;
@@ -143,23 +142,6 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvRegisterHost(
             response->add_registeredhosts()->set_ip(host);
         }
         response->set_hostsync(true);
-    }
-
-    // Add state location information
-    auto [stateSync, registStatesInfo] =
-      planner.retrieveStateInfo(parsedMsg.host().ip());
-    if (stateSync) {
-        for (const auto& [func, info] : registStatesInfo) {
-            auto stateInfo = response->add_statesinfo();
-            stateInfo->set_functionname(info.functionName);
-            stateInfo->set_partitionby(info.partitionBy);
-            stateInfo->set_statekey(info.stateKey);
-            stateInfo->set_parallelism(info.parallelism);
-            for (const auto& [idx, host] : info.stateHost) {
-                stateInfo->mutable_statehost()->insert({ idx, host });
-            }
-        }
-        response->set_statesync(true);
     }
 
     return response;
@@ -194,18 +176,10 @@ void PlannerServer::recvSetMessageResultBatch(std::span<const uint8_t> buffer)
 std::unique_ptr<google::protobuf::Message> PlannerServer::recvGetMessageResult(
   std::span<const uint8_t> buffer)
 {
-    PARSE_MSG(Message, buffer.data(), buffer.size());
+    SPDLOG_ERROR("GetMessageResult not implemented in PlannerServer");
+    throw std::runtime_error("GetMessageResult not implemented in PlannerServer");
 
-    auto resultMsg =
-      planner.getMessageResult(std::make_shared<faabric::Message>(parsedMsg));
-
-    if (resultMsg == nullptr) {
-        resultMsg = std::make_shared<faabric::Message>();
-        resultMsg->set_appid(0);
-        resultMsg->set_id(0);
-    }
-
-    return std::make_unique<faabric::Message>(*resultMsg);
+    return std::make_unique<faabric::Message>();
 }
 
 std::unique_ptr<google::protobuf::Message> PlannerServer::recvGetBatchResults(
@@ -254,18 +228,8 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvGetNumMigrations(
 
 std::unique_ptr<google::protobuf::Message>
 PlannerServer::recvPreloadSchedulingDecision(std::span<const uint8_t> buffer)
-{
-    PARSE_MSG(PointToPointMappings, buffer.data(), buffer.size());
-
-    auto preloadDecision =
-      faabric::batch_scheduler::SchedulingDecision::fromPointToPointMappings(
-        parsedMsg);
-
-    planner.preloadSchedulingDecision(
-      preloadDecision.appId,
-      std::make_shared<faabric::batch_scheduler::SchedulingDecision>(
-        preloadDecision));
-
+{   
+    SPDLOG_ERROR("PreloadSchedulingDecision not implemented in PlannerServer");
     return std::make_unique<faabric::EmptyResponse>();
 }
 
