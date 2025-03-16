@@ -166,6 +166,8 @@ void Planner::flushSchedulingState()
     state.appResults.clear();
     state.appResultWaiters.clear();
     state.numMigrations = 0;
+    state.applicationMetrics =
+      std::make_unique<ApplicationMetrics>("defaultApp", 1);
 
     state.inFlightApps.clear();
 }
@@ -315,6 +317,9 @@ void Planner::setMessageResultBatch(
         int inFlightAppCount = --state.inFlightApps[appId];
         if (inFlightAppCount <= 0) {
             state.inFlightApps.erase(appId);
+            // Statistics the fully processed messages
+            state.applicationMetrics->record(state.appResults[appId]);
+            state.appResults.erase(appId);
         }
     }
     SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
@@ -577,7 +582,7 @@ void Planner::enqueueMessageBatch(
 void Planner::dequeueScheduledMsgs()
 {
     while (!stopThreadTimer) {
-                // Sleep for a while to batch the scheduled requests
+        // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
         CONTINUE_IF_OUTPUTTING
@@ -706,8 +711,7 @@ bool Planner::resetParameter(const std::string& key,
         if (key == "dispatch_period") {
             SPDLOG_INFO("Planner reset dispatchPeriod to {}", value);
             dispatchPeriod = value;
-        }
-        else if (key == "is_outputting"){
+        } else if (key == "is_outputting") {
             SPDLOG_INFO("Planner reset isOutputting to {}", value == 1);
             isOutputting = value == 1;
         }
@@ -731,102 +735,14 @@ bool Planner::resetParameter(const std::string& key,
     return true;
 }
 
-void Planner::outputAppResultsToJson()
+std::string Planner::outputResult()
 {
     faabric::util::FullLock lock(plannerStateMx);
     isOutputting = true;
     // We have to unlock, since the output operation may take a long time
-    lock.unlock();
-    if (state.appResults.empty()) {
-        SPDLOG_INFO("No results to output");
-        return;
-    }
-
-    try {
-        rapidjson::Document document;
-        document.SetObject();
-        rapidjson::Document::AllocatorType& allocator = document.GetAllocator();
-
-        for (const auto& [appId, messages] : state.appResults) {
-            if (state.inFlightApps.contains(appId)) {
-                SPDLOG_DEBUG("App {} is still in flight", appId);
-                continue;
-            }
-            rapidjson::Value appData(rapidjson::kArrayType);
-            for (const auto& [messageId, message] : messages) {
-                rapidjson::Value messageData(rapidjson::kObjectType);
-
-                // Populate the messageData with the specified fields
-                messageData.AddMember("id", message->id(), allocator);
-                messageData.AddMember("appId", message->appid(), allocator);
-                messageData.AddMember(
-                  "user",
-                  rapidjson::StringRef(message->user().c_str()),
-                  allocator);
-                messageData.AddMember(
-                  "function",
-                  rapidjson::StringRef(message->function().c_str()),
-                  allocator);
-                messageData.AddMember(
-                  "output_data",
-                  rapidjson::StringRef(message->outputdata().c_str()),
-                  allocator);
-                messageData.AddMember(
-                  "start_ts", message->starttimestamp(), allocator);
-                messageData.AddMember(
-                  "finish_ts", message->finishtimestamp(), allocator);
-                messageData.AddMember(
-                  "plannerQueueTime", message->plannerqueuetime(), allocator);
-                messageData.AddMember(
-                  "plannerPopTime", message->plannerpoptime(), allocator);
-                messageData.AddMember("plannerDispatchTime",
-                                      message->plannerdispatchtime(),
-                                      allocator);
-                messageData.AddMember(
-                  "workerQueueTime", message->workerqueuetime(), allocator);
-                messageData.AddMember(
-                  "workerPopTime", message->workerpoptime(), allocator);
-                messageData.AddMember("ExecutorPrepareTime",
-                                      message->executorpreparetime(),
-                                      allocator);
-                messageData.AddMember("workerExecuteStart",
-                                      message->workerexecutestart(),
-                                      allocator);
-                messageData.AddMember(
-                  "workerExecuteEnd", message->workerexecuteend(), allocator);
-                messageData.AddMember(
-                  "chainedId", message->chainedid(), allocator);
-                messageData.AddMember(
-                  "parallelismId", message->parallelismid(), allocator);
-
-                appData.PushBack(messageData, allocator);
-            }
-            document.AddMember(
-              rapidjson::Value(std::to_string(appId).c_str(), allocator).Move(),
-              appData,
-              allocator);
-        }
-
-        // Write the JSON to file
-        rapidjson::StringBuffer buffer;
-        rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
-        document.Accept(writer);
-
-        std::ofstream outFile("/tmp/faasm_result.txt");
-        if (!outFile.is_open()) {
-            throw std::runtime_error("Unable to open output file");
-        }
-        outFile << buffer.GetString();
-        outFile.close();
-
-        SPDLOG_INFO("Successfully wrote results to /tmp/faasm_result.txt");
-    } catch (const std::exception& e) {
-        SPDLOG_ERROR("Error outputting results to JSON: {}", e.what());
-    } catch (...) {
-        SPDLOG_ERROR("Unknown error occurred while outputting results to JSON");
-    }
-
-    state.appResults.clear();
+    std::string result = state.applicationMetrics->getMetrics();
+    SPDLOG_INFO("Outputting result: {}", result);
+    return result;
 }
 
 Planner& getPlanner()

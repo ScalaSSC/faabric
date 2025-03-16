@@ -177,6 +177,10 @@ void FunctionCallServer::recvResetParameter(std::span<const uint8_t> buffer)
         faabric::scheduler::getScheduler().resetParameter(key, value);
     } else if (key == "planner_call_interval") {
         faabric::scheduler::getScheduler().resetParameter(key, value);
+    } else if (key == "batch_size") {
+        faabric::scheduler::getScheduler().resetParameter(key, value);
+    } else if (key == "max_replicas") {
+        faabric::scheduler::getScheduler().resetParameter(key, value);
     } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));

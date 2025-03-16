@@ -173,7 +173,6 @@ void Scheduler::reset()
 
     stopBatchTimer = false;
     batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
-
 }
 
 void Scheduler::shutdown()
@@ -564,8 +563,11 @@ void Scheduler::enqueueChainedCalls(
     msgs.clear();
 }
 
-void Scheduler::enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> req){
-    SPDLOG_DEBUG("Enqueueing set results for {} messages", req->messages_size());
+void Scheduler::enqueueSetResults(
+  std::shared_ptr<faabric::BatchExecuteRequest> req)
+{
+    SPDLOG_DEBUG("Enqueueing set results for {} messages",
+                 req->messages_size());
     faabric::util::FullLock lock(mx);
 
     for (int i = 0; i < req->messages_size(); i++) {
@@ -573,7 +575,6 @@ void Scheduler::enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> 
         setResultMsgs.emplace_back(std::make_unique<faabric::Message>(msg));
     }
 }
-
 
 void Scheduler::batchTimerCheck()
 {
@@ -648,9 +649,16 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         SPDLOG_INFO("Reset maxExecutors parameter to : {}", maxExecutors);
     } else if (key == "planner_call_interval") {
         plannerCallInterval = value;
-        SPDLOG_INFO("Reset plannerCallInterval parameter to : {}", plannerCallInterval);
-    }
-    else {
+        SPDLOG_INFO("Reset plannerCallInterval parameter to : {}",
+                    plannerCallInterval);
+    } else if (key == "max_replicas") {
+        maxReplicas = value;
+        SPDLOG_INFO("Reset maxReplicas parameter to : {}", maxReplicas);
+    } else if (key == "batch_size") {
+        executeBatchsize = value;
+        SPDLOG_INFO("Reset executeBatchsize parameter to : {}",
+                    executeBatchsize);
+    } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }
