@@ -314,6 +314,8 @@ void PlannerEndpointHandler::onRequest(
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "planner_call_interval") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
+            } else if (parameter == "decentral_schedule_mode") {
+                faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "is_outputting") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);

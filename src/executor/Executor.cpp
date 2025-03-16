@@ -471,9 +471,9 @@ void Executor::restore(const std::string& snapshotKey)
 
 void Executor::addChainedMessage(const faabric::Message& msg)
 {
-    SPDLOG_DEBUG("Adding chained message {} to executor", msg.id());
+    // SPDLOG_DEBUG("Adding chained message {} to executor", msg.id());
     faabric::util::UniqueLock lock(threadsMutex);
-    SPDLOG_DEBUG("LOCKED obtained by addChainedMessage");
+    // SPDLOG_DEBUG("LOCKED obtained by addChainedMessage");
 
     auto it = chainedMessages.find(msg.id());
     if (it != chainedMessages.end()) {

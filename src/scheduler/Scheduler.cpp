@@ -666,6 +666,9 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         executeBatchsize = value;
         SPDLOG_INFO("Reset executeBatchsize parameter to : {}",
                     executeBatchsize);
+    } else if (key == "decentral_schedule_mode") {
+        decentralScheduler.setScheduleMode(value);
+        SPDLOG_INFO("Reset decentral_schedule_mode parameter to : {}", value);
     } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));

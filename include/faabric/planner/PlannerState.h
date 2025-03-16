@@ -139,7 +139,6 @@ class ApplicationMetrics
         int64_t tempEndTime = std::numeric_limits<int64_t>::min();
         for (auto& [msgId, msg] : msgMap) {
             std::string instanceName = getName(msg);
-            SPDLOG_DEBUG("Recording metrics for instance {}", instanceName);
             if (!instances.contains(instanceName)) {
                 instances[instanceName] =
                   std::make_unique<InstanceMetrics>(instanceName, period);
