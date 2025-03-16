@@ -118,7 +118,7 @@ class Planner
     // MAP<Function, MAP<metric, value>>
     std::map<std::string, FunctionMetrics> collectMetrics();
 
-    void outputAppResultsToJson();
+    std::string outputResult();
 
   private:
     std::shared_ptr<batch_scheduler::StateAwareScheduler> stateAwareScheduler =

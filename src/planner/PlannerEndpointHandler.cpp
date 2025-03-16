@@ -360,7 +360,12 @@ void PlannerEndpointHandler::onRequest(
                 response.body() = std::string("Bad JSON in body's payload");
                 return ctx.sendFunction(std::move(response));
             }
-            faabric::planner::getPlanner().outputAppResultsToJson();
+            // Return the statistics in json format
+            std::string result = faabric::planner::getPlanner().outputResult();
+            response.result(beast::http::status::ok);
+            response.body() = result;
+            response.prepare_payload();
+
             return ctx.sendFunction(std::move(response));
         }
         default: {
