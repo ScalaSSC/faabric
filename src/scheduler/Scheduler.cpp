@@ -196,8 +196,15 @@ void Scheduler::reset()
 
     waitingQueues.clear();
     partitionedWaitingQueues.clear();
-    chainedCallMsgs.clear();
-    setResultMsgs.clear();
+    {
+        faabric::util::FullLock chainedCallMsgslock(chainedCallMsgsMx);
+        chainedCallMsgs.clear();
+    }
+    {
+        faabric::util::FullLock setResultMsgslock(setResultMsgsMx);
+        setResultMsgs.clear();
+    }
+
     scheduledMsgsMap.clear();
 
     registeredHostsMap.clear();
@@ -400,7 +407,7 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             stateLock->unlock();
             break;
         }
-
+        SPDLOG_DEBUG("statelock is acquired for {}", userFuncPar);
         auto msgVec = waitingQueue.getMessages();
         for (auto& msgPointer : msgVec) {
             auto* message = newReq->add_messages();
@@ -444,8 +451,7 @@ void Scheduler::enqueueChainedCalls(
   std::vector<std::unique_ptr<faabric::Message>> msgs)
 {
     SPDLOG_DEBUG("Enqueueing chained calls for {} messages", msgs.size());
-    faabric::util::FullLock lock(mx);
-    // SPDLOG_DEBUG("enqueueChainedCalls:: lock acquired");
+    faabric::util::FullLock lock(chainedCallMsgsMx);
 
     for (auto& msg : msgs) {
         if (msg) {
@@ -453,6 +459,7 @@ void Scheduler::enqueueChainedCalls(
         }
     }
     msgs.clear();
+    SPDLOG_DEBUG("Enqueueing chained calls finished");
 }
 
 void Scheduler::enqueueSetResults(
@@ -460,12 +467,13 @@ void Scheduler::enqueueSetResults(
 {
     SPDLOG_DEBUG("Enqueueing set results for {} messages",
                  req->messages_size());
-    faabric::util::FullLock lock(mx);
+    faabric::util::FullLock lock(setResultMsgsMx);
 
     for (int i = 0; i < req->messages_size(); i++) {
         faabric::Message& msg = req->mutable_messages()->at(i);
         setResultMsgs.emplace_back(std::make_unique<faabric::Message>(msg));
     }
+    SPDLOG_DEBUG("Enqueueing set results finished");
 }
 
 void Scheduler::batchTimerCheck()
@@ -528,6 +536,7 @@ void Scheduler::batchTimerCheck()
         lastPlannerCallCheck = currentMillis;
         auto& plannerCli = faabric::planner::getPlannerClient();
 
+        faabric::util::FullLock setResultMsgsLock(setResultMsgsMx);
         if (!setResultMsgs.empty()) {
             auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
             for (auto& msg : setResultMsgs) {
@@ -538,6 +547,7 @@ void Scheduler::batchTimerCheck()
             plannerCli.setMessageResultBatch(req);
             setResultMsgs.clear();
         }
+        setResultMsgsLock.unlock();
 
         // SPDLOG_DEBUG("batchTimerCheck: finished");
     }
@@ -577,11 +587,13 @@ void Scheduler::dispatchChainedMsgs()
         // SPDLOG_DEBUG("dispatchChainedMsgs:: flag1");
 
         // Schedule the chained calls
+        faabric::util::FullLock chainedCallLock(chainedCallMsgsMx);
         if (!chainedCallMsgs.empty()) {
             auto hosts = decentralScheduler.scheduleMessagesBatch(
               hostMap, chainedCallMsgs);
             enqueueSchedMsgs(hosts, std::move(chainedCallMsgs));
         }
+        chainedCallLock.unlock();
 
         // SPDLOG_DEBUG("dispatchChainedMsgs:: flag2");
 
@@ -914,6 +926,13 @@ void Scheduler::updateHosts(const std::vector<std::string>& hosts)
     hostMap = convertHostMap(registeredHostsMap);
 }
 
+void Scheduler::storeMigrateState(
+  std::multimap<std::string, std::string>&& migrateState)
+{
+    faabric::util::FullLock lock(tempMigrateStateMapMx);
+    tempMigrateStateMap.merge(migrateState);
+}
+
 void Scheduler::updateStatesInfo(
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
     statesInfo)
@@ -922,17 +941,42 @@ void Scheduler::updateStatesInfo(
     // To update states, we must ensure that no executors are running.
     // Otherwise, it might cannot update the states correctly.
     faabric::util::FullLock lock(mx);
+    SPDLOG_DEBUG("updateStatesInfo: scheduler lock acquired");
     faabric::util::FullLock stateLock(stateUpdateMx);
+    SPDLOG_DEBUG("updateStatesInfo: state lock acquired");
 
     isUpdateState = true;
 
     // Update the states info in decentralized scheduler
     decentralScheduler.syncStatesInfo(statesInfo);
-    // Update the states stored in local storage
-    // TODO - Currently we delete all the states, and creates new states. We
-    // should migration the states further.
+
+    // We migrate the old state and create the new state according to the
+    // planner's new scheduling decision.
     auto& stateServer = faabric::state::getGlobalState();
-    stateServer.forceClearAll(true);
+
+    stateServer.backupAll();
+    auto& hashRings = decentralScheduler.getStateHashRing();
+    auto migrationStatesMap =
+      stateServer.schedulePreStates(hashRings, statesInfo);
+
+    // Migrate the states.
+    SPDLOG_INFO("updateStatesInfo: transferring states to other hosts");
+    std::vector<std::thread> threads;
+    for (const auto& [ip, migrStates] : migrationStatesMap) {
+        auto req = std::make_shared<faabric::StateMigrationRequest>();
+        for (const auto& [userFuncPar, serializedState] : migrStates) {
+            auto* migrateState = req->add_migratestates();
+            migrateState->set_userfuncpar(userFuncPar);
+            migrateState->set_serializedstate(serializedState);
+        }
+        threads.emplace_back(
+          [ip, req]() { getFunctionCallClient(ip)->migrateStates(req); });
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
 
     SPDLOG_INFO(
       "updateStatesInfo: states update complete, reallocate states now");
@@ -953,12 +997,34 @@ void Scheduler::updateStatesInfo(
         }
     }
 
+    SPDLOG_INFO(
+      "updateStatesInfo: create states complete, waiting for other hosts");
+
+    // Hurdle - waiting for other hosts to finish the migration
+    faabric::planner::getPlannerClient().migrationComplete();
+
+    SPDLOG_INFO("updateStatesInfo: migration complete, update the states now");
+
+    // Update the states from tempMigrateStateMap to state
+    {
+        faabric::util::FullLock migrateStateLock(tempMigrateStateMapMx);
+        std::ostringstream oss;
+        oss << "tempMigrateStateMap contents:\n";
+        for (const auto& [key, value] : tempMigrateStateMap) {
+            oss << "Key: " << key << " -> Value Size: " << value.size() << "\n";
+        }
+        SPDLOG_INFO("{}", oss.str());
+        stateServer.loadMigrateState(tempMigrateStateMap);
+
+        tempMigrateStateMap.clear();
+        stateServer.cleanBackup();
+    }
+
     SPDLOG_INFO("updateStatesInfo: states reallocation complete, reschedule "
                 "requests now");
 
     // Reschedule all the messages in unprocessed queue and scheduled queue.
     std::vector<std::unique_ptr<faabric::Message>> rescheduleMsgs;
-    SPDLOG_DEBUG("updateStatesInfo: Flag 1");
     for (auto& [queueKey, queuePtr] : waitingQueues) {
         if (queuePtr->getMessagesCount() == 0) {
             continue;
@@ -968,7 +1034,6 @@ void Scheduler::updateStatesInfo(
             rescheduleMsgs.emplace_back(std::move(msg));
         }
     }
-    SPDLOG_DEBUG("updateStatesInfo: Flag 2");
     for (auto& [queueKey, queuePtr] : partitionedWaitingQueues) {
         if (queuePtr->getMessagesCount() == 0) {
             continue;
@@ -978,8 +1043,6 @@ void Scheduler::updateStatesInfo(
             rescheduleMsgs.emplace_back(std::move(msg));
         }
     }
-    SPDLOG_DEBUG("updateStatesInfo: Flag 3");
-
     // Reschedule the scheduled messages in scheduledMsgsMap
     for (auto& [hostIp, msgs] : scheduledMsgsMap) {
         for (auto& msg : msgs) {

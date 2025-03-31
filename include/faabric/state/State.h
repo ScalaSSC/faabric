@@ -1,5 +1,6 @@
 #pragma once
 
+#include <faabric/batch-scheduler/StateAwareScheduler.h>
 #include <faabric/state/FunctionState.h>
 #include <faabric/state/StateKeyValue.h>
 
@@ -48,6 +49,21 @@ class State
 
     std::shared_ptr<StateKeyValue> getKV(const std::string& user,
                                          const std::string& key);
+
+    void backupAll();
+
+    void cleanBackup();
+    
+    std::map<std::string, std::multimap<std::string, std::string>>
+    schedulePreStates(
+      const std::map<std::string,
+                     std::shared_ptr<faabric::util::ConsistentHashRing>>&
+        hashRings,
+      const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+        statesInfo);
+
+    void loadMigrateState(
+      const std::multimap<std::string, std::string>& migrateStates);
 
     void forceClearAll(bool global);
 
@@ -120,9 +136,11 @@ class State
 
     std::unordered_map<std::string, std::shared_ptr<StateKeyValue>> kvMap;
     std::unordered_map<std::string, std::shared_ptr<FunctionState>> fsMap;
+    std::unordered_map<std::string, std::shared_ptr<FunctionState>> backupMap;
 
     std::shared_mutex mapMutex;
     std::shared_mutex fsmapMutex;
+    std::shared_mutex backupMapMutex;
 
     std::shared_ptr<StateKeyValue> doGetKV(const std::string& user,
                                            const std::string& key,

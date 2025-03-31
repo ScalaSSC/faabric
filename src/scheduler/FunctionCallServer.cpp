@@ -56,6 +56,9 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::SyncStatesInfo: {
             return recvSyncStatesInfo(message.udata());
         }
+        case faabric::scheduler::FunctionCalls::MigrateStates: {
+            return recvMigrateStates(message.udata());
+        }
         default: {
             throw std::runtime_error(
               fmt::format("Unrecognized sync call header: {}", header));
@@ -84,7 +87,7 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::recvFlush(
 std::unique_ptr<google::protobuf::Message>
 FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
 {
-    SPDLOG_INFO("Syncing state info to host {}",
+    SPDLOG_INFO("Syncing state info in host {}",
                 faabric::util::getSystemConfig().endpointHost);
 
     PARSE_MSG(planner::SyncStatesInfoRequest, buffer.data(), buffer.size())
@@ -110,6 +113,34 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
     scheduler.updateStatesInfo(tempStatesInfoMap);
 
     return std::make_unique<planner::SyncStatesInfoResponse>();
+}
+
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
+{
+    SPDLOG_DEBUG("RECEIVE Migrating states");
+
+    PARSE_MSG(faabric::StateMigrationRequest, buffer.data(), buffer.size())
+
+    std::ostringstream oss;
+    for (const auto& state : parsedMsg.migratestates()) {
+        oss << state.userfuncpar() << ":" << state.serializedstate().size()
+            << "/";
+    }
+
+    SPDLOG_DEBUG("Migrating {} states to local host {}: {}",
+                 parsedMsg.migratestates_size(),
+                 faabric::util::getSystemConfig().endpointHost,
+                 oss.str());
+
+    std::multimap<std::string, std::string> immiStates;
+    for (const auto& state : parsedMsg.migratestates()) {
+        immiStates.emplace(state.userfuncpar(), state.serializedstate());
+    }
+
+    scheduler.storeMigrateState(std::move(immiStates));
+
+    return std::make_unique<faabric::EmptyResponse>();
 }
 
 void FunctionCallServer::recvExecuteFunctions(std::span<const uint8_t> buffer)

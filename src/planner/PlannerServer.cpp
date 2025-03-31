@@ -77,6 +77,9 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::doSyncRecv(
         case PlannerCalls::EnqueueBatch: {
             return recvEnqueueBatch(message.udata());
         }
+        case PlannerCalls::MigrationComplete: {
+            return recvMigrationComplete(message.udata());
+        }
         default: {
             // If we don't recognise the header, let the client fail, but don't
             // crash the planner
@@ -177,7 +180,8 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvGetMessageResult(
   std::span<const uint8_t> buffer)
 {
     SPDLOG_ERROR("GetMessageResult not implemented in PlannerServer");
-    throw std::runtime_error("GetMessageResult not implemented in PlannerServer");
+    throw std::runtime_error(
+      "GetMessageResult not implemented in PlannerServer");
 
     return std::make_unique<faabric::Message>();
 }
@@ -226,9 +230,17 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvGetNumMigrations(
     return std::make_unique<NumMigrationsResponse>(response);
 }
 
+std::unique_ptr<google::protobuf::Message> PlannerServer::recvMigrationComplete(
+  std::span<const uint8_t> buffer)
+{
+    SPDLOG_DEBUG("Received migration complete message");
+    planner.migratingComplete();
+    return std::make_unique<faabric::EmptyResponse>();
+}
+
 std::unique_ptr<google::protobuf::Message>
 PlannerServer::recvPreloadSchedulingDecision(std::span<const uint8_t> buffer)
-{   
+{
     SPDLOG_ERROR("PreloadSchedulingDecision not implemented in PlannerServer");
     return std::make_unique<faabric::EmptyResponse>();
 }

@@ -55,6 +55,9 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
 
     void syncStateInfo(
       std::shared_ptr<faabric::planner::SyncStatesInfoRequest> info);
+
+    void migrateStates(
+      std::shared_ptr<faabric::StateMigrationRequest> req);
 };
 
 // -----------------------------------

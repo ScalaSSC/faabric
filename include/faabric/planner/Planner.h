@@ -71,7 +71,7 @@ class Planner
     // Setters/getters for individual message results
 
     void setMessageResultBatch(
-      std::shared_ptr<faabric::BatchExecuteRequest> batchMsg);      
+      std::shared_ptr<faabric::BatchExecuteRequest> batchMsg);
 
     // Get all the results recorded for one batch
     std::shared_ptr<faabric::BatchExecuteRequestStatus> getBatchResults(
@@ -98,6 +98,7 @@ class Planner
     // ----------
     // Function State public API
     // ----------
+    bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
 
     bool registerFuncState(const std::string& userFunction,
                            const std::string& partitionBy,
@@ -111,6 +112,10 @@ class Planner
                         const int32_t value,
                         bool plannerParameter = false);
 
+    void initFuncState();
+
+    void rescheduleApp();
+
     // ----------
     // Metrics public API
     // ----------
@@ -119,6 +124,8 @@ class Planner
     std::map<std::string, FunctionMetrics> collectMetrics();
 
     std::string outputResult();
+
+    bool migratingComplete();
 
   private:
     std::shared_ptr<batch_scheduler::StateAwareScheduler> stateAwareScheduler =
@@ -187,6 +194,8 @@ class Planner
     void doDistributeStatesInfo();
 
     void doRescheduleMessages();
+
+    std::atomic<int> migratingHostNum{ 0 };
 };
 
 Planner& getPlanner();

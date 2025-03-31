@@ -39,6 +39,12 @@ void DecentralizedScheduler::syncStatesInfo(
         SPDLOG_INFO(
           "Stateful function {} with {} parallelism", func, info.parallelism);
 
+        if (info.parallelism != info.stateHost.size())
+        {
+            SPDLOG_ERROR("Parallelism and stateHost size mismatch");
+            throw std::runtime_error("Parallelism and stateHost size mismatch");
+        }
+        
         functionParallelism[func] = info.parallelism;
         for (const auto& [parallelismIdx, host] : info.stateHost) {
             std::string stateKey = func + "_" + std::to_string(parallelismIdx);

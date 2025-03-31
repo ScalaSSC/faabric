@@ -348,3 +348,12 @@ message FunctionStateMetricResponse{
 
     repeated FunctionStateMetric metrics = 2;
 }
+
+message MigrateState{
+    string userFuncPar = 1;
+    bytes serializedState = 2;
+}
+
+message StateMigrationRequest{
+    repeated MigrateState migrateStates = 1;
+}

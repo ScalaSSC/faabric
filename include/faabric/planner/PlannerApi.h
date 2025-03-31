@@ -20,5 +20,6 @@ enum PlannerCalls
     PreloadSchedulingDecision = 14,
     SetMessageResultBatch = 15,
     EnqueueBatch = 16,
+    MigrationComplete = 17,
 };
 }

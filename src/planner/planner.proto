@@ -45,11 +45,12 @@ message HttpMessage {
         EXECUTE_BATCH = 10;
         EXECUTE_BATCH_STATUS = 11;
         PRELOAD_SCHEDULING_DECISION = 12;
-        GET_FUNCTION_METRICS = 13;
+        CUSTOM = 13;
         SCALE_FUNCTION_PARALLELISM = 14;
         RESET_STREAM_PARAMETER = 17;
         REGISTER_FUNCTION_STATE = 18;
         OUTPUT_RESULT = 19;
+        REGISTER_APPLICATION = 20;
     }
 
     Type type = 1 [json_name = "http_type"];
@@ -199,4 +200,30 @@ message RegisterFunctionStateRequest{
     string function = 1;
     string attribute = 2;
     string stateKey = 3;
+}
+
+message Node{
+    enum Type {
+        STATELESS = 0;
+        STATEFUL = 1;
+        PARTITIONED_STATEFUL = 2;
+    }
+    string name = 1;
+    Type type = 2 [json_name = "node_type"];;
+    // If the node type is 2, hot it is partitioned.
+    string partitionBy = 3;
+    // If this operator is an input operator
+    bool input = 4;
+    int32 parallelism = 5;
+    repeated string successorNode = 6;
+}
+
+message RegisterApplicationRequest{
+    string appName = 1;
+    repeated Node nodes = 2;
+}
+
+message CustomRequest{
+    string key = 1;
+    string value = 2;
 }

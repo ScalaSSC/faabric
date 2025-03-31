@@ -1,5 +1,6 @@
 #pragma once
 
+#include <faabric/batch-scheduler/Application.h>
 #include <faabric/batch-scheduler/BatchScheduler.h>
 #include <faabric/planner/FunctionMetrics.h>
 #include <faabric/util/config.h>
@@ -42,6 +43,8 @@ class StateAwareScheduler : public BatchScheduler
       const InFlightReqs& inFlightReqs,
       std::shared_ptr<faabric::BatchExecuteRequest> req) override;
 
+    bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
+
     bool updateFuncStatePar(const std::string& userFunction,
                             int newPar,
                             const HostMap& hostMap);
@@ -50,7 +53,7 @@ class StateAwareScheduler : public BatchScheduler
     void increaseFuncStatePar(const std::string& userFunction,
                               int numIncrease,
                               const HostMap& hostMap);
-    
+
     void reduceFuncStatePar(const std::string& userFunction,
                             int numDecrease,
                             const HostMap& hostMap);
@@ -104,9 +107,21 @@ class StateAwareScheduler : public BatchScheduler
 
     const std::map<std::string, FunctionStateInfo> getStateInfo();
 
+    void updateApp(const std::map<std::string, long>& nodeWorkloads);
+
+    void rescheduleApp(const HostMap& hostMap);
+
+    const std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>&
+    getStateHashRing() const
+    {
+        return stateHashRing;
+    }
+
   protected:
     // scheduler lock
     std::shared_mutex scheduleMx;
+
+    int maxParallelism;
 
     // The counter used for round robin scheduling.
     int rbCounter = 0;
@@ -128,7 +143,7 @@ class StateAwareScheduler : public BatchScheduler
     // FunctionUser : Input Parition Key
     std::map<std::string, std::string> statePartitionBy;
 
-    int maxParallelism;
+    std::unique_ptr<batch_scheduler::Application> application;
 
     // TODO - This can be detected by state server and planner, but logic will
     // be extreamly complex. (How to create new function state, BALABALA)
@@ -147,5 +162,11 @@ class StateAwareScheduler : public BatchScheduler
     HashAndParallelismInfo getHashAndParallelismIndex(
       const std::string& userFunction,
       const faabric::Message& msg);
+
+    void groupNodesHelper(
+      const std::string& nodeName,
+      std::vector<std::shared_ptr<Node>>& currentGroup,
+      std::vector<std::vector<std::shared_ptr<Node>>>& groups,
+      std::unordered_set<std::string>& visited);
 };
 }

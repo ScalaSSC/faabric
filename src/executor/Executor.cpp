@@ -328,17 +328,11 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             try {
                 returnValue =
                   executeTask(threadPoolIdx, task.messageIndex, task.req);
-                if (stateLock) {
-                    stateLock->unlock();
-                }
             } catch (const std::exception& ex) {
                 returnValue = 1;
                 std::string errorMessage =
                   fmt::format("Task threw exception. What: {}", ex.what());
                 SPDLOG_ERROR(errorMessage);
-                if (stateLock) {
-                    stateLock->unlock();
-                }
                 for (int i = 0; i < task.req->messages_size(); i++) {
                     task.req->mutable_messages()->at(i).set_outputdata(
                       errorMessage);
@@ -382,6 +376,13 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             // Enqueue the message result
             faabric::scheduler::getScheduler().enqueueSetResults(
               std::move(task.req));
+
+            if (stateLock) {
+                SPDLOG_DEBUG(
+                  "statelock unlocked by thread {}:{}", id, threadPoolIdx);
+                stateLock->unlock();
+            }
+
             continue;
         }
     }

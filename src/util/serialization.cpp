@@ -361,4 +361,96 @@ std::map<std::string, std::map<std::string, std::string>> deserializeNestedMap(
     return nestedMap;
 }
 
+std::string serializeParStateMap(
+  const std::map<std::string, std::vector<uint8_t>>& m)
+{
+    std::string buffer;
+
+    // Write the number of pairs as a 32-bit unsigned integer.
+    uint32_t numPairs = static_cast<uint32_t>(m.size());
+    buffer.append(reinterpret_cast<const char*>(&numPairs), sizeof(numPairs));
+
+    // Iterate over each key-value pair.
+    for (const auto& [key, vec] : m) {
+        // Write key length.
+        uint32_t keyLen = static_cast<uint32_t>(key.size());
+        buffer.append(reinterpret_cast<const char*>(&keyLen), sizeof(keyLen));
+        // Write key characters (if any).
+        if (keyLen > 0) {
+            buffer.append(key.data(), key.size());
+        }
+
+        // Write the vector size.
+        uint32_t vecSize = static_cast<uint32_t>(vec.size());
+        buffer.append(reinterpret_cast<const char*>(&vecSize), sizeof(vecSize));
+        // Write vector data if not empty.
+        if (vecSize > 0) {
+            buffer.append(reinterpret_cast<const char*>(vec.data()),
+                          vec.size());
+        }
+    }
+
+    return buffer;
+}
+
+// Deserialize a binary string back into a map of <string, vector<uint8_t>>.
+std::map<std::string, std::vector<uint8_t>> deserializeParStateMap(
+  const std::string& data)
+{
+    std::map<std::string, std::vector<uint8_t>> m;
+    size_t pos = 0;
+    size_t dataSize = data.size();
+
+    // Check that we have enough data for the number of pairs.
+    if (dataSize < sizeof(uint32_t)) {
+        throw std::runtime_error("Data too short to contain map size");
+    }
+
+    // Read the number of pairs.
+    uint32_t numPairs;
+    std::memcpy(&numPairs, data.data() + pos, sizeof(numPairs));
+    pos += sizeof(numPairs);
+
+    // Loop through each pair.
+    for (uint32_t i = 0; i < numPairs; ++i) {
+        // Read key length.
+        if (pos + sizeof(uint32_t) > dataSize) {
+            throw std::runtime_error("Data too short for key length");
+        }
+        uint32_t keyLen;
+        std::memcpy(&keyLen, data.data() + pos, sizeof(keyLen));
+        pos += sizeof(keyLen);
+
+        // Read key string.
+        if (pos + keyLen > dataSize) {
+            throw std::runtime_error("Data too short for key string");
+        }
+        std::string key(data.data() + pos, keyLen);
+        pos += keyLen;
+
+        // Read vector length.
+        if (pos + sizeof(uint32_t) > dataSize) {
+            throw std::runtime_error("Data too short for vector length");
+        }
+        uint32_t vecSize;
+        std::memcpy(&vecSize, data.data() + pos, sizeof(vecSize));
+        pos += sizeof(vecSize);
+
+        // Read vector data.
+        std::vector<uint8_t> vec;
+        if (vecSize > 0) {
+            if (pos + vecSize > dataSize) {
+                throw std::runtime_error("Data too short for vector data");
+            }
+            vec.resize(vecSize);
+            std::memcpy(vec.data(), data.data() + pos, vecSize);
+            pos += vecSize;
+        }
+
+        m.emplace(std::move(key), std::move(vec));
+    }
+
+    return m;
+}
+
 }

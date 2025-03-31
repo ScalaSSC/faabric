@@ -120,6 +120,8 @@ class PlannerClient final : public faabric::transport::MessageEndpointClient
     void preloadSchedulingDecision(
       std::shared_ptr<faabric::batch_scheduler::SchedulingDecision> preloadDec);
 
+    bool migrationComplete();
+
     // ------
     // Function State calls
     // ------

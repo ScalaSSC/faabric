@@ -1,9 +1,11 @@
 #pragma once
 
-#include <cstdint>
 #include <faabric/state/FunctionStateMetrics.h>
 #include <faabric/state/FunctionStateRegistry.h>
 #include <faabric/state/StateKeyValue.h>
+#include <faabric/util/hash.h>
+
+#include <cstdint>
 #include <map>
 #include <semaphore>
 #include <set>
@@ -38,6 +40,7 @@ class FunctionState
                   int parallelismIdIn);
 
     void isPartitioned();
+
     /***
      * Functions used by the Stateful Function Operator
      */
@@ -56,6 +59,16 @@ class FunctionState
     int readPartitionStateSize(std::set<std::string>& keys);
     std::vector<uint8_t> readPartitionState(std::set<std::string>& keys);
     void writePartitionStateUnlocks(std::vector<uint8_t>& states);
+
+    // Reschedule partition states
+    // MAP<IP, serialized state>
+    std::map<int, std::string> scheduleParState(
+      const std::shared_ptr<faabric::util::ConsistentHashRing>& hashRing,
+      const std::map<int, std::string>& stateHost);
+    void addMigrateState(const std::string& serializedState);
+
+    bool getIsPartitioned() { return partition; }
+    std::string getUserFunc() { return user + "_" + function; };
 
   private:
     std::shared_mutex funcStateMutex;
@@ -89,6 +102,7 @@ class FunctionState
     void allocateChunk(long offset, size_t length);
     void reSize(long length);
     void doSet(const uint8_t* data);
+    void doSet(const std::string& data);
 
     // ----------------------------------------
     // Partitioned Function State

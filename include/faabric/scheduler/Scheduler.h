@@ -127,6 +127,9 @@ class Scheduler
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
         statesInfo);
 
+    void storeMigrateState(
+      std::multimap<std::string, std::string>&& migrateState);
+
   private:
     std::string thisHost;
 
@@ -183,8 +186,10 @@ class Scheduler
              std::unique_ptr<faabric::util::PartitionedStateMessageQueue>>
       partitionedWaitingQueues;
 
+    std::shared_mutex chainedCallMsgsMx;
     std::vector<std::unique_ptr<faabric::Message>> chainedCallMsgs;
 
+    std::shared_mutex setResultMsgsMx;
     std::vector<std::unique_ptr<faabric::Message>> setResultMsgs;
 
     // ---- Batch Execution ----
@@ -204,6 +209,9 @@ class Scheduler
     // scheduledMsgsMapMx is used for scheduledMsgsMap
     std::shared_mutex scheduledMsgsMapMx;
     std::map<std::string, std::list<std::unique_ptr<Message>>> scheduledMsgsMap;
+
+    std::shared_mutex tempMigrateStateMapMx;
+    std::multimap<std::string, std::string> tempMigrateStateMap;
 
     faabric::batch_scheduler::DecentralizedScheduler decentralScheduler;
 

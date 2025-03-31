@@ -133,7 +133,16 @@ void FunctionCallClient::syncStateInfo(
   std::shared_ptr<faabric::planner::SyncStatesInfoRequest> req)
 {
     faabric::planner::SyncStatesInfoResponse resp;
-    syncSend(faabric::scheduler::FunctionCalls::SyncStatesInfo, req.get(), &resp);
+    syncSend(
+      faabric::scheduler::FunctionCalls::SyncStatesInfo, req.get(), &resp);
+}
+
+void FunctionCallClient::migrateStates(
+  std::shared_ptr<faabric::StateMigrationRequest> req)
+{
+    faabric::EmptyResponse resp;
+    syncSend(
+      faabric::scheduler::FunctionCalls::MigrateStates, req.get(), &resp);
 }
 
 // -----------------------------------

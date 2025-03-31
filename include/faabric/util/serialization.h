@@ -6,7 +6,8 @@
 #include <vector>
 
 // THERE MUST BE SAME AS CPP LIMFAASM UTIL SERIALIZATION
-// TODO - Ensure the consistency with client.cpp/serialization.h
+// TODO - Ensure the consistency with client.cpp/serialization.h.
+// Except the serializeParStateMap and deserializeParStateMap
 
 namespace faabric::util {
 
@@ -40,16 +41,15 @@ std::map<std::string, std::vector<uint8_t>> deserializeParState(
   const std::vector<uint8_t>& bytes);
 
 // Serialize a string into a vector of uint8_t
-void serializeString(std::vector<uint8_t>& buffer,
-                            const std::string& str);
+void serializeString(std::vector<uint8_t>& buffer, const std::string& str);
 
 // Deserialize a string from a vector of uint8_t
 std::string deserializeString(const std::vector<uint8_t>& buffer,
-                                     size_t& index);
+                              size_t& index);
 
 // Serialize a map of strings
 void serializeMap(std::vector<uint8_t>& buffer,
-                         const std::map<std::string, std::string>& map);
+                  const std::map<std::string, std::string>& map);
 
 // Deserialize a map of strings
 std::map<std::string, std::string> deserializeMap(
@@ -62,9 +62,17 @@ void serializeNestedMap(
   const std::map<std::string, std::map<std::string, std::string>>& nestedMap);
 
 // Deserialize a nested map
-std::map<std::string, std::map<std::string, std::string>>
-deserializeNestedMap(const std::vector<uint8_t>& buffer, size_t& index);
+std::map<std::string, std::map<std::string, std::string>> deserializeNestedMap(
+  const std::vector<uint8_t>& buffer,
+  size_t& index);
 
 // Helper function to append an unsigned 32-bit integer to the buffer
 void appendUint32(std::vector<uint8_t>& buffer, uint32_t value);
+
+std::string serializeParStateMap(
+  const std::map<std::string, std::vector<uint8_t>>& m);
+
+std::map<std::string, std::vector<uint8_t>> deserializeParStateMap(
+  const std::string& data);
+
 }

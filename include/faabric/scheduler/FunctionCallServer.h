@@ -28,6 +28,9 @@ class FunctionCallServer final
     std::unique_ptr<google::protobuf::Message> recvSyncStatesInfo(
       std::span<const uint8_t> buffer);
 
+    std::unique_ptr<google::protobuf::Message> recvMigrateStates(
+      std::span<const uint8_t> buffer);
+
     void recvExecuteFunctions(std::span<const uint8_t> buffer);
 
     void recvExecuteFunctionsLazy(std::span<const uint8_t> buffer);

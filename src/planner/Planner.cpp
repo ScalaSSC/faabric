@@ -13,6 +13,7 @@
 #include <faabric/util/gids.h>
 #include <faabric/util/locks.h>
 #include <faabric/util/logging.h>
+#include <faabric/util/string_tools.h>
 
 #include <fstream>
 #include <map>
@@ -173,8 +174,8 @@ void Planner::flushSchedulingState()
     state.appResultWaiters.clear();
     state.numMigrations = 0;
     state.inFlightApps.clear();
-    state.applicationMetrics = std::make_unique<ApplicationMetrics>(
-      "defaultApp", 1);
+    state.applicationMetrics =
+      std::make_unique<ApplicationMetrics>("defaultApp", 1);
 }
 
 std::vector<std::shared_ptr<Host>> Planner::getAvailableHosts(bool locked)
@@ -323,7 +324,6 @@ void Planner::setMessageResultBatch(
     // When outputing result, we doesn't allow any set result operation.
     RETURN_IF_OUTPUTTING
     faabric::util::FullLock reqStatusLock(state.reqStatusMx);
-
     // Check again
     RETURN_IF_OUTPUTTING
     SPDLOG_DEBUG("InFlightApps size before set: {}", state.inFlightApps.size());
@@ -572,12 +572,21 @@ std::map<std::string, FunctionMetrics> Planner::collectMetrics()
     return metricsStats;
 }
 
+bool Planner::registerApp(std::unique_ptr<batch_scheduler::Application> app)
+{
+    SPDLOG_INFO("Planner received request to register application {}",
+                app->getName());
+    faabric::util::FullLock lock(plannerMx);
+    stateAwareScheduler->registerApp(std::move(app));
+    return true;
+}
+
 // updateFuncPar calls doDistributeStatesInfo and doRescheduleMessages
 bool Planner::updateFuncPar(const std::string& userFunc, int newPar, bool init)
 {
     SPDLOG_INFO("Planner received request to changed parallelism for {} by {}",
-                 userFunc,
-                 newPar);
+                userFunc,
+                newPar);
     faabric::util::FullLock lock(plannerMx);
 
     isUpdateState = true;
@@ -595,9 +604,22 @@ bool Planner::updateFuncPar(const std::string& userFunc, int newPar, bool init)
     return true;
 }
 
+void Planner::initFuncState()
+{
+    faabric::util::FullLock lock(plannerMx);
+    isUpdateState = true;
+
+    doDistributeStatesInfo();
+    doRescheduleMessages();
+    isUpdateState = false;
+}
+
 void Planner::doDistributeStatesInfo()
 {
-    SPDLOG_INFO("Planner distribute state info");
+    int hostSize = state.hostMap.size();
+    SPDLOG_INFO("Planner distribute state info to {} hosts", hostSize);
+    // Stores the number of workers needed to migrate the state info
+    migratingHostNum.store(hostSize);
 
     // Prepare state info sync request
     auto registStatesInfo = stateAwareScheduler->getStateInfo();
@@ -613,7 +635,7 @@ void Planner::doDistributeStatesInfo()
         }
     }
 
-    SPDLOG_INFO("Syncing state info to {} hosts", state.hostMap.size());
+    SPDLOG_INFO("Planner begin sending states");
     std::vector<std::thread> threads;
     for (const auto& [ip, host] : state.hostMap) {
         threads.emplace_back([&, ip]() {
@@ -627,18 +649,18 @@ void Planner::doDistributeStatesInfo()
             }
         });
     }
-
-    // Wait for all threads to complete
     for (auto& t : threads) {
         if (t.joinable()) {
             t.join();
         }
     }
+
+    SPDLOG_INFO("Planner distributes state info finished");
 }
 
 void Planner::doRescheduleMessages()
 {
-    SPDLOG_DEBUG("Planner reschedule messages");
+    SPDLOG_DEBUG("Planner starts reschedule messages");
 
     // Gather all messages from scheduledMsgsMap into a vector.
     std::vector<std::unique_ptr<faabric::Message>> messages;
@@ -698,6 +720,54 @@ bool Planner::resetParameter(const std::string& key,
               req));
     }
 
+    SPDLOG_DEBUG("Planner reschedules messages done");
+    return true;
+}
+
+void Planner::rescheduleApp()
+{
+    SPDLOG_INFO("Planner reschedules application");
+    faabric::util::FullLock lock(plannerMx);
+    // Update the application node processed tuples.
+    // Fetch the workload from metrics at first.
+    auto instWorkloadMap = state.applicationMetrics->getWorkloads();
+    std::map<std::string, long> operatorWorkloadMap;
+
+    for (const auto& [instName, count] : instWorkloadMap) {
+        SPDLOG_DEBUG("Instance {} has workload {}", instName, count);
+        auto userFuncParTuple = util::splitUserFuncPar(instName);
+        std::string funcName =
+          std::get<0>(userFuncParTuple) + "_" + std::get<1>(userFuncParTuple);
+        SPDLOG_DEBUG("Function name: {}", funcName);
+        operatorWorkloadMap[funcName] += count;
+    }
+
+    for (const auto& [funcName, count] : operatorWorkloadMap) {
+        SPDLOG_DEBUG("Function {} has workload {}", funcName, count);
+    }
+
+    // Update the processed tuples.
+    stateAwareScheduler->updateApp(operatorWorkloadMap);
+    stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
+    SPDLOG_INFO("Planner reschedules application done");
+
+    // Reschedule the states and messages in queue
+    doDistributeStatesInfo();
+    doRescheduleMessages();
+}
+
+bool Planner::migratingComplete()
+{
+    int oldValue = migratingHostNum.fetch_sub(1);
+    if (oldValue == 1) {
+        migratingHostNum.notify_all();
+    } else {
+        int current = migratingHostNum.load();
+        while (current != 0) {
+            migratingHostNum.wait(current);
+            current = migratingHostNum.load();
+        }
+    }
     return true;
 }
 

@@ -30,6 +30,85 @@ State::State(std::string thisIPIn)
   : thisIP(thisIPIn)
 {}
 
+void State::backupAll()
+{
+    faabric::util::FullLock fsmaplock(fsmapMutex);
+    faabric::util::FullLock backupMaplock(backupMapMutex);
+    backupMap = std::move(fsMap);
+    fsMap.clear();
+}
+
+void State::cleanBackup()
+{
+    faabric::util::FullLock lock(backupMapMutex);
+    backupMap.clear();
+}
+
+std::map<std::string, std::multimap<std::string, std::string>>
+State::schedulePreStates(
+  const std::map<std::string,
+                 std::shared_ptr<faabric::util::ConsistentHashRing>>& hashRings,
+  const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+    statesInfo)
+{
+    // state migration map
+    // MAP <IP, <UserFuncPar ,serialized states>>
+    std::map<std::string, std::multimap<std::string, std::string>>
+      migrationStatesMap;
+    for (const auto& [preFuncName, state] : backupMap) {
+        std::string userFunc = state->getUserFunc();
+        if (!statesInfo.contains(userFunc)) {
+            SPDLOG_ERROR("Function {} not found in states info", userFunc);
+            throw std::runtime_error("Function not found in states info");
+        }
+        const auto& info = statesInfo.at(userFunc);
+        std::shared_ptr<faabric::util::ConsistentHashRing> hashRing;
+        if (state->getIsPartitioned() ){
+            if (!hashRings.contains(userFunc)) {
+                SPDLOG_ERROR("Hash ring not found for function {}", userFunc);
+                throw std::runtime_error("Hash ring not found for function");
+            }
+            hashRing = hashRings.at(userFunc);
+        }
+        auto migratedStates = state->scheduleParState(hashRing, info.stateHost);
+        // Add migratedStates to migrationStatesMap
+        for (const auto& [parIdx, serializedState] : migratedStates) {
+            std::string ip = info.stateHost.at(parIdx);
+            std::string userFuncPar = userFunc + "_" + std::to_string(parIdx);
+            migrationStatesMap[ip].emplace(userFuncPar,
+                                           std::move(serializedState));
+        }
+    }
+
+    std::ostringstream oss;
+    oss << "MigrationStatesMap contents: \n";
+    for (const auto& [ip, innerMap] : migrationStatesMap) {
+        oss << "IP: " << ip << " | Keys: ";
+        for (const auto& [userFuncPar, serializedState] : innerMap) {
+            oss << userFuncPar << " ";
+        }
+        oss << "; \n";
+    }
+    SPDLOG_INFO("{}", oss.str());
+
+    return migrationStatesMap;
+}
+
+void State::loadMigrateState(
+  const std::multimap<std::string, std::string>& migrateStates)
+{
+    faabric::util::FullLock lock(fsmapMutex);
+
+    for (const auto& [userFuncPar, serializedState] : migrateStates) {
+        if (!fsMap.contains(userFuncPar)) {
+            SPDLOG_ERROR("Function state {} not found for migration",
+                         userFuncPar);
+            throw std::runtime_error("Function state not found for migration");
+        }
+        fsMap.at(userFuncPar)->addMigrateState(serializedState);
+    }
+}
+
 void State::forceClearAll(bool global)
 {
     std::string stateMode = faabric::util::getSystemConfig().stateMode;
@@ -41,7 +120,7 @@ void State::forceClearAll(bool global)
         throw std::runtime_error("Unrecognised state mode: " + stateMode);
     }
     {
-        faabric::util::SharedLock sharedLock(mapMutex);
+        faabric::util::FullLock lock(mapMutex);
         kvMap.clear();
     }
     {

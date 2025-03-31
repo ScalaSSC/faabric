@@ -506,6 +506,14 @@ void PlannerClient::preloadSchedulingDecision(
     syncSend(PlannerCalls::PreloadSchedulingDecision, &mappings, &response);
 }
 
+bool PlannerClient::migrationComplete()
+{
+    EmptyRequest request;
+    faabric::EmptyResponse response;
+    syncSend(PlannerCalls::MigrationComplete, &request, &response);
+    return true;
+}
+
 // ------
 // Function State calls
 // ------

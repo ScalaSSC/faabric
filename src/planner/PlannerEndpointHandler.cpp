@@ -1,3 +1,4 @@
+#include <faabric/batch-scheduler/Application.h>
 #include <faabric/batch-scheduler/BatchScheduler.h>
 #include <faabric/batch-scheduler/StateAwareScheduler.h>
 #include <faabric/endpoint/FaabricEndpoint.h>
@@ -243,15 +244,29 @@ void PlannerEndpointHandler::onRequest(
 
             return ctx.sendFunction(std::move(response));
         }
-        case faabric::planner::HttpMessage_Type_PRELOAD_SCHEDULING_DECISION: {
-            SPDLOG_DEBUG(
-              "Planner received PRELOAD_SCHEDULING_DECISION request");
-            response.result(beast::http::status::bad_request);
-            response.body() = std::string("Not implemented");
-            return ctx.sendFunction(std::move(response));
-        }
-        case faabric::planner::HttpMessage_Type_GET_FUNCTION_METRICS: {
-            SPDLOG_DEBUG("Planner received GET_FUNCTION_METRICS request");
+        case faabric::planner::HttpMessage_Type_CUSTOM: {
+            SPDLOG_DEBUG("Planner received CUSTOM request");
+            faabric::planner::CustomRequest rawReq;
+            try {
+                faabric::util::jsonToMessage(msg.payloadjson(), &rawReq);
+            } catch (faabric::util::JsonSerialisationException e) {
+                response.result(beast::http::status::bad_request);
+                response.body() = std::string("Bad JSON in body's payload");
+                return ctx.sendFunction(std::move(response));
+            }
+            std::string key = rawReq.key();
+            std::string value = rawReq.value();
+            SPDLOG_DEBUG("Custom request with key {} and value {}", key, value);
+            if (key == "reschedule") {
+                faabric::planner::getPlanner().rescheduleApp();
+            } else {
+                SPDLOG_ERROR("Unrecognized custom request key {}", key);
+                response.result(beast::http::status::bad_request);
+                response.body() =
+                  std::string("Unrecognized custom request key");
+                return ctx.sendFunction(std::move(response));
+            }
+
             response.result(beast::http::status::ok);
             return ctx.sendFunction(std::move(response));
         }
@@ -350,6 +365,75 @@ void PlannerEndpointHandler::onRequest(
                 response.body() = std::string("Failed to register state");
                 return ctx.sendFunction(std::move(response));
             }
+            return ctx.sendFunction(std::move(response));
+        }
+        case faabric::planner::HttpMessage_Type_REGISTER_APPLICATION: {
+            SPDLOG_INFO("Planner received REGISTER_APPLICATION request");
+            faabric::planner::RegisterApplicationRequest rawReq;
+            try {
+                faabric::util::jsonToMessage(msg.payloadjson(), &rawReq);
+            } catch (faabric::util::JsonSerialisationException e) {
+                response.result(beast::http::status::bad_request);
+                response.body() = std::string("Bad JSON in body's payload");
+                return ctx.sendFunction(std::move(response));
+            }
+            std::string appName = rawReq.appname();
+            auto applicationPtr =
+              std::make_unique<faabric::batch_scheduler::Application>(appName);
+
+            for (const auto& node : rawReq.nodes()) {
+                batch_scheduler::NodeType type =
+                  static_cast<batch_scheduler::NodeType>(node.type());
+                if (type == batch_scheduler::NodeType::STATELESS) {
+                    batch_scheduler::Node n(node.name(), type);
+                    applicationPtr->addNode(
+                      std::make_shared<batch_scheduler::Node>(n), node.input());
+                } else {
+                    std::string partitionBy = "None";
+                    if (type ==
+                        batch_scheduler::NodeType::PARTITIONED_STATEFUL) {
+                        partitionBy = node.partitionby();
+                    }
+                    batch_scheduler::Node n(
+                      node.name(), type, node.parallelism(), partitionBy);
+                    applicationPtr->addNode(
+                      std::make_shared<batch_scheduler::Node>(n), node.input());
+                }
+                if (node.successornode_size() > 0) {
+                    for (const auto& successor : node.successornode()) {
+                        applicationPtr->addConnection(node.name(), successor);
+                    }
+                }
+            }
+
+            faabric::planner::getPlanner().registerApp(
+              std::move(applicationPtr));
+
+            // Register the states.
+            for (const auto& node : rawReq.nodes()) {
+                batch_scheduler::NodeType type =
+                  static_cast<batch_scheduler::NodeType>(node.type());
+                if (type == batch_scheduler::NodeType::STATELESS) {
+                    continue;
+                }
+                std::string userFunction = node.name();
+                std::string partitionBy = node.partitionby();
+                std::string stateKey;
+                if (type == batch_scheduler::NodeType::PARTITIONED_STATEFUL) {
+                    stateKey = "Unknown";
+                } else {
+                    stateKey = "None";
+                }
+                planner::getPlanner().registerFuncState(
+                  userFunction, partitionBy, stateKey);
+                if (node.parallelism() > 1) {
+                    planner::getPlanner().updateFuncPar(userFunction,
+                                                        node.parallelism());
+                }
+            }
+
+            planner::getPlanner().initFuncState();
+
             return ctx.sendFunction(std::move(response));
         }
         case faabric::planner::HttpMessage_Type_OUTPUT_RESULT: {

@@ -27,6 +27,12 @@ class InstanceMetrics
       : instanceName(instanceNameIn)
       , period(periodIn) {};
 
+    long getCount() const
+    {
+        faabric::util::FullLock lock(instMx);
+        return count;
+    }
+
     void record(const std::shared_ptr<faabric::Message>& msg)
     {
         faabric::util::FullLock lock(instMx);
@@ -160,6 +166,17 @@ class ApplicationMetrics
         if (tempEndTime > endTime) {
             endTime = tempEndTime;
         }
+    }
+
+    std::map<std::string, long> getWorkloads(){
+        faabric::util::FullLock lock(opMx);
+
+        std::map<std::string, long> workloads;
+        for (const auto& [instName, instancePtr] : instances) {
+            workloads[instName] = instancePtr->getCount();
+        }
+
+        return workloads;
     }
 
     std::string getMetrics() const

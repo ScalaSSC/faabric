@@ -11,5 +11,6 @@ enum FunctionCalls
     ResetParameter = 5,
     ExecuteFunctionsBatch = 6,
     SyncStatesInfo = 7,
+    MigrateStates = 8,
 };
 }
