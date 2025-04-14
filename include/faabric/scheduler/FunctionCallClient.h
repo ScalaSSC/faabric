@@ -1,5 +1,6 @@
 #pragma once
 
+#include <faabric/batch-scheduler/WorkersLoadState.h>
 #include <faabric/planner/planner.pb.h>
 #include <faabric/proto/faabric.pb.h>
 #include <faabric/scheduler/FunctionCallApi.h>
@@ -47,6 +48,9 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
 
     void setMessageResult(std::shared_ptr<faabric::Message> msg);
 
+    void getWorkerLoad(
+      faabric::batch_scheduler::WorkersLoadState& workersLoadState);
+
     void resetParameter(
       std::shared_ptr<faabric::planner::ResetStreamParameterRequest> req);
 
@@ -56,8 +60,7 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
     void syncStateInfo(
       std::shared_ptr<faabric::planner::SyncStatesInfoRequest> info);
 
-    void migrateStates(
-      std::shared_ptr<faabric::StateMigrationRequest> req);
+    void migrateStates(std::shared_ptr<faabric::StateMigrationRequest> req);
 };
 
 // -----------------------------------

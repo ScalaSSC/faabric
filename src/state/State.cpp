@@ -63,7 +63,7 @@ State::schedulePreStates(
         }
         const auto& info = statesInfo.at(userFunc);
         std::shared_ptr<faabric::util::ConsistentHashRing> hashRing;
-        if (state->getIsPartitioned() ){
+        if (state->getIsPartitioned()) {
             if (!hashRings.contains(userFunc)) {
                 SPDLOG_ERROR("Hash ring not found for function {}", userFunc);
                 throw std::runtime_error("Hash ring not found for function");

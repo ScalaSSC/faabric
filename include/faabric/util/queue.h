@@ -369,7 +369,7 @@ class BatchQueue : public BatchQueueBase
 {
   protected:
     std::string userFuncPar;
-    const int batchSize;
+    int batchSize;
     std::queue<std::unique_ptr<faabric::Message>> batchQueue;
     int messagesCount = 0;
     std::mutex m_mutex;
@@ -462,6 +462,18 @@ class BatchQueue : public BatchQueueBase
             lastTime = faabric::util::getGlobalClock().epochMillis();
         }
     }
+
+    std::string getUserFuncPar()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return userFuncPar;
+    }
+
+    void resetBatchSize(int newBatchSize)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        batchSize = newBatchSize;
+    }
 };
 
 class PartitionedStateMessageQueue : public BatchQueue
@@ -526,7 +538,7 @@ class PartitionedStateMessageQueue : public BatchQueue
 
         messagesCount++;
         enqueueBatchSize++;
-        if (enqueueBatchSize == batchSize) {
+        if (enqueueBatchSize >= batchSize) {
             enqueueBatchNum++;
             enqueueBatchSize = 0;
         }

@@ -24,7 +24,6 @@ faabric_lib(planner
     PlannerClient.cpp
     PlannerEndpointHandler.cpp
     PlannerServer.cpp
-    FunctionLatency.cpp
     FunctionMetrics.cpp
     ${PLANNER_PB_SRC}
 )

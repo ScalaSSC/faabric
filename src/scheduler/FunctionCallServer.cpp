@@ -59,6 +59,9 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::MigrateStates: {
             return recvMigrateStates(message.udata());
         }
+        case faabric::scheduler::FunctionCalls::GetWorkerLoad: {
+            return recvGetWorkerLoad(message.udata());
+        }
         default: {
             throw std::runtime_error(
               fmt::format("Unrecognized sync call header: {}", header));
@@ -141,6 +144,21 @@ FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
     scheduler.storeMigrateState(std::move(immiStates));
 
     return std::make_unique<faabric::EmptyResponse>();
+}
+
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvGetWorkerLoad(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
+    auto instancesLoads = faabric::scheduler::getScheduler().statsLocalLoad();
+
+    faabric::InstancesLoadState response;
+    auto* loadMap = response.mutable_instancesload();
+    for (const auto& [instanceName, instanceLoad] : instancesLoads) {
+        (*loadMap)[instanceName] = instanceLoad;
+    }
+
+    return std::make_unique<faabric::InstancesLoadState>(response);
 }
 
 void FunctionCallServer::recvExecuteFunctions(std::span<const uint8_t> buffer)

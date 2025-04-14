@@ -149,9 +149,10 @@ message Message {
     // Exec-graph utils
     bool recordExecGraph = 35 [json_name = "record_exec_graph"];
     repeated int32 chainedMsgIds = 36;
-    map<string, int32> intExecGraphDetails = 37;
-    map<string, string> execGraphDetails = 38;
+    // map<string, int32> intExecGraphDetails = 37;
+    // map<string, string> execGraphDetails = 38;
 
+    int32 executeBatchSize = 86;
     // Chained Call numbers
     int32 chainedMsgNum = 87;
     // State
@@ -161,8 +162,8 @@ message Message {
     int64 plannerQueueTime = 89;
     int64 plannerPopTime = 90;
     int64 plannerDispatchTime = 91;
-    int64 workerQueueTime = 92;
-    int64 workerPopTime = 93;
+    map<string, int64> metricRecorder = 92;
+    int32 workerQueueWaitTime = 93;
     // Time for claiming executor
     int32 ExecutorPrepareTime = 94;
     int64 workerExecuteStart = 95;
@@ -356,4 +357,8 @@ message MigrateState{
 
 message StateMigrationRequest{
     repeated MigrateState migrateStates = 1;
+}
+
+message InstancesLoadState{
+    map<string, int32> instancesLoad = 1;
 }

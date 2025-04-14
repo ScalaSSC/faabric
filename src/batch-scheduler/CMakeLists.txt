@@ -2,6 +2,7 @@ faabric_lib(scheduling_util
     DecisionCache.cpp
     SchedulingDecision.cpp
     Application.cpp
+    WorkersLoadState.cpp
 )
 
 faabric_lib(batch_scheduler

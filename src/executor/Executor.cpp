@@ -325,6 +325,7 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             ExecutorContext::set(this, task.req, task.messageIndex);
             // Execute the task
             int32_t returnValue;
+            int32_t executeBatchSize = task.req->messages_size();
             try {
                 returnValue =
                   executeTask(threadPoolIdx, task.messageIndex, task.req);
@@ -346,6 +347,8 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             for (int i = 0; i < task.req->messages_size(); i++) {
                 task.req->mutable_messages()->at(i).set_returnvalue(
                   returnValue);
+                task.req->mutable_messages()->at(i).set_executebatchsize(
+                  executeBatchSize);
             }
 
             std::atomic_thread_fence(std::memory_order_release);

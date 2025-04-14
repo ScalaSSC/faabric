@@ -39,12 +39,11 @@ void DecentralizedScheduler::syncStatesInfo(
         SPDLOG_INFO(
           "Stateful function {} with {} parallelism", func, info.parallelism);
 
-        if (info.parallelism != info.stateHost.size())
-        {
+        if (info.parallelism != info.stateHost.size()) {
             SPDLOG_ERROR("Parallelism and stateHost size mismatch");
             throw std::runtime_error("Parallelism and stateHost size mismatch");
         }
-        
+
         functionParallelism[func] = info.parallelism;
         for (const auto& [parallelismIdx, host] : info.stateHost) {
             std::string stateKey = func + "_" + std::to_string(parallelismIdx);
@@ -66,6 +65,7 @@ void DecentralizedScheduler::syncStatesInfo(
     }
 }
 
+// Decentralized scheduler assign stateless messages locally.
 std::string DecentralizedScheduler::scheduleMessage(
   const HostMap& hostMap,
   const std::unique_ptr<Message>& msg)
@@ -103,6 +103,16 @@ std::string DecentralizedScheduler::scheduleMessage(
     }
     // Otherwise the request by using round robin.
     else {
+        auto workerloads = workersLoadState.getWorkerStats(userFunc + "_0");
+        SPDLOG_DEBUG("GET WORKER LOADS FOR {} and its size is {}", userFunc, 
+                     workerloads.size());
+        for (const auto& [workerIP, stats] : workerloads) {
+            const auto& [load, avgTransferTime] = stats;
+            SPDLOG_DEBUG("Worker IP: {}, Load: {}, Average Transfer Time: {}",
+                         workerIP,
+                         load,
+                         avgTransferTime);
+        }
         host = localHost;
         msg->set_messagetype(0);
     }
@@ -114,6 +124,7 @@ std::string DecentralizedScheduler::scheduleMessage(
     return host;
 }
 
+// Schedule Message Mode 1 is using round robin to assgin stateless requests.
 std::string DecentralizedScheduler::scheduleMessageMode1(
   const HostMap& hostMap,
   const std::unique_ptr<Message>& msg)

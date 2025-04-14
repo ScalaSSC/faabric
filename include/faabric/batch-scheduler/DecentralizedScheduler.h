@@ -1,6 +1,7 @@
 #pragma once
 
 #include <faabric/batch-scheduler/StateAwareScheduler.h>
+#include <faabric/batch-scheduler/WorkersLoadState.h>
 
 namespace faabric::batch_scheduler {
 
@@ -28,10 +29,14 @@ class DecentralizedScheduler final : public StateAwareScheduler
 
     void setScheduleMode(int mode);
 
+    WorkersLoadState& getWorkersLoadState() { return workersLoadState; }
+
   private:
     std::string localHost;
 
     int scheduleMode = 0;
+
+    WorkersLoadState workersLoadState;
 };
 
 }

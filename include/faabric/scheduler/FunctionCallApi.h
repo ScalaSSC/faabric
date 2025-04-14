@@ -7,7 +7,7 @@ enum FunctionCalls
     ExecuteFunctions = 1,
     Flush = 2,
     SetMessageResult = 3,
-    ExecuteFunctionsLazy = 4,
+    GetWorkerLoad = 4,
     ResetParameter = 5,
     ExecuteFunctionsBatch = 6,
     SyncStatesInfo = 7,

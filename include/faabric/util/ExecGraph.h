@@ -49,11 +49,11 @@ std::string execNodeToJson(const ExecGraphNode& node);
 
 std::string execGraphToJson(const ExecGraph& graph);
 
-void addDetail(faabric::Message& msg,
-               const std::string& key,
-               const std::string& value);
+// void addDetail(faabric::Message& msg,
+//                const std::string& key,
+//                const std::string& value);
 
-void incrementCounter(faabric::Message& msg,
-                      const std::string& key,
-                      const int valueToIncrement = 1);
+// void incrementCounter(faabric::Message& msg,
+//                       const std::string& key,
+//                       const int valueToIncrement = 1);
 }

@@ -236,29 +236,29 @@ std::string execGraphToJson(const ExecGraph& graph)
     return res.str();
 }
 
-void addDetail(faabric::Message& msg,
-               const std::string& key,
-               const std::string& value)
-{
-    if (!msg.recordexecgraph()) {
-        return;
-    }
+// void addDetail(faabric::Message& msg,
+//                const std::string& key,
+//                const std::string& value)
+// {
+//     if (!msg.recordexecgraph()) {
+//         return;
+//     }
 
-    auto& stringMap = *msg.mutable_execgraphdetails();
+//     auto& stringMap = *msg.mutable_execgraphdetails();
 
-    stringMap[key] = value;
-}
+//     stringMap[key] = value;
+// }
 
-void incrementCounter(faabric::Message& msg,
-                      const std::string& key,
-                      const int valueToIncrement)
-{
-    if (!msg.recordexecgraph()) {
-        return;
-    }
+// void incrementCounter(faabric::Message& msg,
+//                       const std::string& key,
+//                       const int valueToIncrement)
+// {
+//     if (!msg.recordexecgraph()) {
+//         return;
+//     }
 
-    auto& stringMap = *msg.mutable_intexecgraphdetails();
+//     auto& stringMap = *msg.mutable_intexecgraphdetails();
 
-    stringMap[key] += valueToIncrement;
-}
+//     stringMap[key] += valueToIncrement;
+// }
 }

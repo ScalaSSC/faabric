@@ -2,7 +2,6 @@
 
 #include <faabric/batch-scheduler/BatchScheduler.h>
 #include <faabric/batch-scheduler/SchedulingDecision.h>
-#include <faabric/planner/FunctionLatency.h>
 #include <faabric/planner/planner.pb.h>
 #include <faabric/proto/faabric.pb.h>
 #include <faabric/util/queue.h>
@@ -41,10 +40,11 @@ class InstanceMetrics
           msg->plannerpoptime() - msg->plannerqueuetime();
         int newPlannerConsumeTime =
           msg->plannerdispatchtime() - msg->plannerpoptime();
-        int newWorkerQueueTime = msg->workerpoptime() - msg->workerqueuetime();
+        int newWorkerQueueTime = msg->workerqueuewaittime();
         int newExecutorPrepTime = msg->executorpreparetime();
         int newWorkerExecuteTime =
           msg->workerexecuteend() - msg->workerexecutestart();
+        int newExecuteBatchSize = msg->executebatchsize();
 
         count++;
 
@@ -68,6 +68,15 @@ class InstanceMetrics
           avgWorkerExecuteTime +
           (static_cast<double>(newWorkerExecuteTime) - avgWorkerExecuteTime) /
             static_cast<double>(count);
+        int recordBatchSize = ++batchCounter[newExecuteBatchSize];
+        if (recordBatchSize >= newExecuteBatchSize) {
+            batchCount++;
+            avgExecuteBatchSize =
+              avgExecuteBatchSize +
+              (static_cast<double>(newExecuteBatchSize) - avgExecuteBatchSize) /
+                static_cast<double>(batchCount);
+            batchCounter[newExecuteBatchSize] = 0;
+        }
 
         std::string host = msg->executedhost();
         hostStats[host]++;
@@ -91,6 +100,7 @@ class InstanceMetrics
         doc.AddMember("avgWorkerQueueTime", avgWorkerQueueTime, alloc);
         doc.AddMember("avgExecutorPrepTime", avgExecutorPrepTime, alloc);
         doc.AddMember("avgWorkerExecuteTime", avgWorkerExecuteTime, alloc);
+        doc.AddMember("avgExecuteBatchSize", avgExecuteBatchSize, alloc);
 
         rapidjson::Value hostStatsObj(rapidjson::kObjectType);
         for (const auto& [host, stat] : hostStats) {
@@ -112,18 +122,39 @@ class InstanceMetrics
         return buffer.GetString();
     }
 
+    void reset()
+    {
+        faabric::util::FullLock lock(instMx);
+
+        count = 0;
+        batchCount = 0;
+
+        avgPlannerQueueTime = 0.0;
+        avgPlannerConsumeTime = 0.0;
+        avgWorkerQueueTime = 0.0;
+        avgExecutorPrepTime = 0.0;
+        avgWorkerExecuteTime = 0.0;
+        avgExecuteBatchSize = 0.0;
+
+        batchCounter.clear();
+        hostStats.clear();
+    }
+
   private:
     // Name is User_Func_Par
     mutable std::shared_mutex instMx;
     const std::string instanceName;
     const int period;
     long count = 0;
+    long batchCount = 0;
 
     double avgPlannerQueueTime = 0.0;
     double avgPlannerConsumeTime = 0.0;
     double avgWorkerQueueTime = 0.0;
     double avgExecutorPrepTime = 0.0;
     double avgWorkerExecuteTime = 0.0;
+    double avgExecuteBatchSize = 0.0;
+    std::map<int, int> batchCounter;
     std::map<std::string, int> hostStats;
 };
 
@@ -168,7 +199,8 @@ class ApplicationMetrics
         }
     }
 
-    std::map<std::string, long> getWorkloads(){
+    std::map<std::string, long> getWorkloads()
+    {
         faabric::util::FullLock lock(opMx);
 
         std::map<std::string, long> workloads;
@@ -268,6 +300,20 @@ class ApplicationMetrics
         rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
         doc.Accept(writer);
         return buffer.GetString();
+    }
+
+    void reset()
+    {
+        faabric::util::FullLock lock(opMx);
+
+        count = 0;
+        startTime = std::numeric_limits<int64_t>::max();
+        endTime = std::numeric_limits<int64_t>::min();
+        latencies.clear();
+
+        for (auto& [instName, instancePtr] : instances) {
+            instancePtr->reset();
+        }
     }
 
   private:

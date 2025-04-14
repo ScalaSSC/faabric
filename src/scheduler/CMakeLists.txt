@@ -2,6 +2,7 @@ faabric_lib(scheduler
     FunctionCallClient.cpp
     FunctionCallServer.cpp
     Scheduler.cpp
+    InstancesLoadState.cpp
 )
 
 # FIXME: do we need all these deps here?
