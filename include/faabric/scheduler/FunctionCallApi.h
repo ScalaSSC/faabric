@@ -12,5 +12,6 @@ enum FunctionCalls
     ExecuteFunctionsBatch = 6,
     SyncStatesInfo = 7,
     MigrateStates = 8,
+    GetRuntimeStats = 9,
 };
 }

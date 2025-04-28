@@ -133,8 +133,20 @@ message RegisterHostResponse {
     repeated FunctionStateInfo statesInfo = 7;
 }
 
+message StatelessWeight {
+    map<string, int32> hostWeight = 1;
+}
+
+message ParStateWeight {
+    map<int32, int32> partitionWeight = 1;
+}
+
 message SyncStatesInfoRequest {
     repeated FunctionStateInfo statesInfo = 1;
+    map<string, StatelessWeight> statelessReqWeight = 2;
+    map<string, ParStateWeight>  parStateReqWeight = 3;    
+    map<string, string> operatorCollocateMap = 4;
+    map<string, string> operatorCollocateHeadMap = 5;
 }
 
 message SyncStatesInfoResponse {
@@ -216,6 +228,7 @@ message Node{
     bool input = 4;
     int32 parallelism = 5;
     repeated string successorNode = 6;
+    repeated string inputFields = 7;
 }
 
 message RegisterApplicationRequest{

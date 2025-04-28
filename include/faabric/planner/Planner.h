@@ -104,15 +104,14 @@ class Planner
                            const std::string& partitionBy,
                            const std::string& stateKey);
 
-    bool updateFuncPar(const std::string& userFunc,
-                       int newPar,
-                       bool init = false);
+    bool updateFuncPar(const std::string& userFunc, int newPar);
 
     bool resetParameter(const std::string& key,
                         const int32_t value,
                         bool plannerParameter = false);
 
-    void initFuncState();
+    void initFuncState(std::vector<std::string> statelessOpts,
+                       std::map<std::string, int> parStateOpts);
 
     void rescheduleApp();
 
@@ -153,6 +152,9 @@ class Planner
     // ---- Batch Call Scheduled Requests ----
     std::thread dequeueScheduledMsgsThread;
 
+    std::thread updateRuntimeStatsThread;
+
+    int scheduleMode = 0;
     bool streamMode = faabric::util::getSystemConfig().streamMode;
     long lastParallelismUpdate;
     int parallelismUpdateInterval;
@@ -187,6 +189,8 @@ class Planner
 
     int dispatchPeriod = 20; // ms
 
+    int runtimeStatsUpdatePeriod = 5000; // ms
+
     void dequeueScheduledMsgs();
 
     bool isOutputting = false;
@@ -196,6 +200,8 @@ class Planner
     void doRescheduleMessages();
 
     std::atomic<int> migratingHostNum{ 0 };
+
+    void updateRuntimeStats();
 };
 
 Planner& getPlanner();

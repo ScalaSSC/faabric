@@ -59,8 +59,11 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::MigrateStates: {
             return recvMigrateStates(message.udata());
         }
-        case faabric::scheduler::FunctionCalls::GetWorkerLoad: {
-            return recvGetWorkerLoad(message.udata());
+        // case faabric::scheduler::FunctionCalls::GetWorkerLoad: {
+        //     return recvGetWorkerLoad(message.udata());
+        // }
+        case faabric::scheduler::FunctionCalls::GetRuntimeStats: {
+            return recvGetRuntimeStats(message.udata());
         }
         default: {
             throw std::runtime_error(
@@ -94,6 +97,45 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
                 faabric::util::getSystemConfig().endpointHost);
 
     PARSE_MSG(planner::SyncStatesInfoRequest, buffer.data(), buffer.size())
+
+    // Update the stateless and partitioned stateful operator weights.
+    std::map<std::string, std::map<std::string, int>> newStatelessReqWeight;
+    std::map<std::string, std::map<int, int>> newParStateReqWeight;
+    std::map<std::string, std::string> newOptCollocate;
+    std::map<std::string, std::string> newOptCollocateHead;
+
+    const auto& srwMap = parsedMsg.statelessreqweight();
+    for (const auto& outer : srwMap) {
+        const std::string& funcPar = outer.first;
+        const auto& innerMsg = outer.second;
+
+        const auto& hostMap = innerMsg.hostweight();
+        for (const auto& hostPair : hostMap) {
+            newStatelessReqWeight[funcPar][hostPair.first] = hostPair.second;
+        }
+    }
+
+    const auto& pswMap = parsedMsg.parstatereqweight();
+    for (const auto& outer : pswMap) {
+        const std::string& userFunc = outer.first;
+        const auto& innerMsg = outer.second;
+
+        const auto& partMap = innerMsg.partitionweight();
+        for (const auto& partPair : partMap) {
+            newParStateReqWeight[userFunc][partPair.first] = partPair.second;
+        }
+    }
+
+    const auto& ocMap = parsedMsg.operatorcollocatemap();
+    for (const auto& [statelessOp, parStateOp] : ocMap) {
+        newOptCollocate[statelessOp] = parStateOp;
+    }
+
+    const auto& ochMap = parsedMsg.operatorcollocateheadmap();
+    for (const auto& [statelessOp, parStateOp] : ochMap) {
+        newOptCollocateHead[statelessOp] = parStateOp;
+    }
+
     std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>
       tempStatesInfoMap;
 
@@ -113,7 +155,11 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
                      faabric::batch_scheduler::to_string(info));
     }
 
-    scheduler.updateStatesInfo(tempStatesInfoMap);
+    scheduler.updateStatesInfo(newStatelessReqWeight,
+                               newParStateReqWeight,
+                               newOptCollocate,
+                               newOptCollocateHead,
+                               tempStatesInfoMap);
 
     return std::make_unique<planner::SyncStatesInfoResponse>();
 }
@@ -146,19 +192,108 @@ FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
     return std::make_unique<faabric::EmptyResponse>();
 }
 
-std::unique_ptr<google::protobuf::Message>
-FunctionCallServer::recvGetWorkerLoad(std::span<const uint8_t> buffer)
-{
-    PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
-    auto instancesLoads = faabric::scheduler::getScheduler().statsLocalLoad();
+// std::unique_ptr<google::protobuf::Message>
+// FunctionCallServer::recvGetWorkerLoad(std::span<const uint8_t> buffer)
+// {
+//     PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
+//     auto instancesLoads =
+//     faabric::scheduler::getScheduler().statsLocalLoad();
 
-    faabric::InstancesLoadState response;
-    auto* loadMap = response.mutable_instancesload();
-    for (const auto& [instanceName, instanceLoad] : instancesLoads) {
-        (*loadMap)[instanceName] = instanceLoad;
+//     faabric::InstancesLoadState response;
+//     auto* loadMap = response.mutable_instancesload();
+//     for (const auto& [instanceName, instanceLoad] : instancesLoads) {
+//         (*loadMap)[instanceName] = instanceLoad;
+//     }
+
+//     return std::make_unique<faabric::InstancesLoadState>(response);
+// }
+
+void logRuntimeStatsUpdateRequest(const faabric::RuntimeStatsUpdateRequest& req)
+{
+    std::ostringstream oss;
+    oss << "RuntimeStatsUpdateRequest:\n";
+
+    int numResults = req.collectedstats_size();
+    oss << "Number of collected results: " << numResults << "\n";
+
+    for (int i = 0; i < numResults; i++) {
+        const auto& result = req.collectedstats(i);
+        oss << "Result [" << i << "]:\n";
+        oss << "  Host: " << result.host() << "\n";
+
+        int numInstances = result.instancesstats_size();
+        oss << "  Number of instance stats: " << numInstances << "\n";
+
+        for (int j = 0; j < numInstances; j++) {
+            const auto& instance = result.instancesstats(j);
+            oss << "    Instance [" << j << "]:\n";
+            oss << "      Instance Name: " << instance.instancename() << "\n";
+            oss << "      Executed Count: " << instance.executedcount() << "\n";
+            oss << "      Chained Call Count: " << instance.chainedcallcount()
+                << "\n";
+
+            // Log the sourceStats map.
+            oss << "      sourceStats: { ";
+            for (const auto& entry : instance.sourcestats()) {
+                oss << entry.first << ": " << entry.second << " ";
+            }
+            oss << "}\n";
+
+            // Log the chainedCallStats map.
+            oss << "      chainedCallStats: { ";
+            for (const auto& entry : instance.chainedcallstats()) {
+                oss << entry.first << ": " << entry.second << " ";
+            }
+            oss << "}\n";
+        }
     }
 
-    return std::make_unique<faabric::InstancesLoadState>(response);
+    spdlog::debug("{}", oss.str());
+}
+
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvGetRuntimeStats(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::RuntimeStatsUpdateRequest, buffer.data(), buffer.size())
+
+    // Collect the stats
+    auto stats = faabric::scheduler::getScheduler().getRuntimeStats();
+
+    faabric::RuntimeStatsResult response;
+    response.set_host(faabric::util::getSystemConfig().endpointHost);
+
+    for (const auto& [instanceName, instanceStats] : stats) {
+        faabric::InstanceStatsPayload* payload = response.add_instancesstats();
+        payload->set_instancename(instanceName);
+        payload->set_executedcount(instanceStats.executedCount);
+
+        for (const auto& [source, count] : instanceStats.sourceStats) {
+            (*payload->mutable_sourcestats())[source] = count;
+        }
+
+        payload->set_chainedcallcount(instanceStats.chainedCallCount);
+
+        for (const auto& [dest, count] : instanceStats.chainedCallStats) {
+            (*payload->mutable_chainedcallstats())[dest] = count;
+        }
+    }
+
+    // Update the new collected stats to scheduler
+    // Get the source stats.
+    // logRuntimeStatsUpdateRequest(parsedMsg);
+    std::map<std::string, std::map<std::string, int>> sourceCountStats;
+    for (const auto& result : parsedMsg.collectedstats()) {
+        std::string hostIp = result.host();
+        for (const auto& instance : result.instancesstats()) {
+            std::string instanceName = instance.instancename();
+            int chainedCallCount = instance.chainedcallcount();
+            sourceCountStats[instanceName][hostIp] = chainedCallCount;
+        }
+    }
+
+    scheduler.updateStatelessDist(sourceCountStats);
+
+    return std::make_unique<faabric::RuntimeStatsResult>(std::move(response));
 }
 
 void FunctionCallServer::recvExecuteFunctions(std::span<const uint8_t> buffer)
@@ -206,7 +341,7 @@ void FunctionCallServer::recvResetParameter(std::span<const uint8_t> buffer)
         faabric::scheduler::getScheduler().resetParameter(key, value);
     } else if (key == "max_replicas") {
         faabric::scheduler::getScheduler().resetParameter(key, value);
-    } else if (key == "decentral_schedule_mode") {
+    } else if (key == "schedule_mode") {
         faabric::scheduler::getScheduler().resetParameter(key, value);
     } else {
         throw std::runtime_error(

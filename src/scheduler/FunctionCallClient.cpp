@@ -82,25 +82,35 @@ void FunctionCallClient::sendFlush()
     }
 }
 
-void FunctionCallClient::getWorkerLoad(
-  faabric::batch_scheduler::WorkersLoadState& workersLoadState)
+// void FunctionCallClient::getWorkerLoad(
+//   faabric::batch_scheduler::WorkersLoadState& workersLoadState)
+// {
+//     faabric::EmptyRequest req;
+//     faabric::InstancesLoadState resp;
+//     auto startTime = faabric::util::getGlobalClock().epochMicros();
+//     syncSend(faabric::scheduler::GetWorkerLoad, &req, &resp);
+//     auto endTime = faabric::util::getGlobalClock().epochMicros();
+//     auto elapsedTime = endTime - startTime;
+//     SPDLOG_DEBUG("Get worker load took {} micros", elapsedTime);
+//     std::map<std::string, int> instancesLoadMap;
+//     SPDLOG_DEBUG("Obtained for host {}", host);
+//     for (const auto& [instanceName, instanceLoad] : resp.instancesload()) {
+//         SPDLOG_DEBUG(
+//           "Obtained Instance {} with load: {}", instanceName, instanceLoad);
+//         instancesLoadMap[instanceName] = instanceLoad;
+//     }
+//     workersLoadState.updateState(
+//       std::move(host), std::move(instancesLoadMap), elapsedTime / 2);
+// }
+
+std::unique_ptr<faabric::RuntimeStatsResult>
+FunctionCallClient::getRuntimeStats(faabric::RuntimeStatsUpdateRequest req)
 {
-    faabric::EmptyRequest req;
-    faabric::InstancesLoadState resp;
-    auto startTime = faabric::util::getGlobalClock().epochMicros();
-    syncSend(faabric::scheduler::GetWorkerLoad, &req, &resp);
-    auto endTime = faabric::util::getGlobalClock().epochMicros();
-    auto elapsedTime = endTime - startTime;
-    SPDLOG_DEBUG("Get worker load took {} micros", elapsedTime);
-    std::map<std::string, int> instancesLoadMap;
-    SPDLOG_DEBUG("Obtained for host {}", host);
-    for (const auto& [instanceName, instanceLoad] : resp.instancesload()) {
-        SPDLOG_DEBUG(
-          "Obtained Instance {} with load: {}", instanceName, instanceLoad);
-        instancesLoadMap[instanceName] = instanceLoad;
-    }
-    workersLoadState.updateState(
-      std::move(host), std::move(instancesLoadMap), elapsedTime / 2);
+    // Not sure if syncSend the same req with multiple threads to different
+    // hosts is thread safe. Copy the req just in case. So we don't use &.
+    faabric::RuntimeStatsResult resp;
+    syncSend(faabric::scheduler::FunctionCalls::GetRuntimeStats, &req, &resp);
+    return std::make_unique<faabric::RuntimeStatsResult>(resp);
 }
 
 void FunctionCallClient::executeFunctions(
@@ -139,6 +149,8 @@ void FunctionCallClient::executeFunctionsBatch(
     auto batchMsgsList = std::make_shared<faabric::MessageBatch>();
     SPDLOG_DEBUG(
       "Batch execute call {} with Batch size: {}", host, msgs.size());
+    batchMsgsList->set_invokehost(
+      faabric::util::getSystemConfig().endpointHost);
     for (auto& msg : msgs) {
         batchMsgsList->add_messages()->CopyFrom(*msg);
     }

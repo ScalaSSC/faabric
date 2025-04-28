@@ -2,9 +2,11 @@
 
 #include <faabric/batch-scheduler/Application.h>
 #include <faabric/batch-scheduler/BatchScheduler.h>
+#include <faabric/batch-scheduler/RuntimeSummary.h>
 #include <faabric/planner/FunctionMetrics.h>
 #include <faabric/util/config.h>
 #include <faabric/util/hash.h>
+#include <faabric/util/locks.h>
 
 #include <map>
 #include <set>
@@ -13,6 +15,9 @@
 #include <tuple>
 
 namespace faabric::batch_scheduler {
+
+using NodeGroup = std::tuple<std::vector<std::shared_ptr<Node>>, std::string>;
+inline const std::string NONE_STRING = "None";
 
 struct HashAndParallelismInfo
 {
@@ -54,10 +59,6 @@ class StateAwareScheduler : public BatchScheduler
                               int numIncrease,
                               const HostMap& hostMap);
 
-    void reduceFuncStatePar(const std::string& userFunction,
-                            int numDecrease,
-                            const HostMap& hostMap);
-
   private:
     bool isFirstDecisionBetter(
       std::shared_ptr<SchedulingDecision> decisionA,
@@ -82,6 +83,18 @@ class StateAwareScheduler : public BatchScheduler
 
     virtual ~StateAwareScheduler() = default;
 
+    std::string scheduleStatelessMessageRB(std::string& userFunc,
+                                           const HostMap& hostMap,
+                                           const std::unique_ptr<Message>& msg);
+
+    std::string scheduleStatelessMessageApportion(
+      std::string& userFunc,
+      const HostMap& hostMap,
+      const std::unique_ptr<Message>& msg);
+
+    std::string scheduleStatefulMessage(std::string& userFunc,
+                                        const std::unique_ptr<Message>& msg);
+
     virtual std::string scheduleMessage(const HostMap& hostMap,
                                         const std::unique_ptr<Message>& msg);
 
@@ -94,6 +107,8 @@ class StateAwareScheduler : public BatchScheduler
       std::shared_ptr<std::map<std::string, std::string>> oldStateHost);
 
     virtual void resetScheduler();
+
+    void setScheduleMode(int mode);
 
     const std::map<std::string, int>& getFunctionParallelismMap() const
     {
@@ -117,15 +132,82 @@ class StateAwareScheduler : public BatchScheduler
         return stateHashRing;
     }
 
+    std::map<std::string, std::map<std::string, int>> getStatelessReqWeight()
+      const
+    {
+        return statelessReqWeight;
+    }
+
+    void setStatelessReqWeight(
+      const std::map<std::string, std::map<std::string, int>>& w)
+    {
+        statelessReqWeight = w;
+    }
+
+    std::map<std::string, std::map<int, int>> getParStateReqWeight() const
+    {
+        return parStateReqWeight;
+    }
+
+    void setParStateReqWeight(
+      const std::map<std::string, std::map<int, int>>& w)
+    {
+        parStateReqWeight = w;
+    }
+
+    std::map<std::string, std::string> getOptsCollocateMap() const
+    {
+        return optsCollocateMap;
+    }
+
+    void setOptsCollocateMap(const std::map<std::string, std::string>& w)
+    {
+        optsCollocateMap = w;
+        runtimeSummary.setOptsCollocateMap(w);
+    }
+
+    std::map<std::string, std::string> getOptsCollocateHeadMap() const
+    {
+        return optsCollocateHeadMap;
+    }
+
+    void setOptsCollocateHeadMap(const std::map<std::string, std::string>& w)
+    {
+        optsCollocateHeadMap = w;
+        runtimeSummary.setOptsCollocateHeadMap(w);
+    } 
+    
+    // The Req dist for both stateless and stateful functions.
+    void updateReqDist();
+
+    void reallocateSummaryDist(
+      const std::map<std::string, std::map<std::string, int>>&
+        sourceCountStats);
+
   protected:
     // scheduler lock
     std::shared_mutex scheduleMx;
 
+    int scheduleMode = 0;
+
     int maxParallelism;
 
-    // The counter used for round robin scheduling.
-    int rbCounter = 0;
-    std::atomic<unsigned int> atomicRbCounter{ 0 };
+    // hostAssign Counter is used when assign states to the hosts.
+    std::atomic<unsigned int> stateRbCounter{ 0 };
+
+    std::shared_mutex counterMx;
+    std::map<std::string, std::shared_ptr<std::atomic_uint>> counterTable;
+
+    int weightFactor = 1000;
+    // MAP <USER_FUNC_PARALLELISM, MAP<IP, proportion>>
+    std::map<std::string, std::map<std::string, int>> statelessReqWeight;
+    // MAP <USER_FUNC, MAP<PARALLELISM_IDX, proportion>>
+    std::map<std::string, std::map<int, int>> parStateReqWeight;
+    // MAP <STATELESS_OPERATOR, PARATITIONED_STATEFUL_OPERATOR>
+    std::map<std::string, std::string> optsCollocateMap;
+    std::map<std::string, std::string> optsCollocateHeadMap;
+
+    RuntimeSummary runtimeSummary;
 
     /***
      * The following maps are used to store the state of the functions.
@@ -133,7 +215,7 @@ class StateAwareScheduler : public BatchScheduler
     // Function_User : Parallelism
     std::map<std::string, int> functionParallelism;
     // Function_User : Counter. It is used for shuffle grouping.
-    std::map<std::string, int> functionCounter;
+    std::map<std::string, unsigned int> functionCounter;
     // Function_User_ParallelismIndex : Host
     std::map<std::string, std::string> stateHost;
     // Function_User : hashRing
@@ -168,5 +250,11 @@ class StateAwareScheduler : public BatchScheduler
       std::vector<std::shared_ptr<Node>>& currentGroup,
       std::vector<std::vector<std::shared_ptr<Node>>>& groups,
       std::unordered_set<std::string>& visited);
+
+    void groupNodesHelper(const std::string& nodeName,
+                          std::vector<std::shared_ptr<Node>>& currentGroup,
+                          std::string& currentPartition,
+                          std::vector<NodeGroup>& groups,
+                          std::unordered_set<std::string>& visited);
 };
 }

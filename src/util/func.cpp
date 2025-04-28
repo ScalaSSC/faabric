@@ -19,6 +19,12 @@ std::vector<uint8_t> messageToBytes(const faabric::Message& msg)
     return inputData;
 }
 
+std::string getUserFuncPar(const faabric::Message& msg) {
+    std::string userFuncPar = msg.user() + "_" + msg.function() + "_" +
+                              std::to_string(msg.parallelismid());
+    return userFuncPar;
+}
+
 std::string funcToString(const faabric::Message& msg, bool includeId)
 {
     std::string str = msg.user() + "/" + msg.function();

@@ -6,6 +6,8 @@
 #include <faabric/util/serialization.h>
 #include <faabric/util/string_tools.h>
 
+#include <algorithm>
+
 #define MAIN_KEY_PREFIX "main_"
 
 namespace faabric::batch_scheduler {
@@ -135,7 +137,7 @@ bool StateAwareScheduler::registerFunctionState(const std::string& userFunction,
 
     faabric::util::FullLock lock(scheduleMx);
 
-    if (partitionBy == "None" || stateKey == "None") {
+    if (partitionBy == NONE_STRING || stateKey == NONE_STRING) {
         funcStateRegMap[userFunction] = std::make_tuple("", "");
     } else {
         funcStateRegMap[userFunction] = std::make_tuple(partitionBy, stateKey);
@@ -153,6 +155,8 @@ HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
   const std::string& userFunction,
   const faabric::Message& msg)
 {
+    faabric::util::FullLock lock(scheduleMx);
+
     // For the partitioned stateful. Using key-partitioning.
     if (statePartitionBy.find(userFunction) != statePartitionBy.end()) {
         // get the input KEY.
@@ -163,11 +167,11 @@ HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
           faabric::util::deserializeMap(inputVec, index);
         std::string keyData = inputData[statePartitionBy[userFunction]];
         SPDLOG_TRACE("UserFunction {}'s input data: {}", userFunction, keyData);
-        // If the HashRing is not initialized, initialize it.
+        // If the HashRing is not initialized, throw error.
         if (stateHashRing.find(userFunction) == stateHashRing.end()) {
-            stateHashRing[userFunction] =
-              std::make_shared<faabric::util::ConsistentHashRing>(
-                functionParallelism[userFunction]);
+            SPDLOG_ERROR("HashRing for {} is not initialized", userFunction);
+            throw std::runtime_error("HashRing for " + userFunction +
+                                     " is not initialized");
         }
         // Hashing the keyData and set the partition index.
         std::vector<uint8_t> keyDataVec = faabric::util::stringToBytes(keyData);
@@ -185,8 +189,8 @@ HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
     // Otherwise, use shuffle data-partitioning.
     return { 1,
              0,
-             functionCounter[userFunction]++ %
-               functionParallelism[userFunction] };
+             static_cast<int>(functionCounter[userFunction]++ %
+                              functionParallelism[userFunction]) };
 }
 
 // Now, we only register the state to the Redis.
@@ -229,7 +233,8 @@ void StateAwareScheduler::registerState(const HostMap& hostMap,
     // The default parallelism is 1 and parallelism Idx is 0
     std::string funcParaId = userFunc + "_0";
     // Assign state to a host.
-    int hostIdx = rbCounter++ % hostMap.size();
+    int hostIdx =
+      stateRbCounter.fetch_add(1, std::memory_order_relaxed) % hostMap.size();
     std::string host = getNthKey(hostMap, hostIdx);
     stateHost[funcParaId] = host;
     // If it is partitioned state, register it.
@@ -242,6 +247,80 @@ void StateAwareScheduler::registerState(const HostMap& hostMap,
     registerStateToRedis(funcParaId, host);
 }
 
+std::string StateAwareScheduler::scheduleStatelessMessageRB(
+  std::string& userFunc,
+  const HostMap& hostMap,
+  const std::unique_ptr<Message>& msg)
+{
+    int counter;
+    {
+        faabric::util::FullLock lock(scheduleMx);
+        counter = functionCounter[userFunc]++;
+    }
+    int hostIdx = counter % hostMap.size();
+    std::string host = getNthKey(hostMap, hostIdx);
+    msg->set_messagetype(0);
+    return host;
+}
+
+std::string StateAwareScheduler::scheduleStatelessMessageApportion(
+  std::string& userFunc,
+  const HostMap& hostMap,
+  const std::unique_ptr<Message>& msg)
+{
+    std::string host = "unknown";
+    if (optsCollocateMap.contains(userFunc)) {
+        // If the optsCollocateMap contains the userFunc. We will try to
+        // collocate it with the state.
+        std::string& collocateFunc = optsCollocateMap[userFunc];
+        auto parallelismInfo = getHashAndParallelismIndex(collocateFunc, *msg);
+        std::string collocateUserFuncPar =
+          collocateFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
+        if (stateHost.find(collocateUserFuncPar) == stateHost.end()) {
+            throw std::runtime_error("StateHost is not initialized");
+        }
+        std::string collocateHost = stateHost[collocateUserFuncPar];
+        host = runtimeSummary.getHost(userFunc, collocateHost);
+    } else {
+        // Otherwise the request by using round robin.
+        std::string userFuncPar = userFunc + "_0";
+        std::shared_ptr<std::atomic_uint> counterPtr;
+        {
+            faabric::util::FullLock lock(counterMx);
+            auto& slot = counterTable[userFuncPar];
+            if (!slot) {
+                slot = std::make_shared<std::atomic_uint>(0u);
+            }
+            counterPtr = slot;
+        }
+        unsigned int localCounter =
+          counterPtr->fetch_add(1u, std::memory_order_relaxed);
+
+        host = runtimeSummary.getHost(userFuncPar, localCounter);
+    }
+    msg->set_messagetype(0);
+    return host;
+}
+
+std::string StateAwareScheduler::scheduleStatefulMessage(
+  std::string& userFunc,
+  const std::unique_ptr<Message>& msg)
+{
+    auto parallelismInfo = getHashAndParallelismIndex(userFunc, *msg);
+    std::string userFuncPar =
+      userFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
+    if (stateHost.find(userFuncPar) == stateHost.end()) {
+        throw std::runtime_error("StateHost is not initialized");
+    }
+    std::string host = stateHost[userFuncPar];
+    // Register the parallelismIdx to it.
+    // If Scheduling failed, the next scheduling will overwrite it.
+    msg->set_messagetype(parallelismInfo.messageType);
+    msg->set_hash(parallelismInfo.hash);
+    msg->set_parallelismid(parallelismInfo.parallelismIdx);
+    return host;
+}
+
 std::string StateAwareScheduler::scheduleMessage(
   const HostMap& hostMap,
   const std::unique_ptr<faabric::Message>& msg)
@@ -251,31 +330,22 @@ std::string StateAwareScheduler::scheduleMessage(
     }
     std::string userFunc = msg->user() + "_" + msg->function();
     std::string host = "unknown";
-    // For function-state function, assign near state
+    // Stateful or partitioned stateful function
     if (functionParallelism.contains(userFunc)) {
-        // If function-state has not been initialized, initialize it.
-        faabric::util::FullLock lock(scheduleMx);
         // TODO - get parallelism is not thread safe now
-        auto parallelismInfo = getHashAndParallelismIndex(userFunc, *msg);
-        lock.unlock();
-        std::string userFuncPar =
-          userFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
-        if (stateHost.find(userFuncPar) == stateHost.end()) {
-            throw std::runtime_error("StateHost is not initialized");
-        }
-        host = stateHost[userFuncPar];
-        // Register the parallelismIdx to it.
-        // If Scheduling failed, the next scheduling will overwrite it.
-        msg->set_messagetype(parallelismInfo.messageType);
-        msg->set_hash(parallelismInfo.hash);
-        msg->set_parallelismid(parallelismInfo.parallelismIdx);
+        host = scheduleStatefulMessage(userFunc, msg);
     }
-    // Otherwise the request by using round robin.
+    // stateless operator
     else {
-        int hostIdx = atomicRbCounter.fetch_add(1, std::memory_order_relaxed) %
-                      hostMap.size();
-        host = getNthKey(hostMap, hostIdx);
-        msg->set_messagetype(0);
+        if (scheduleMode == 0) {
+            // If schedule mode is 0 (The scheduler should dispatch stateless
+            // messages in accordance with the expected proportions).
+            host = scheduleStatelessMessageApportion(userFunc, hostMap, msg);
+        } else {
+            // If schedule mode is 1 or 2 (The scheduler dispatch stateless
+            // messages in round-robin).
+            host = scheduleStatelessMessageRB(userFunc, hostMap, msg);
+        }
     }
     if (host == "unknown") {
         throw std::runtime_error("Host is unknown");
@@ -313,8 +383,8 @@ bool StateAwareScheduler::updateFuncStatePar(const std::string& userFunction,
     }
 
     if (newPar < functionParallelism[userFunction]) {
-        reduceFuncStatePar(
-          userFunction, functionParallelism[userFunction] - newPar, hostMap);
+        SPDLOG_ERROR("Decrease parallelism is not supported now.");
+        throw std::runtime_error("Decrease parallelism is not supported now");
         return false;
     }
 
@@ -323,6 +393,7 @@ bool StateAwareScheduler::updateFuncStatePar(const std::string& userFunction,
 
 // TODO - change it to increase or decrease function parallelism. It should
 // return the old stateHost instead of the true/false
+// This function is only used when initializing the function state.
 void StateAwareScheduler::increaseFuncStatePar(const std::string& userFunction,
                                                int numIncrease,
                                                const HostMap& hostMap)
@@ -391,40 +462,8 @@ void StateAwareScheduler::increaseFuncStatePar(const std::string& userFunction,
                 functionParallelism[userFunction]);
 
     // If the state is partitioned, update the Hash method.
-    if (statePartitionBy.contains(userFunction)) {
-        // Change the state hashing ring
-        stateHashRing[userFunction] =
-          std::make_shared<faabric::util::ConsistentHashRing>(
-            functionParallelism[userFunction]);
-    }
-}
-
-void StateAwareScheduler::reduceFuncStatePar(const std::string& userFunction,
-                                             int numDecrease,
-                                             const HostMap& hostMap)
-{
-    SPDLOG_INFO("Reduce {} parallelism for {}", numDecrease, userFunction);
-
-    int currentPar = functionParallelism[userFunction];
-    int startIdx = currentPar - numDecrease;
-    int endIdx = currentPar; // Exclusive
-
-    for (int idx = startIdx; idx < endIdx; ++idx) {
-        std::string userFunctionIdx = userFunction + "_" + std::to_string(idx);
-        auto it = stateHost.find(userFunctionIdx);
-        if (it != stateHost.end()) {
-            stateHost.erase(it);
-            deleteStateFromRedis(userFunctionIdx);
-        } else {
-            SPDLOG_WARN("No stateHost mapping found for {}", userFunctionIdx);
-        }
-    }
-
-    functionParallelism[userFunction] -= numDecrease;
-    SPDLOG_INFO("New parallelism for {} is {}",
-                userFunction,
-                functionParallelism[userFunction]);
-    // If the state is partitioned, update the Hash method.
+    // It is ok to use default construct function. Because before running, the
+    // weight for each parallelism are the same.
     if (statePartitionBy.contains(userFunction)) {
         // Change the state hashing ring
         stateHashRing[userFunction] =
@@ -531,6 +570,19 @@ void StateAwareScheduler::updateApp(
     }
 }
 
+void StateAwareScheduler::updateReqDist()
+{
+    runtimeSummary.updateExpDist(statelessReqWeight);
+    runtimeSummary.reallocateAll(true);
+}
+
+void StateAwareScheduler::reallocateSummaryDist(
+  const std::map<std::string, std::map<std::string, int>>& sourceCountStats)
+{
+    runtimeSummary.updateSourceDist(sourceCountStats);
+    runtimeSummary.reallocateAll(false);
+}
+
 void StateAwareScheduler::groupNodesHelper(
   const std::string& nodeName,
   std::vector<std::shared_ptr<Node>>& currentGroup,
@@ -553,11 +605,46 @@ void StateAwareScheduler::groupNodesHelper(
     for (const auto& succName : connIt->second) {
         const std::shared_ptr<Node>& succNode =
           application->getNodes().at(succName);
+        bool joinCurrent = false;
         if (succNode->type == STATELESS) {
             // For stateless nodes, continue in the same group.
+            joinCurrent = true;
+        }
+        if (succNode->type == PARTITIONED_STATEFUL) {
+            std::string partitionedKey = succNode->partitionBy;
+            // For partitioned stateful nodes, check if all the previous
+            // stateless nodes contains the same field key and partitioned
+            // stateful opeartor contains the same partitioned attribute. Add it
+            // in the current group.
+            bool added = true;
+            for (const auto& node : currentGroup) {
+                if (node->type == STATEFUL) {
+                    added = false;
+                    break;
+                } else if (node->type == STATELESS) {
+                    auto inputFeilds = node->inputFeilds;
+                    if (!inputFeilds.contains(partitionedKey)) {
+                        added = false;
+                        break;
+                    }
+                } else if (node->type == PARTITIONED_STATEFUL) {
+                    if (node->partitionBy != partitionedKey) {
+                        added = false;
+                        break;
+                    }
+                } else {
+                    // This should never happen. Since we
+                    added = false;
+                    break;
+                }
+            }
+            if (added) {
+                joinCurrent = true;
+            }
+        }
+        if (joinCurrent) {
             groupNodesHelper(succName, currentGroup, groups, visited);
-        } else {
-            // Else, start a new group.
+        } else { // Fallback. Else, start a new group.
             std::vector<std::shared_ptr<Node>> newGroup;
             groupNodesHelper(succName, newGroup, groups, visited);
             if (!newGroup.empty()) {
@@ -567,12 +654,88 @@ void StateAwareScheduler::groupNodesHelper(
     }
 }
 
+void StateAwareScheduler::groupNodesHelper(
+  const std::string& nodeName,
+  std::vector<std::shared_ptr<Node>>& currentGroup,
+  std::string& currentPartition,
+  std::vector<NodeGroup>& groups,
+  std::unordered_set<std::string>& visited)
+{
+    if (!visited.insert(nodeName).second) {
+        return;
+    }
+
+    auto node = application->getNodes().at(nodeName);
+    currentGroup.push_back(node);
+
+    // If this node is a partitioned‐stateful, set (or re‐set) the key:
+    if (node->type == PARTITIONED_STATEFUL) {
+        currentPartition = node->partitionBy;
+    }
+
+    // no successors? finish this group:
+    auto connIt = application->getConnections().find(nodeName);
+    if (connIt == application->getConnections().end()) {
+        // push (nodes, partitionKey) as one tuple:
+        groups.emplace_back(currentGroup, currentPartition);
+        return;
+    }
+
+    // for each successor, decide whether to stay in this group…
+    for (const auto& succName : connIt->second) {
+        auto succ = application->getNodes().at(succName);
+        bool joinCurrent = false;
+
+        if (succ->type == STATELESS) {
+            joinCurrent = true;
+        } else if (succ->type == PARTITIONED_STATEFUL) {
+            // If local group has stateful nodes, start a new group:
+            bool hasStateful = false;
+            for (const auto& node : currentGroup) {
+                if (node->type == STATEFUL) {
+                    hasStateful = true;
+                    break;
+                }
+            }
+            if (!hasStateful) {
+                if (currentPartition == NONE_STRING ||
+                    currentPartition == succ->partitionBy) {
+                    joinCurrent = true;
+                }
+            }
+        }
+
+        if (joinCurrent) {
+            // recurse in same group (partition stays as‐is)
+            groupNodesHelper(
+              succName, currentGroup, currentPartition, groups, visited);
+        } else {
+            // close out the current group first:
+            groups.emplace_back(currentGroup, currentPartition);
+
+            // start a brand‐new group for this branch, with fresh state:
+            std::vector<std::shared_ptr<Node>> newGroup;
+            std::string newPartition = NONE_STRING;
+            groupNodesHelper(succName, newGroup, newPartition, groups, visited);
+        }
+    }
+}
+
+/***
+ * The steps of reschedule App:
+ * 1. Calculate the workload of each operator, which is based on the executed
+ * requests number.
+ * 2. Group the operators into groups. TODO - combine the partitioned stateful
+ * with same attribute.
+ * 3. Map groups to hosts.
+ * 4. Arrange the states accordingly.
+ * ***/
 void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
 {
     SPDLOG_INFO("StateAwareScheduler: Reschedule the application according to "
                 "the metrics");
 
-    // Calculate the workload of each operator (node).
+    // 1. Calculate the workload of each operator.
     if (!application) {
         SPDLOG_WARN("No application registered");
         return;
@@ -583,7 +746,7 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
         return;
     }
 
-    double totalPreWorkload = 0;
+    // Get the minimum processed tuples operator in the application.
     long minimizedInput = std::numeric_limits<long>::max();
     for (auto& [nodeName, node] : appNodes) {
         if (node->processedTuples < minimizedInput) {
@@ -597,46 +760,141 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
         return;
     }
 
+    // Calculate the workload of each operator and total workload (number of
+    // requests processed by operators)
+    // Preworkload is the number of requests processed by each operator in the
+    // last period.
+    double totalPreWorkload = 0;
     for (auto& [nodeName, node] : appNodes) {
         node->preWorkload = std::round(
           static_cast<double>(node->processedTuples) / minimizedInput);
 
-        // If no preworkload for any node, we pass this rescheduling.
-        if (node->preWorkload <= 1.0) {
+        // It should never be less than 1.0, just in case.
+        if (node->preWorkload < 1.0) {
             node->preWorkload = 1.0;
         }
         totalPreWorkload += node->preWorkload;
     }
 
     // Update the resource required for each operator (number of workers).
-    double totalResource = 0.0;
-    for (auto& [nodeName, node] : appNodes) {
-        node->reqResource =
-          hostMap.size() * (node->preWorkload / totalPreWorkload);
-        totalResource += node->reqResource;
-    }
-    if (totalResource != hostMap.size()) {
-        SPDLOG_WARN("Total resource is not equal to the number of hosts");
-        throw std::runtime_error("Total resource is not equal to the number of "
-                                 "hosts");
-        return;
+    const int NUM_WORKERS = hostMap.size();
+
+    struct Quantised
+    {
+        std::shared_ptr<Node> node; // pointer to the original node object
+        int units;                  // 1 unit == 0.1 workers
+        double frac;                // fractional part kept for tie‑breaks
+    };
+
+    const int TOTAL_UNITS = NUM_WORKERS * 10; // 0.1‑granularity budget
+    std::vector<Quantised> bucket;
+    bucket.reserve(appNodes.size());
+
+    int usedUnits = 0;
+
+    //--------------------------------------------------------------------------
+    // step 1: convert each exact share to "baseUnits" (floor in 0.1 steps)
+    //--------------------------------------------------------------------------
+    for (auto& [name, n] : appNodes) {
+
+        double exactShare = static_cast<double>(NUM_WORKERS) * n->preWorkload /
+                            totalPreWorkload; // original
+        double rawUnitsD = exactShare * 10.0; // 0.1 units
+        int baseUnits = static_cast<int>(std::floor(rawUnitsD));
+
+        if (baseUnits == 0) // enforce the 0.1 minimum
+            baseUnits = 1;
+
+        double frac = rawUnitsD - baseUnits; // 0 ≤ frac < 1
+
+        bucket.push_back({ n, baseUnits, frac });
+        usedUnits += baseUnits;
     }
 
-    // Combine operators into groups.
-    std::vector<std::vector<std::shared_ptr<Node>>> groups;
+    //--------------------------------------------------------------------------
+    // step 2: distribute (+) or steal (–) leftover units
+    //--------------------------------------------------------------------------
+
+    // 2a. We have *too few* units → hand out leftovers to highest "frac"
+    int remain = TOTAL_UNITS - usedUnits;
+    if (remain > 0) {
+        std::sort(bucket.begin(),
+                  bucket.end(),
+                  [](const Quantised& a, const Quantised& b) {
+                      return a.frac > b.frac; // descending
+                  });
+        for (int i = 0; i < remain; ++i)
+            bucket[i % bucket.size()].units += 1;
+    }
+
+    // 2b. We have *too many* units → take units from lowest "frac"
+    else if (remain < 0) {
+        remain = -remain; // units to remove   (> 0)
+
+        // sort buckets by ascending fractional remainder (cheapest to cut)
+        std::vector<Quantised*> order;
+        order.reserve(bucket.size());
+        for (auto& q : bucket)
+            order.push_back(&q);
+
+        std::sort(order.begin(),
+                  order.end(),
+                  [](const Quantised* a, const Quantised* b) {
+                      return a->frac < b->frac;
+                  });
+
+        // round‑robin removal: at most one unit per bucket per sweep
+        std::size_t i = 0;
+        while (remain > 0) {
+            Quantised* q = order[i];
+
+            if (q->units > 1) { // keep ≥ 0.1 (1 unit) per bucket
+                --q->units;
+                --remain;
+            }
+
+            i = (i + 1) % order.size(); // next bucket in the cycle
+            /* If we've looped back to the beginning and could not remove
+               anything on this entire sweep, it means all buckets are at
+               their minimum 0.1 already. */
+            if (i == 0 && remain > 0) {
+                SPDLOG_ERROR("Unable to rebalance to integer‑0.1 units");
+                throw std::runtime_error("quantisation failed");
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // step 3: write the quantised values back to each node
+    //--------------------------------------------------------------------------
+    for (auto& q : bucket)
+        q.node->reqResource = q.units / 10.0; // 0.1‑granularity
+
+    for (auto& [name, n] : appNodes) {
+        SPDLOG_DEBUG(
+          "Node {} requires {} resource units", name, n->reqResource);
+    }
+
+    application->showConnections();
+
+    // 2. Group the operators into groups.
+    // TODO - combine the partitioned stateful operaoters with the same
+    // attribute.
+    std::vector<NodeGroup> groups;
     std::unordered_set<std::string> visited;
+
     for (const auto& inputNode : application->getInputNodes()) {
-        if (visited.find(inputNode) != visited.end()) {
+        if (visited.count(inputNode))
             continue;
-        }
-        std::vector<std::shared_ptr<Node>> currentGroup;
-        groupNodesHelper(inputNode, currentGroup, groups, visited);
-        if (!currentGroup.empty()) {
-            groups.push_back(currentGroup);
-        }
+
+        std::vector<std::shared_ptr<Node>> startGroup;
+        std::string startPartition = NONE_STRING;
+
+        groupNodesHelper(
+          inputNode, startGroup, startPartition, groups, visited);
     }
 
-    // Map groups to hosts.
+    // 3. Map groups to hosts.
     std::map<std::string, double> workerRemaining;
     for (const auto& [ip, host] : hostMap) {
         workerRemaining[ip] = 1.0;
@@ -650,7 +908,7 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
     // For each group, compute the total required resource and assign workers.
     for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
         double groupReqResource = 0.0;
-        for (const auto& node : groups[groupIndex]) {
+        for (const auto& node : std::get<0>(groups[groupIndex])) {
             groupReqResource += node->reqResource;
         }
 
@@ -680,7 +938,8 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
             }
         }
 
-        if (groupReqResource > 0) {
+        // 1e-9 is rounding up tolerance.
+        if (groupReqResource > 1e-9) {
             SPDLOG_WARN("Not enough resources to assign group {}", groupIndex);
             throw std::runtime_error("Insufficient resources across workers");
         }
@@ -694,74 +953,42 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
         }
     }
 
-    // Arrange the states accordingly.
+    // 4. Arrange the states accordingly.
     // We change the parallelism of partitioned stateful operators to the number
     // of functions. We don't change the parallelism of the stateful function.
     // For each group, we assign the state to allocated workers.
 
-    std::map<std::string, double> workerAvailRes;
-    for (const auto& [ip, host] : hostMap) {
-        workerAvailRes[ip] = 1.0;
-    }
-
     std::map<std::string, std::string> newStateHost;
     std::map<std::string, int> newFuncPar;
+    // MAP <USER_FUNC_PARALLELISM, MAP<IP, proportion>>
+    std::map<std::string, std::map<std::string, int>> newStatelessReqWeight;
+    // MAP <USER_FUNC, MAP<PARALLELISM_IDX, proportion>>
+    std::map<std::string, std::map<int, int>> newParStateReqWeight;
 
     // For each group, statistics its states and assigns states to workers.
     for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
-        const auto& group = groups[groupIndex];
-        const auto& groupAllocation = groupAllocations[groupIndex];
+        const auto& group = std::get<0>(groups[groupIndex]);
+        auto groupAllocation = groupAllocations[groupIndex];
 
-        // MAP <operator, parallelism>
-        std::map<std::string, int> statesMap;
-        std::map<std::string, int> parStatesMap;
-
+        // Assign the stateful states to workers at first, we assign the
+        // stateful states at first in greedy method (with maximum avialble
+        // resource).
         for (const auto& node : group) {
-            if (node->type == STATELESS) {
+            if (node->type != STATEFUL) {
                 continue;
-            } else if (node->type == STATEFUL) {
-                // We don't change the parallelism of the stateful function.
-                int para = node->parallelism;
-                statesMap[node->name] = para;
-                newFuncPar[node->name] = para;
-            } else if (node->type == PARTITIONED_STATEFUL) {
-                // We change the parallelism of partitioned stateful operators
-                // to the number of workers (allocated to this group).
-                int para = groupAllocation.size();
-                parStatesMap[node->name] = para;
-                newFuncPar[node->name] = para;
-            } else {
-                SPDLOG_WARN("Unknown node type: {}", node->type);
-                throw std::runtime_error("Unknown node type");
             }
-        }
-
-        // Assign the states to workers. For stateful, we assign it to
-        // workers with avilable resource. For partitioned stateful, we
-        // assign it to every workers.
-        // Assign partitioned stateful to every worker.
-        for (const auto& [parState, para] : parStatesMap) {
-            auto node = appNodes[parState];
-            for (int i = 0; i < para; ++i) {
-                auto ip = getNthKey(groupAllocation, i);
-                newStateHost[parState + "_" + std::to_string(i)] = ip;
-                // Update the available resource.
-                double reqRes = (node->reqResource) / para;
-                workerAvailRes[ip] -= reqRes;
-            }
-        }
-
-        // Assign stateful to workers with most available resource.
-        for (const auto& [statefulName, para] : statesMap) {
-            auto node = appNodes[statefulName];
+            std::string statefulName = node->name;
+            // We don't change the parallelism of the stateful function.
+            int para = node->parallelism;
+            newFuncPar[statefulName] = para;
             for (int i = 0; i < para; ++i) {
                 // Find the worker with the maximum available resource in this
                 // group.
                 std::string bestWorker;
                 double bestAvail = -1.0;
                 for (const auto& [ip, value] : groupAllocation) {
-                    if (workerAvailRes[ip] > bestAvail) {
-                        bestAvail = workerAvailRes[ip];
+                    if (value > bestAvail) {
+                        bestAvail = value;
                         bestWorker = ip;
                     }
                 }
@@ -769,7 +996,93 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
                   bestWorker;
                 // Update the available resource for the selected worker.
                 double reqRes = (node->reqResource) / para;
-                workerAvailRes[bestWorker] -= reqRes;
+                groupAllocation[bestWorker] =
+                  std::max(0.0, groupAllocation[bestWorker] - reqRes);
+            }
+        }
+
+        // Then, we assign all the partitioned stateful operators and stateless
+        // operators. For partitioned stateful, we assign it to every workers,
+        // (who has higher than 10% resource).
+        // If this group doesn't has other type of operators, we skip it.
+        int numOtherType = 0;
+        for (const auto& node : group) {
+            if (node->type == STATEFUL) {
+                continue;
+            }
+            numOtherType++;
+        }
+        if (numOtherType == 0) {
+            continue;
+        }
+
+        std::map<std::string, int> ipWeight;
+        for (const auto& [ip, alloc] : groupAllocation) {
+            ipWeight[ip] = std::lround(alloc * weightFactor);
+        }
+        // Do assign the stateless and partitioned stateful operators.
+        for (const auto& node : group) {
+            if (node->type == STATELESS) {
+                // Stateless operator, assign it to all workers.
+                std::string statefulName = node->name;
+                newStatelessReqWeight[statefulName + "_0"] = ipWeight;
+            }
+            if (node->type == PARTITIONED_STATEFUL) {
+                std::string statefulName = node->name;
+                int index = 0;
+                newFuncPar[statefulName] = ipWeight.size();
+                for (const auto& [ip, weight] : ipWeight) {
+                    std::string userFuncPar =
+                      statefulName + "_" + std::to_string(index);
+                    newParStateReqWeight[statefulName][index] = weight;
+                    newStateHost[userFuncPar] = ip;
+                    index++;
+                }
+            }
+        }
+    }
+
+    // Since some stateless operators
+    std::map<std::string, std::string> newOptsCollocateMap;
+    std::map<std::string, std::string> newOptsCollocateHeadMap;
+    for (const auto& group : groups) {
+        const auto& groupNodes = std::get<0>(group);
+        const auto& groupPartition = std::get<1>(group);
+        if (groupPartition == NONE_STRING) {
+            continue;
+        }
+        for (int i = 0; i < groupNodes.size(); i++) {
+            const auto& node = groupNodes[i];
+            // We only consider the stateless operators.
+            if (node->type != STATELESS) {
+                continue;
+            }
+            for (int j = i + 1; j < groupNodes.size(); j++) {
+                const auto& rearNode = groupNodes[j];
+                if (rearNode->type != PARTITIONED_STATEFUL) {
+                    continue;
+                }
+                // If later nodes has partitioned stateful operator, we have to
+                // mark it as collocate with a partitioned stateful operator.
+                // If it is the head of the group or it only has stateful
+                // operators before. It is the head.
+                if (i == 0) {
+                    newOptsCollocateHeadMap[node->name] = rearNode->name;
+                    break;
+                }
+                // If i is connected by a stateful operator.
+                else {
+                    auto sourceNodes = application->getSource(node->name);
+                    for (const auto& sourceNode : sourceNodes) {
+                        if (sourceNode->type == STATEFUL) {
+                            newOptsCollocateHeadMap[node->name] =
+                              rearNode->name;
+                            break;
+                        }
+                    }
+                }
+                newOptsCollocateMap[node->name] = rearNode->name;
+                break;
             }
         }
     }
@@ -777,7 +1090,7 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
     // SHOW the new state allocation
     for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
         SPDLOG_INFO("Group {} mapping:", groupIndex);
-        const auto& group = groups[groupIndex];
+        const auto& group = std::get<0>(groups[groupIndex]);
 
         // Log the nodes in the current group.
         SPDLOG_INFO("  Nodes in group:");
@@ -801,9 +1114,40 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
         SPDLOG_INFO("  {} assigned to worker {}", stateName, workerIP);
     }
 
+    // Log the share of stateless operators and partitioned stateful operators.
+    SPDLOG_INFO("Stateless operators share:");
+    for (const auto& [userFuncPar, hostShares] : newStatelessReqWeight) {
+        for (const auto& [host, share] : hostShares) {
+            // one flat line per <operator, host> pair
+            SPDLOG_INFO("stateless_dist  op={}  host={}  share={}",
+                        userFuncPar,
+                        host,
+                        share);
+        }
+    }
+    SPDLOG_INFO("Partitioned stateful operators share:");
+    for (const auto& [userFunc, indexShares] : newParStateReqWeight) {
+        for (const auto& [index, share] : indexShares) {
+            std::string userFuncPar = userFunc + "_" + std::to_string(index);
+
+            // one flat line per <operator, host> pair
+            SPDLOG_INFO(
+              "partitioned_stateful_dist  op={}  inst={} host={} share={}",
+              userFunc,
+              userFuncPar,
+              newStateHost[userFuncPar],
+              share);
+        }
+    }
+
     // Update the state host and parallelism info.
     stateHost = newStateHost;
     functionParallelism = newFuncPar;
+    statelessReqWeight = newStatelessReqWeight;
+    parStateReqWeight = newParStateReqWeight;
+    setOptsCollocateMap(newOptsCollocateMap);
+    setOptsCollocateHeadMap(newOptsCollocateHeadMap);
+
     stateHashRing.clear();
 
     redis::Redis& redis = redis::Redis::getState();
@@ -817,17 +1161,21 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
             SPDLOG_ERROR("Function {} has no parallelism", userFunction);
             throw std::runtime_error("Function parallelism not found");
         }
+        auto weightDist = parStateReqWeight[userFunction];
         stateHashRing[userFunction] =
-          std::make_shared<faabric::util::ConsistentHashRing>(
-            functionParallelism[userFunction]);
+          std::make_shared<faabric::util::ConsistentHashRing>(weightDist);
     }
+}
+
+void StateAwareScheduler::setScheduleMode(int mode)
+{
+    scheduleMode = mode;
 }
 
 void StateAwareScheduler::resetScheduler()
 {
     SPDLOG_INFO("Flushing state information");
-    rbCounter = 0;
-    atomicRbCounter.store(0);
+    stateRbCounter.store(0);
 
     redis::Redis& redis = redis::Redis::getState();
     redis.flushAll();
@@ -837,6 +1185,9 @@ void StateAwareScheduler::resetScheduler()
     stateHashRing.clear();
     statePartitionBy.clear();
     funcStateRegMap.clear();
+    statelessReqWeight.clear();
+    parStateReqWeight.clear();
+    optsCollocateMap.clear();
 }
 
 } // namespace faabric::batch_scheduler

@@ -256,9 +256,12 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvCallBatch(
 std::unique_ptr<google::protobuf::Message> PlannerServer::recvEnqueueBatch(
   std::span<const uint8_t> buffer)
 {
-    SPDLOG_ERROR("EnqueueBatch not implemented in DecentralizedPlannerServer");
-    throw std::runtime_error("EnqueueBatch not implemented in PlannerServer");
-    return nullptr;
+    PARSE_MSG(BatchExecuteRequest, buffer.data(), buffer.size());
+    auto req = std::make_shared<faabric::BatchExecuteRequest>(parsedMsg);
+
+    planner.scheduleMessages(req, true);
+
+    return std::make_unique<faabric::EmptyResponse>();
 }
 
 }

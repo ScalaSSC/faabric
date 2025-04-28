@@ -5,18 +5,6 @@
 
 namespace faabric::batch_scheduler {
 
-template<typename K, typename V>
-K getNthKey(const std::map<K, V>& map, std::size_t n)
-{
-    if (n >= map.size()) {
-        throw std::out_of_range("Index out of range");
-    }
-
-    auto it = map.begin();
-    std::advance(it, n);
-    return it->first;
-}
-
 void DecentralizedScheduler::resetScheduler()
 {
     StateAwareScheduler::resetScheduler();
@@ -35,6 +23,7 @@ void DecentralizedScheduler::syncStatesInfo(
     stateHashRing.clear();
 
     SPDLOG_INFO("Denctralscheduler syns {} function states", statesInfo.size());
+    // func is userFuncPar
     for (const auto& [func, info] : statesInfo) {
         SPDLOG_INFO(
           "Stateful function {} with {} parallelism", func, info.parallelism);
@@ -59,118 +48,10 @@ void DecentralizedScheduler::syncStatesInfo(
                     func,
                     info.partitionBy);
         statePartitionBy[func] = info.partitionBy;
+        auto weightDist = parStateReqWeight[func];
         stateHashRing[func] =
-          std::make_shared<faabric::util::ConsistentHashRing>(
-            functionParallelism[func]);
+          std::make_shared<faabric::util::ConsistentHashRing>(weightDist);
     }
 }
 
-// Decentralized scheduler assign stateless messages locally.
-std::string DecentralizedScheduler::scheduleMessage(
-  const HostMap& hostMap,
-  const std::unique_ptr<Message>& msg)
-{
-    if (scheduleMode == 1) {
-        return scheduleMessageMode1(hostMap, msg);
-    }
-
-    // SPDLOG_DEBUG("DecentralizedScheduler scheduling message");
-
-    if (msg->user().empty() || msg->function().empty()) {
-        throw std::runtime_error("User or function is empty");
-    }
-    std::string userFunc = msg->user() + "_" + msg->function();
-    std::string host = "unknown";
-    // For function-state function, assign near state
-    if (functionParallelism.contains(userFunc)) {
-        // If function-state has not been initialized, initialize it.
-        faabric::util::FullLock lock(scheduleMx);
-        // TODO - get parallelism is not thread safe now
-        auto parallelismInfo = getHashAndParallelismIndex(userFunc, *msg);
-        lock.unlock();
-        std::string userFuncPar =
-          userFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
-        userFunc = userFuncPar;
-        if (stateHost.find(userFuncPar) == stateHost.end()) {
-            throw std::runtime_error("StateHost is not initialized");
-        }
-        host = stateHost[userFuncPar];
-        // Register the parallelismIdx to it.
-        // If Scheduling failed, the next scheduling will overwrite it.
-        msg->set_messagetype(parallelismInfo.messageType);
-        msg->set_hash(parallelismInfo.hash);
-        msg->set_parallelismid(parallelismInfo.parallelismIdx);
-    }
-    // Otherwise the request by using round robin.
-    else {
-        auto workerloads = workersLoadState.getWorkerStats(userFunc + "_0");
-        SPDLOG_DEBUG("GET WORKER LOADS FOR {} and its size is {}", userFunc, 
-                     workerloads.size());
-        for (const auto& [workerIP, stats] : workerloads) {
-            const auto& [load, avgTransferTime] = stats;
-            SPDLOG_DEBUG("Worker IP: {}, Load: {}, Average Transfer Time: {}",
-                         workerIP,
-                         load,
-                         avgTransferTime);
-        }
-        host = localHost;
-        msg->set_messagetype(0);
-    }
-    if (host == "unknown") {
-        throw std::runtime_error("Host is unknown");
-    }
-
-    SPDLOG_TRACE("Scheduling message {} to host {}", userFunc, host);
-    return host;
-}
-
-// Schedule Message Mode 1 is using round robin to assgin stateless requests.
-std::string DecentralizedScheduler::scheduleMessageMode1(
-  const HostMap& hostMap,
-  const std::unique_ptr<Message>& msg)
-{
-    if (msg->user().empty() || msg->function().empty()) {
-        throw std::runtime_error("User or function is empty");
-    }
-    std::string userFunc = msg->user() + "_" + msg->function();
-    std::string host = "unknown";
-    // For function-state function, assign near state
-    if (functionParallelism.contains(userFunc)) {
-        // If function-state has not been initialized, initialize it.
-        faabric::util::FullLock lock(scheduleMx);
-        // TODO - get parallelism is not thread safe now
-        auto parallelismInfo = getHashAndParallelismIndex(userFunc, *msg);
-        lock.unlock();
-        std::string userFuncPar =
-          userFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
-        userFunc = userFuncPar;
-        if (stateHost.find(userFuncPar) == stateHost.end()) {
-            throw std::runtime_error("StateHost is not initialized");
-        }
-        host = stateHost[userFuncPar];
-        // Register the parallelismIdx to it.
-        // If Scheduling failed, the next scheduling will overwrite it.
-        msg->set_messagetype(parallelismInfo.messageType);
-        msg->set_hash(parallelismInfo.hash);
-        msg->set_parallelismid(parallelismInfo.parallelismIdx);
-    }
-    // Otherwise the request by using round robin.
-    else {
-        int hostIdx = atomicRbCounter.fetch_add(1, std::memory_order_relaxed) %
-                      hostMap.size();
-        host = getNthKey(hostMap, hostIdx);
-        msg->set_messagetype(0);
-    }
-    if (host == "unknown") {
-        throw std::runtime_error("Host is unknown");
-    }
-
-    SPDLOG_TRACE("Scheduling message {} to host {}", userFunc, host);
-    return host;
-}
-
-void DecentralizedScheduler::setScheduleMode(int mode)
-{
-    scheduleMode = mode;
-}
 }

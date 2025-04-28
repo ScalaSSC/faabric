@@ -58,7 +58,8 @@ message BatchExecuteRequest {
 }
 
 message MessageBatch{
-    repeated Message messages = 1;
+    string invokeHost = 1;
+    repeated Message messages = 2;
 }
 
 message BatchExecuteRequestList{
@@ -359,6 +360,23 @@ message StateMigrationRequest{
     repeated MigrateState migrateStates = 1;
 }
 
-message InstancesLoadState{
-    map<string, int32> instancesLoad = 1;
+message InstanceStatsPayload{
+    string instanceName = 1;
+    int32 executedCount = 2;
+    map<string, int32> sourceStats = 3;
+    int32 chainedCallCount = 4;
+    map<string, int32> chainedCallStats = 5;
 }
+
+message RuntimeStatsResult{
+    string host = 1;
+    repeated InstanceStatsPayload instancesStats = 2;
+}
+
+message RuntimeStatsUpdateRequest{
+    repeated RuntimeStatsResult collectedStats = 1;
+}
+
+// message InstancesLoadState{
+//     map<string, int32> instancesLoad = 1;
+// }

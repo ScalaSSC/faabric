@@ -5,6 +5,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -16,18 +17,22 @@ enum NodeType
     PARTITIONED_STATEFUL = 2
 };
 std::string nodeTypeToString(NodeType type);
+
 class Node
 {
   public:
     std::string name;
     NodeType type;
     int parallelism;
+    std::set<std::string> inputFeilds;
     std::string partitionBy;
     long processedTuples = 0;
     Node(const std::string& nameIn,
          NodeType typeIn,
-         int parallelismIn = 1,
-         const std::string& partitionByIn = "None");
+         int parallelismIn,
+         std::set<std::string> inputFeildsIn = {},
+         const std::string& partitionByIn = "None"
+         );
     // Used for rescheduling. It the records the metrics in the last window.
     double preWorkload = 0;
     double reqResource = 0;
@@ -49,6 +54,7 @@ class Application
     void addNode(std::shared_ptr<Node> node, bool isInput = false);
     void addConnection(const std::string& src, const std::string& dest);
     void displayApplication() const;
+    std::vector<std::shared_ptr<Node>> getSource(const std::string& node);
 
     std::map<std::string, std::shared_ptr<Node>>& getNodes()
     {
@@ -64,6 +70,18 @@ class Application
         }
         return inputNodes;
     }
+    
     const ConnectionInfo& getConnections() const { return connections; }
+    
+    const void showConnections() const
+    {
+        SPDLOG_INFO("Connections in application {}: ", name);
+        for (const auto& [src, dests] : connections) {
+            SPDLOG_INFO("  {} -> ", src);
+            for (const auto& dest : dests) {
+                SPDLOG_INFO("    {}", dest);
+            }
+        }
+    }
 };
 }

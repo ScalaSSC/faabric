@@ -272,31 +272,10 @@ void PlannerEndpointHandler::onRequest(
         }
         case faabric::planner::HttpMessage_Type_SCALE_FUNCTION_PARALLELISM: {
             SPDLOG_DEBUG("Planner received SCALE_FUNCTION_PARALLELISM request");
-            faabric::planner::FunctionScaleRequest rawReq;
-            try {
-                faabric::util::jsonToMessage(msg.payloadjson(), &rawReq);
-            } catch (faabric::util::JsonSerialisationException e) {
-                response.result(beast::http::status::bad_request);
-                response.body() = std::string("Bad JSON in body's payload");
-                return ctx.sendFunction(std::move(response));
-            }
-
-            std::string user = rawReq.user();
-            std::string func = rawReq.function();
-            std::string userFunc = user + "_" + func;
-            int newPar = rawReq.parallelism();
-            bool init = rawReq.initialize();
-            SPDLOG_DEBUG(
-              "Scaling function {} to parallelism {} with {} initialization",
-              userFunc,
-              newPar,
-              init);
-
-            faabric::planner::getPlanner().updateFuncPar(
-              userFunc, newPar, init);
-
-            response.result(beast::http::status::ok);
-            response.body() = std::string("Parallelism updated successfully");
+            SPDLOG_ERROR("SCALE_FUNCTION_PARALLELISM not implemented");
+            response.result(beast::http::status::bad_request);
+            response.body() =
+              std::string("SCALE_FUNCTION_PARALLELISM not implemented");
             return ctx.sendFunction(std::move(response));
         }
         case faabric::planner::HttpMessage_Type_RESET_STREAM_PARAMETER: {
@@ -329,7 +308,7 @@ void PlannerEndpointHandler::onRequest(
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "planner_call_interval") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
-            } else if (parameter == "decentral_schedule_mode") {
+            } else if (parameter == "schedule_mode") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "is_outputting") {
                 faabric::planner::getPlanner().resetParameter(
@@ -381,11 +360,34 @@ void PlannerEndpointHandler::onRequest(
             auto applicationPtr =
               std::make_unique<faabric::batch_scheduler::Application>(appName);
 
+            // Statistics the name of the stateless nodes and partitioned
+            // stateful nodes.
+            std::vector<std::string> statelessOpts;
+            std::map<std::string, int> parStateOpts;
             for (const auto& node : rawReq.nodes()) {
                 batch_scheduler::NodeType type =
                   static_cast<batch_scheduler::NodeType>(node.type());
+                if (type == faabric::batch_scheduler::NodeType::STATELESS) {
+                    statelessOpts.push_back(node.name());
+                }
+                if (type ==
+                    faabric::batch_scheduler::NodeType::PARTITIONED_STATEFUL) {
+                    parStateOpts[node.name()] = node.parallelism();
+                }
+            }
+
+            // For each node, add it to the application.
+            for (const auto& node : rawReq.nodes()) {
+                batch_scheduler::NodeType type =
+                  static_cast<batch_scheduler::NodeType>(node.type());
+                std::set<std::string> inputFeilds;
+                if (node.inputfields_size() > 0) {
+                    for (const auto& field : node.inputfields()) {
+                        inputFeilds.insert(field);
+                    }
+                }
                 if (type == batch_scheduler::NodeType::STATELESS) {
-                    batch_scheduler::Node n(node.name(), type);
+                    batch_scheduler::Node n(node.name(), type, 1, std::move(inputFeilds));
                     applicationPtr->addNode(
                       std::make_shared<batch_scheduler::Node>(n), node.input());
                 } else {
@@ -395,7 +397,7 @@ void PlannerEndpointHandler::onRequest(
                         partitionBy = node.partitionby();
                     }
                     batch_scheduler::Node n(
-                      node.name(), type, node.parallelism(), partitionBy);
+                      node.name(), type, node.parallelism(), std::move(inputFeilds), partitionBy);
                     applicationPtr->addNode(
                       std::make_shared<batch_scheduler::Node>(n), node.input());
                 }
@@ -432,7 +434,7 @@ void PlannerEndpointHandler::onRequest(
                 }
             }
 
-            planner::getPlanner().initFuncState();
+            planner::getPlanner().initFuncState(statelessOpts, parStateOpts);
 
             return ctx.sendFunction(std::move(response));
         }

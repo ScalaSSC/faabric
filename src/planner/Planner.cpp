@@ -16,6 +16,7 @@
 #include <faabric/util/string_tools.h>
 
 #include <fstream>
+#include <future>
 #include <map>
 #include <memory>
 #include <rapidjson/document.h>
@@ -82,6 +83,8 @@ Planner::Planner()
 
     dequeueScheduledMsgsThread =
       std::thread(&Planner::dequeueScheduledMsgs, this);
+
+    updateRuntimeStatsThread = std::thread(&Planner::updateRuntimeStats, this);
 }
 
 Planner::~Planner()
@@ -90,6 +93,9 @@ Planner::~Planner()
     stopThreadTimer = true;
     if (dequeueScheduledMsgsThread.joinable()) {
         dequeueScheduledMsgsThread.join();
+    }
+    if (updateRuntimeStatsThread.joinable()) {
+        updateRuntimeStatsThread.join();
     }
 }
 
@@ -436,13 +442,6 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
     SPDLOG_DEBUG("Planner is Scheduling {} messages", req->messages_size());
     auto currentTime = faabric::util::getGlobalClock().epochMicros();
 
-    if (isChained) {
-        SPDLOG_ERROR(
-          "Chained call should be scheduled by decentralized scheduler");
-        throw std::runtime_error(
-          "Chained call should be scheduled by decentralized scheduler");
-    }
-
     // When outputing result, we doesn't allow any schedule message operation.
     RETURN_IF_OUTPUTTING
     // First loop: handle state without creating a shared_ptr
@@ -465,13 +464,13 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
         }
         {
             faabric::util::FullLock reqStatusLock(state.reqStatusMx);
-            if (state.inFlightApps.contains(appid)) {
-                SPDLOG_ERROR("app Id {} is already running", appid);
+            if (!isChained) {
+                // SPDLOG_ERROR("app Id {} is already running", appid);
                 // Flush the old chainedId
-                state.inFlightApps[appid] = 0;
+                state.inFlightApps[appid] = 1;
             }
 
-            state.inFlightApps[appid]++;
+            // state.inFlightApps[appid]++;
         }
 
         i++; // Only increment i if a message was not removed
@@ -581,8 +580,7 @@ bool Planner::registerApp(std::unique_ptr<batch_scheduler::Application> app)
     return true;
 }
 
-// updateFuncPar calls doDistributeStatesInfo and doRescheduleMessages
-bool Planner::updateFuncPar(const std::string& userFunc, int newPar, bool init)
+bool Planner::updateFuncPar(const std::string& userFunc, int newPar)
 {
     SPDLOG_INFO("Planner received request to changed parallelism for {} by {}",
                 userFunc,
@@ -594,21 +592,32 @@ bool Planner::updateFuncPar(const std::string& userFunc, int newPar, bool init)
     stateAwareScheduler->updateFuncStatePar(
       userFunc, newPar, state.batchSchedHostMap);
 
-    if (init) {
-        doDistributeStatesInfo();
-        // Rescheduling the scheduled messages in scheduledMsgsMap
-        doRescheduleMessages();
-    }
-
     isUpdateState = false;
     return true;
 }
 
-void Planner::initFuncState()
+void Planner::initFuncState(std::vector<std::string> statelessOpts,
+                            std::map<std::string, int> parStateOpts)
 {
     faabric::util::FullLock lock(plannerMx);
     isUpdateState = true;
+    // Generage the stateless and partitioned stateful operator weights.
+    std::map<std::string, std::map<std::string, int>> statelessReqWeight;
+    for (const auto& func : statelessOpts) {
+        for (const auto& [ip, host] : state.hostMap) {
+            statelessReqWeight[func + "_0"][ip] = 1;
+        }
+    }
+    stateAwareScheduler->setStatelessReqWeight(statelessReqWeight);
+    std::map<std::string, std::map<int, int>> parStateReqWeight;
+    for (const auto& [func, par] : parStateOpts) {
+        for (int i = 0; i < par; i++) {
+            parStateReqWeight[func][i] = 1;
+        }
+    }
+    stateAwareScheduler->setParStateReqWeight(parStateReqWeight);
 
+    stateAwareScheduler->updateReqDist();
     doDistributeStatesInfo();
     doRescheduleMessages();
     isUpdateState = false;
@@ -633,6 +642,49 @@ void Planner::doDistributeStatesInfo()
         for (const auto& [idx, host] : info.stateHost) {
             stateInfo->mutable_statehost()->insert({ idx, host });
         }
+    }
+
+    // Add the stateless and partitioned stateful operator weights.
+    auto statelessReqWeight = stateAwareScheduler->getStatelessReqWeight();
+
+    auto* srwMap =
+      req->mutable_statelessreqweight(); // Map<string,StatelessWeight>
+
+    for (const auto& [funcPar, hostWeights] : statelessReqWeight) {
+        auto& innerMsg = (*srwMap)[funcPar];
+
+        auto* hostWeightMap = innerMsg.mutable_hostweight();
+        for (const auto& [host, weight] : hostWeights) {
+            (*hostWeightMap)[host] = weight;
+        }
+    }
+
+    auto parStateReqWeight = stateAwareScheduler->getParStateReqWeight();
+
+    auto* pswMap =
+      req->mutable_parstatereqweight(); // Map<string,ParStateWeight>
+
+    for (const auto& [funcName, partWeights] : parStateReqWeight) {
+        auto& innerMsg = (*pswMap)[funcName];
+
+        auto* partWeightMap = innerMsg.mutable_partitionweight();
+        for (const auto& [idx, weight] : partWeights) {
+            (*partWeightMap)[idx] = weight;
+        }
+    }
+
+    auto optsCollocateMap = stateAwareScheduler->getOptsCollocateMap();
+    auto* ocMap = req->mutable_operatorcollocatemap();
+
+    for (const auto& [funcName, collocate] : optsCollocateMap) {
+        (*ocMap)[funcName] = collocate;
+    }
+
+    auto optsCollocateHeadMap = stateAwareScheduler->getOptsCollocateHeadMap();
+    auto* ochMap = req->mutable_operatorcollocateheadmap();
+
+    for (const auto& [funcName, collocate] : optsCollocateHeadMap) {
+        (*ochMap)[funcName] = collocate;
     }
 
     SPDLOG_INFO("Planner begin sending states");
@@ -705,6 +757,17 @@ bool Planner::resetParameter(const std::string& key,
         }
         return true;
     }
+    if (key == "schedule_mode") {
+        // Schedule Mode 0: Decentralized Scheduler.
+        // Schedule Mode 1: Decentralized Scheduler with Default Logic (colocate
+        // stateful requests with their requried states and rountrobin for
+        // stateless requests).
+        // Schedule Mode 2: Centralized Scheduler.
+        SPDLOG_INFO("Planner reset schedule mode to {}", value);
+        stateAwareScheduler->setScheduleMode(value);
+        scheduleMode = value;
+    }
+
     // Reset the parameter of the worker hosts
     auto availableHosts = getAvailableHosts(true);
     faabric::planner::ResetStreamParameterRequest req;
@@ -752,6 +815,7 @@ void Planner::rescheduleApp()
     SPDLOG_INFO("Planner reschedules application done");
 
     // Reschedule the states and messages in queue
+    stateAwareScheduler->updateReqDist();
     doDistributeStatesInfo();
     doRescheduleMessages();
 }
@@ -779,6 +843,65 @@ std::string Planner::outputResult()
     std::string result = state.applicationMetrics->getMetrics();
     SPDLOG_INFO("Outputting result: {}", result);
     return result;
+}
+
+void Planner::updateRuntimeStats()
+{
+    // It doesn't need to be thread-safe, since all the stats in each worker
+    // are thread-safe. Map to accumulate the runtime stats from each host.
+    std::map<std::string, std::unique_ptr<faabric::RuntimeStatsResult>> results;
+    std::mutex resultsMutex; // Protects access to results.
+    faabric::RuntimeStatsUpdateRequest request;
+
+    while (!stopThreadTimer) {
+        // Sleep for a while to batch the scheduled requests
+        std::this_thread::sleep_for(
+          std::chrono::milliseconds(runtimeStatsUpdatePeriod));
+
+        std::vector<std::future<void>> futures;
+        // Iterate over all hosts.
+        for (const auto& [ip, hostInfo] : state.batchSchedHostMap) {
+            // Launch an asynchronous task for each host.
+            futures.emplace_back(std::async(
+              std::launch::async, [&results, &resultsMutex, &request, ip]() {
+                  // Fetch the runtime stats for the host using its IP.
+                  auto stats = faabric::scheduler::getFunctionCallClient(ip)
+                                 ->getRuntimeStats(request);
+
+                  // Lock the results map before writing.
+                  std::lock_guard<std::mutex> lock(resultsMutex);
+                  results[ip] = std::move(stats);
+              }));
+        }
+
+        // Wait for all the async tasks to complete.
+        for (auto& fut : futures) {
+            fut.get();
+        }
+
+        // Update the request with the results.
+        request.clear_collectedstats();
+        for (const auto& [ip, stats] : results) {
+            if (!stats) {
+                continue;
+            }
+            auto* newStats = request.add_collectedstats();
+            newStats->CopyFrom(*stats);
+        }
+
+        std::map<std::string, std::map<std::string, int>> sourceCountStats;
+        for (const auto& result : request.collectedstats()) {
+            std::string hostIp = result.host();
+            for (const auto& instance : result.instancesstats()) {
+                std::string instanceName = instance.instancename();
+                int chainedCallCount = instance.chainedcallcount();
+                sourceCountStats[instanceName][hostIp] = chainedCallCount;
+            }
+        }
+        stateAwareScheduler->reallocateSummaryDist(sourceCountStats);
+
+        results.clear();
+    }
 }
 
 Planner& getPlanner()

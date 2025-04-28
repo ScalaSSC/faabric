@@ -19,10 +19,12 @@ std::string nodeTypeToString(NodeType type)
 Node::Node(const std::string& nameIn,
            NodeType typeIn,
            int parallelismIn,
+           std::set<std::string> inputFeildsIn,
            const std::string& partitionByIn)
   : name(nameIn)
   , type(typeIn)
   , parallelism(parallelismIn)
+  , inputFeilds(std::move(inputFeildsIn))
   , partitionBy(partitionByIn)
 {}
 
@@ -36,6 +38,22 @@ void Application::addNode(std::shared_ptr<Node> node, bool isInput)
     if (isInput) {
         inputNodes.push_back(node->name);
     }
+}
+
+std::vector<std::shared_ptr<Node>> Application::getSource(
+  const std::string& node)
+{
+    std::vector<std::shared_ptr<Node>> sourceNodes;
+    for (auto& [name, successors] : connections) {
+        for (auto& successor : successors) {
+            if (successor == node) {
+                sourceNodes.push_back(nodes[name]);
+                break;
+            }
+        }
+    }
+
+    return sourceNodes;
 }
 
 void Application::addConnection(const std::string& src, const std::string& dest)
@@ -58,6 +76,10 @@ void Application::displayApplication() const
                   << nodeTypeToString(node->type) << " , parallelism - "
                   << node->parallelism << " , partitionBy - "
                   << node->partitionBy << "\n";
+        logStream << "    Input fields: ";
+        for (const auto& field : node->inputFeilds) {
+            logStream << field << " ";
+        }
         // Check for outgoing connections
         auto connIt = connections.find(nodeName);
         if (connIt != connections.end() && !connIt->second.empty()) {

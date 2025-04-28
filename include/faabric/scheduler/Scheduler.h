@@ -4,7 +4,8 @@
 #include <faabric/executor/Executor.h>
 #include <faabric/planner/PlannerClient.h>
 #include <faabric/proto/faabric.pb.h>
-#include <faabric/scheduler/InstancesLoadState.h>
+// #include <faabric/scheduler/InstancesLoadState.h>
+#include <faabric/scheduler/InstancesRuntimeStats.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/transport/PointToPointBroker.h>
 #include <faabric/util/PeriodicBackgroundThread.h>
@@ -125,15 +126,26 @@ class Scheduler
     void updateHosts(const std::vector<std::string>& hosts);
 
     void updateStatesInfo(
+      const std::map<std::string, std::map<std::string, int>>&
+        newStatelessReqWeight,
+      const std::map<std::string, std::map<int, int>>& newParStateReqWeight,
+      const std::map<std::string, std::string> newOptCollocate,
+      const std::map<std::string, std::string> newOptCollocateHead,
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
         statesInfo);
 
     void storeMigrateState(
       std::multimap<std::string, std::string>&& migrateState);
 
-    std::map<std::string, int> statsLocalLoad();
+    // std::map<std::string, int> statsLocalLoad();
 
-    void updateWorkersLoad();
+    // void updateWorkersLoad();
+
+    std::map<std::string, InstanceStatsResult> getRuntimeStats();
+
+    void updateStatelessDist(
+      const std::map<std::string, std::map<std::string, int>>&
+        sourceCountStats);
 
   private:
     std::string thisHost;
@@ -143,6 +155,8 @@ class Scheduler
     std::shared_mutex mx;
 
     std::atomic<bool> _isShutdown = false;
+
+    int scheduleMode = 0;
 
     // Maximum number of replicas per function
     int maxReplicas = 8;
@@ -233,12 +247,14 @@ class Scheduler
     util::ThreadSafeQueue<std::unique_ptr<faabric::MessageBatch>> unschedMsgs;
 
     // Worker workload update timer
-    long lastWorkersUpdate = 0;
-    int workerUpdateInterval = 3000; // ms
+    // long lastWorkersUpdate = 0;
+    // int workerUpdateInterval = 3000; // ms
 
     // Statistics the loads of workers
-    size_t maxSamples = 10000;
-    InstancesLoadState instancesLoadState;
+    // size_t maxSamples = 10000;
+    // InstancesLoadState instancesLoadState;
+
+    InstancesRuntimeStats runtimeStats;
 
     void enqueueSchedMsgs(std::vector<std::string> hosts,
                           std::vector<std::unique_ptr<faabric::Message>> msgs);

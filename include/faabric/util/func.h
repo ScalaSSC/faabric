@@ -17,6 +17,8 @@ class FunctionMigratedException : public faabric::util::FaabricException
     {}
 };
 
+std::string getUserFuncPar(const faabric::Message& msg);
+
 std::string funcToString(const faabric::Message& msg, bool includeId);
 
 std::string funcParToString(const faabric::Message& msg, bool includeId);
