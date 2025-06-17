@@ -428,4 +428,28 @@ void State::deleteFS(const std::string& user,
     }
 }
 
+std::string State::readPersistentState(std::string& key)
+{
+    std::string value = persistentState.read(key);
+    return value;
+}
+
+std::vector<std::string> State::readPersistentStateBatch(
+  const std::vector<std::string>& keys)
+{
+    std::vector<std::string> values = persistentState.readBatch(keys);
+    return values;
+}
+
+void State::writePersistentState(std::string& key, std::string& value)
+{
+    persistentState.write(key, value);
+}
+
+void State::writePersistentStateBatch(
+  const std::map<std::string, std::string>& data)
+{
+    persistentState.writeBatch(data);
+}
+
 }

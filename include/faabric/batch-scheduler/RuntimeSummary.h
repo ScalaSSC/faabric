@@ -2,6 +2,7 @@
 
 #include <faabric/util/config.h>
 #include <faabric/util/locks.h>
+#include <faabric/util/string_tools.h>
 
 #include <algorithm> // std::sort, std::shuffle
 #include <cmath>     // std::floor
@@ -103,13 +104,13 @@ class WindowedRecord
         if (!isHead) {
             // If this operator is the not first one in the group, we only
             // schedule them locally.
-            if (windowQuota.count(localHost) == 0) {
-                SPDLOG_WARN("For the none-head stateless operator, local host "
-                            "{} is not expected distribution",
-                            localHost);
-                throw std::runtime_error(
-                  "Local host is not expected distribution");
-            }
+            // if (windowQuota.count(localHost) == 0) {
+            //     SPDLOG_WARN("For the none-head stateless operator, local host "
+            //                 "{} is not expected distribution",
+            //                 localHost);
+            //     throw std::runtime_error(
+            //       "Local host is not expected distribution");
+            // }
             windowQuota[localHost] = RING_SIZE;
         } else {
             // If this operator is the first one int the group, we assign them
@@ -214,6 +215,11 @@ class RuntimeSummary
         faabric::util::SharedLock lock(summaryMx);
         auto it = windowedRecords.find(instance);
         if (it == windowedRecords.end()) {
+            // SPDLOG all keys
+            SPDLOG_DEBUG("Windowed records keys: {}", windowedRecords.size());
+            for (const auto& [key, _] : windowedRecords) {
+                SPDLOG_DEBUG("Key: {}", key);
+            }
             SPDLOG_ERROR("No collocate map for instance {} found", instance);
             throw std::runtime_error("No collocate map for instance " +
                                      instance);
@@ -409,8 +415,12 @@ class RuntimeSummary
     }
 
     // Calculate the adjusted distribution.
+    // instanceName is user_function_parallelism.
+    // init means whether this is the first time reallocate call after
+    // centralized shceduler reallocating.
     void reallocate(const std::string& instanceName, bool init)
     {
+        // isLocal means if the next instance will run on the local hosts?
         bool isLocal = false;
         for (const auto& [host, _] : expectedDist[instanceName]) {
             if (host == localHost) {
@@ -434,7 +444,14 @@ class RuntimeSummary
         }
 
         // If collocate with partitioned operators.
-        if (optsCollocateHeadMap.contains(instanceName)) {
+        auto [user, function, parallelismId] =
+          faabric::util::splitUserFuncPar(instanceName);
+        std::string operatorName = user + "_" + function;
+        if (optsCollocateHeadMap.contains(operatorName)) {
+            SPDLOG_DEBUG("Collocate head operator {} with partitioned stateful "
+                         "operator {}",
+                         operatorName,
+                         optsCollocateHeadMap[operatorName]);
             if (init) {
                 auto expDist = expectedDist[instanceName];
                 windowedRecords[instanceName] =
@@ -442,12 +459,19 @@ class RuntimeSummary
             }
             return;
         }
-        if (optsCollocateMap.contains(instanceName)) {
+        if (optsCollocateMap.contains(operatorName)) {
+            SPDLOG_DEBUG("Collocate operator {} with partitioned stateful "
+                         "operator {}",
+                         operatorName,
+                         optsCollocateMap[operatorName]);
             if (init) {
                 auto expDist = expectedDist[instanceName];
                 windowedRecords[instanceName] =
                   std::make_shared<WindowedRecord>(expDist, false);
             } else {
+                if (!isLocal){
+                    return;
+                }
                 auto dist = getReallocateLocalShare(instanceName);
                 windowedRecords[instanceName]->updateWindow(dist);
             }

@@ -46,7 +46,7 @@ message HttpMessage {
         EXECUTE_BATCH_STATUS = 11;
         PRELOAD_SCHEDULING_DECISION = 12;
         CUSTOM = 13;
-        SCALE_FUNCTION_PARALLELISM = 14;
+        SET_PERSISTENT_STATE = 14;
         RESET_STREAM_PARAMETER = 17;
         REGISTER_FUNCTION_STATE = 18;
         OUTPUT_RESULT = 19;
@@ -239,4 +239,8 @@ message RegisterApplicationRequest{
 message CustomRequest{
     string key = 1;
     string value = 2;
+}
+
+message MapMessage{
+    map<string, string> payload = 5;
 }

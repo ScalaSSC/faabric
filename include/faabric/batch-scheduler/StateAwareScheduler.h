@@ -175,14 +175,26 @@ class StateAwareScheduler : public BatchScheduler
     {
         optsCollocateHeadMap = w;
         runtimeSummary.setOptsCollocateHeadMap(w);
-    } 
-    
+    }
+
     // The Req dist for both stateless and stateful functions.
     void updateReqDist();
 
     void reallocateSummaryDist(
       const std::map<std::string, std::map<std::string, int>>&
         sourceCountStats);
+
+    bool nodeCollocation(const std::string& current,
+                         const std::string& partitionKey,
+                         const std::unordered_set<std::string>& groupNodeNames);
+
+    void collectCollocation(
+      const std::string& current,
+      const std::string& psName,
+      const std::string& partitionKey,
+      std::map<std::string, std::string>& collocateMap,
+      std::map<std::string, std::string>& headMap,
+      const std::unordered_set<std::string>& groupNodeNames);
 
   protected:
     // scheduler lock
@@ -245,11 +257,11 @@ class StateAwareScheduler : public BatchScheduler
       const std::string& userFunction,
       const faabric::Message& msg);
 
-    void groupNodesHelper(
-      const std::string& nodeName,
-      std::vector<std::shared_ptr<Node>>& currentGroup,
-      std::vector<std::vector<std::shared_ptr<Node>>>& groups,
-      std::unordered_set<std::string>& visited);
+    // void groupNodesHelper(
+    //   const std::string& nodeName,
+    //   std::vector<std::shared_ptr<Node>>& currentGroup,
+    //   std::vector<std::vector<std::shared_ptr<Node>>>& groups,
+    //   std::unordered_set<std::string>& visited);
 
     void groupNodesHelper(const std::string& nodeName,
                           std::vector<std::shared_ptr<Node>>& currentGroup,

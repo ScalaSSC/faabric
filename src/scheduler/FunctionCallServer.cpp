@@ -38,6 +38,10 @@ void FunctionCallServer::doAsyncRecv(transport::Message& message)
             recvResetParameter(message.udata());
             break;
         }
+        case faabric::scheduler::FunctionCalls::SetPersistentState: {
+            recvSetPersistentState(message.udata());
+            break;
+        }
         default: {
             throw std::runtime_error(
               fmt::format("Unrecognized async call header: {}", header));
@@ -347,6 +351,21 @@ void FunctionCallServer::recvResetParameter(std::span<const uint8_t> buffer)
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }
+}
+
+void FunctionCallServer::recvSetPersistentState(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::planner::MapMessage, buffer.data(), buffer.size())
+    const auto& protoMap = parsedMsg.payload();
+
+    std::map<std::string, std::string> kvMap;
+    for (const auto& entry : protoMap) {
+        // SPDLOG_DEBUG("Setting persistent state: {} -> {}", entry.first,
+        //              entry.second);
+        kvMap.emplace(entry.first, entry.second);
+    }
+
+    faabric::scheduler::getScheduler().setLocalPersistentState(kvMap);
 }
 
 }

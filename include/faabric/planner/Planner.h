@@ -115,6 +115,8 @@ class Planner
 
     void rescheduleApp();
 
+    void setPersistentState(const faabric::planner::MapMessage& mapMsg);
+
     // ----------
     // Metrics public API
     // ----------

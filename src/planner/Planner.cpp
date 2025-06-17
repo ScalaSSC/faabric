@@ -571,6 +571,10 @@ std::map<std::string, FunctionMetrics> Planner::collectMetrics()
     return metricsStats;
 }
 
+/***
+ * The logic of registerApp is save the application workflow in the scheduler
+ ***/
+
 bool Planner::registerApp(std::unique_ptr<batch_scheduler::Application> app)
 {
     SPDLOG_INFO("Planner received request to register application {}",
@@ -579,6 +583,11 @@ bool Planner::registerApp(std::unique_ptr<batch_scheduler::Application> app)
     stateAwareScheduler->registerApp(std::move(app));
     return true;
 }
+
+/***
+ * Update the function parallelism not only update the information in scheduler,
+ * but also register the states in Redis.
+ ***/
 
 bool Planner::updateFuncPar(const std::string& userFunc, int newPar)
 {
@@ -596,6 +605,10 @@ bool Planner::updateFuncPar(const std::string& userFunc, int newPar)
     return true;
 }
 
+/***
+ * This function initializes the each function / function parallelism have the
+ * same weight and then distribute the information to workers.
+ ***/
 void Planner::initFuncState(std::vector<std::string> statelessOpts,
                             std::map<std::string, int> parStateOpts)
 {
@@ -618,6 +631,7 @@ void Planner::initFuncState(std::vector<std::string> statelessOpts,
     stateAwareScheduler->setParStateReqWeight(parStateReqWeight);
 
     stateAwareScheduler->updateReqDist();
+    stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
     doDistributeStatesInfo();
     doRescheduleMessages();
     isUpdateState = false;
@@ -692,6 +706,7 @@ void Planner::doDistributeStatesInfo()
     for (const auto& [ip, host] : state.hostMap) {
         threads.emplace_back([&, ip]() {
             try {
+                SPDLOG_DEBUG("Planner sync state info to host {}", ip);
                 faabric::scheduler::getFunctionCallClient(ip)->syncStateInfo(
                   req);
             } catch (const std::exception& e) {
@@ -818,6 +833,19 @@ void Planner::rescheduleApp()
     stateAwareScheduler->updateReqDist();
     doDistributeStatesInfo();
     doRescheduleMessages();
+}
+
+void Planner::setPersistentState(const faabric::planner::MapMessage& mapMsg)
+{
+    faabric::util::FullLock lock(plannerMx);
+    auto availableHosts = getAvailableHosts(true);
+    auto mapMsgShared = std::make_shared<faabric::planner::MapMessage>(mapMsg);
+
+    for (const auto& host : availableHosts) {
+        SPDLOG_INFO("Planner set persistent state to {}", host->ip());
+        faabric::scheduler::getFunctionCallClient(host->ip())
+          ->setPersistentState(mapMsgShared);
+    }
 }
 
 bool Planner::migratingComplete()

@@ -61,6 +61,20 @@ void Application::addConnection(const std::string& src, const std::string& dest)
     connections[src].push_back(dest);
 }
 
+void Application::buildInvertConnections()
+{
+    reverseConnections.clear();
+    for (const auto& [src, dests] : connections) {
+        for (const auto& dest : dests) {
+            reverseConnections[dest].push_back(src);
+        }
+    }
+    for (auto& [dest, srcs] : reverseConnections) {
+        std::sort(srcs.begin(), srcs.end());
+        srcs.erase(std::unique(srcs.begin(), srcs.end()), srcs.end());
+    }
+}
+
 void Application::displayApplication() const
 {
     SPDLOG_INFO("OUTPUT Application DAG: {}", name);
@@ -92,4 +106,143 @@ void Application::displayApplication() const
     }
     SPDLOG_INFO("{}", logStream.str());
 }
+
+double Application::computePreWorkloads()
+{
+    // Get the minimum processed tuples operator in the application.
+    long minimizedInput = std::numeric_limits<long>::max();
+    for (auto& [nodeName, node] : nodes) {
+        if (node->processedTuples < minimizedInput) {
+            minimizedInput = node->processedTuples;
+        }
+    }
+
+    // When minimized input is 0, we set each operator share the same workload.
+    if (minimizedInput == 0) {
+        for (auto& [nodeName, node] : nodes) {
+            node->processedTuples = 1;
+        }
+        minimizedInput = 1;
+    }
+
+    // Calculate the workload of each operator and total workload.
+    // Preworkload is quantified by number of requests processed.
+    double totalPreWorkload = 0;
+    for (auto& [nodeName, node] : nodes) {
+        node->preWorkload = std::round(
+          static_cast<double>(node->processedTuples) / minimizedInput);
+
+        // It should never be less than 1.0, just in case.
+        if (node->preWorkload < 1.0) {
+            node->preWorkload = 1.0;
+        }
+        totalPreWorkload += node->preWorkload;
+    }
+
+    return totalPreWorkload;
+}
+
+void Application::quantiseResources(const int numHosts,
+                                    double totalPreWorkload)
+{
+    // Update the resource required for each operator (number of workers).
+    auto& appNodes = nodes;
+
+    struct Quantised
+    {
+        std::shared_ptr<Node> node; // pointer to the original node object
+        int units;                  // 1 unit == 0.1 workers
+        double frac;                // fractional part kept for tie‑breaks
+    };
+
+    const int TOTAL_UNITS = numHosts * 10; // 0.1‑granularity budget
+    std::vector<Quantised> bucket;
+    bucket.reserve(appNodes.size());
+
+    int usedUnits = 0;
+
+    //--------------------------------------------------------------------------
+    // step 1: convert each exact share to "baseUnits" (floor in 0.1 steps)
+    //--------------------------------------------------------------------------
+    for (auto& [name, n] : appNodes) {
+
+        double exactShare = static_cast<double>(numHosts) * n->preWorkload /
+                            totalPreWorkload; // original
+        double rawUnitsD = exactShare * 10.0; // 0.1 units
+        int baseUnits = static_cast<int>(std::floor(rawUnitsD));
+
+        if (baseUnits == 0) // enforce the 0.1 minimum
+            baseUnits = 1;
+
+        double frac = rawUnitsD - baseUnits; // 0 ≤ frac < 1
+
+        bucket.push_back({ n, baseUnits, frac });
+        usedUnits += baseUnits;
+    }
+
+    //--------------------------------------------------------------------------
+    // step 2: distribute (+) or steal (–) leftover units
+    //--------------------------------------------------------------------------
+
+    // 2a. We have *too few* units → hand out leftovers to highest "frac"
+    int remain = TOTAL_UNITS - usedUnits;
+    if (remain > 0) {
+        std::sort(bucket.begin(),
+                  bucket.end(),
+                  [](const Quantised& a, const Quantised& b) {
+                      return a.frac > b.frac; // descending
+                  });
+        for (int i = 0; i < remain; ++i)
+            bucket[i % bucket.size()].units += 1;
+    }
+
+    // 2b. We have *too many* units → take units from lowest "frac"
+    else if (remain < 0) {
+        remain = -remain; // units to remove   (> 0)
+
+        // sort buckets by ascending fractional remainder (cheapest to cut)
+        std::vector<Quantised*> order;
+        order.reserve(bucket.size());
+        for (auto& q : bucket)
+            order.push_back(&q);
+
+        std::sort(order.begin(),
+                  order.end(),
+                  [](const Quantised* a, const Quantised* b) {
+                      return a->frac < b->frac;
+                  });
+
+        // round‑robin removal: at most one unit per bucket per sweep
+        std::size_t i = 0;
+        while (remain > 0) {
+            Quantised* q = order[i];
+
+            if (q->units > 1) { // keep ≥ 0.1 (1 unit) per bucket
+                --q->units;
+                --remain;
+            }
+
+            i = (i + 1) % order.size(); // next bucket in the cycle
+            /* If we've looped back to the beginning and could not remove
+               anything on this entire sweep, it means all buckets are at
+               their minimum 0.1 already. */
+            if (i == 0 && remain > 0) {
+                SPDLOG_ERROR("Unable to rebalance to integer‑0.1 units");
+                throw std::runtime_error("quantisation failed");
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // step 3: write the quantised values back to each node
+    //--------------------------------------------------------------------------
+    for (auto& q : bucket)
+        q.node->reqResource = q.units / 10.0; // 0.1‑granularity
+
+    for (auto& [name, n] : appNodes) {
+        SPDLOG_DEBUG(
+          "Node {} requires {} resource units", name, n->reqResource);
+    }
+}
+
 }

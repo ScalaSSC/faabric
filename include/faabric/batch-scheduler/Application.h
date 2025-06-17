@@ -31,13 +31,14 @@ class Node
          NodeType typeIn,
          int parallelismIn,
          std::set<std::string> inputFeildsIn = {},
-         const std::string& partitionByIn = "None"
-         );
+         const std::string& partitionByIn = "None");
     // Used for rescheduling. It the records the metrics in the last window.
     double preWorkload = 0;
     double reqResource = 0;
 };
 
+// ConnectionInfo is a map where the key is the source node name and the value
+// are the destinations.
 using ConnectionInfo = std::map<std::string, std::vector<std::string>>;
 
 class Application
@@ -46,14 +47,20 @@ class Application
     std::string name;
     std::map<std::string, std::shared_ptr<Node>> nodes;
     std::vector<std::string> inputNodes;
+    // Source -> Destination connections
     ConnectionInfo connections;
+    ConnectionInfo reverseConnections;
 
   public:
     std::string getName() const { return name; }
     Application(const std::string& appName);
     void addNode(std::shared_ptr<Node> node, bool isInput = false);
     void addConnection(const std::string& src, const std::string& dest);
+    void buildInvertConnections();
     void displayApplication() const;
+    double computePreWorkloads(); // return total workload
+    // TODO - Now we only support homogenous cluster.
+    void quantiseResources(const int numHosts, double totalPreWorkload);
     std::vector<std::shared_ptr<Node>> getSource(const std::string& node);
 
     std::map<std::string, std::shared_ptr<Node>>& getNodes()
@@ -70,9 +77,9 @@ class Application
         }
         return inputNodes;
     }
-    
+
     const ConnectionInfo& getConnections() const { return connections; }
-    
+
     const void showConnections() const
     {
         SPDLOG_INFO("Connections in application {}: ", name);

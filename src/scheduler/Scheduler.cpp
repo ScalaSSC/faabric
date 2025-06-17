@@ -1175,4 +1175,12 @@ void Scheduler::updateStatelessDist(
     decentralScheduler.reallocateSummaryDist(sourceCountStats);
 }
 
+void Scheduler::setLocalPersistentState(
+  const std::map<std::string, std::string>& kvMap)
+{
+    SPDLOG_INFO("Setting local persistent state");
+    faabric::state::getGlobalState().writePersistentStateBatch(kvMap);
+    SPDLOG_INFO("Local persistent state set successfully");
+}
+
 }

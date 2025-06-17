@@ -2,6 +2,7 @@
 
 #include <faabric/batch-scheduler/StateAwareScheduler.h>
 #include <faabric/state/FunctionState.h>
+#include <faabric/state/PersistentState.h>
 #include <faabric/state/StateKeyValue.h>
 
 #include <shared_mutex>
@@ -53,7 +54,7 @@ class State
     void backupAll();
 
     void cleanBackup();
-    
+
     std::map<std::string, std::multimap<std::string, std::string>>
     schedulePreStates(
       const std::map<std::string,
@@ -116,6 +117,20 @@ class State
                                    int32_t parallelismId,
                                    std::vector<uint8_t>& data);
 
+    //---------------------
+    // Persistent State API
+    //---------------------
+
+    std::string readPersistentState(std::string& key);
+
+    std::vector<std::string> readPersistentStateBatch(
+      const std::vector<std::string>& keys);
+
+    void writePersistentState(std::string& key, std::string& value);
+
+    void writePersistentStateBatch(
+      const std::map<std::string, std::string>& data);
+
     std::string getThisIP();
 
     std::shared_ptr<FunctionState> createFS(const std::string& user,
@@ -137,6 +152,7 @@ class State
     std::unordered_map<std::string, std::shared_ptr<StateKeyValue>> kvMap;
     std::unordered_map<std::string, std::shared_ptr<FunctionState>> fsMap;
     std::unordered_map<std::string, std::shared_ptr<FunctionState>> backupMap;
+    PersistentState persistentState;
 
     std::shared_mutex mapMutex;
     std::shared_mutex fsmapMutex;

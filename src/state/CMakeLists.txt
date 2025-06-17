@@ -10,6 +10,7 @@ faabric_lib(state
     FunctionState.cpp
     FunctionStateRegistry.cpp
     FunctionStateClient.cpp
+    PersistentState.cpp
 )
 
 target_link_libraries(state PRIVATE

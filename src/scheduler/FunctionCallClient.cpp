@@ -142,6 +142,12 @@ void FunctionCallClient::resetParameter(
     asyncSend(faabric::scheduler::FunctionCalls::ResetParameter, req.get());
 }
 
+void FunctionCallClient::setPersistentState(
+  std::shared_ptr<faabric::planner::MapMessage> req)
+{
+    asyncSend(faabric::scheduler::FunctionCalls::SetPersistentState, req.get());
+}
+
 void FunctionCallClient::executeFunctionsBatch(
   std::list<std::unique_ptr<faabric::Message>>&& msgs)
 {
