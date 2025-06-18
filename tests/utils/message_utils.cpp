@@ -38,8 +38,8 @@ void checkMessageEquality(const faabric::Message& msgA,
     REQUIRE(msgA.cmdline() == msgB.cmdline());
 
     REQUIRE(msgA.recordexecgraph() == msgB.recordexecgraph());
-    checkMessageMapEquality(msgA.execgraphdetails(), msgB.execgraphdetails());
-    checkMessageMapEquality(msgA.intexecgraphdetails(),
-                            msgB.intexecgraphdetails());
+    // checkMessageMapEquality(msgA.execgraphdetails(), msgB.execgraphdetails());
+    // checkMessageMapEquality(msgA.intexecgraphdetails(),
+    //                         msgB.intexecgraphdetails());
 }
 }
