@@ -368,6 +368,10 @@ std::vector<std::string> StateAwareScheduler::scheduleMessagesBatch(
   const HostMap& hostMap,
   const std::vector<std::unique_ptr<faabric::Message>>& msgs)
 {
+    if (hostMap.empty()) {
+        SPDLOG_ERROR("Host map is empty, cannot schedule messages");
+        throw std::runtime_error("Host map is empty");
+    }
     std::vector<std::string> hosts;
     hosts.resize(msgs.size());
     for (int i = 0; i < msgs.size(); i++) {

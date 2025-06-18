@@ -21,6 +21,7 @@
 #include <faabric/util/string_tools.h>
 #include <faabric/util/testing.h>
 
+#include <sstream>
 #include <unordered_set>
 
 using namespace faabric::util;
@@ -108,6 +109,14 @@ void Scheduler::addHostToGlobalSet(
     auto registerHostResult =
       faabric::planner::getPlannerClient().registerHost(req);
     int plannerTimeout = std::get<0>(registerHostResult);
+
+    auto hostSync = std::get<1>(registerHostResult);
+    if (!hostSync) {
+        SPDLOG_ERROR("Host {} not registered in planner", hostIp);
+        throw std::runtime_error("Host not registered in planner");
+    }
+    auto& hostMap = std::get<2>(registerHostResult);
+    updateHosts(hostMap);
 
     // Once the host is registered, set-up a periodic thread to send a heart-
     // beat to the planner. Note that this method may be called multiple times
@@ -211,8 +220,10 @@ void Scheduler::reset()
 
     scheduledMsgsMap.clear();
 
-    registeredHostsMap.clear();
-    hostMap.clear();
+    // This function is called when planner flush executors. In this case,
+    // planner didn't flush the hostmap, the scheduler also should not flush it.
+    // registeredHostsMap.clear();
+    // hostMap.clear();
 
     stopBatchTimer = false;
     batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
@@ -982,16 +993,22 @@ int Scheduler::getMonitoredInfoTest()
 void Scheduler::updateHosts(const std::vector<std::string>& hosts)
 {
     faabric::util::FullLock lock(mx);
+    if (hosts.empty()) {
+        SPDLOG_ERROR("No hosts provided to updateHosts");
+        throw std::runtime_error("No hosts provided to updateHosts");
+        return;
+    }
     registeredHostsMap.clear();
     for (const auto& host : hosts) {
         registeredHostsMap.emplace(host, host);
     }
 
-    for (const auto& entry : registeredHostsMap) {
-        SPDLOG_INFO("Local registered host map Key: {}, Value: {}",
-                    entry.first,
-                    entry.second);
+    std::ostringstream oss;
+    oss << "Registered hosts:\n";
+    for (const auto& [key, value] : registeredHostsMap) {
+        oss << key << "=" << value << ";\n";
     }
+    SPDLOG_INFO("updateHosts: {}", oss.str());
 
     hostMap = convertHostMap(registeredHostsMap);
 }

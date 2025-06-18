@@ -151,9 +151,6 @@ void Planner::flushHosts()
 
     state.hostMap.clear();
     state.batchSchedHostMap.clear();
-    for (const auto& [ip, host] : state.hostMap) {
-        host->set_hostsync(true);
-    }
 }
 
 void Planner::flushExecutors()
@@ -228,8 +225,8 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
         return false;
     }
 
+    bool requireHostSync = false;
     faabric::util::FullLock lock(plannerMx);
-
     auto it = state.hostMap.find(hostIn.ip());
     if (it == state.hostMap.end() || isHostExpired(it->second)) {
         // If the host entry has expired, we remove it and treat the host
@@ -243,15 +240,10 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
         SPDLOG_INFO(
           "Registering host {} with {} slots", hostIn.ip(), hostIn.slots());
         auto regHost = std::make_shared<Host>(hostIn);
-        regHost->set_hostsync(true);
         state.hostMap.emplace(
           std::make_pair<std::string, std::shared_ptr<Host>>(
             (std::string)hostIn.ip(), std::move(regHost)));
-        // Update the host map to decentralized schedulers.
-        for (const auto& [ip, host] : state.hostMap) {
-            host->set_hostsync(true);
-        }
-
+        requireHostSync = true;
     } else if (it != state.hostMap.end() && overwrite) {
         // We allow overwritting the host state by sending another register
         // request with same IP but different host resources. This is useful
@@ -262,11 +254,20 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
                     hostIn.usedslots());
         it->second->set_slots(hostIn.slots());
         it->second->set_usedslots(hostIn.usedslots());
+        requireHostSync = true;
     } else if (it != state.hostMap.end()) {
         SPDLOG_TRACE("NOT overwritting host {} with {} slots (used {})",
                      hostIn.ip(),
                      hostIn.slots(),
                      hostIn.usedslots());
+    }
+
+    if (requireHostSync) {
+        // Update the host map to decentralized schedulers.
+        for (const auto& [ip, host] : state.hostMap) {
+            host->set_hostsync(true);
+        }
+        state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
     }
 
     // Irrespective, set the timestamp
@@ -275,7 +276,6 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
       ->mutable_registerts()
       ->set_epochms(faabric::util::getGlobalClock().epochMillis());
 
-    state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
     return true;
 }
 
@@ -285,7 +285,11 @@ const std::pair<bool, HostPtrMap&> Planner::getRegisteredHost(
     faabric::util::SharedLock lock(plannerMx);
 
     auto it = state.hostMap.find(hostIp);
-    if (it != state.hostMap.end() && it->second->hostsync()) {
+    if (it == state.hostMap.end()) {
+        SPDLOG_ERROR("Host {} not found in planner", hostIp);
+        throw std::runtime_error("Host not found in planner");
+    }
+    if (it->second->hostsync()) {
         it->second->set_hostsync(false);
         return { true, state.hostMap };
     }

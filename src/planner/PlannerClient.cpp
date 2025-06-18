@@ -27,11 +27,6 @@ void KeepAliveThread::doWork()
 
     faabric::util::SharedLock lock(keepAliveThreadMx);
 
-    if (sch != nullptr) {
-        // int status = sch->getMonitoredInfoTest();
-        // SPDLOG_DEBUG("Keep-alive thread status: {}", status);
-    }
-
     auto [time, hostSync, hostMap, statesSync, statesInfo] =
       cli.registerHost(thisHostReq);
 
@@ -39,11 +34,6 @@ void KeepAliveThread::doWork()
         // Update local registered hosts map
         sch->updateHosts(hostMap);
     }
-
-    // if (statesSync) {
-    //     // Update local function states info
-    //     sch->updateStatesInfo(statesInfo);
-    // }
 }
 
 void KeepAliveThread::setRequest(
