@@ -824,9 +824,9 @@ void Planner::rescheduleApp()
         operatorWorkloadMap[funcName] += count;
     }
 
-    for (const auto& [funcName, count] : operatorWorkloadMap) {
-        SPDLOG_DEBUG("Function {} has workload {}", funcName, count);
-    }
+    // for (const auto& [funcName, count] : operatorWorkloadMap) {
+    //     SPDLOG_DEBUG("Function {} has workload {}", funcName, count);
+    // }
 
     // Update the processed tuples.
     stateAwareScheduler->updateApp(operatorWorkloadMap);
