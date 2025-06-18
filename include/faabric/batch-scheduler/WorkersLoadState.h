@@ -115,7 +115,7 @@ class WorkersLoadState
         for (auto& [instance, workerLoad] : instanceWorkerLoad) {
             SPDLOG_DEBUG(
               "Instance: {}, Worker Load: {}", instance, workerLoad.size());
-            for (auto& [workerIP, load] : workerLoad) {
+            for ([[maybe_unused]]auto& [workerIP, load] : workerLoad) {
                 SPDLOG_DEBUG("Worker IP: {}, Load: {}", workerIP, load);
             }
         }
