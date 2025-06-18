@@ -239,7 +239,7 @@ void Application::quantiseResources(const int numHosts,
     for (auto& q : bucket)
         q.node->reqResource = q.units / 10.0; // 0.1‑granularity
 
-    for (auto& [name, n] : appNodes) {
+    for ([[maybe_unused]]auto& [name, n] : appNodes) {
         SPDLOG_DEBUG(
           "Node {} requires {} resource units", name, n->reqResource);
     }
