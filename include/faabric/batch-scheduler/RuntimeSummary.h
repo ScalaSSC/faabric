@@ -217,9 +217,9 @@ class RuntimeSummary
         if (it == windowedRecords.end()) {
             // SPDLOG all keys
             SPDLOG_DEBUG("Windowed records keys: {}", windowedRecords.size());
-            for (const auto& [key, _] : windowedRecords) {
-                SPDLOG_DEBUG("Key: {}", key);
-            }
+            // for (const auto& [key, _] : windowedRecords) {
+            //     SPDLOG_DEBUG("Key: {}", key);
+            // }
             SPDLOG_ERROR("No collocate map for instance {} found", instance);
             throw std::runtime_error("No collocate map for instance " +
                                      instance);
