@@ -302,6 +302,22 @@ int FunctionState::acquireIndivLocks(std::set<std::string>& keys,
     return stateVec.size();
 }
 
+std::map<std::string, std::vector<uint8_t>>
+FunctionState::readPartitionStateLock(std::set<std::string>& keys)
+{
+    // Get the thread ID
+    std::map<std::string, std::vector<uint8_t>> filteredMap;
+
+    std::string acquiredKeysStr;
+    auto acquiredKeys = multiKeysLock.tryAcquire(keys);
+    faabric::util::FullLock lock(funcStateMutex);
+    for (const auto& key : acquiredKeys) {
+        auto indivState = indivStateMap[key].getState();
+        filteredMap.emplace(key, indivState);
+    }
+    return filteredMap;
+}
+
 void FunctionState::writePartitionStateUnlocks(std::vector<uint8_t>& states)
 {
     faabric::util::FullLock lock(funcStateMutex);

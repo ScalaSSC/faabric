@@ -346,6 +346,17 @@ void State::readIndivFuncState(const std::string& user,
     std::copy(stateVec.data(), stateVec.data() + stateLength, buffer);
 }
 
+std::map<std::string, std::vector<uint8_t>> State::readIndivFuncStateLock(
+  const std::string& user,
+  const std::string& func,
+  int32_t parallelismId,
+  std::set<std::string>& keys)
+{
+    auto targetFs = doGetFS(user, func, parallelismId);
+
+    return targetFs->readPartitionStateLock(keys);
+}
+
 void State::writeIndivFuncStateUnlock(const std::string& user,
                                       const std::string& func,
                                       int32_t parallelismId,

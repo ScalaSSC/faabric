@@ -112,6 +112,12 @@ class State
                             int bufferLength,
                             std::set<std::string>& keys);
 
+    std::map<std::string, std::vector<uint8_t>> readIndivFuncStateLock(
+      const std::string& user,
+      const std::string& func,
+      int32_t parallelismId,
+      std::set<std::string>& keys);
+
     void writeIndivFuncStateUnlock(const std::string& user,
                                    const std::string& func,
                                    int32_t parallelismId,

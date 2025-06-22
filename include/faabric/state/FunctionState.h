@@ -58,6 +58,8 @@ class FunctionState
                           int acquireTimes);
     int readPartitionStateSize(std::set<std::string>& keys);
     std::vector<uint8_t> readPartitionState(std::set<std::string>& keys);
+    std::map<std::string, std::vector<uint8_t>> readPartitionStateLock(
+      std::set<std::string>& keys);
     void writePartitionStateUnlocks(std::vector<uint8_t>& states);
 
     // Reschedule partition states
