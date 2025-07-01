@@ -13,6 +13,7 @@
 #include <faabric/util/gids.h>
 #include <faabric/util/locks.h>
 #include <faabric/util/logging.h>
+#include <faabric/util/message.h>
 #include <faabric/util/string_tools.h>
 
 #include <fstream>
@@ -425,19 +426,6 @@ int Planner::getNumMigrations()
     return state.numMigrations.load(std::memory_order_acquire);
 }
 
-bool Planner::registerFuncState(const std::string& userFunction,
-                                const std::string& partitionBy,
-                                const std::string& stateKey)
-{
-    SPDLOG_DEBUG("Planner received request to register function state for {}",
-                 userFunction);
-    faabric::util::FullLock lock(plannerMx);
-    bool registerResult = stateAwareScheduler->registerFunctionState(
-      userFunction, partitionBy, stateKey, state.batchSchedHostMap);
-
-    return registerResult;
-}
-
 // Schedule Messages should not called when reschedule state, outputting the
 // result.
 void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
@@ -579,66 +567,50 @@ std::map<std::string, FunctionMetrics> Planner::collectMetrics()
  * The logic of registerApp is save the application workflow in the scheduler
  ***/
 
-bool Planner::registerApp(std::unique_ptr<batch_scheduler::Application> app)
+bool Planner::registerApp(faabric::planner::RegisterApplicationRequest& rawReq,
+                          std::unique_ptr<batch_scheduler::Application> app,
+                          bool init)
 {
-    SPDLOG_INFO("Planner received request to register application {}",
-                app->getName());
+    SPDLOG_INFO("Planner registers application {}", app->getName());
     faabric::util::FullLock lock(plannerMx);
     stateAwareScheduler->registerApp(std::move(app));
+    distributeApp(rawReq);
+    if (init) {
+        stateAwareScheduler->initApp(state.batchSchedHostMap);
+        stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
+        doDistributeStatesInfo();
+        doRescheduleMessages();
+    }
     return true;
 }
 
-/***
- * Update the function parallelism not only update the information in scheduler,
- * but also register the states in Redis.
- ***/
-
-bool Planner::updateFuncPar(const std::string& userFunc, int newPar)
+void Planner::distributeApp(
+  faabric::planner::RegisterApplicationRequest& rawReq)
 {
-    SPDLOG_INFO("Planner received request to changed parallelism for {} by {}",
-                userFunc,
-                newPar);
-    faabric::util::FullLock lock(plannerMx);
-
-    isUpdateState = true;
-
-    stateAwareScheduler->updateFuncStatePar(
-      userFunc, newPar, state.batchSchedHostMap);
-
-    isUpdateState = false;
-    return true;
-}
-
-/***
- * This function initializes the each function / function parallelism have the
- * same weight and then distribute the information to workers.
- ***/
-void Planner::initFuncState(std::vector<std::string> statelessOpts,
-                            std::map<std::string, int> parStateOpts)
-{
-    faabric::util::FullLock lock(plannerMx);
-    isUpdateState = true;
-    // Generage the stateless and partitioned stateful operator weights.
-    std::map<std::string, std::map<std::string, int>> statelessReqWeight;
-    for (const auto& func : statelessOpts) {
-        for (const auto& [ip, host] : state.hostMap) {
-            statelessReqWeight[func + "_0"][ip] = 1;
+    SPDLOG_INFO("Planner distributes application {} to workers",
+                rawReq.appname());
+    auto req =
+      std::make_shared<faabric::planner::RegisterApplicationRequest>(rawReq);
+    std::vector<std::thread> threads;
+    for (const auto& [ip, host] : state.hostMap) {
+        threads.emplace_back([&, ip]() {
+            try {
+                SPDLOG_DEBUG("Planner distributes application to host {}", ip);
+                faabric::scheduler::getFunctionCallClient(ip)
+                  ->registerApplication(req);
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR("Failed to distributes application to host {}: {}",
+                             ip,
+                             e.what());
+                throw e;
+            }
+        });
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
         }
     }
-    stateAwareScheduler->setStatelessReqWeight(statelessReqWeight);
-    std::map<std::string, std::map<int, int>> parStateReqWeight;
-    for (const auto& [func, par] : parStateOpts) {
-        for (int i = 0; i < par; i++) {
-            parStateReqWeight[func][i] = 1;
-        }
-    }
-    stateAwareScheduler->setParStateReqWeight(parStateReqWeight);
-
-    stateAwareScheduler->updateReqDist();
-    stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
-    doDistributeStatesInfo();
-    doRescheduleMessages();
-    isUpdateState = false;
 }
 
 void Planner::doDistributeStatesInfo()
@@ -662,48 +634,10 @@ void Planner::doDistributeStatesInfo()
         }
     }
 
-    // Add the stateless and partitioned stateful operator weights.
-    auto statelessReqWeight = stateAwareScheduler->getStatelessReqWeight();
+    auto scheduledOperatorsMap =
+      stateAwareScheduler->getScheduledOperatorsMap();
 
-    auto* srwMap =
-      req->mutable_statelessreqweight(); // Map<string,StatelessWeight>
-
-    for (const auto& [funcPar, hostWeights] : statelessReqWeight) {
-        auto& innerMsg = (*srwMap)[funcPar];
-
-        auto* hostWeightMap = innerMsg.mutable_hostweight();
-        for (const auto& [host, weight] : hostWeights) {
-            (*hostWeightMap)[host] = weight;
-        }
-    }
-
-    auto parStateReqWeight = stateAwareScheduler->getParStateReqWeight();
-
-    auto* pswMap =
-      req->mutable_parstatereqweight(); // Map<string,ParStateWeight>
-
-    for (const auto& [funcName, partWeights] : parStateReqWeight) {
-        auto& innerMsg = (*pswMap)[funcName];
-
-        auto* partWeightMap = innerMsg.mutable_partitionweight();
-        for (const auto& [idx, weight] : partWeights) {
-            (*partWeightMap)[idx] = weight;
-        }
-    }
-
-    auto optsCollocateMap = stateAwareScheduler->getOptsCollocateMap();
-    auto* ocMap = req->mutable_operatorcollocatemap();
-
-    for (const auto& [funcName, collocate] : optsCollocateMap) {
-        (*ocMap)[funcName] = collocate;
-    }
-
-    auto optsCollocateHeadMap = stateAwareScheduler->getOptsCollocateHeadMap();
-    auto* ochMap = req->mutable_operatorcollocateheadmap();
-
-    for (const auto& [funcName, collocate] : optsCollocateHeadMap) {
-        (*ochMap)[funcName] = collocate;
-    }
+    faabric::util::serializeScheduledOperatorMap(req, scheduledOperatorsMap);
 
     SPDLOG_INFO("Planner begin sending states");
     std::vector<std::thread> threads;
@@ -834,7 +768,7 @@ void Planner::rescheduleApp()
     SPDLOG_INFO("Planner reschedules application done");
 
     // Reschedule the states and messages in queue
-    stateAwareScheduler->updateReqDist();
+    // stateAwareScheduler->updateReqDist();
     doDistributeStatesInfo();
     doRescheduleMessages();
 }
@@ -930,7 +864,7 @@ void Planner::updateRuntimeStats()
                 sourceCountStats[instanceName][hostIp] = chainedCallCount;
             }
         }
-        stateAwareScheduler->reallocateSummaryDist(sourceCountStats);
+        stateAwareScheduler->runtimeSourceUpdate(sourceCountStats);
 
         results.clear();
     }

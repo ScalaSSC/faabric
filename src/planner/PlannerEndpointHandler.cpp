@@ -10,6 +10,7 @@
 #include <faabric/util/batch.h>
 #include <faabric/util/json.h>
 #include <faabric/util/logging.h>
+#include <faabric/util/message.h>
 
 namespace faabric::planner {
 
@@ -314,30 +315,6 @@ void PlannerEndpointHandler::onRequest(
 
             return ctx.sendFunction(std::move(response));
         }
-        case faabric::planner::HttpMessage_Type_REGISTER_FUNCTION_STATE: {
-            SPDLOG_DEBUG("Planner received REGISTER_FUNCTION_STATE request");
-            faabric::planner::RegisterFunctionStateRequest rawReq;
-            try {
-                faabric::util::jsonToMessage(msg.payloadjson(), &rawReq);
-            } catch (faabric::util::JsonSerialisationException e) {
-                response.result(beast::http::status::bad_request);
-                response.body() = std::string("Bad JSON in body's payload");
-                return ctx.sendFunction(std::move(response));
-            }
-            std::string function = rawReq.function();
-            std::string attribute = rawReq.attribute();
-            std::string stateKey = rawReq.statekey();
-            bool registerResult =
-              faabric::planner::getPlanner().registerFuncState(
-                function, attribute, stateKey);
-            if (!registerResult) {
-                SPDLOG_ERROR("Failed to register function state");
-                response.result(beast::http::status::internal_server_error);
-                response.body() = std::string("Failed to register state");
-                return ctx.sendFunction(std::move(response));
-            }
-            return ctx.sendFunction(std::move(response));
-        }
         case faabric::planner::HttpMessage_Type_SET_PERSISTENT_STATE: {
             SPDLOG_DEBUG("Planner received SET_PERSISTENT_STATE request");
             faabric::planner::MapMessage rawReq;
@@ -361,89 +338,12 @@ void PlannerEndpointHandler::onRequest(
                 response.body() = std::string("Bad JSON in body's payload");
                 return ctx.sendFunction(std::move(response));
             }
-            std::string appName = rawReq.appname();
-            auto applicationPtr =
-              std::make_unique<faabric::batch_scheduler::Application>(appName);
 
-            // Statistics the name of the stateless nodes and partitioned
-            // stateful nodes.
-            std::vector<std::string> statelessOpts;
-            std::map<std::string, int> parStateOpts;
-            for (const auto& node : rawReq.nodes()) {
-                batch_scheduler::NodeType type =
-                  static_cast<batch_scheduler::NodeType>(node.type());
-                if (type == faabric::batch_scheduler::NodeType::STATELESS) {
-                    statelessOpts.push_back(node.name());
-                }
-                if (type ==
-                    faabric::batch_scheduler::NodeType::PARTITIONED_STATEFUL) {
-                    parStateOpts[node.name()] = node.parallelism();
-                }
-            }
+            auto applicationPtr = faabric::util::parseApplicationMsg(rawReq);
 
-            // For each node, add it to the application.
-            for (const auto& node : rawReq.nodes()) {
-                batch_scheduler::NodeType type =
-                  static_cast<batch_scheduler::NodeType>(node.type());
-                std::set<std::string> inputFeilds;
-                if (node.inputfields_size() > 0) {
-                    for (const auto& field : node.inputfields()) {
-                        inputFeilds.insert(field);
-                    }
-                }
-                if (type == batch_scheduler::NodeType::STATELESS) {
-                    batch_scheduler::Node n(
-                      node.name(), type, 1, std::move(inputFeilds));
-                    applicationPtr->addNode(
-                      std::make_shared<batch_scheduler::Node>(n), node.input());
-                } else {
-                    std::string partitionBy = "None";
-                    if (type ==
-                        batch_scheduler::NodeType::PARTITIONED_STATEFUL) {
-                        partitionBy = node.partitionby();
-                    }
-                    batch_scheduler::Node n(node.name(),
-                                            type,
-                                            node.parallelism(),
-                                            std::move(inputFeilds),
-                                            partitionBy);
-                    applicationPtr->addNode(
-                      std::make_shared<batch_scheduler::Node>(n), node.input());
-                }
-                if (node.successornode_size() > 0) {
-                    for (const auto& successor : node.successornode()) {
-                        applicationPtr->addConnection(node.name(), successor);
-                    }
-                }
-            }
-
-            faabric::planner::getPlanner().registerApp(
-              std::move(applicationPtr));
-
-            // Register the states.
-            for (const auto& node : rawReq.nodes()) {
-                batch_scheduler::NodeType type =
-                  static_cast<batch_scheduler::NodeType>(node.type());
-                if (type == batch_scheduler::NodeType::STATELESS) {
-                    continue;
-                }
-                std::string userFunction = node.name();
-                std::string partitionBy = node.partitionby();
-                std::string stateKey;
-                if (type == batch_scheduler::NodeType::PARTITIONED_STATEFUL) {
-                    stateKey = "Unknown";
-                } else {
-                    stateKey = "None";
-                }
-                planner::getPlanner().registerFuncState(
-                  userFunction, partitionBy, stateKey);
-                if (node.parallelism() >= 1) {
-                    planner::getPlanner().updateFuncPar(userFunction,
-                                                        node.parallelism());
-                }
-            }
-
-            planner::getPlanner().initFuncState(statelessOpts, parStateOpts);
+            // Distribute the application to the workers.
+            faabric::planner::getPlanner().registerApp(rawReq,
+              std::move(applicationPtr), true);
 
             return ctx.sendFunction(std::move(response));
         }

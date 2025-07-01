@@ -8,6 +8,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <vector>
 
 namespace faabric::util {
@@ -79,6 +80,22 @@ class ConsistentHashRing
         if (it == ring.end())
             it = ring.begin();
         return { h, it->second };
+    }
+
+    std::string nodeWeightsToString()
+    {
+        faabric::util::SharedLock lock(ringMutex);
+
+        std::ostringstream ss;
+        bool first = true;
+        for (auto const& [nodeId, weight] : nodeWeights) {
+            if (!first) {
+                ss << ", ";
+            }
+            first = false;
+            ss << nodeId << ":" << weight;
+        }
+        return ss.str();
     }
 
   private:

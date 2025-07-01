@@ -5,6 +5,7 @@
 #include <faabric/planner/PlannerClient.h>
 #include <faabric/proto/faabric.pb.h>
 // #include <faabric/scheduler/InstancesLoadState.h>
+#include <faabric/batch-scheduler/RuntimeSummary.h>
 #include <faabric/scheduler/InstancesRuntimeStats.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/transport/PointToPointBroker.h>
@@ -45,6 +46,8 @@ class Scheduler
 
     // Check the waiting queue peroiodically.
     void batchTimerCheck();
+
+    bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
 
     void enqueueChainedCalls(
       std::vector<std::unique_ptr<faabric::Message>> msgs);
@@ -126,11 +129,8 @@ class Scheduler
     void updateHosts(const std::vector<std::string>& hosts);
 
     void updateStatesInfo(
-      const std::map<std::string, std::map<std::string, int>>&
-        newStatelessReqWeight,
-      const std::map<std::string, std::map<int, int>>& newParStateReqWeight,
-      const std::map<std::string, std::string> newOptCollocate,
-      const std::map<std::string, std::string> newOptCollocateHead,
+      const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
+        scheuduledOperatorMap,
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
         statesInfo);
 

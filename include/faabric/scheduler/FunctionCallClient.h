@@ -48,8 +48,8 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
 
     void setMessageResult(std::shared_ptr<faabric::Message> msg);
 
-    // void getWorkerLoad(
-    //   faabric::batch_scheduler::WorkersLoadState& workersLoadState);
+    void registerApplication(
+      std::shared_ptr<faabric::planner::RegisterApplicationRequest> req);
 
     std::unique_ptr<faabric::RuntimeStatsResult> getRuntimeStats(
       faabric::RuntimeStatsUpdateRequest req);

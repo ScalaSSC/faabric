@@ -14,5 +14,6 @@ enum FunctionCalls
     MigrateStates = 8,
     GetRuntimeStats = 9,
     SetPersistentState = 10,
+    RegisterApplication = 11,
 };
 }

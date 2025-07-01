@@ -49,6 +49,7 @@ class FunctionState
     size_t size() const;
     void get(uint8_t* buffer);
     void set(const uint8_t* buffer, long length, bool unlock = false);
+    std::vector<uint8_t> getFuncStateLock(bool lockin = false);
 
     /***
      * Functions used by the Partitioned Stateful Function Operator

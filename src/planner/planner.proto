@@ -133,20 +133,46 @@ message RegisterHostResponse {
     repeated FunctionStateInfo statesInfo = 7;
 }
 
-message StatelessWeight {
-    map<string, int32> hostWeight = 1;
+enum NodeType {
+  STATELESS = 0;
+  STATEFUL = 1;
+  PARTITIONED_STATEFUL = 2;
 }
 
-message ParStateWeight {
-    map<int32, int32> partitionWeight = 1;
+message ScheduledNode {
+  string name = 1;
+  NodeType type = 2;
+  bool is_input = 3;
+  int32 parallelism = 4;
+  repeated string input_fields = 5;
+  string partition_by = 6;
+  int64 processed_tuples = 7;
+  double pre_workload = 8;
+  double req_resource = 9;
+}
+
+enum LocalStatelessOperatorType {
+  UNKNOWN = 0;
+  ROUNDROBIN_HEAD = 1;
+  ROUNDROBIN_BODY = 2;
+  COLLOCATE_HEAD = 3;
+  COLLOCATE_BODY = 4;
+}
+
+message ScheduledOperator {
+  ScheduledNode node = 1;
+  int32 group_id = 2;
+  bool is_collocate = 3;
+  string collocate_with = 4;
+  int32 parallelism = 5;
+  map<string, int32> weight_dist = 6;
+  map<int32, string> parallelism_dist = 7;
+  LocalStatelessOperatorType local_type = 8;
 }
 
 message SyncStatesInfoRequest {
     repeated FunctionStateInfo statesInfo = 1;
-    map<string, StatelessWeight> statelessReqWeight = 2;
-    map<string, ParStateWeight>  parStateReqWeight = 3;    
-    map<string, string> operatorCollocateMap = 4;
-    map<string, string> operatorCollocateHeadMap = 5;
+    repeated ScheduledOperator scheduled_operators = 2; 
 }
 
 message SyncStatesInfoResponse {
@@ -215,13 +241,8 @@ message RegisterFunctionStateRequest{
 }
 
 message Node{
-    enum Type {
-        STATELESS = 0;
-        STATEFUL = 1;
-        PARTITIONED_STATEFUL = 2;
-    }
     string name = 1;
-    Type type = 2 [json_name = "node_type"];;
+    NodeType type = 2 [json_name = "node_type"];;
     // If the node type is 2, hot it is partitioned.
     string partitionBy = 3;
     // If this operator is an input operator

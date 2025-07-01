@@ -300,6 +300,18 @@ int State::readFuncState(const std::string& user,
     return targetFs->size();
 }
 
+std::vector<uint8_t> State::readFuncStateLock(const std::string& user,
+                                              const std::string& func,
+                                              int32_t parallelismId,
+                                              bool lock)
+{
+    auto targetFs = doGetFS(user, func, parallelismId);
+
+    // Lock the state and read it
+    std::vector<uint8_t> stateVec = targetFs->getFuncStateLock(lock);
+    return stateVec;
+}
+
 void State::setFuncState(const std::string& user,
                          const std::string& func,
                          int32_t parallelismId,

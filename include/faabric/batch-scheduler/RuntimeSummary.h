@@ -1,5 +1,6 @@
 #pragma once
 
+#include <faabric/batch-scheduler/Application.h>
 #include <faabric/util/config.h>
 #include <faabric/util/locks.h>
 #include <faabric/util/string_tools.h>
@@ -9,25 +10,163 @@
 #include <map>
 #include <random> // std::default_random_engine
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
 namespace faabric::batch_scheduler {
 
-struct HostSlot
+enum LocalStatelessOperatorType
 {
-    std::string host;
-    std::size_t slots = 0;  // how many entries in the ring
-    double remainder = 0.0; // fractional leftover
+    UNKNOWN = 0,
+    ROUNDROBIN_HEAD = 1,
+    ROUNDROBIN_BODY = 2,
+    COLLOCATE_HEAD = 3,
+    COLLOCATE_BODY = 4,
 };
 
-struct GapInfo
+inline ::faabric::planner::LocalStatelessOperatorType toProto(
+  LocalStatelessOperatorType t)
 {
-    std::string host;
-    double gap = 0.0;      // positive (expected – source)
-    std::size_t slots = 0; // integer allocation
-    double rem = 0.0;      // fractional remainder
+    switch (t) {
+        case LocalStatelessOperatorType::UNKNOWN:
+            return ::faabric::planner::LocalStatelessOperatorType::UNKNOWN;
+        case LocalStatelessOperatorType::ROUNDROBIN_HEAD:
+            return ::faabric::planner::LocalStatelessOperatorType::
+              ROUNDROBIN_HEAD;
+        case LocalStatelessOperatorType::ROUNDROBIN_BODY:
+            return ::faabric::planner::LocalStatelessOperatorType::
+              ROUNDROBIN_BODY;
+        case LocalStatelessOperatorType::COLLOCATE_HEAD:
+            return ::faabric::planner::LocalStatelessOperatorType::
+              COLLOCATE_HEAD;
+        case LocalStatelessOperatorType::COLLOCATE_BODY:
+            return ::faabric::planner::LocalStatelessOperatorType::
+              COLLOCATE_BODY;
+    }
+    // Fallback for any future/new values
+    return ::faabric::planner::LocalStatelessOperatorType::UNKNOWN;
+}
+
+inline LocalStatelessOperatorType fromProto(
+  ::faabric::planner::LocalStatelessOperatorType t)
+{
+    switch (t) {
+        case ::faabric::planner::LocalStatelessOperatorType::UNKNOWN:
+            return LocalStatelessOperatorType::UNKNOWN;
+        case ::faabric::planner::LocalStatelessOperatorType::ROUNDROBIN_HEAD:
+            return LocalStatelessOperatorType::ROUNDROBIN_HEAD;
+        case ::faabric::planner::LocalStatelessOperatorType::ROUNDROBIN_BODY:
+            return LocalStatelessOperatorType::ROUNDROBIN_BODY;
+        case ::faabric::planner::LocalStatelessOperatorType::COLLOCATE_HEAD:
+            return LocalStatelessOperatorType::COLLOCATE_HEAD;
+        case ::faabric::planner::LocalStatelessOperatorType::COLLOCATE_BODY:
+            return LocalStatelessOperatorType::COLLOCATE_BODY;
+        // If Protobuf ever adds values you don’t recognize, fall back:
+        default:
+            return LocalStatelessOperatorType::UNKNOWN;
+    }
+}
+
+struct ScheduledOperator
+{
+    ScheduledOperator(Node nodeIn,
+                      int groupIdIn,
+                      bool isCollocateIn,
+                      std::string collocateWithIn,
+                      int parallelismIn,
+                      std::map<std::string, int> weightDistIn,
+                      std::map<int, std::string> parallelismDistIn,
+                      LocalStatelessOperatorType localTypeIn)
+      : node(std::move(nodeIn))
+      , groupId(groupIdIn)
+      , isCollocate(isCollocateIn)
+      , collocateWith(std::move(collocateWithIn))
+      , parallelism(parallelismIn)
+      , weightDist(std::move(weightDistIn))
+      , parallelismDist(std::move(parallelismDistIn))
+      , localType(localTypeIn)
+    {}
+
+    Node node;
+    // std::string userFunction;
+    // NodeType type;
+    // bool isInput;
+    int groupId;
+    // Only used for stateless operators.
+    bool isCollocate;
+    std::string collocateWith;
+    // This is the parallelism of the operator after rescheduled.
+    // The parallelism in node maybe changed by the scheduler.
+    int parallelism;
+    // IP -> weight distribution.
+    std::map<std::string, int> weightDist;
+    // Idx -> IP distribution. (only for partitioned stateful operators)
+    std::map<int, std::string> parallelismDist;
+    enum LocalStatelessOperatorType localType = UNKNOWN;
 };
+
+static const char* localNodeTypeToString(NodeType t)
+{
+    switch (t) {
+        case NodeType::STATELESS:
+            return "STATELESS";
+        case NodeType::STATEFUL:
+            return "STATEFUL";
+        case NodeType::PARTITIONED_STATEFUL:
+            return "PARTITIONED_STATEFUL";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+[[maybe_unused]]
+static std::string to_string(const ScheduledOperator& s)
+{
+    std::ostringstream oss;
+    oss << "{ name=" << s.node.name
+        << " type=" << localNodeTypeToString(s.node.type)
+        << " group=" << s.groupId
+        << " collocate=" << (s.isCollocate ? "true" : "false")
+        << " collWith=" << s.collocateWith << " par=" << s.parallelism
+        << " wDist={";
+    for (auto const& [h, w] : s.weightDist) {
+        oss << h << ":" << w << ",";
+    }
+    oss << "} pDist={";
+    for (auto const& [i, h] : s.parallelismDist) {
+        oss << i << "->" << h << ",";
+    }
+    oss << "}}";
+    return oss.str();
+}
+
+[[maybe_unused]]
+static void printScheduledOperatorsMap(
+  const std::map<std::string, ScheduledOperator>& scheduledOperatorsMap)
+{
+    std::ostringstream ss;
+
+    for (const auto& [key, sop] : scheduledOperatorsMap) {
+        ss << key << " => " << to_string(sop) << "\n";
+    }
+
+    SPDLOG_INFO("ScheduledOperatorsMap:\n{}", ss.str());
+}
+
+inline ScheduledOperator& getScheduledOperatorOrThrow(
+  std::map<std::string, ScheduledOperator>& ops,
+  const std::string& nodeName)
+{
+    auto it = ops.find(nodeName);
+    if (it == ops.end()) {
+        SPDLOG_ERROR("Source node {} not found in scheduled operators map",
+                     nodeName);
+        throw std::runtime_error(
+          "Source node not found in scheduled operators map");
+    }
+    return it->second;
+}
 
 // The number of slots in the ring.
 const std::size_t RING_SIZE = 100;
@@ -38,50 +177,22 @@ class WindowedRecord
 {
   public:
     // Constructor: workers list, target proportions, and window size
-    explicit WindowedRecord(std::map<std::string, double>& expectedDist,
-                            bool isHead)
+    explicit WindowedRecord(std::map<std::string, double>& expDist,
+                            std::map<std::string, double>& srcDist,
+                            bool isBody)
       : windowPos(0)
       , windowSize(RING_SIZE)
     {
         faabric::util::FullLock lock(wrMx);
-        setWindow(expectedDist, isHead);
+        setWindow(expDist, srcDist, isBody);
     }
 
     // Schedule a request, returning the chosen host
-    std::string schedule(const std::string& recommended)
-    {
-        faabric::util::FullLock lock(wrMx);
-
-        if (windowPos == windowSize) {
-            assignedCount.clear();
-            windowPos = 0;
-        }
-        std::string pickHost = recommended;
-        if (assignedCount[recommended] >= windowQuota[recommended]) {
-            for (auto& [host, count] : assignedCount) {
-                if (assignedCount[host] < windowQuota[host]) {
-                    pickHost = host;
-                    break;
-                }
-            }
-        }
-
-        assignedCount[pickHost]++;
-        windowPos++;
-        return pickHost;
-    }
-
-    void updateWindow(std::map<std::string, int>& scheduleWeights)
-    {
-        faabric::util::FullLock lock(wrMx);
-        windowSize = 0;
-        for (const auto& [host, weight] : scheduleWeights) {
-            windowQuota[host] = weight;
-            windowSize += weight;
-        }
-        windowPos = 0;
-        assignedCount.clear();
-    }
+    std::string schedule(const unsigned int counter);
+    std::string schedule(const std::string& recommended);
+    // Only the "BODY" type operators can update the window.
+    void updateWindow(std::map<std::string, double>& expDist,
+                      std::map<std::string, double>& srcDist);
 
   private:
     std::shared_mutex wrMx;
@@ -89,44 +200,21 @@ class WindowedRecord
     int windowPos;
     // If might not equals to WINDOW_SIZE
     int windowSize;
+    std::vector<std::string> workers;
     std::map<std::string, int> windowQuota;
     std::map<std::string, int> assignedCount;
     std::string localHost = faabric::util::getSystemConfig().endpointHost;
 
     // Reset quotas and counters at the start of a window
-    void setWindow(std::map<std::string, double>& expectedDist, bool isHead)
-    {
-        windowSize = 0;
-        std::vector<std::string> hosts;
-        for (const auto& [host, _] : expectedDist) {
-            hosts.push_back(host);
-        }
-        if (!isHead) {
-            // If this operator is the not first one in the group, we only
-            // schedule them locally.
-            // if (windowQuota.count(localHost) == 0) {
-            //     SPDLOG_WARN("For the none-head stateless operator, local host "
-            //                 "{} is not expected distribution",
-            //                 localHost);
-            //     throw std::runtime_error(
-            //       "Local host is not expected distribution");
-            // }
-            windowQuota[localHost] = RING_SIZE;
-        } else {
-            // If this operator is the first one int the group, we assign them
-            // into workers according to the expected distribution.
-            for (const auto& [host, share] : expectedDist) {
-                int hostQuota = static_cast<int>(std::ceil(share * RING_SIZE));
-                windowQuota[host] = hostQuota;
-            }
-        }
+    void setWindow(std::map<std::string, double>& expDist,
+                   std::map<std::string, double>& srcDist,
+                   bool isBody);
 
-        windowPos = 0;
-        for (const auto& [host, quota] : windowQuota) {
-            windowSize += quota;
-        }
-        assignedCount.clear();
-    }
+    std::map<std::string, int> getBodyWindowedSlots(
+      std::map<std::string, double>& expDist,
+      std::map<std::string, double>& srcDist);
+
+    std::string doSchedule(const std::string& initialHost);
 };
 
 class RuntimeSummary
@@ -134,371 +222,43 @@ class RuntimeSummary
   public:
     RuntimeSummary() = default;
 
-    void setOptsCollocateMap(const std::map<std::string, std::string>& w)
-    {
-        faabric::util::FullLock lock(summaryMx);
-        optsCollocateMap = w;
-    }
-
-    void setOptsCollocateHeadMap(const std::map<std::string, std::string>& w)
-    {
-        faabric::util::FullLock lock(summaryMx);
-        optsCollocateHeadMap = w;
-    }
-
-    void reallocateAll(bool init)
-    {
-        faabric::util::FullLock lock(summaryMx);
-        for (const auto& [instanceName, _] : expectedDist) {
-            reallocate(instanceName, init);
-        }
-    }
+    void initScheduledOperators(
+      const batch_scheduler::Application& application,
+      const std::map<std::string, ScheduledOperator>& scheduledOperatorsMapIn,
+      bool planner = false);
 
     void updateSourceDist(
-      std::map<std::string, std::map<std::string, int>> sourceCountStats)
-    {
-        faabric::util::FullLock lock(summaryMx);
-        sourceDist.clear();
-        for (const auto& [instanceName, hostCount] : sourceCountStats) {
-            int sumCount = 0;
-            for (const auto& [host, count] : hostCount) {
-                sumCount += count;
-            }
-            if (sumCount <= 0) {
-                SPDLOG_WARN("Total count <= 0 for instance {}", instanceName);
-                continue;
-            }
-            auto& dist = sourceDist[instanceName];
-            for (const auto& [host, count] : hostCount) {
-                dist[host] = static_cast<double>(count) / sumCount;
-            }
-        }
-    }
+      std::map<std::string, std::map<std::string, int>> sourceCountStats,
+      bool reschedule);
 
-    void updateExpDist(
-      const std::map<std::string, std::map<std::string, int>>& statelessWeights)
-    {
-        faabric::util::FullLock lock(summaryMx);
-        expectedDist.clear();
-        for (const auto& [instanceName, hostWeight] : statelessWeights) {
-            int sumWeight = 0;
-            for (const auto& [host, weight] : hostWeight) {
-                sumWeight += weight;
-            }
-            if (sumWeight <= 0) {
-                SPDLOG_WARN("Total weight <= 0 for instance {}", instanceName);
-                continue;
-            }
-            auto& dist = expectedDist[instanceName];
-            for (const auto& [host, weight] : hostWeight) {
-                dist[host] = static_cast<double>(weight) / sumWeight;
-            }
-        }
-    }
-
-    std::string getHost(const std::string& instance, unsigned int counter)
-    {
-        faabric::util::SharedLock lock(summaryMx);
-        auto it = hostsRingMap.find(instance);
-        if (it == hostsRingMap.end()) {
-            SPDLOG_WARN("No ring for instance {}", instance);
-            throw std::runtime_error("No ring for instance");
-        }
-        const auto& ring = it->second;
-        // counter is unsigned, ring.size() is size_t → coerce to size_t
-        size_t idx = static_cast<size_t>(counter) % ring.size();
-        return ring[idx];
-    }
-
-    std::string getHost(const std::string& instance, std::string recommended)
-    {
-        faabric::util::SharedLock lock(summaryMx);
-        auto it = windowedRecords.find(instance);
-        if (it == windowedRecords.end()) {
-            // SPDLOG all keys
-            SPDLOG_DEBUG("Windowed records keys: {}", windowedRecords.size());
-            // for (const auto& [key, _] : windowedRecords) {
-            //     SPDLOG_DEBUG("Key: {}", key);
-            // }
-            SPDLOG_ERROR("No collocate map for instance {} found", instance);
-            throw std::runtime_error("No collocate map for instance " +
-                                     instance);
-        }
-        std::string host = it->second->schedule(recommended);
-        return host;
-    }
+    std::string getHost(const std::string& instance, unsigned int counter);
+    std::string getHost(const std::string& instance, std::string recommended);
 
   private:
     std::shared_mutex summaryMx;
     std::string localHost = faabric::util::getSystemConfig().endpointHost;
-
+    bool isPlanner = false;
+    // The actual runtime distribution.
     std::map<std::string, std::map<std::string, double>> sourceDist;
-    // The monitored actual distribution.
-    // MAP<Instance Name, MAP<IP, distribution>>
-    // std::map<std::string, std::map<std::string, double>> actualDist;
-
     // The expected distribution from centralized scheduler.
     // MAP<Instance Name, MAP<IP, distribution>>
     std::map<std::string, std::map<std::string, double>> expectedDist;
 
-    std::map<std::string, std::string> optsCollocateMap;
-    std::map<std::string, std::string> optsCollocateHeadMap;
-
-    std::map<std::string, std::vector<std::string>> hostsRingMap;
-
+    std::map<std::string, ScheduledOperator> scheduledOperatorsMap;
     // MAP <USER_FUNC, WindowedRecord>
     std::map<std::string, std::shared_ptr<WindowedRecord>> windowedRecords;
 
-    std::map<std::string, int> getReallocateLocalShare(
-      const std::string& instance)
-    {
-        SPDLOG_DEBUG(
-          "Reallocating hostsShares for instance {} which runs locally",
-          instance);
+    // MAP <Instance Name, LocalStatelessOperatorType>
+    std::map<std::string, LocalStatelessOperatorType>
+      localScheduledOperatorsMap;
 
-        std::map<std::string, int> hostsSlots;
-        // 1. Look up the expected and source distribution for this instance.
-        const auto expIt = expectedDist.find(instance);
-        const auto srcIt = sourceDist.find(instance);
-        if (expIt == expectedDist.end() || srcIt == sourceDist.end()) {
-            SPDLOG_ERROR("No expected/source distribution for instance {}",
-                         instance);
-            throw std::runtime_error(
-              "No expected/source distribution for instance");
-        }
-        const auto& expMap = expIt->second;
-        const auto& srcMap = srcIt->second;
+    void initAll(const batch_scheduler::Application& application, bool planner);
 
-        if (expMap.count(localHost) == 0 || srcMap.count(localHost) == 0) {
-            SPDLOG_WARN("No local host in expected or source distribution");
-            throw std::runtime_error(
-              "No local host in expected or source distribution");
-        }
+    void initOpertaor(const batch_scheduler::Application& application,
+                      std::string operatorName);
 
-        double expectedLocal = expMap.at(localHost);
-        double sourceLocal = srcMap.at(localHost);
-
-        double localShare = expectedLocal / sourceLocal;
-        int localSlots = static_cast<int>(std::round(localShare * RING_SIZE));
-        hostsSlots[localHost] = localSlots;
-
-        // 2. If generated request on local host is less than expected, we
-        // assign all requests locally.
-        if (localSlots >= RING_SIZE) {
-            hostsSlots[localHost] = RING_SIZE;
-            return hostsSlots;
-        }
-
-        // 3. Otherwise, we have to assign the remaining requests to other
-        // hosts according to round-robin.
-        std::size_t remaining = RING_SIZE - localSlots;
-
-        // 4. Build the gaps between the expected and source distributions of
-        // other hosts.
-        std::vector<GapInfo> gaps;
-        double totalGap = 0.0;
-
-        for (const auto& [host, expShare] : expMap) {
-            if (host == localHost)
-                continue;
-            double srcShare = srcMap.count(host) ? srcMap.at(host) : 0.0;
-            double gap = expShare - srcShare;
-            if (gap > 0.0) {
-                totalGap += gap;
-                gaps.push_back({ host, gap });
-            }
-        }
-
-        // 5. Allocate the remaining slots.
-        auto allocateByShare = [&](double share) {
-            double scaled = share * remaining;
-            std::size_t n = static_cast<std::size_t>(std::floor(scaled));
-            return std::pair<std::size_t, double>{ n, scaled - n };
-        };
-
-        if (totalGap == 0.0) {
-            // It shouldn't happen, but just in case. Allocate requets locally.
-            hostsSlots[localHost] = RING_SIZE;
-            return hostsSlots;
-        } else {
-            for (auto& g : gaps) {
-                auto [cnt, frac] = allocateByShare(g.gap / totalGap);
-                g.slots = cnt;
-                g.rem = frac;
-            }
-        }
-
-        // 6. Hand out the remaining slots to the largest remainders.
-        std::size_t used = 0;
-        for (const auto& g : gaps)
-            used += g.slots;
-        std::size_t left = remaining - used;
-
-        std::sort(
-          gaps.begin(), gaps.end(), [](const GapInfo& a, const GapInfo& b) {
-              return a.rem > b.rem;
-          });
-        for (std::size_t i = 0; i < left; ++i)
-            ++gaps[i].slots;
-
-        // 7. Emit the final ring.
-        for (const auto& g : gaps) {
-            hostsSlots[g.host] = g.slots;
-        }
-
-        return hostsSlots;
-    }
-
-    std::vector<std::string> reallocateLocalImpl(const std::string& instance)
-    {
-        SPDLOG_DEBUG("Reallocating ring for instance {} which runs locally",
-                     instance);
-        std::vector<std::string> hostsRing;
-        auto hostsSlots = getReallocateLocalShare(instance);
-        for (const auto& [host, slots] : hostsSlots) {
-            hostsRing.insert(hostsRing.end(), slots, host);
-        }
-        std::shuffle(hostsRing.begin(),
-                     hostsRing.end(),
-                     std::default_random_engine{ std::random_device{}() });
-        return hostsRing;
-    }
-
-    std::vector<std::string> reallocateRemoteImpl(const std::string& instance)
-    {
-        SPDLOG_DEBUG("Reallocating ring for instance {} which runs remotely",
-                     instance);
-        std::vector<std::string> hostsRing;
-        hostsRing.reserve(RING_SIZE);
-
-        // 1. Look up the expected distribution for this instance.
-        const auto expIt = expectedDist.find(instance);
-        if (expIt == expectedDist.end()) {
-            return hostsRing; // nothing to do
-        }
-        const auto& distMap = expIt->second; // map<host, share>
-
-        // 2. Build per‑host slot counts using the “largest remainder” rule.
-        std::vector<HostSlot> slots;
-        slots.reserve(distMap.size());
-
-        std::size_t used = 0;
-        for (const auto& [host, share] : distMap) {
-            double scaled = share * RING_SIZE;
-            // std::floor is the C++ standard‑library function that rounds a
-            // floating‑point value down to the nearest integer boundary.
-            std::size_t cnt = static_cast<std::size_t>(std::floor(scaled));
-            used += cnt;
-            slots.push_back({ host, cnt, scaled - cnt });
-        }
-
-        // 3. Hand out the remaining slots to the largest remainders.
-        std::size_t remaining = RING_SIZE - used;
-        std::sort(
-          slots.begin(), slots.end(), [](const HostSlot& a, const HostSlot& b) {
-              return a.remainder > b.remainder;
-          });
-        for (std::size_t i = 0; i < remaining; ++i) {
-            ++slots[i].slots;
-        }
-
-        // 4. Emit the final ring.
-        for (const auto& h : slots) {
-            hostsRing.insert(hostsRing.end(), h.slots, h.host);
-        }
-
-        std::shuffle(hostsRing.begin(),
-                     hostsRing.end(),
-                     std::default_random_engine{ std::random_device{}() });
-
-        return hostsRing;
-    }
-
-    // Calculate the adjusted distribution.
-    // instanceName is user_function_parallelism.
-    // init means whether this is the first time reallocate call after
-    // centralized shceduler reallocating.
-    void reallocate(const std::string& instanceName, bool init)
-    {
-        // isLocal means if the next instance will run on the local hosts?
-        bool isLocal = false;
-        for (const auto& [host, _] : expectedDist[instanceName]) {
-            if (host == localHost) {
-                isLocal = true;
-                break;
-            }
-        }
-
-        // If no sourceDist found, we assume each host has the same.
-        if (sourceDist.find(instanceName) == sourceDist.end()) {
-            sourceDist[instanceName] = expectedDist[instanceName];
-        }
-        // Print the source distribution and expected distribution.
-        SPDLOG_INFO("The source distribution for {} is:", instanceName);
-        for (const auto& [host, share] : sourceDist[instanceName]) {
-            SPDLOG_INFO("{}: {:.2f}", host, share);
-        }
-        SPDLOG_INFO("The expected distribution for {} is:", instanceName);
-        for (const auto& [host, share] : expectedDist[instanceName]) {
-            SPDLOG_INFO("{}: {:.2f}", host, share);
-        }
-
-        // If collocate with partitioned operators.
-        auto [user, function, parallelismId] =
-          faabric::util::splitUserFuncPar(instanceName);
-        std::string operatorName = user + "_" + function;
-        if (optsCollocateHeadMap.contains(operatorName)) {
-            SPDLOG_DEBUG("Collocate head operator {} with partitioned stateful "
-                         "operator {}",
-                         operatorName,
-                         optsCollocateHeadMap[operatorName]);
-            if (init) {
-                auto expDist = expectedDist[instanceName];
-                windowedRecords[instanceName] =
-                  std::make_shared<WindowedRecord>(expDist, true);
-            }
-            return;
-        }
-        if (optsCollocateMap.contains(operatorName)) {
-            SPDLOG_DEBUG("Collocate operator {} with partitioned stateful "
-                         "operator {}",
-                         operatorName,
-                         optsCollocateMap[operatorName]);
-            if (init) {
-                auto expDist = expectedDist[instanceName];
-                windowedRecords[instanceName] =
-                  std::make_shared<WindowedRecord>(expDist, false);
-            } else {
-                if (!isLocal){
-                    return;
-                }
-                auto dist = getReallocateLocalShare(instanceName);
-                windowedRecords[instanceName]->updateWindow(dist);
-            }
-            return;
-        }
-
-        if (isLocal) {
-            // If the next instance will run on the local host.
-            hostsRingMap[instanceName] = reallocateLocalImpl(instanceName);
-        } else {
-            // Otherwise, just round-robin according to the expected
-            // distribution.
-            hostsRingMap[instanceName] = reallocateRemoteImpl(instanceName);
-        }
-
-        auto localHostRing = hostsRingMap[instanceName];
-        std::unordered_map<std::string, int> counts;
-        for (const auto& host : localHostRing) {
-            ++counts[host];
-        }
-
-        int total = static_cast<int>(localHostRing.size());
-        SPDLOG_INFO("The host ring info for {} is:", instanceName);
-        for (auto& [host, cnt] : counts) {
-            double share = static_cast<double>(cnt) / total;
-            SPDLOG_INFO("{}: {:.2f} / count {}", host, share, cnt);
-        }
-    }
+    void doInitExpectedDist(ScheduledOperator& schedOp);
+    void doInitSourceDist(ScheduledOperator& schedOp,
+                          const batch_scheduler::Application& application);
 };
 }

@@ -14,11 +14,14 @@ class DecentralizedScheduler final : public StateAwareScheduler
 
     virtual ~DecentralizedScheduler() = default;
 
+    void resetScheduler() override;
+
+    void setScheuduledOperatorMap(
+      const std::map<std::string, ScheduledOperator>& scheuduledOperatorMapIn);
+
     void syncStatesInfo(
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
         statesInfo);
-
-    void resetScheduler() override;
 
   private:
     std::string localHost;

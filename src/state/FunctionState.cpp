@@ -242,6 +242,17 @@ void FunctionState::get(uint8_t* buffer)
     std::copy(bytePtr, bytePtr + stateSize, buffer);
 }
 
+std::vector<uint8_t> FunctionState::getFuncStateLock(bool lockin)
+{
+    faabric::util::FullLock lock(funcStateMutex);
+
+    if (lockin) {
+        lockWrite();
+    }
+    uint8_t* bytePtr = BYTES(sharedMemory);
+    return std::vector<uint8_t>(bytePtr, bytePtr + stateSize);
+}
+
 int FunctionState::readPartitionStateSize(std::set<std::string>& keys)
 {
     return readPartitionState(keys).size();

@@ -16,6 +16,7 @@
 
 namespace faabric::batch_scheduler {
 
+// List of Nodes, and the partition key of the group.
 using NodeGroup = std::tuple<std::vector<std::shared_ptr<Node>>, std::string>;
 inline const std::string NONE_STRING = "None";
 
@@ -48,17 +49,6 @@ class StateAwareScheduler : public BatchScheduler
       const InFlightReqs& inFlightReqs,
       std::shared_ptr<faabric::BatchExecuteRequest> req) override;
 
-    bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
-
-    bool updateFuncStatePar(const std::string& userFunction,
-                            int newPar,
-                            const HostMap& hostMap);
-
-    // the following functions are public only for tests.
-    void increaseFuncStatePar(const std::string& userFunction,
-                              int numIncrease,
-                              const HostMap& hostMap);
-
   private:
     bool isFirstDecisionBetter(
       std::shared_ptr<SchedulingDecision> decisionA,
@@ -78,10 +68,13 @@ class StateAwareScheduler : public BatchScheduler
     StateAwareScheduler()
     {
         // Initialization code here
-        funcStateInitializer();
     }
 
     virtual ~StateAwareScheduler() = default;
+
+    bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
+
+    void initApp(const HostMap& hostMap);
 
     std::string scheduleStatelessMessageRB(std::string& userFunc,
                                            const HostMap& hostMap,
@@ -115,11 +108,6 @@ class StateAwareScheduler : public BatchScheduler
         return functionParallelism;
     }
 
-    bool registerFunctionState(const std::string& userFunction,
-                               const std::string& partitionBy,
-                               const std::string& stateKey,
-                               const HostMap& hostMap);
-
     const std::map<std::string, FunctionStateInfo> getStateInfo();
 
     void updateApp(const std::map<std::string, long>& nodeWorkloads);
@@ -132,57 +120,11 @@ class StateAwareScheduler : public BatchScheduler
         return stateHashRing;
     }
 
-    std::map<std::string, std::map<std::string, int>> getStatelessReqWeight()
+    const std::map<std::string, ScheduledOperator>& getScheduledOperatorsMap()
       const
     {
-        return statelessReqWeight;
+        return scheduledOperatorsMap;
     }
-
-    void setStatelessReqWeight(
-      const std::map<std::string, std::map<std::string, int>>& w)
-    {
-        statelessReqWeight = w;
-    }
-
-    std::map<std::string, std::map<int, int>> getParStateReqWeight() const
-    {
-        return parStateReqWeight;
-    }
-
-    void setParStateReqWeight(
-      const std::map<std::string, std::map<int, int>>& w)
-    {
-        parStateReqWeight = w;
-    }
-
-    std::map<std::string, std::string> getOptsCollocateMap() const
-    {
-        return optsCollocateMap;
-    }
-
-    void setOptsCollocateMap(const std::map<std::string, std::string>& w)
-    {
-        optsCollocateMap = w;
-        runtimeSummary.setOptsCollocateMap(w);
-    }
-
-    std::map<std::string, std::string> getOptsCollocateHeadMap() const
-    {
-        return optsCollocateHeadMap;
-    }
-
-    void setOptsCollocateHeadMap(const std::map<std::string, std::string>& w)
-    {
-        optsCollocateHeadMap = w;
-        runtimeSummary.setOptsCollocateHeadMap(w);
-    }
-
-    // The Req dist for both stateless and stateful functions.
-    void updateReqDist();
-
-    void reallocateSummaryDist(
-      const std::map<std::string, std::map<std::string, int>>&
-        sourceCountStats);
 
     bool nodeCollocation(const std::string& current,
                          const std::string& partitionKey,
@@ -193,8 +135,22 @@ class StateAwareScheduler : public BatchScheduler
       const std::string& psName,
       const std::string& partitionKey,
       std::map<std::string, std::string>& collocateMap,
-      std::map<std::string, std::string>& headMap,
       const std::unordered_set<std::string>& groupNodeNames);
+
+    std::map<std::string, ScheduledOperator> buildScheduledOperatorsForGroup(
+      int groupId,
+      const std::vector<std::shared_ptr<Node>>& group,
+      const std::map<std::string, std::string>& newOptsCollocateMap,
+      const std::map<std::string, std::map<std::string, int>>&
+        newStatelessReqWeight,
+      const std::map<std::string, std::map<int, int>>& newParStateReqWeight)
+      const;
+
+    void runtimeSourceUpdate(
+      const std::map<std::string, std::map<std::string, int>>&
+        sourceCountStats);
+
+    void printScheduleInfomation() const;
 
   protected:
     // scheduler lock
@@ -202,22 +158,10 @@ class StateAwareScheduler : public BatchScheduler
 
     int scheduleMode = 0;
 
-    int maxParallelism;
-
     // hostAssign Counter is used when assign states to the hosts.
     std::atomic<unsigned int> stateRbCounter{ 0 };
 
-    std::shared_mutex counterMx;
-    std::map<std::string, std::shared_ptr<std::atomic_uint>> counterTable;
-
     int weightFactor = 1000;
-    // MAP <USER_FUNC_PARALLELISM, MAP<IP, proportion>>
-    std::map<std::string, std::map<std::string, int>> statelessReqWeight;
-    // MAP <USER_FUNC, MAP<PARALLELISM_IDX, proportion>>
-    std::map<std::string, std::map<int, int>> parStateReqWeight;
-    // MAP <STATELESS_OPERATOR, PARATITIONED_STATEFUL_OPERATOR>
-    std::map<std::string, std::string> optsCollocateMap;
-    std::map<std::string, std::string> optsCollocateHeadMap;
 
     RuntimeSummary runtimeSummary;
 
@@ -226,18 +170,21 @@ class StateAwareScheduler : public BatchScheduler
      */
     // Function_User : Parallelism
     std::map<std::string, int> functionParallelism;
-    // Function_User : Counter. It is used for shuffle grouping.
-    std::map<std::string, unsigned int> functionCounter;
     // Function_User_ParallelismIndex : Host
     std::map<std::string, std::string> stateHost;
-    // Function_User : hashRing
+    // Function_User : hashRing. It is used for partitioned stateful operators.
     std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>
       stateHashRing;
     // Only partitioned stateful function will be registered here.
     // FunctionUser : Input Parition Key
     std::map<std::string, std::string> statePartitionBy;
+    // Function_User : Counter. It is used for shuffle grouping.
+    std::shared_mutex counterMx;
+    std::map<std::string, std::shared_ptr<std::atomic_uint>> counterTable;
+    unsigned int getNextCounter(const std::string& userFunc);
 
     std::unique_ptr<batch_scheduler::Application> application;
+    std::map<std::string, ScheduledOperator> scheduledOperatorsMap;
 
     // TODO - This can be detected by state server and planner, but logic will
     // be extreamly complex. (How to create new function state, BALABALA)
@@ -245,11 +192,20 @@ class StateAwareScheduler : public BatchScheduler
     // It is only used for initialization.
     std::map<std::string, std::tuple<std::string, std::string>> funcStateRegMap;
 
-    void registerState(const HostMap& hostMap,
-                       std::string userFunc,
-                       int parallelism = 1);
+    bool registerFunctionState(Node& node, const HostMap& hostMap);
 
-    void funcStateInitializer();
+    bool updateFuncStatePar(const std::string& userFunction,
+                            int newPar,
+                            const HostMap& hostMap);
+
+    // the following functions are public only for tests.
+    void increaseFuncStatePar(const std::string& userFunction,
+                              int numIncrease,
+                              const HostMap& hostMap);
+
+    void doRegisterState(const HostMap& hostMap,
+                         std::string userFunc,
+                         int parallelism = 1);
 
     // Message Type : 0 - Stateless, 1 - Stateful, 2 - Paritioned Stateful
 
@@ -257,11 +213,9 @@ class StateAwareScheduler : public BatchScheduler
       const std::string& userFunction,
       const faabric::Message& msg);
 
-    // void groupNodesHelper(
-    //   const std::string& nodeName,
-    //   std::vector<std::shared_ptr<Node>>& currentGroup,
-    //   std::vector<std::vector<std::shared_ptr<Node>>>& groups,
-    //   std::unordered_set<std::string>& visited);
+    void groupNodesHelper(const std::string& nodeName,
+                          std::vector<NodeGroup>& groups,
+                          std::unordered_set<std::string>& visited);
 
     void groupNodesHelper(const std::string& nodeName,
                           std::vector<std::shared_ptr<Node>>& currentGroup,

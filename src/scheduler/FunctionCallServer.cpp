@@ -7,6 +7,7 @@
 #include <faabric/util/config.h>
 #include <faabric/util/func.h>
 #include <faabric/util/logging.h>
+#include <faabric/util/message.h>
 
 namespace faabric::scheduler {
 FunctionCallServer::FunctionCallServer()
@@ -36,6 +37,10 @@ void FunctionCallServer::doAsyncRecv(transport::Message& message)
         }
         case faabric::scheduler::FunctionCalls::ResetParameter: {
             recvResetParameter(message.udata());
+            break;
+        }
+        case faabric::scheduler::FunctionCalls::RegisterApplication: {
+            recvRegisterApplication(message.udata());
             break;
         }
         case faabric::scheduler::FunctionCalls::SetPersistentState: {
@@ -102,43 +107,8 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
 
     PARSE_MSG(planner::SyncStatesInfoRequest, buffer.data(), buffer.size())
 
-    // Update the stateless and partitioned stateful operator weights.
-    std::map<std::string, std::map<std::string, int>> newStatelessReqWeight;
-    std::map<std::string, std::map<int, int>> newParStateReqWeight;
-    std::map<std::string, std::string> newOptCollocate;
-    std::map<std::string, std::string> newOptCollocateHead;
-
-    const auto& srwMap = parsedMsg.statelessreqweight();
-    for (const auto& outer : srwMap) {
-        const std::string& funcPar = outer.first;
-        const auto& innerMsg = outer.second;
-
-        const auto& hostMap = innerMsg.hostweight();
-        for (const auto& hostPair : hostMap) {
-            newStatelessReqWeight[funcPar][hostPair.first] = hostPair.second;
-        }
-    }
-
-    const auto& pswMap = parsedMsg.parstatereqweight();
-    for (const auto& outer : pswMap) {
-        const std::string& userFunc = outer.first;
-        const auto& innerMsg = outer.second;
-
-        const auto& partMap = innerMsg.partitionweight();
-        for (const auto& partPair : partMap) {
-            newParStateReqWeight[userFunc][partPair.first] = partPair.second;
-        }
-    }
-
-    const auto& ocMap = parsedMsg.operatorcollocatemap();
-    for (const auto& [statelessOp, parStateOp] : ocMap) {
-        newOptCollocate[statelessOp] = parStateOp;
-    }
-
-    const auto& ochMap = parsedMsg.operatorcollocateheadmap();
-    for (const auto& [statelessOp, parStateOp] : ochMap) {
-        newOptCollocateHead[statelessOp] = parStateOp;
-    }
+    auto scheuduledOperatorMap =
+      faabric::util::parseScheduledOperatorMap(parsedMsg);
 
     std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>
       tempStatesInfoMap;
@@ -159,11 +129,7 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
                      faabric::batch_scheduler::to_string(info));
     }
 
-    scheduler.updateStatesInfo(newStatelessReqWeight,
-                               newParStateReqWeight,
-                               newOptCollocate,
-                               newOptCollocateHead,
-                               tempStatesInfoMap);
+    scheduler.updateStatesInfo(scheuduledOperatorMap, tempStatesInfoMap);
 
     return std::make_unique<planner::SyncStatesInfoResponse>();
 }
@@ -195,22 +161,6 @@ FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
 
     return std::make_unique<faabric::EmptyResponse>();
 }
-
-// std::unique_ptr<google::protobuf::Message>
-// FunctionCallServer::recvGetWorkerLoad(std::span<const uint8_t> buffer)
-// {
-//     PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
-//     auto instancesLoads =
-//     faabric::scheduler::getScheduler().statsLocalLoad();
-
-//     faabric::InstancesLoadState response;
-//     auto* loadMap = response.mutable_instancesload();
-//     for (const auto& [instanceName, instanceLoad] : instancesLoads) {
-//         (*loadMap)[instanceName] = instanceLoad;
-//     }
-
-//     return std::make_unique<faabric::InstancesLoadState>(response);
-// }
 
 void logRuntimeStatsUpdateRequest(const faabric::RuntimeStatsUpdateRequest& req)
 {
@@ -351,6 +301,17 @@ void FunctionCallServer::recvResetParameter(std::span<const uint8_t> buffer)
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }
+}
+
+void FunctionCallServer::recvRegisterApplication(
+  std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::planner::RegisterApplicationRequest,
+              buffer.data(),
+              buffer.size())
+    auto applicationPtr = faabric::util::parseApplicationMsg(parsedMsg);
+
+    faabric::scheduler::getScheduler().registerApp(std::move(applicationPtr));
 }
 
 void FunctionCallServer::recvSetPersistentState(std::span<const uint8_t> buffer)

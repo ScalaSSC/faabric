@@ -376,7 +376,3 @@ message RuntimeStatsResult{
 message RuntimeStatsUpdateRequest{
     repeated RuntimeStatsResult collectedStats = 1;
 }
-
-// message InstancesLoadState{
-//     map<string, int32> instancesLoad = 1;
-// }

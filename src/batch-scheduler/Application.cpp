@@ -18,11 +18,13 @@ std::string nodeTypeToString(NodeType type)
 
 Node::Node(const std::string& nameIn,
            NodeType typeIn,
+           bool isInputIn,
            int parallelismIn,
            std::set<std::string> inputFeildsIn,
            const std::string& partitionByIn)
   : name(nameIn)
   , type(typeIn)
+  , isInput(isInputIn)
   , parallelism(parallelismIn)
   , inputFeilds(std::move(inputFeildsIn))
   , partitionBy(partitionByIn)
@@ -41,13 +43,18 @@ void Application::addNode(std::shared_ptr<Node> node, bool isInput)
 }
 
 std::vector<std::shared_ptr<Node>> Application::getSource(
-  const std::string& node)
+  const std::string& node) const
 {
     std::vector<std::shared_ptr<Node>> sourceNodes;
     for (auto& [name, successors] : connections) {
+        if (nodes.contains(name) == false) {
+            SPDLOG_ERROR("Node {} not found in application nodes", name);
+            throw std::runtime_error("Node not found in application nodes");
+            continue;
+        }
         for (auto& successor : successors) {
             if (successor == node) {
-                sourceNodes.push_back(nodes[name]);
+                sourceNodes.push_back(nodes.at(name));
                 break;
             }
         }
@@ -79,7 +86,7 @@ void Application::displayApplication() const
 {
     SPDLOG_INFO("OUTPUT Application DAG: {}", name);
     std::ostringstream logStream;
-    logStream << "Application: " << name << "\n";
+    logStream << "\nApplication: " << name << "\n";
     logStream << "Input Nodes:\n";
     for (const auto& node : inputNodes) {
         logStream << "    " << node << "\n";
@@ -142,8 +149,7 @@ double Application::computePreWorkloads()
     return totalPreWorkload;
 }
 
-void Application::quantiseResources(const int numHosts,
-                                    double totalPreWorkload)
+void Application::quantiseResources(const int numHosts, double totalPreWorkload)
 {
     // Update the resource required for each operator (number of workers).
     auto& appNodes = nodes;
@@ -239,10 +245,12 @@ void Application::quantiseResources(const int numHosts,
     for (auto& q : bucket)
         q.node->reqResource = q.units / 10.0; // 0.1‑granularity
 
-    for ([[maybe_unused]]auto& [name, n] : appNodes) {
-        SPDLOG_DEBUG(
-          "Node {} requires {} resource units", name, n->reqResource);
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG
+    std::ostringstream oss;
+    for (auto& [name, n] : appNodes) {
+        oss << name << "(" << n->reqResource << "), ";
     }
+    SPDLOG_DEBUG("Node workloads: {}", oss.str());
+#endif
 }
-
 }

@@ -98,20 +98,15 @@ class Planner
     // ----------
     // Function State public API
     // ----------
-    bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
+    bool registerApp(faabric::planner::RegisterApplicationRequest& rawReq,
+                     std::unique_ptr<batch_scheduler::Application> app,
+                     bool init = false);
 
-    bool registerFuncState(const std::string& userFunction,
-                           const std::string& partitionBy,
-                           const std::string& stateKey);
-
-    bool updateFuncPar(const std::string& userFunc, int newPar);
+    void distributeApp(faabric::planner::RegisterApplicationRequest& rawReq);
 
     bool resetParameter(const std::string& key,
                         const int32_t value,
                         bool plannerParameter = false);
-
-    void initFuncState(std::vector<std::string> statelessOpts,
-                       std::map<std::string, int> parStateOpts);
 
     void rescheduleApp();
 
@@ -187,7 +182,7 @@ class Planner
     // ----------
     // Request scheduling private API
     // ----------
-    bool isUpdateState = false;
+    // bool isUpdateState = false;
 
     int dispatchPeriod = 20; // ms
 

@@ -1,11 +1,13 @@
 #pragma once
 
+#include <faabric/planner/planner.pb.h>
 #include <faabric/util/logging.h>
 
 #include <iostream>
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -16,22 +18,56 @@ enum NodeType
     STATEFUL = 1,
     PARTITIONED_STATEFUL = 2
 };
+
+inline ::faabric::planner::NodeType toProto(NodeType t)
+{
+    switch (t) {
+        case NodeType::STATELESS:
+            return ::faabric::planner::NodeType::STATELESS;
+        case NodeType::STATEFUL:
+            return ::faabric::planner::NodeType::STATEFUL;
+        case NodeType::PARTITIONED_STATEFUL:
+            return ::faabric::planner::NodeType::PARTITIONED_STATEFUL;
+        default:
+            SPDLOG_ERROR("Unknown NodeType: {}", static_cast<int>(t));
+            throw std::runtime_error("Unknown NodeType");
+    }
+}
+
+inline NodeType fromProto(::faabric::planner::NodeType t)
+{
+    switch (t) {
+        case ::faabric::planner::NodeType::STATELESS:
+            return NodeType::STATELESS;
+        case ::faabric::planner::NodeType::STATEFUL:
+            return NodeType::STATEFUL;
+        case ::faabric::planner::NodeType::PARTITIONED_STATEFUL:
+            return NodeType::PARTITIONED_STATEFUL;
+        default:
+            SPDLOG_ERROR("Unknown proto NodeType: {}", static_cast<int>(t));
+            throw std::runtime_error("Unknown proto NodeType");
+    }
+}
+
 std::string nodeTypeToString(NodeType type);
 
 class Node
 {
   public:
+    Node(const std::string& nameIn,
+         NodeType typeIn,
+         bool isInputIn,
+         int parallelismIn,
+         std::set<std::string> inputFeildsIn = {},
+         const std::string& partitionByIn = "None");
+
     std::string name;
     NodeType type;
+    bool isInput; // If this node is an input node
     int parallelism;
     std::set<std::string> inputFeilds;
     std::string partitionBy;
     long processedTuples = 0;
-    Node(const std::string& nameIn,
-         NodeType typeIn,
-         int parallelismIn,
-         std::set<std::string> inputFeildsIn = {},
-         const std::string& partitionByIn = "None");
     // Used for rescheduling. It the records the metrics in the last window.
     double preWorkload = 0;
     double reqResource = 0;
@@ -61,7 +97,7 @@ class Application
     double computePreWorkloads(); // return total workload
     // TODO - Now we only support homogenous cluster.
     void quantiseResources(const int numHosts, double totalPreWorkload);
-    std::vector<std::shared_ptr<Node>> getSource(const std::string& node);
+    std::vector<std::shared_ptr<Node>> getSource(const std::string& node) const;
 
     std::map<std::string, std::shared_ptr<Node>>& getNodes()
     {
@@ -82,13 +118,28 @@ class Application
 
     const void showConnections() const
     {
-        SPDLOG_INFO("Connections in application {}: ", name);
+        std::ostringstream oss;
+        bool firstSrc = true;
+
         for (const auto& [src, dests] : connections) {
-            SPDLOG_INFO("  {} -> ", src);
-            for (const auto& dest : dests) {
-                SPDLOG_INFO("    {}", dest);
+            if (!firstSrc) {
+                oss << "; ";
             }
+            firstSrc = false;
+
+            oss << src << "->[";
+            bool firstDst = true;
+            for (const auto& dst : dests) {
+                if (!firstDst) {
+                    oss << ", ";
+                }
+                firstDst = false;
+                oss << dst;
+            }
+            oss << "]";
         }
+
+        SPDLOG_INFO("Connections in application {}: {}", name, oss.str());
     }
 };
 }

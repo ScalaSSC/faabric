@@ -31,4 +31,5 @@ faabric_lib(util
     serialization.cpp
     hash.cpp
     map.cpp
+    message.cpp
 )

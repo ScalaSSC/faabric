@@ -87,6 +87,11 @@ class State
                       int32_t parallelismId,
                       char* buffer);
 
+    std::vector<uint8_t> readFuncStateLock(const std::string& user,
+                                           const std::string& func,
+                                           int32_t parallelismId,
+                                           bool lock);
+
     void setFuncState(const std::string& user,
                       const std::string& func,
                       int32_t parallelismId,

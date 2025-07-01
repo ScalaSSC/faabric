@@ -335,6 +335,14 @@ long Scheduler::getFunctionExecutorCount(const faabric::Message& msg)
     return executors[funcStr].size();
 }
 
+bool Scheduler::registerApp(std::unique_ptr<batch_scheduler::Application> app)
+{
+    SPDLOG_INFO("Scheduler registers application {}", app->getName());
+    faabric::util::FullLock lock(mx);
+    decentralScheduler.registerApp(std::move(app));
+    return true;
+}
+
 // Enqueue the request messages from remote into local unprocess queue for
 // further processing.
 void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
@@ -1021,11 +1029,8 @@ void Scheduler::storeMigrateState(
 }
 
 void Scheduler::updateStatesInfo(
-  const std::map<std::string, std::map<std::string, int>>&
-    newStatelessReqWeight,
-  const std::map<std::string, std::map<int, int>>& newParStateReqWeight,
-  const std::map<std::string, std::string> newOptCollocate,
-  const std::map<std::string, std::string> newOptCollocateHead,
+  const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
+    scheuduledOperatorMap,
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
     statesInfo)
 {
@@ -1039,34 +1044,7 @@ void Scheduler::updateStatesInfo(
     faabric::util::FullLock stateLock(stateUpdateMx);
     SPDLOG_DEBUG("updateStatesInfo: state lock acquired");
 
-    SPDLOG_INFO("Stateless operator request weights:");
-    for (const auto& [userFuncPar, hostWeights] : newStatelessReqWeight) {
-        SPDLOG_INFO("  Operator instance: {}", userFuncPar);
-        for (const auto& [host, weight] : hostWeights) {
-            SPDLOG_INFO("    Host: {}  Weight: {}", host, weight);
-        }
-    }
-
-    // Logging newParStateReqWeight: map<string, map<int,int>>
-    SPDLOG_INFO("Partitioned stateful operator request weights:");
-    for (const auto& [userFunc, parWeights] : newParStateReqWeight) {
-        SPDLOG_INFO("  Stateful operator: {}", userFunc);
-        for (const auto& [parIndex, weight] : parWeights) {
-            SPDLOG_INFO("    Partition {}  Weight: {}", parIndex, weight);
-        }
-    }
-
-    // Logging newOptCollocate: map<string, string>
-    SPDLOG_INFO("Collocate operator:");
-    for (const auto& [userFunc, collocate] : newOptCollocate) {
-        SPDLOG_INFO("  Operator: {}  Collocate: {}", userFunc, collocate);
-    }
-
-    decentralScheduler.setStatelessReqWeight(newStatelessReqWeight);
-    decentralScheduler.setParStateReqWeight(newParStateReqWeight);
-    decentralScheduler.setOptsCollocateMap(newOptCollocate);
-    decentralScheduler.setOptsCollocateHeadMap(newOptCollocateHead);
-    decentralScheduler.updateReqDist();
+    decentralScheduler.setScheuduledOperatorMap(scheuduledOperatorMap);
 
     // Update the states info in decentralized scheduler
     decentralScheduler.syncStatesInfo(statesInfo);
@@ -1189,7 +1167,8 @@ std::map<std::string, InstanceStatsResult> Scheduler::getRuntimeStats()
 void Scheduler::updateStatelessDist(
   const std::map<std::string, std::map<std::string, int>>& sourceCountStats)
 {
-    decentralScheduler.reallocateSummaryDist(sourceCountStats);
+    // TODO - update the source.
+    decentralScheduler.runtimeSourceUpdate(sourceCountStats);
 }
 
 void Scheduler::setLocalPersistentState(

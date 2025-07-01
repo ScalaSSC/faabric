@@ -82,27 +82,6 @@ void FunctionCallClient::sendFlush()
     }
 }
 
-// void FunctionCallClient::getWorkerLoad(
-//   faabric::batch_scheduler::WorkersLoadState& workersLoadState)
-// {
-//     faabric::EmptyRequest req;
-//     faabric::InstancesLoadState resp;
-//     auto startTime = faabric::util::getGlobalClock().epochMicros();
-//     syncSend(faabric::scheduler::GetWorkerLoad, &req, &resp);
-//     auto endTime = faabric::util::getGlobalClock().epochMicros();
-//     auto elapsedTime = endTime - startTime;
-//     SPDLOG_DEBUG("Get worker load took {} micros", elapsedTime);
-//     std::map<std::string, int> instancesLoadMap;
-//     SPDLOG_DEBUG("Obtained for host {}", host);
-//     for (const auto& [instanceName, instanceLoad] : resp.instancesload()) {
-//         SPDLOG_DEBUG(
-//           "Obtained Instance {} with load: {}", instanceName, instanceLoad);
-//         instancesLoadMap[instanceName] = instanceLoad;
-//     }
-//     workersLoadState.updateState(
-//       std::move(host), std::move(instancesLoadMap), elapsedTime / 2);
-// }
-
 std::unique_ptr<faabric::RuntimeStatsResult>
 FunctionCallClient::getRuntimeStats(faabric::RuntimeStatsUpdateRequest req)
 {
@@ -146,6 +125,13 @@ void FunctionCallClient::setPersistentState(
   std::shared_ptr<faabric::planner::MapMessage> req)
 {
     asyncSend(faabric::scheduler::FunctionCalls::SetPersistentState, req.get());
+}
+
+void FunctionCallClient::registerApplication(
+  std::shared_ptr<faabric::planner::RegisterApplicationRequest> req)
+{
+    asyncSend(faabric::scheduler::FunctionCalls::RegisterApplication,
+              req.get());
 }
 
 void FunctionCallClient::executeFunctionsBatch(
