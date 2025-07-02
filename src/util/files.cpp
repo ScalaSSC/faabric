@@ -40,7 +40,8 @@ std::vector<uint8_t> readFileToBytes(const std::string& path)
     result.resize(fsize);
     int cpos = 0;
     while (cpos < fsize) {
-        int rc = read(fd, result.data(), fsize - cpos);
+        // int rc = read(fd, result.data(), fsize - cpos);
+        int rc = read(fd, result.data() + cpos, fsize - cpos);
         if (rc < 0) {
             perror("Couldn't read file");
             throw std::runtime_error("Couldn't read file " + path);

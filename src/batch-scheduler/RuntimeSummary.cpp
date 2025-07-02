@@ -338,7 +338,7 @@ void RuntimeSummary::updateSourceDist(
             sumCount += count;
         }
         if (sumCount <= 0) {
-            SPDLOG_WARN("Total count <= 0 for instance {}", instanceName);
+            // SPDLOG_DEBUG("Total count <= 0 for instance {}", instanceName);
             continue;
         }
         auto& dist = sourceDist[instanceName];

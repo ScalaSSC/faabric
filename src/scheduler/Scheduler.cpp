@@ -504,8 +504,10 @@ void Scheduler::enqueueChainedCalls(
     SPDLOG_DEBUG("Enqueueing chained calls for {} messages", msgs.size());
     faabric::util::FullLock lock(chainedCallMsgsMx);
 
+    auto currentTime = faabric::util::getGlobalClock().epochMicros();
     for (auto& msg : msgs) {
         if (msg) {
+            msg->set_plannerqueuetime(currentTime);
             chainedCallMsgs.emplace_back(std::move(msg));
         }
     }
@@ -613,7 +615,6 @@ void Scheduler::enqueueSchedMsgs(
     for (int i = 0; i < msgs.size(); i++) {
         auto msg = std::move(msgs[i]);
         auto host = hosts[i];
-        msg->set_plannerqueuetime(currentTime);
         msg->set_plannerpoptime(currentTime);
         scheduledMsgsMap[host].push_back(std::move(msg));
     }
@@ -659,19 +660,25 @@ void Scheduler::dispatchChainedMsgs()
         // MAP<instanceName, <host, count>>
         std::map<std::string, std::map<std::string, int>> chainedCallsCounter;
 
-        faabric::util::FullLock chainedCallLock(chainedCallMsgsMx);
-        if (!chainedCallMsgs.empty()) {
+        std::vector<std::unique_ptr<faabric::Message>> localChainedCallMsgs;
+        {
+            faabric::util::FullLock chainedCallLock(chainedCallMsgsMx);
+            if (!chainedCallMsgs.empty()) {
+                localChainedCallMsgs = std::move(chainedCallMsgs);
+                chainedCallMsgs.clear(); // just in case
+            }
+        }
+        if (!localChainedCallMsgs.empty()) {
             auto hosts = decentralScheduler.scheduleMessagesBatch(
-              hostMap, chainedCallMsgs);
+              hostMap, localChainedCallMsgs);
             // Statistics the chained calls
-            for (int i = 0; i < chainedCallMsgs.size(); i++) {
-                auto msg = chainedCallMsgs[i].get();
+            for (int i = 0; i < localChainedCallMsgs.size(); i++) {
+                auto msg = localChainedCallMsgs[i].get();
                 std::string userFuncPar = faabric::util::getUserFuncPar(*msg);
                 chainedCallsCounter[userFuncPar][hosts[i]]++;
             }
-            enqueueSchedMsgs(hosts, std::move(chainedCallMsgs));
+            enqueueSchedMsgs(hosts, std::move(localChainedCallMsgs));
         }
-        chainedCallLock.unlock();
 
         for (auto& [instancesName, hostCounter] : chainedCallsCounter) {
             for (auto& [host, count] : hostCounter) {
@@ -710,8 +717,7 @@ void Scheduler::dispatchChainedMsgs()
             // If locally, we put the messages into a batch directly
             if (hostIp == thisHost) {
                 auto batchMsgs = std::make_unique<faabric::MessageBatch>();
-                batchMsgs->set_invokehost(
-                  faabric::util::getSystemConfig().endpointHost);
+                batchMsgs->set_invokehost(thisHost);
                 SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
                              thisHost,
                              msgs.size());

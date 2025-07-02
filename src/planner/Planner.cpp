@@ -444,7 +444,9 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
     while (i < req->messages_size()) {
         auto* message = req->mutable_messages(i); // Use a pointer directly
         // Record planner enqueue time
-        message->set_plannerqueuetime(currentTime);
+        if (!isChained) {
+            message->set_plannerqueuetime(currentTime);
+        }
 
         // Record the chained call count
         int appid = message->appid();
@@ -461,7 +463,6 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
                 // Flush the old chainedId
                 state.inFlightApps[appid] = 1;
             }
-
             // state.inFlightApps[appid]++;
         }
 

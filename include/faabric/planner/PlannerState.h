@@ -95,8 +95,8 @@ class InstanceMetrics
           "instanceName", rapidjson::Value(instanceName.c_str(), alloc), alloc);
         doc.AddMember("period", period, alloc);
         doc.AddMember("count", count, alloc);
-        doc.AddMember("avgPlannerQueueTime", avgPlannerQueueTime, alloc);
-        doc.AddMember("avgPlannerConsumeTime", avgPlannerConsumeTime, alloc);
+        doc.AddMember("avgPlannerScheduleTime", avgPlannerQueueTime, alloc);
+        doc.AddMember("avgPlannerDispatchTime", avgPlannerConsumeTime, alloc);
         doc.AddMember("avgWorkerQueueTime", avgWorkerQueueTime, alloc);
         doc.AddMember("avgExecutorPrepTime", avgExecutorPrepTime, alloc);
         doc.AddMember("avgWorkerExecuteTime", avgWorkerExecuteTime, alloc);
