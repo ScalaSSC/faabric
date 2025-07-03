@@ -36,22 +36,23 @@ void WindowedRecord::setWindow(std::map<std::string, double>& expDist,
 void WindowedRecord::updateWindow(std::map<std::string, double>& expDist,
                                   std::map<std::string, double>& srcDist)
 {
-    windowSize = 0;
-    workers.clear();
+    // TODO - temporarily. We don't update the window for now.
+    // windowSize = 0;
+    // workers.clear();
 
-    windowQuota = getBodyWindowedSlots(expDist, srcDist);
+    // windowQuota = getBodyWindowedSlots(expDist, srcDist);
 
-    windowPos = 0;
-    for (const auto& [host, quota] : windowQuota) {
-        workers.push_back(host);
-        windowSize += quota;
-    }
+    // windowPos = 0;
+    // for (const auto& [host, quota] : windowQuota) {
+    //     workers.push_back(host);
+    //     windowSize += quota;
+    // }
 
-    if (workers.empty()) {
-        SPDLOG_WARN("No workers found for windowed record");
-        throw std::runtime_error("No workers found for windowed record");
-    }
-    assignedCount.clear();
+    // if (workers.empty()) {
+    //     SPDLOG_WARN("No workers found for windowed record");
+    //     throw std::runtime_error("No workers found for windowed record");
+    // }
+    // assignedCount.clear();
 }
 
 std::map<std::string, int> WindowedRecord::getBodyWindowedSlots(
@@ -60,7 +61,14 @@ std::map<std::string, int> WindowedRecord::getBodyWindowedSlots(
 {
     // 1. Sanity check: expected and source distributions must exist.
     if (!expDist.contains(localHost) || !srcDist.contains(localHost)) {
-        SPDLOG_WARN("Localhost '{}' not found in distribution", localHost);
+        SPDLOG_WARN("for {}, Localhost '{}' not found in distribution",
+                    userFuncPar,
+                    localHost);
+        // DEBUG the expDist and srcDist
+        SPDLOG_DEBUG("Expected distribution: {}",
+                     faabric::util::mapToString(expDist));
+        SPDLOG_DEBUG("Source distribution: {}",
+                     faabric::util::mapToString(srcDist));
         throw std::runtime_error("Local host missing in distribution");
     }
 
@@ -247,7 +255,7 @@ void RuntimeSummary::initOpertaor(
     // init the source windowed distribution.
 
     windowedRecords[instanceName] =
-      std::make_shared<WindowedRecord>(expDist, srcDist, isBody);
+      std::make_shared<WindowedRecord>(instanceName, expDist, srcDist, isBody);
 }
 
 void RuntimeSummary::doInitExpectedDist(ScheduledOperator& schedOp)

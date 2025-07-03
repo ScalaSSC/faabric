@@ -177,10 +177,12 @@ class WindowedRecord
 {
   public:
     // Constructor: workers list, target proportions, and window size
-    explicit WindowedRecord(std::map<std::string, double>& expDist,
+    explicit WindowedRecord(std::string userFuncPar,
+                            std::map<std::string, double>& expDist,
                             std::map<std::string, double>& srcDist,
                             bool isBody)
-      : windowPos(0)
+      : userFuncPar(userFuncPar)
+      , windowPos(0)
       , windowSize(RING_SIZE)
     {
         faabric::util::FullLock lock(wrMx);
@@ -196,6 +198,7 @@ class WindowedRecord
 
   private:
     std::shared_mutex wrMx;
+    std::string userFuncPar;
     // Windowing state
     int windowPos;
     // If might not equals to WINDOW_SIZE
@@ -245,7 +248,7 @@ class RuntimeSummary
     std::map<std::string, std::map<std::string, double>> expectedDist;
 
     std::map<std::string, ScheduledOperator> scheduledOperatorsMap;
-    // MAP <USER_FUNC, WindowedRecord>
+    // MAP <USER_FUNC_Par, WindowedRecord>
     std::map<std::string, std::shared_ptr<WindowedRecord>> windowedRecords;
 
     // MAP <Instance Name, LocalStatelessOperatorType>

@@ -113,3 +113,7 @@ __pycache__/
 venv/
 venv-bm/
 *.egg-info/
+
+# proto
+src/planner/planner_pb2.py
+src/proto/faabric_pb2.py

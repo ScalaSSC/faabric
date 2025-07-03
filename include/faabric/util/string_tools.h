@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -37,5 +38,25 @@ std::string vectorToString(std::vector<T> vec)
 
 std::pair<std::string, std::string> splitUserFunc(const std::string& input);
 
-std::tuple<std::string, std::string, std::string> splitUserFuncPar(const std::string& input);
+std::tuple<std::string, std::string, std::string> splitUserFuncPar(
+  const std::string& input);
+
+template<typename K, typename V>
+std::string mapToString(const std::map<K, V>& map_to_print)
+{
+    std::stringstream ss;
+    ss << "{";
+
+    bool is_first = true;
+    for (const auto& pair : map_to_print) {
+        if (!is_first) {
+            ss << ", ";
+        }
+        ss << "\"" << pair.first << "\": " << pair.second;
+        is_first = false;
+    }
+
+    ss << "}";
+    return ss.str();
+}
 }
