@@ -350,6 +350,7 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
     // If the scheduler is updating state information, we may need to transfer
     // them to other nodes. So, just enqueue them temporarily.
     if (isUpdateState) {
+        SPDLOG_DEBUG("Enqueueing messages while updating state");
         unschedMsgs.enqueue(std::move(msgs));
         return;
     }
@@ -404,6 +405,8 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
     for (const auto& [instancesName, count] : instancesCounter) {
         runtimeStats.instanceAdd(instancesName, invokeHost, count);
     }
+
+    SPDLOG_DEBUG("Enqueued {} messages completed", nMessages);
 }
 
 void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
@@ -535,7 +538,9 @@ void Scheduler::batchTimerCheck()
         std::this_thread::sleep_for(
           std::chrono::milliseconds(conf.batchCheckInterval));
 
+        // SPDLOG_DEBUG("batchTimerCheck: trying to acquire mx lock");
         faabric::util::FullLock lock(mx);
+        // SPDLOG_DEBUG("batchTimerCheck: acquired mx lock");
 
         if (stopBatchTimer) {
             break;
@@ -543,7 +548,7 @@ void Scheduler::batchTimerCheck()
 
         // If we have some unScheduled messages, schedule them.
         while (!unschedMsgs.empty()) {
-            // SPDLOG_DEBUG("Processing unscheduled messages");
+            SPDLOG_DEBUG("Processing unscheduled messages");
             auto msgs = unschedMsgs.dequeue()->messages();
             std::vector<std::unique_ptr<faabric::Message>> msgsVec;
             msgsVec.reserve(msgs.size());
@@ -555,8 +560,14 @@ void Scheduler::batchTimerCheck()
             enqueueSchedMsgs(hosts, std::move(msgsVec));
         }
 
+        // long totalWaitingMessages = 0;
+        // for (auto const& [userFuncPar, waitingBatch] : waitingQueues) {
+        //     totalWaitingMessages += waitingBatch->getMessagesCount();
+        // }
         // SPDLOG_DEBUG(
-        //   "batchTimerCheck: Checking waiting queues for batch execution");
+        //   "batchTimerCheck: Checking waitingQueues. Total messages: {}",
+        //   totalWaitingMessages);
+
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
             if (waitingBatch->getMessagesCount() == 0) {
                 continue;
@@ -566,6 +577,18 @@ void Scheduler::batchTimerCheck()
                 executeBatchForQueue(userFuncPar, *waitingBatch, lock);
             }
         }
+
+        // NEW DEBUGGING CODE
+        // ==================================
+        // long totalPartitionedMessages = 0;
+        // for (auto const& [userFuncPar, waitingBatch] :
+        //      partitionedWaitingQueues) {
+        //     totalPartitionedMessages += waitingBatch->getMessagesCount();
+        // }
+        // SPDLOG_DEBUG("batchTimerCheck: Checking partitionedWaitingQueues. "
+        //              "Total messages: {}",
+        //              totalPartitionedMessages);
+        // ==================================
 
         // if Repartitioned, parititioned state functions are in the
         // partitionedWaitingQueues.
@@ -627,7 +650,9 @@ void Scheduler::dispatchChainedMsgs()
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
 
+        // SPDLOG_DEBUG("dispatchChainedMsgs: trying to acquire mx lock");
         faabric::util::FullLock mxLock(mx);
+        // SPDLOG_DEBUG("dispatchChainedMsgs: acquired mx lock");
 
         if (stopThreadTimer) {
             break;
@@ -651,6 +676,7 @@ void Scheduler::dispatchChainedMsgs()
             SPDLOG_DEBUG("Chaining call batch size: {}", req->messages_size());
             plannerCli.enqueueFunctions(req);
             chainedCallMsgs.clear();
+            SPDLOG_DEBUG("Chaining call batch completed");
             continue;
         }
 
@@ -817,9 +843,23 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
         }
         if (totalExecutors < maxExecutors) {
             return true;
+        } else {
+            // REASON 1: Total system executors are maxed out.
+            SPDLOG_DEBUG("No available executor for {}: total system executor "
+                         "limit reached ({} >= {})",
+                         funcStr,
+                         totalExecutors,
+                         maxExecutors);
         }
+    } else {
+        // REASON 2: Replicas for this specific function are maxed out.
+        SPDLOG_DEBUG("No available executor for {}: max replicas for function "
+                     "reached ({} >= {})",
+                     funcStr,
+                     thisExecutors.size(),
+                     maxReplicas);
     }
-    SPDLOG_TRACE("NO Available executor for {}", funcStr);
+
     return false;
 }
 
@@ -869,11 +909,11 @@ std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
     return claimed;
 }
 
-std::string Scheduler::getThisHost()
-{
-    faabric::util::SharedLock lock(mx);
-    return thisHost;
-}
+// std::string Scheduler::getThisHost()
+// {
+//     faabric::util::SharedLock lock(mx);
+//     return thisHost;
+// }
 
 void Scheduler::setThreadResultLocally(uint32_t appId,
                                        uint32_t msgId,
@@ -1006,7 +1046,10 @@ int Scheduler::getMonitoredInfoTest()
 
 void Scheduler::updateHosts(const std::vector<std::string>& hosts)
 {
+    SPDLOG_DEBUG("updateHosts: Updating hosts with {} entries", hosts.size());
+    SPDLOG_DEBUG("updateHosts: trying to acquire mx lock");
     faabric::util::FullLock lock(mx);
+    SPDLOG_DEBUG("updateHosts: acquired mx lock");
     if (hosts.empty()) {
         SPDLOG_ERROR("No hosts provided to updateHosts");
         throw std::runtime_error("No hosts provided to updateHosts");
@@ -1040,7 +1083,7 @@ void Scheduler::updateStatesInfo(
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
     statesInfo)
 {
-    SPDLOG_INFO("updateStatesInfo: Update states info starts");
+    SPDLOG_DEBUG("updateStatesInfo: Update states info starts");
     isUpdateState = true;
     // Update the states info in decentralized scheduler
     // To update states, we must ensure that no executors are running.

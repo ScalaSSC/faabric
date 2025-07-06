@@ -165,12 +165,20 @@ class ApplicationMetrics
       : appName(appNameIn)
       , period(periodIn) {};
 
-    void record(const std::map<int, std::shared_ptr<faabric::Message>>& msgMap)
+    void record(const std::map<int, std::shared_ptr<faabric::Message>>& msgMap,
+                int runningReqs)
     {
-        if (msgMap.empty()) {
+        int msgMapSize = msgMap.size();
+        if (msgMapSize == 0) {
             return;
         }
-
+        avgExecutionOperators =
+          avgExecutionOperators +
+          (static_cast<double>(msgMapSize) - avgExecutionOperators) /
+            (count + 1);
+        avgRunningReqs =
+          avgRunningReqs +
+          (static_cast<double>(runningReqs) - avgRunningReqs) / (count + 1);
         faabric::util::FullLock lock(opMx);
         int64_t tempStartTime = std::numeric_limits<int64_t>::max();
         int64_t tempEndTime = std::numeric_limits<int64_t>::min();
@@ -224,8 +232,10 @@ class ApplicationMetrics
           "appName", rapidjson::Value(appName.c_str(), alloc), alloc);
         doc.AddMember("period", period, alloc);
         doc.AddMember("count", count, alloc);
+        doc.AddMember("avgRunningReqs", avgRunningReqs, alloc);
         doc.AddMember("startTime", startTime, alloc);
         doc.AddMember("endTime", endTime, alloc);
+        doc.AddMember("avgExecutionOperators", avgExecutionOperators, alloc);
 
         // Calculate throughput as messages per second.
         double throughput = 0.0;
@@ -327,6 +337,8 @@ class ApplicationMetrics
     long count = 0;
     int64_t startTime = std::numeric_limits<int64_t>::max();
     int64_t endTime = std::numeric_limits<int64_t>::min();
+    double avgExecutionOperators = 0.0;
+    double avgRunningReqs = 0.0;
 
     std::string getName(const std::shared_ptr<faabric::Message> msg)
     {

@@ -849,7 +849,11 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
                     throw std::runtime_error("State host for " + userFuncPar +
                                              " not found");
                 }
-                parallelismDist[i] = stateHost.at(userFuncPar);
+                auto assignedIp = stateHost.at(userFuncPar);
+                parallelismDist[i] = assignedIp;
+                // Assuming the weight distribution for each stateful
+                // parallelism instance is the same
+                weightDist[assignedIp] = weightFactor / parallelism;
             }
         }
 

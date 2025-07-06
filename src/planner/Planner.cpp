@@ -356,13 +356,14 @@ void Planner::setMessageResultBatch(
         state.appResults[appId][msgId] =
           std::make_shared<faabric::Message>(msg);
 
-        int chainedMsgNum = msg.chainedmsgnum();
-        state.inFlightApps[appId] += chainedMsgNum;
+        state.inFlightApps[appId] += msg.chainedmsgnum();
         int inFlightAppCount = --state.inFlightApps[appId];
         if (inFlightAppCount <= 0) {
             state.inFlightApps.erase(appId);
+            int inFlightCount = state.inFlightApps.size();
             // Statistics the fully processed messages
-            state.applicationMetrics->record(state.appResults[appId]);
+            state.applicationMetrics->record(state.appResults[appId],
+                                             inFlightCount);
             state.appResults.erase(appId);
         }
     }
@@ -443,10 +444,6 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
     int i = 0;
     while (i < req->messages_size()) {
         auto* message = req->mutable_messages(i); // Use a pointer directly
-        // Record planner enqueue time
-        if (!isChained) {
-            message->set_plannerqueuetime(currentTime);
-        }
 
         // Record the chained call count
         int appid = message->appid();
@@ -462,6 +459,7 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
                 // SPDLOG_ERROR("app Id {} is already running", appid);
                 // Flush the old chainedId
                 state.inFlightApps[appid] = 1;
+                message->set_plannerqueuetime(currentTime);
             }
             // state.inFlightApps[appid]++;
         }
@@ -824,6 +822,9 @@ void Planner::updateRuntimeStats()
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeStatsUpdatePeriod));
+
+        // TODO - temporarily disable the runtime stats update
+        continue;
 
         std::vector<std::future<void>> futures;
         // Iterate over all hosts.

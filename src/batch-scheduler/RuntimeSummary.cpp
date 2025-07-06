@@ -2,148 +2,47 @@
 
 namespace faabric::batch_scheduler {
 
-void WindowedRecord::setWindow(std::map<std::string, double>& expDist,
-                               std::map<std::string, double>& srcDist,
-                               bool isBody)
-{
-    windowSize = 0;
-    workers.clear();
+// --- Implementation of the new ProbabilisticScheduler ---
 
-    if (isBody) {
-        windowQuota = getBodyWindowedSlots(expDist, srcDist);
-    } else {
-        // If this operator is the first one int the group, we assign them
-        // into workers according to the expected distribution.
-        for (const auto& [host, share] : expDist) {
-            int hostQuota = static_cast<int>(std::ceil(share * RING_SIZE));
-            windowQuota[host] = hostQuota;
+ProbabilisticScheduler::ProbabilisticScheduler(
+  const std::map<std::string, double>& weights)
+{
+    if (weights.empty()) {
+        SPDLOG_ERROR("Cannot create ProbabilisticScheduler with empty weights");
+        throw std::runtime_error("Empty weights for scheduler");
+    }
+
+    double cumulative = 0.0;
+    for (const auto& [host, weight] : weights) {
+        cumulative += weight;
+        cdf.emplace_back(cumulative, host);
+    }
+
+    // Sanity check to ensure the total probability is close to 1.0
+    if (cdf.empty() || std::abs(cdf.back().first - 1.0) > 1e-9) {
+        SPDLOG_WARN("Weights do not sum to 1.0 for scheduler. Sum is {}",
+                    cdf.back().first);
+    }
+}
+
+const std::string& ProbabilisticScheduler::schedule() const
+{
+    // Use a thread-local random number generator for performance and safety.
+    // This avoids locking a global generator.
+    thread_local std::mt19937 generator(std::random_device{}());
+    thread_local std::uniform_real_distribution<double> distribution(0.0, 1.0);
+
+    double p = distribution(generator);
+
+    // Find the host whose cumulative probability range contains 'p'
+    for (const auto& [cumulative_prob, host] : cdf) {
+        if (p <= cumulative_prob) {
+            return host;
         }
     }
 
-    windowPos = 0;
-    for (const auto& [host, quota] : windowQuota) {
-        workers.push_back(host);
-        windowSize += quota;
-    }
-
-    if (workers.empty()) {
-        SPDLOG_WARN("No workers found for windowed record");
-        throw std::runtime_error("No workers found for windowed record");
-    }
-    assignedCount.clear();
-}
-
-void WindowedRecord::updateWindow(std::map<std::string, double>& expDist,
-                                  std::map<std::string, double>& srcDist)
-{
-    // TODO - temporarily. We don't update the window for now.
-    // windowSize = 0;
-    // workers.clear();
-
-    // windowQuota = getBodyWindowedSlots(expDist, srcDist);
-
-    // windowPos = 0;
-    // for (const auto& [host, quota] : windowQuota) {
-    //     workers.push_back(host);
-    //     windowSize += quota;
-    // }
-
-    // if (workers.empty()) {
-    //     SPDLOG_WARN("No workers found for windowed record");
-    //     throw std::runtime_error("No workers found for windowed record");
-    // }
-    // assignedCount.clear();
-}
-
-std::map<std::string, int> WindowedRecord::getBodyWindowedSlots(
-  std::map<std::string, double>& expDist,
-  std::map<std::string, double>& srcDist)
-{
-    // 1. Sanity check: expected and source distributions must exist.
-    if (!expDist.contains(localHost) || !srcDist.contains(localHost)) {
-        SPDLOG_WARN("for {}, Localhost '{}' not found in distribution",
-                    userFuncPar,
-                    localHost);
-        // DEBUG the expDist and srcDist
-        SPDLOG_DEBUG("Expected distribution: {}",
-                     faabric::util::mapToString(expDist));
-        SPDLOG_DEBUG("Source distribution: {}",
-                     faabric::util::mapToString(srcDist));
-        throw std::runtime_error("Local host missing in distribution");
-    }
-
-    std::map<std::string, int> hostsSlots;
-    double localShare = expDist.at(localHost) / srcDist.at(localHost);
-    int localSlots = static_cast<int>(std::round(localShare * RING_SIZE));
-    hostsSlots[localHost] = localSlots;
-
-    // 2. If generated request on local host is less than expected, we
-    // assign all requests locally.
-    if (localSlots >= RING_SIZE)
-        return hostsSlots;
-
-    // 3. therwise, we have to assign the remaining requests to other
-    // hosts according to round-robin.
-    int remaining = RING_SIZE - localSlots;
-    std::map<std::string, double> gaps;
-    double totalGap = 0.0;
-
-    for (const auto& [host, expShare] : expDist) {
-        if (host == localHost)
-            continue;
-        double srcShare = srcDist.count(host) ? srcDist.at(host) : 0.0;
-        double gap = expShare - srcShare;
-        if (gap > 0.0) {
-            totalGap += gap;
-            gaps.emplace(host, gap);
-        }
-    }
-
-    // 5. Allocate the remaining slots.
-    for (auto& [host, gap] : gaps) {
-        double portion = gap / totalGap;
-        int slot = static_cast<std::size_t>(std::ceil(portion * remaining));
-        hostsSlots[host] = slot;
-    }
-
-    return hostsSlots;
-}
-
-std::string WindowedRecord::schedule(const unsigned int counter)
-{
-    faabric::util::FullLock lock(wrMx);
-    const std::string& rec = workers[counter % workers.size()];
-    return doSchedule(rec);
-}
-
-std::string WindowedRecord::schedule(const std::string& recommended)
-{
-    faabric::util::FullLock lock(wrMx);
-    return doSchedule(recommended);
-}
-
-std::string WindowedRecord::doSchedule(const std::string& initialHost)
-{
-
-    // 1) Reset at window boundary
-    if (windowPos == windowSize) {
-        assignedCount.clear();
-        windowPos = 0;
-    }
-
-    std::string pickHost = initialHost;
-    if (assignedCount[initialHost] >= windowQuota[initialHost]) {
-        for (auto& [host, count] : windowQuota) {
-            if (assignedCount[host] < windowQuota[host]) {
-                pickHost = host;
-                break;
-            }
-        }
-    }
-
-    assignedCount[pickHost]++;
-    windowPos++;
-    return pickHost;
+    // Fallback to the last host (should only happen with floating point errors)
+    return cdf.back().second;
 }
 
 void RuntimeSummary::initScheduledOperators(
@@ -170,6 +69,10 @@ void RuntimeSummary::initAll(const batch_scheduler::Application& application,
     // For planner, we need to initialize the schedule for input opeartors.
     if (planner) {
         for (const auto& [optName, scheduledOpt] : scheduledOperatorsMap) {
+            if (scheduledOpt.node.type !=
+                batch_scheduler::NodeType::STATELESS) {
+                continue; // Only stateless operators are considered
+            }
             if (scheduledOpt.node.isInput) {
                 initOperators.insert(optName);
             }
@@ -179,6 +82,10 @@ void RuntimeSummary::initAll(const batch_scheduler::Application& application,
     // operators (whose source is in this node).
     else {
         for (const auto& [optName, scheduledOpt] : scheduledOperatorsMap) {
+            if (scheduledOpt.node.type !=
+                batch_scheduler::NodeType::STATELESS) {
+                continue; // Only stateless operators are considered
+            }
             // If the source node of optName is in this node, we need to
             // shcedule it.
             auto sourceNodes = application.getSource(optName);
@@ -202,7 +109,7 @@ void RuntimeSummary::initOpertaor(
   std::string operatorName)
 {
     SPDLOG_DEBUG("Initializing operator runtime summary for {}", operatorName);
-    // Judge the local operator type;
+
     auto& scheduledOpt =
       getScheduledOperatorOrThrow(scheduledOperatorsMap, operatorName);
     bool isCollocate = scheduledOpt.isCollocate;
@@ -242,20 +149,39 @@ void RuntimeSummary::initOpertaor(
 
     std::string instanceName = scheduledOpt.node.name + "_0";
 
-    localScheduledOperatorsMap[instanceName] = scheduledOpt.localType;
+    // localScheduledOperatorsMap[instanceName] = scheduledOpt.localType;
     // Update the expected distribution and source distribution.
 
     doInitExpectedDist(scheduledOpt);
-    auto expDist = expectedDist[instanceName];
-    std::map<std::string, double> srcDist = std::map<std::string, double>();
-    if (isBody) {
-        doInitSourceDist(scheduledOpt, application);
-        srcDist = sourceDist[instanceName];
-    }
-    // init the source windowed distribution.
+    auto& expDist = expectedDist[instanceName];
 
-    windowedRecords[instanceName] =
-      std::make_shared<WindowedRecord>(instanceName, expDist, srcDist, isBody);
+    // CHANGED: Create a ProbabilisticScheduler instead of a WindowedRecord.
+    // Note: The complex logic from getBodyWindowedSlots and srcDist is removed
+    // as it's part of the stateful, corrective windowing model. The
+    // probabilistic model simply uses the target expected distribution.
+    probabilisticSchedulers[instanceName] =
+      std::make_shared<ProbabilisticScheduler>(expDist);
+}
+
+std::string RuntimeSummary::getHost(const std::string& instance,
+                                    unsigned int counter)
+{
+    // The 'counter' argument is ignored in the probabilistic model.
+    faabric::util::SharedLock lock(summaryMx);
+    auto it = probabilisticSchedulers.find(instance);
+    if (it == probabilisticSchedulers.end()) {
+        SPDLOG_ERROR("No scheduler for instance {} found", instance);
+        throw std::runtime_error("No scheduler for instance " + instance);
+    }
+    // Directly call the lock-free schedule method
+    return it->second->schedule();
+}
+
+std::string RuntimeSummary::getHost(const std::string& instance,
+                                    const std::string& recommended)
+{
+    // The 'recommended' host is also ignored, as scheduling is purely random.
+    return recommended; // This is a no-op in the probabilistic model.
 }
 
 void RuntimeSummary::doInitExpectedDist(ScheduledOperator& schedOp)
@@ -308,69 +234,10 @@ void RuntimeSummary::doInitSourceDist(
     }
 }
 
-std::string RuntimeSummary::getHost(const std::string& instance,
-                                    unsigned int counter)
-{
-    faabric::util::SharedLock lock(summaryMx);
-    auto it = windowedRecords.find(instance);
-    if (it == windowedRecords.end()) {
-        SPDLOG_ERROR("No collocate map for instance {} found", instance);
-        throw std::runtime_error("No collocate map for instance " + instance);
-    }
-    std::string host = it->second->schedule(counter);
-    return host;
-}
-
-std::string RuntimeSummary::getHost(const std::string& instance,
-                                    std::string recommended)
-{
-    faabric::util::SharedLock lock(summaryMx);
-    auto it = windowedRecords.find(instance);
-    if (it == windowedRecords.end()) {
-        SPDLOG_ERROR("No collocate map for instance {} found", instance);
-        throw std::runtime_error("No collocate map for instance " + instance);
-    }
-    std::string host = it->second->schedule(recommended);
-    return host;
-}
-
 void RuntimeSummary::updateSourceDist(
   std::map<std::string, std::map<std::string, int>> sourceCountStats,
   bool reschedule)
 {
-    faabric::util::FullLock lock(summaryMx);
-    sourceDist.clear();
-    for (const auto& [instanceName, hostCount] : sourceCountStats) {
-        int sumCount = 0;
-        for (const auto& [host, count] : hostCount) {
-            sumCount += count;
-        }
-        if (sumCount <= 0) {
-            // SPDLOG_DEBUG("Total count <= 0 for instance {}", instanceName);
-            continue;
-        }
-        auto& dist = sourceDist[instanceName];
-        for (const auto& [host, count] : hostCount) {
-            dist[host] = static_cast<double>(count) / sumCount;
-        }
-    }
-
-    if (!reschedule) {
-        return;
-    }
-    // Do the reschedule job
-    for (auto& [instanceName, localType] : localScheduledOperatorsMap) {
-        if (!sourceDist.contains(instanceName)) {
-            continue;
-        }
-        if (localType == LocalStatelessOperatorType::ROUNDROBIN_HEAD ||
-            localType == LocalStatelessOperatorType::COLLOCATE_HEAD) {
-            continue;
-        }
-        auto expDist = expectedDist.at(instanceName);
-        auto srcDist = sourceDist.at(instanceName);
-        windowedRecords.at(instanceName)->updateWindow(expDist, srcDist);
-    }
+    // TODO currently do nothing.
 }
-
-} // namespace faabric::batch_scheduler
+}

@@ -316,7 +316,7 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
 
         // If we want to execute batch-processing
         if (task.messageIndex == STREAM_BATCH) {
-            SPDLOG_TRACE(
+            SPDLOG_DEBUG(
               "Thread {}:{} executing task appid: {} (batch processing)",
               id,
               threadPoolIdx,
@@ -359,7 +359,7 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             assert(oldTaskCount >= 1);
 
             faabric::Message firstMsg = task.req->messages().at(0);
-            SPDLOG_TRACE("Task {} finished by thread {}:{} ({} left)",
+            SPDLOG_DEBUG("Task {} finished by thread {}:{} ({} left)",
                          faabric::util::funcToString(firstMsg, true),
                          id,
                          threadPoolIdx,

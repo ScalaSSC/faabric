@@ -235,27 +235,21 @@ void FunctionState::doSet(const std::string& data)
 }
 
 // Only the Master node can return its data, otherwise pull at first.
-void FunctionState::get(uint8_t* buffer)
-{
-    faabric::util::FullLock lock(funcStateMutex);
-    auto bytePtr = BYTES(sharedMemory);
-    std::copy(bytePtr, bytePtr + stateSize, buffer);
-}
+// void FunctionState::get(uint8_t* buffer)
+// {
+//     faabric::util::FullLock lock(funcStateMutex);
+//     auto bytePtr = BYTES(sharedMemory);
+//     std::copy(bytePtr, bytePtr + stateSize, buffer);
+// }
 
 std::vector<uint8_t> FunctionState::getFuncStateLock(bool lockin)
 {
-    faabric::util::FullLock lock(funcStateMutex);
-
     if (lockin) {
         lockWrite();
     }
+    faabric::util::FullLock lock(funcStateMutex);
     uint8_t* bytePtr = BYTES(sharedMemory);
     return std::vector<uint8_t>(bytePtr, bytePtr + stateSize);
-}
-
-int FunctionState::readPartitionStateSize(std::set<std::string>& keys)
-{
-    return readPartitionState(keys).size();
 }
 
 std::vector<uint8_t> FunctionState::readPartitionState(
@@ -276,41 +270,6 @@ std::vector<uint8_t> FunctionState::readPartitionState(
     }
     auto stateVec = faabric::util::serializeParState(filteredMap);
     return stateVec;
-}
-
-int FunctionState::acquireIndivLocks(std::set<std::string>& keys,
-                                     uint8_t* buffer,
-                                     int acquireTimes)
-{
-
-    // Get the thread ID
-    std::map<std::string, std::vector<uint8_t>> filteredMap;
-
-    std::string acquiredKeysStr;
-    auto acquiredKeys = multiKeysLock.tryAcquire(keys);
-    faabric::util::FullLock lock(funcStateMutex);
-    for (const auto& key : acquiredKeys) {
-        if (!acquiredKeysStr.empty()) {
-            acquiredKeysStr += "|";
-        }
-        acquiredKeysStr += key;
-        if (!indivStateMap[key].getState().empty()) {
-            filteredMap.emplace(key, indivStateMap.at(key).getState());
-        }
-    }
-
-    std::vector<uint8_t> acquiredKeysVec(acquiredKeysStr.begin(),
-                                         acquiredKeysStr.end());
-    acquiredKeysVec.push_back('\0');
-
-    // Step 2: Create the vector and copy the locked data into it
-    std::copy(acquiredKeysVec.data(),
-              acquiredKeysVec.data() + acquiredKeysVec.size(),
-              reinterpret_cast<uint8_t*>(buffer));
-
-    // Step3: Calculate the Vec Size
-    auto stateVec = faabric::util::serializeParState(filteredMap);
-    return stateVec.size();
 }
 
 std::map<std::string, std::vector<uint8_t>>

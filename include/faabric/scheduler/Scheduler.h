@@ -95,7 +95,7 @@ class Scheduler
 
     size_t getCachedMessageCount();
 
-    std::string getThisHost();
+    // std::string getThisHost();
 
     void addHostToGlobalSet();
 

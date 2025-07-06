@@ -47,17 +47,13 @@ class FunctionState
     long lockWrite();
     void unlockWrite();
     size_t size() const;
-    void get(uint8_t* buffer);
+    // void get(uint8_t* buffer);
     void set(const uint8_t* buffer, long length, bool unlock = false);
     std::vector<uint8_t> getFuncStateLock(bool lockin = false);
 
     /***
      * Functions used by the Partitioned Stateful Function Operator
      */
-    int acquireIndivLocks(std::set<std::string>& keys,
-                          uint8_t* buffer,
-                          int acquireTimes);
-    int readPartitionStateSize(std::set<std::string>& keys);
     std::vector<uint8_t> readPartitionState(std::set<std::string>& keys);
     std::map<std::string, std::vector<uint8_t>> readPartitionStateLock(
       std::set<std::string>& keys);

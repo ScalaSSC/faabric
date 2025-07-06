@@ -82,10 +82,10 @@ class State
                                 int32_t parallelismId,
                                 bool lock = false);
 
-    int readFuncState(const std::string& user,
-                      const std::string& func,
-                      int32_t parallelismId,
-                      char* buffer);
+    // int readFuncState(const std::string& user,
+    //                   const std::string& func,
+    //                   int32_t parallelismId,
+    //                   char* buffer);
 
     std::vector<uint8_t> readFuncStateLock(const std::string& user,
                                            const std::string& func,
@@ -102,13 +102,6 @@ class State
     //---------------------
     // Stateful Function State API
     //---------------------
-
-    int getIndivFuncStateSizeLock(const std::string& user,
-                                  const std::string& func,
-                                  int32_t parallelismId,
-                                  uint8_t* buffer,
-                                  std::set<std::string>& keys,
-                                  int acquireTimes);
 
     void readIndivFuncState(const std::string& user,
                             const std::string& func,

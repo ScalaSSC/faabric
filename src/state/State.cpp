@@ -289,16 +289,16 @@ size_t State::getFunctionStateSize(const std::string& user,
     return targetFs->size();
 }
 
-int State::readFuncState(const std::string& user,
-                         const std::string& func,
-                         int32_t parallelismId,
-                         char* buffer)
-{
-    auto targetFs = doGetFS(user, func, parallelismId);
+// int State::readFuncState(const std::string& user,
+//                          const std::string& func,
+//                          int32_t parallelismId,
+//                          char* buffer)
+// {
+//     auto targetFs = doGetFS(user, func, parallelismId);
 
-    targetFs->get(reinterpret_cast<uint8_t*>(buffer));
-    return targetFs->size();
-}
+//     targetFs->get(reinterpret_cast<uint8_t*>(buffer));
+//     return targetFs->size();
+// }
 
 std::vector<uint8_t> State::readFuncStateLock(const std::string& user,
                                               const std::string& func,
@@ -322,19 +322,6 @@ void State::setFuncState(const std::string& user,
     auto targetFs = doGetFS(user, func, parallelismId);
 
     targetFs->set(reinterpret_cast<uint8_t*>(buffer), bufferLen, unlock);
-}
-
-int State::getIndivFuncStateSizeLock(const std::string& user,
-                                     const std::string& func,
-                                     int32_t parallelismId,
-                                     uint8_t* buffer,
-                                     std::set<std::string>& keys,
-                                     int acquireTimes)
-{
-    auto targetFs = doGetFS(user, func, parallelismId);
-
-    int size = targetFs->acquireIndivLocks(keys, buffer, acquireTimes);
-    return size;
 }
 
 void State::readIndivFuncState(const std::string& user,

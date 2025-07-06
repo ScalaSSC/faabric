@@ -5,10 +5,10 @@
 #include <faabric/util/locks.h>
 #include <faabric/util/string_tools.h>
 
-#include <algorithm> // std::sort, std::shuffle
-#include <cmath>     // std::floor
+#include <algorithm>
+#include <cmath>
 #include <map>
-#include <random> // std::default_random_engine
+#include <random>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -169,55 +169,24 @@ inline ScheduledOperator& getScheduledOperatorOrThrow(
 }
 
 // The number of slots in the ring.
-const std::size_t RING_SIZE = 100;
+// const std::size_t RING_SIZE = 100;
 
-// WindowedRecord is a class used for scheduling requests to stateless operators
-// before partitioned stateful operators.
-class WindowedRecord
+// NEW: A stateless scheduler that uses probability. Replaces WindowedRecord.
+class ProbabilisticScheduler
 {
   public:
-    // Constructor: workers list, target proportions, and window size
-    explicit WindowedRecord(std::string userFuncPar,
-                            std::map<std::string, double>& expDist,
-                            std::map<std::string, double>& srcDist,
-                            bool isBody)
-      : userFuncPar(userFuncPar)
-      , windowPos(0)
-      , windowSize(RING_SIZE)
-    {
-        faabric::util::FullLock lock(wrMx);
-        setWindow(expDist, srcDist, isBody);
-    }
+    // Constructor pre-computes the Cumulative Distribution Function (CDF)
+    explicit ProbabilisticScheduler(
+      const std::map<std::string, double>& weights);
 
-    // Schedule a request, returning the chosen host
-    std::string schedule(const unsigned int counter);
-    std::string schedule(const std::string& recommended);
-    // Only the "BODY" type operators can update the window.
-    void updateWindow(std::map<std::string, double>& expDist,
-                      std::map<std::string, double>& srcDist);
+    // Returns a host based on the weighted probability.
+    // This method is const and lock-free, making it extremely fast.
+    const std::string& schedule() const;
 
   private:
-    std::shared_mutex wrMx;
-    std::string userFuncPar;
-    // Windowing state
-    int windowPos;
-    // If might not equals to WINDOW_SIZE
-    int windowSize;
-    std::vector<std::string> workers;
-    std::map<std::string, int> windowQuota;
-    std::map<std::string, int> assignedCount;
-    std::string localHost = faabric::util::getSystemConfig().endpointHost;
-
-    // Reset quotas and counters at the start of a window
-    void setWindow(std::map<std::string, double>& expDist,
-                   std::map<std::string, double>& srcDist,
-                   bool isBody);
-
-    std::map<std::string, int> getBodyWindowedSlots(
-      std::map<std::string, double>& expDist,
-      std::map<std::string, double>& srcDist);
-
-    std::string doSchedule(const std::string& initialHost);
+    // This vector stores the pre-computed CDF.
+    // e.g., {{0.6, "host_a"}, {0.9, "host_b"}, {1.0, "host_c"}}
+    std::vector<std::pair<double, std::string>> cdf;
 };
 
 class RuntimeSummary
@@ -234,27 +203,27 @@ class RuntimeSummary
       std::map<std::string, std::map<std::string, int>> sourceCountStats,
       bool reschedule);
 
+    // The 'counter' and 'recommended' arguments are no longer needed for
+    // probabilistic scheduling but are kept for API compatibility.
     std::string getHost(const std::string& instance, unsigned int counter);
-    std::string getHost(const std::string& instance, std::string recommended);
+    std::string getHost(const std::string& instance,
+                        const std::string& recommended);
 
   private:
     std::shared_mutex summaryMx;
     std::string localHost = faabric::util::getSystemConfig().endpointHost;
     bool isPlanner = false;
-    // The actual runtime distribution.
-    std::map<std::string, std::map<std::string, double>> sourceDist;
-    // The expected distribution from centralized scheduler.
-    // MAP<Instance Name, MAP<IP, distribution>>
+
     std::map<std::string, std::map<std::string, double>> expectedDist;
+    std::map<std::string, std::map<std::string, double>> sourceDist;
 
     std::map<std::string, ScheduledOperator> scheduledOperatorsMap;
-    // MAP <USER_FUNC_Par, WindowedRecord>
-    std::map<std::string, std::shared_ptr<WindowedRecord>> windowedRecords;
 
-    // MAP <Instance Name, LocalStatelessOperatorType>
-    std::map<std::string, LocalStatelessOperatorType>
-      localScheduledOperatorsMap;
+    // CHANGED: Replaced WindowedRecord with the new ProbabilisticScheduler
+    std::map<std::string, std::shared_ptr<ProbabilisticScheduler>>
+      probabilisticSchedulers;
 
+    // ... (other private members and methods are the same) ...
     void initAll(const batch_scheduler::Application& application, bool planner);
 
     void initOpertaor(const batch_scheduler::Application& application,
