@@ -834,25 +834,11 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
             return true;
         }
     }
-    // If current current replicas is less than the max size.
+    // We don't have to check the maxExecutors here, since in updateStatesInfo, max replicas are limited. Total number of executors won't exceed the maxExecutors.. 
+    // If current current replicas is less than the max size, return true.
     if (thisExecutors.size() < maxReplicas) {
-        // If we have enough slots, we can return true.
-        int totalExecutors = 0;
-        for (const auto& pair : executors) {
-            totalExecutors += pair.second.size();
-        }
-        if (totalExecutors < maxExecutors) {
             return true;
-        } else {
-            // REASON 1: Total system executors are maxed out.
-            SPDLOG_DEBUG("No available executor for {}: total system executor "
-                         "limit reached ({} >= {})",
-                         funcStr,
-                         totalExecutors,
-                         maxExecutors);
-        }
     } else {
-        // REASON 2: Replicas for this specific function are maxed out.
         SPDLOG_DEBUG("No available executor for {}: max replicas for function "
                      "reached ({} >= {})",
                      funcStr,
@@ -1093,6 +1079,35 @@ void Scheduler::updateStatesInfo(
     faabric::util::FullLock stateLock(stateUpdateMx);
     SPDLOG_DEBUG("updateStatesInfo: state lock acquired");
 
+    // reset max replicas based on number of instances assigned loccally.
+    int localInstanceCount = 0;
+    for (const auto& [operatorName, operatorInfo] : scheuduledOperatorMap) {
+        if (operatorInfo.node.type == faabric::batch_scheduler::STATELESS) {
+            if (operatorInfo.weightDist.count(thisHost) > 0) {
+                localInstanceCount++;
+            }
+        } else {
+            for (const auto& [_, ip] : operatorInfo.parallelismDist) {
+                if (ip == thisHost) {
+                    localInstanceCount++;
+                }
+            }
+        }
+    }
+    if (localInstanceCount == 0) {
+        localInstanceCount = maxExecutors;
+    }
+    maxReplicas = maxExecutors / localInstanceCount;
+    SPDLOG_INFO("updateStatesInfo: localInstanceCount is {}, maxReplicas is "
+                "{}, maxExecutors is {}",
+                localInstanceCount,
+                maxReplicas,
+                maxExecutors);
+    if (maxReplicas < 1) {
+        SPDLOG_ERROR("maxReplicas is less than 1, too many instances");
+        throw std::runtime_error("maxReplicas is less than 1");
+    }
+
     decentralScheduler.setScheuduledOperatorMap(scheuduledOperatorMap);
 
     // Update the states info in decentralized scheduler
@@ -1129,7 +1144,6 @@ void Scheduler::updateStatesInfo(
     SPDLOG_INFO(
       "updateStatesInfo: states update complete, reallocate states now");
 
-    std::string thisHost = faabric::util::getSystemConfig().endpointHost;
     // Intialize new allocated state
     for (const auto& [stateKey, stateInfo] : statesInfo) {
         for (const auto& [id, ip] : stateInfo.stateHost) {
