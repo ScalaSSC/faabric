@@ -1,13 +1,41 @@
 #pragma once
 
+#include <faabric/batch-scheduler/BatchScheduler.h>
+
+#include <condition_variable>
 #include <iostream>
 #include <map>
+#include <mutex> // For std::unique_lock and std::lock
 #include <shared_mutex>
-#include <condition_variable>
-#include <utility>  // For std::move
-#include <mutex>    // For std::unique_lock and std::lock
+#include <utility> // For std::move
 
 namespace faabric::util {
+
+faabric::batch_scheduler::HostMap getFirstNElements(
+  const faabric::batch_scheduler::HostMap& originalMap,
+  size_t count)
+{
+    // Create a new map to store the filtered results.
+    faabric::batch_scheduler::HostMap filteredMap;
+
+    // Get an iterator to the beginning of the original map.
+    auto it = originalMap.begin();
+
+    // Loop for 'count' times, or until we reach the end of the map,
+    // whichever comes first.
+    for (size_t i = 0; i < count && it != originalMap.end(); ++i) {
+        // Insert the key-value pair the iterator is pointing to into the new
+        // map. C++17's insert_or_assign or C++11's insert can be used. Using
+        // `insert` is simple and effective here.
+        filteredMap.insert(*it);
+
+        // Move the iterator to the next element.
+        ++it;
+    }
+
+    return filteredMap;
+}
+
 template<typename K, typename V>
 class ThreadSafeMap
 {
@@ -125,7 +153,8 @@ class ThreadSafeMap
     const V& operator[](const K& key) const
     {
         std::shared_lock lock(mtx);
-        return map.at(key); // Use at() for const access to ensure exception on missing key
+        // Use at() for const access to ensure exception on missing key
+        return map.at(key);
     }
 
     // Add at method for bounds-checked access
@@ -148,4 +177,5 @@ class ThreadSafeMap
         map.clear();
     }
 };
+
 }

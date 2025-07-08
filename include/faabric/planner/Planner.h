@@ -183,6 +183,7 @@ class Planner
     // Request scheduling private API
     // ----------
     // bool isUpdateState = false;
+    int numHostsScheduled = 0;
 
     int dispatchPeriod = 20; // ms
 

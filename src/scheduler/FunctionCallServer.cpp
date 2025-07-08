@@ -285,9 +285,7 @@ void FunctionCallServer::recvResetParameter(std::span<const uint8_t> buffer)
     std::string key = parsedMsg.parameter();
     int32_t value = parsedMsg.value();
     SPDLOG_INFO("FunctionCall Server Resetting parameter {} to {}", key, value);
-    if (key == "is_repartition") {
-        faabric::scheduler::getScheduler().resetParameter(key, value);
-    } else if (key == "max_executors") {
+    if (key == "max_executors") {
         faabric::scheduler::getScheduler().resetParameter(key, value);
     } else if (key == "planner_call_interval") {
         faabric::scheduler::getScheduler().resetParameter(key, value);

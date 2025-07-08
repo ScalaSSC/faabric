@@ -290,8 +290,6 @@ void PlannerEndpointHandler::onRequest(
                 maxInflightApps = value;
             } else if (parameter == "max_executors") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
-            } else if (parameter == "is_repartition") {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "dispatch_period") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
@@ -304,6 +302,9 @@ void PlannerEndpointHandler::onRequest(
             } else if (parameter == "schedule_mode") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "is_outputting") {
+                faabric::planner::getPlanner().resetParameter(
+                  parameter, value, true);
+            } else if (parameter == "num_hosts_scheduled") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
             } else {
@@ -342,8 +343,8 @@ void PlannerEndpointHandler::onRequest(
             auto applicationPtr = faabric::util::parseApplicationMsg(rawReq);
 
             // Distribute the application to the workers.
-            faabric::planner::getPlanner().registerApp(rawReq,
-              std::move(applicationPtr), true);
+            faabric::planner::getPlanner().registerApp(
+              rawReq, std::move(applicationPtr), true);
 
             return ctx.sendFunction(std::move(response));
         }

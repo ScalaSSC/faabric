@@ -13,6 +13,7 @@
 #include <faabric/util/gids.h>
 #include <faabric/util/locks.h>
 #include <faabric/util/logging.h>
+#include <faabric/util/map.h>
 #include <faabric/util/message.h>
 #include <faabric/util/string_tools.h>
 
@@ -180,6 +181,9 @@ void Planner::flushSchedulingState()
     state.inFlightApps.clear();
     state.applicationMetrics =
       std::make_unique<ApplicationMetrics>("defaultApp", 1);
+
+    state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
+    numHostsScheduled = 0;
 }
 
 std::vector<std::shared_ptr<Host>> Planner::getAvailableHosts(bool locked)
@@ -575,6 +579,11 @@ bool Planner::registerApp(faabric::planner::RegisterApplicationRequest& rawReq,
     stateAwareScheduler->registerApp(std::move(app));
     distributeApp(rawReq);
     if (init) {
+        if (numHostsScheduled != 0 &&
+            numHostsScheduled < state.batchSchedHostMap.size()) {
+            state.batchSchedHostMap = faabric::util::getFirstNElements(
+              state.batchSchedHostMap, numHostsScheduled);
+        }
         stateAwareScheduler->initApp(state.batchSchedHostMap);
         stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
         doDistributeStatesInfo();
@@ -700,12 +709,13 @@ bool Planner::resetParameter(const std::string& key,
 
     // Reset the parameter of planner
     if (plannerParameter) {
+        SPDLOG_INFO("Planner reset parameter {} to {}", key, value);
         if (key == "dispatch_period") {
-            SPDLOG_INFO("Planner reset dispatchPeriod to {}", value);
             dispatchPeriod = value;
         } else if (key == "is_outputting") {
-            SPDLOG_INFO("Planner reset isOutputting to {}", value == 1);
             isOutputting = value == 1;
+        } else if (key == "num_hosts_scheduled") {
+            numHostsScheduled = value;
         }
         return true;
     }
