@@ -7,11 +7,12 @@
 #include <faabric/planner/PlannerState.h>
 #include <faabric/planner/planner.pb.h>
 #include <faabric/proto/faabric.pb.h>
+#include <faabric/scheduler/InstancesRuntimeStats.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/util/queue.h>
-#include <utility>
 
 #include <shared_mutex>
+#include <utility>
 
 namespace faabric::planner {
 enum FlushType
@@ -187,7 +188,7 @@ class Planner
 
     int dispatchPeriod = 20; // ms
 
-    int runtimeStatsUpdatePeriod = 20000; // ms
+    int runtimeStatsUpdatePeriod = 5000; // ms
 
     void dequeueScheduledMsgs();
 

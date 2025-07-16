@@ -1519,7 +1519,7 @@ void StateAwareScheduler::runtimeSourceUpdate(
 {
     faabric::util::FullLock lock(scheduleMx);
     SPDLOG_DEBUG("Updating runtime source information");
-    runtimeSummary.updateSourceDist(sourceCountStats, true);
+    runtimeSummary.updateSourceDist(sourceCountStats);
 }
 
 void StateAwareScheduler::setScheduleMode(int mode)

@@ -235,9 +235,13 @@ void RuntimeSummary::doInitSourceDist(
 }
 
 void RuntimeSummary::updateSourceDist(
-  std::map<std::string, std::map<std::string, int>> sourceCountStats,
-  bool reschedule)
+  std::map<std::string, std::map<std::string, int>> sourceCountStats)
 {
-    // TODO currently do nothing.
+    if (isPlanner) {
+        
+
+    } else {
+        
+    }
 }
 }

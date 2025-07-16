@@ -200,8 +200,7 @@ class RuntimeSummary
       bool planner = false);
 
     void updateSourceDist(
-      std::map<std::string, std::map<std::string, int>> sourceCountStats,
-      bool reschedule);
+      std::map<std::string, std::map<std::string, int>> sourceCountStats);
 
     // The 'counter' and 'recommended' arguments are no longer needed for
     // probabilistic scheduling but are kept for API compatibility.

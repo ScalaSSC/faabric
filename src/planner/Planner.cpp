@@ -845,6 +845,8 @@ void Planner::updateRuntimeStats()
     std::mutex resultsMutex; // Protects access to results.
     faabric::RuntimeStatsUpdateRequest request;
 
+    // We fetch the runtime stats periodically. Each iteration sends the stats
+    // in the last iteration and feteches the new stats.
     while (!stopThreadTimer) {
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(
