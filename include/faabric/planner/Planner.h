@@ -187,7 +187,7 @@ class Planner
 
     int dispatchPeriod = 20; // ms
 
-    int runtimeStatsUpdatePeriod = 5000; // ms
+    int runtimeStatsUpdatePeriod = 20000; // ms
 
     void dequeueScheduledMsgs();
 

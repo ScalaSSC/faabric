@@ -330,49 +330,58 @@ bool Planner::isHostExpired(std::shared_ptr<Host> host, long epochTimeMs)
     return (epochTimeMs - host->registerts().epochms()) > hostTimeoutMs;
 }
 
+// IMPORTANT : A -> B. But the message result of B can be set before A.
 void Planner::setMessageResultBatch(
   std::shared_ptr<faabric::BatchExecuteRequest> batchMsg)
 {
     SPDLOG_DEBUG("Planner received message result batch with {} messages",
                  batchMsg->messages_size());
 
-    // When outputing result, we doesn't allow any set result operation.
     RETURN_IF_OUTPUTTING
     faabric::util::FullLock reqStatusLock(state.reqStatusMx);
-    // Check again
     RETURN_IF_OUTPUTTING
+
     SPDLOG_DEBUG("InFlightApps size before set: {}", state.inFlightApps.size());
     for (int msgIdx = 0; msgIdx < batchMsg->messages_size(); msgIdx++) {
         auto msg = batchMsg->messages(msgIdx);
         int appId = msg.appid();
         int msgId = msg.id();
-        int chainedId = msg.chainedid();
-        if (appId != chainedId) {
-            SPDLOG_ERROR("App Id and Chained ID are different: {} and {}",
-                         appId,
-                         chainedId);
-            throw std::runtime_error("Message ID and Chained ID are different");
-        }
-        // SPDLOG_DEBUG("Setting message result for app {} msg {}", appId, msgId);
+
+        // This check ensures we don't process results for an app that
+        // should have already been cleaned up.
         if (!state.inFlightApps.contains(appId)) {
-            SPDLOG_ERROR("App {} is not in flight", appId);
+            SPDLOG_WARN(
+              "App {} is not in flight but received result for msg {}",
+              appId,
+              msgId);
             continue;
         }
+
+        // Store the result for the current message
         state.appResults[appId][msgId] =
           std::make_shared<faabric::Message>(msg);
 
+        // For each message this one chained to, add it to the in-flight set
+        // ONLY if we haven't already seen its result.
         for (int32_t chainedMsgId : msg.chainedmsgids()) {
-            state.inFlightApps[appId].insert(chainedMsgId);
+            auto resultRecord = state.appResults.at(appId);
+            if (!resultRecord.contains(chainedMsgId)) {
+                state.inFlightApps[appId].insert(chainedMsgId);
+            }
         }
+
+        // Remove the current message from the in-flight set
         state.inFlightApps[appId].erase(msgId);
-        int inFlightAppCount = state.inFlightApps[appId].size();
-        if (inFlightAppCount == 0) {
-            state.inFlightApps.erase(appId);
-            int inFlightCount = state.inFlightApps.size();
-            // Statistics the fully processed messages
-            state.applicationMetrics->record(state.appResults[appId],
+
+        // If this was the last in-flight message for the app, clean up.
+        if (state.inFlightApps.at(appId).empty()) {
+            int inFlightCount = state.inFlightApps.size() - 1;
+            // Record metrics before erasing the results
+            state.applicationMetrics->record(state.appResults.at(appId),
                                              inFlightCount);
+            // Erase the app from tracking
             state.appResults.erase(appId);
+            state.inFlightApps.erase(appId);
         }
     }
     SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
@@ -840,9 +849,6 @@ void Planner::updateRuntimeStats()
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeStatsUpdatePeriod));
-
-        // TODO - temporarily disable the runtime stats update
-        continue;
 
         std::vector<std::future<void>> futures;
         // Iterate over all hosts.
