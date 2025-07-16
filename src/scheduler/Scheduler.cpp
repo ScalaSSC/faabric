@@ -834,10 +834,12 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
             return true;
         }
     }
-    // We don't have to check the maxExecutors here, since in updateStatesInfo, max replicas are limited. Total number of executors won't exceed the maxExecutors.. 
-    // If current current replicas is less than the max size, return true.
+    // We don't have to check the maxExecutors here, since in updateStatesInfo,
+    // max replicas are limited. Total number of executors won't exceed the
+    // maxExecutors. If current current replicas is less than the max size,
+    // return true.
     if (thisExecutors.size() < maxReplicas) {
-            return true;
+        return true;
     } else {
         SPDLOG_DEBUG("No available executor for {}: max replicas for function "
                      "reached ({} >= {})",
@@ -1083,7 +1085,11 @@ void Scheduler::updateStatesInfo(
     int localInstanceCount = 0;
     for (const auto& [operatorName, operatorInfo] : scheuduledOperatorMap) {
         if (operatorInfo.node.type == faabric::batch_scheduler::STATELESS) {
-            if (operatorInfo.weightDist.count(thisHost) > 0) {
+            // For distributed scheduler (default) and centralized scheduler,
+            // stateless operator are distributed in RB across all hosts.
+            if (scheduleMode == 1 || scheduleMode == 2) {
+                localInstanceCount++;
+            } else if (operatorInfo.weightDist.count(thisHost) > 0) {
                 localInstanceCount++;
             }
         } else {

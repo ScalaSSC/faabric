@@ -3,10 +3,12 @@
 #include <faabric/state/FunctionStateClient.h>
 #include <faabric/util/batch.h>
 #include <faabric/util/logging.h>
+// #include <faabric/util/map.h>
 #include <faabric/util/serialization.h>
 #include <faabric/util/string_tools.h>
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 
 #define MAIN_KEY_PREFIX "main_"
@@ -409,6 +411,24 @@ std::string StateAwareScheduler::scheduleStatelessMessageApportion(
     return host;
 }
 
+std::string StateAwareScheduler::scheduleStatelessMessageFaaSFlow(
+  std::string& userFunc,
+  const HostMap& hostMap,
+  const std::unique_ptr<Message>& msg)
+{
+    std::string host = "unknown";
+    std::string userFuncPar = userFunc + "_0";
+    auto shceduledOperator =
+      getScheduledOperatorOrThrow(scheduledOperatorsMap, userFunc);
+
+    // Otherwise the request by using round robin.
+    auto localCounter = getNextCounter(userFunc);
+    host = runtimeSummary.getHost(userFuncPar, localCounter);
+
+    msg->set_messagetype(0);
+    return host;
+}
+
 HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
   const std::string& userFunction,
   const faabric::Message& msg)
@@ -490,10 +510,15 @@ std::string StateAwareScheduler::scheduleMessage(
             // If schedule mode is 0 (The scheduler should dispatch stateless
             // messages in accordance with the expected proportions).
             host = scheduleStatelessMessageApportion(userFunc, hostMap, msg);
-        } else {
+        } else if (scheduleMode == 1 || scheduleMode == 2) {
             // If schedule mode is 1 or 2 (The scheduler dispatch stateless
             // messages in round-robin).
             host = scheduleStatelessMessageRB(userFunc, hostMap, msg);
+        } else if (scheduleMode == 3) {
+            host = scheduleStatelessMessageFaaSFlow(userFunc, hostMap, msg);
+        } else {
+            SPDLOG_ERROR("Unknown schedule mode: {}", scheduleMode);
+            throw std::runtime_error("Unknown schedule mode");
         }
     }
     if (host == "unknown") {
@@ -615,69 +640,6 @@ void StateAwareScheduler::updateApp(
                      application->getNodes().at(nodeName)->processedTuples);
     }
 }
-
-// void StateAwareScheduler::groupNodesHelper(
-//   const std::string& nodeName,
-//   std::vector<std::shared_ptr<Node>>& currentGroup,
-//   std::string& currentPartition,
-//   std::vector<NodeGroup>& groups,
-//   std::unordered_set<std::string>& visited)
-// {
-//     if (!visited.insert(nodeName).second) {
-//         return;
-//     }
-
-//     auto node = application->getNodes().at(nodeName);
-//     currentGroup.push_back(node);
-
-//     if (node->type == PARTITIONED_STATEFUL) {
-//         currentPartition = node->partitionBy;
-//     }
-
-//     auto connIt = application->getConnections().find(nodeName);
-
-//     std::vector<std::string> joinable, splitters;
-//     if (connIt != application->getConnections().end()) {
-//         for (auto const& succName : connIt->second) {
-//             auto succ = application->getNodes().at(succName);
-
-//             bool canJoin = false;
-//             // stateless always joins
-//             if (node->type != STATEFUL && succ->type == STATELESS) {
-//                 canJoin = true;
-//             }
-//             // partitioned can join if partitionKey matches or not yet set
-//             if (node->type != STATEFUL && succ->type == PARTITIONED_STATEFUL)
-//             {
-//                 if (currentPartition == NONE_STRING ||
-//                     currentPartition == succ->partitionBy) {
-//                     canJoin = true;
-//                 }
-//             }
-
-//             if (canJoin) {
-//                 joinable.push_back(succName);
-//             } else {
-//                 splitters.push_back(succName);
-//             }
-//         }
-//     }
-
-//     for (auto& js : joinable) {
-//         groupNodesHelper(js, currentGroup, currentPartition, groups,
-//         visited);
-//     }
-
-//     if (joinable.empty() && !currentGroup.empty()) {
-//         groups.emplace_back(currentGroup, currentPartition);
-//     }
-
-//     for (auto& ss : splitters) {
-//         std::vector<std::shared_ptr<Node>> nextGroup;
-//         std::string nextPart = NONE_STRING;
-//         groupNodesHelper(ss, nextGroup, nextPart, groups, visited);
-//     }
-// }
 
 void StateAwareScheduler::groupNodesHelper(
   const std::string& nodeName,
@@ -882,6 +844,10 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
  * ***/
 void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
 {
+    if (scheduleMode == 3) {
+        rescheduleAppFaaSFlow(hostMap);
+        return;
+    }
     SPDLOG_INFO("StateAwareScheduler: Reschedule the application according to "
                 "the metrics");
 
@@ -901,10 +867,8 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
         return;
     }
 
-    double totalPreWorkload = application->computePreWorkloads();
     // TODO - scale the number of hosts.
-    int numHosts = hostMap.size();
-    application->quantiseResources(numHosts, totalPreWorkload);
+    application->quantiseResources(hostMap.size());
     application->showConnections();
 
     //--------------------------------------------------------------------------
@@ -1143,6 +1107,326 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
           buildScheduledOperatorsForGroup(groupId,
                                           std::get<0>(groups[groupId]),
                                           newOptsCollocateMap,
+                                          newStatelessReqWeight,
+                                          newParStateReqWeight);
+        scheduledOperatorsMap.insert(grpMap.begin(), grpMap.end());
+    }
+
+    // Init the runtime summary.
+    runtimeSummary.initScheduledOperators(
+      *application, scheduledOperatorsMap, true);
+
+    // Initialize the State Information for stateful and partitioned stateful
+    // operators.
+    stateHashRing.clear();
+
+    redis::Redis& redis = redis::Redis::getState();
+    redis.flushAll();
+    for (const auto& [stateName, ip] : stateHost) {
+        registerStateToRedis(stateName, ip);
+    }
+
+    for (const auto& [userFunction, partitionBy] : statePartitionBy) {
+        if (!functionParallelism.contains(userFunction)) {
+            SPDLOG_ERROR("Function {} has no parallelism", userFunction);
+            throw std::runtime_error("Function parallelism not found");
+        }
+        auto weightDist = newParStateReqWeight[userFunction];
+        stateHashRing[userFunction] =
+          std::make_shared<faabric::util::ConsistentHashRing>(weightDist);
+    }
+
+    printScheduleInfomation();
+}
+
+NodeGroup& groupContainingNode(std::vector<NodeGroup>& groups,
+                               const std::string& nodeName)
+{
+    for (auto& group : groups) {
+        const auto& nodeVector = std::get<0>(group);
+        for (const auto& nodePtr : nodeVector) {
+            if (nodePtr->name == nodeName) {
+                return group;
+            }
+        }
+    }
+
+    SPDLOG_ERROR("Node {} not found in any group", nodeName);
+    throw std::runtime_error("Node not found in any group");
+}
+
+int getRequireResource(const NodeGroup& group)
+{
+    int totalResource = 0;
+    const auto& nodeVector = std::get<0>(group);
+    for (const auto& nodePtr : nodeVector) {
+        totalResource += nodePtr->reqResource;
+    }
+    return totalResource;
+}
+
+/**
+ * @brief Performs the main greedy grouping algorithm for FaaSFlow scheduling.
+ *
+ * This function initializes each node as its own group, assigns it to a worker,
+ * and then iteratively merges groups based on connection weights and resource
+ * constraints until no more merges are possible.
+ *
+ * @param hostMap A map of available hosts (workers).
+ * @param appNodes A map of all nodes in the application.
+ * @return A tuple containing:
+ * - The final vector of merged NodeGroups.
+ * - The final vector of group allocations.
+ * - The final map of remaining resources on each worker.
+ */
+std::tuple<std::vector<NodeGroup>,
+           std::vector<std::map<std::string, double>>,
+           std::map<std::string, double>>
+StateAwareScheduler::groupNodesGreedily(const HostMap& hostMap)
+{
+    // --- Initial State Setup ---
+    auto& appNodes = application->getNodes();
+
+    std::vector<NodeGroup> groups;
+    std::vector<std::map<std::string, double>> groupAllocations;
+    std::map<std::string, double> workerRemaining;
+
+    for (const auto& [ip, host] : hostMap) {
+        workerRemaining[ip] = 1.0;
+    }
+
+    // --- Initial Group Creation and Placement (Done ONCE) ---
+    // Each node starts as its own group, assigned to the best available worker.
+    for (const auto& [nodeName, node] : appNodes) {
+        groups.push_back({ { node }, NONE_STRING });
+
+        // Find the worker with maximum available resource.
+        std::string bestWorker;
+        double bestAvail = std::numeric_limits<double>::lowest();
+        for (const auto& [ip, value] : workerRemaining) {
+            if (value > bestAvail) {
+                bestAvail = value;
+                bestWorker = ip;
+            }
+        }
+
+        groupAllocations.push_back({ { bestWorker, node->reqResource } });
+        workerRemaining[bestWorker] -= node->reqResource;
+    }
+
+    // --- Iterative Merging Loop ---
+    bool merged = true;
+    while (merged) {
+        merged = false;
+        auto connectionsWithWeight = application->getConnectionsWithWeight();
+
+        for (const auto& conn : connectionsWithWeight) {
+            auto& inputGroup = groupContainingNode(groups, conn.input);
+            auto& outputGroup = groupContainingNode(groups, conn.output);
+
+            if (&inputGroup == &outputGroup) {
+                continue;
+            }
+
+            int inputResource = getRequireResource(inputGroup);
+            int outputResource = getRequireResource(outputGroup);
+            if (inputResource + outputResource > 1) {
+                continue;
+            }
+
+            // If a merge is possible, set the flag and perform the merge.
+            merged = true;
+
+            // Find indices and ensure index1 < index2
+            int index1 = -1, index2 = -1;
+            for (size_t i = 0; i < groups.size(); ++i) {
+                if (&groups[i] == &inputGroup)
+                    index1 = i;
+                if (&groups[i] == &outputGroup)
+                    index2 = i;
+            }
+            if (index1 > index2)
+                std::swap(index1, index2);
+
+            // Free up resources from original groups
+            for (const auto& [workerIp, resource] : groupAllocations[index2]) {
+                workerRemaining[workerIp] += resource;
+            }
+            for (const auto& [workerIp, resource] : groupAllocations[index1]) {
+                workerRemaining[workerIp] += resource;
+            }
+
+            // Perform the merge of nodes and allocations
+            auto& target_nodes = std::get<0>(groups[index1]);
+            auto& source_nodes = std::get<0>(groups[index2]);
+            target_nodes.insert(target_nodes.end(),
+                                std::make_move_iterator(source_nodes.begin()),
+                                std::make_move_iterator(source_nodes.end()));
+            groups.erase(groups.begin() + index2);
+            groupAllocations.erase(groupAllocations.begin() + index2);
+
+            NodeGroup& mergedGroup = groups[index1];
+
+            // Find a new worker for the merged group
+            double mergedResource = getRequireResource(mergedGroup);
+            std::string bestWorker;
+            double bestAvail = std::numeric_limits<double>::lowest();
+            for (const auto& [ip, avail] : workerRemaining) {
+                if (avail >= mergedResource) {
+                    bestWorker = ip;
+                    break;
+                }
+                if (avail > bestAvail) {
+                    bestAvail = avail;
+                    bestWorker = ip;
+                }
+            }
+
+            // Assign the merged group to the new worker and update state
+            workerRemaining[bestWorker] -= mergedResource;
+            groupAllocations[index1] = { { bestWorker, mergedResource } };
+        }
+    }
+
+    if (groups.empty()) {
+        SPDLOG_ERROR("No groups formed after greedy grouping");
+        throw std::runtime_error("No groups formed after greedy grouping");
+    }
+    return { groups, groupAllocations, workerRemaining };
+}
+
+void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
+{
+    SPDLOG_INFO("Rescheduling the application in FaaSFlow Mode");
+
+    scheduledOperatorsMap.clear();
+
+    //--------------------------------------------------------------------------
+    // 1. Calculate the workload of each operator.
+    //--------------------------------------------------------------------------
+
+    if (!application) {
+        SPDLOG_WARN("No application registered");
+        return;
+    }
+    auto& appNodes = application->getNodes();
+    if (appNodes.empty()) {
+        SPDLOG_WARN("No nodes recorded in the application");
+        return;
+    }
+
+    application->quantiseResources(hostMap.size());
+    application->showConnections();
+
+    //--------------------------------------------------------------------------
+    // 2. Assign groups to nodes Randomly
+    //--------------------------------------------------------------------------
+
+    auto [groups, groupAllocations, workerRemaining] =
+      groupNodesGreedily(hostMap);
+
+    // --------------------------------------------------------------------------
+    // 3. Allocate the unused workers to the groups.
+    //---------------------------------------------------------------------------
+    for (const auto& [ip, host] : hostMap) {
+        // Skip workers that have already been assigned some workload.
+        // We are only interested in workers that are completely free.
+        if (workerRemaining.at(ip) != 1.0) {
+            continue;
+        }
+
+        // Find the group with the most nodes. This will be our target.
+        int targetIdx = -1;
+        double maxResource = 0.0;
+        for (int i = 0; i < groupAllocations.size(); ++i) {
+            const auto& groupAllocation = groupAllocations[i];
+            for (const auto& [workerIp, resource] : groupAllocation) {
+                if (resource > maxResource) {
+                    maxResource = resource;
+                    targetIdx = i;
+                }
+            }
+        }
+
+        if (targetIdx != -1) {
+            // Update the groupAllocations and workerRemaining.
+            double totalResource = 0;
+            for (const auto& [_, resource] : groupAllocations[targetIdx]) {
+                totalResource += resource;
+            }
+            groupAllocations[targetIdx][ip] = 0.0;
+            double newEvenShare =
+              totalResource / groupAllocations[targetIdx].size();
+
+            for (auto& [workerIp, allocatedResource] :
+                 groupAllocations[targetIdx]) {
+                workerRemaining[workerIp] += allocatedResource;
+                // Then, assign the new even share and deduct it
+                allocatedResource = newEvenShare;
+                workerRemaining[workerIp] -= newEvenShare;
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 4. Arrange the states accordingly.
+    //--------------------------------------------------------------------------
+    std::map<std::string, std::string> newStateHost;
+    std::map<std::string, int> newFunctionParallelism;
+    // MAP <USER_FUNC_PARALLELISM, MAP<IP, proportion>>
+    std::map<std::string, std::map<std::string, int>> newStatelessReqWeight;
+    // MAP <USER_FUNC, MAP<PARALLELISM_IDX, proportion>>
+    std::map<std::string, std::map<int, int>> newParStateReqWeight;
+
+    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+        const auto& group = std::get<0>(groups[groupIndex]);
+        auto groupAllocation = groupAllocations[groupIndex];
+        for (const auto& node : group) {
+            std::string userFunc = node->name;
+            if (node->type == STATELESS) {
+                // STATELESS: Assign it to all workers evenly.
+                for (const auto& [ip, weight] : groupAllocation) {
+                    newStatelessReqWeight[userFunc + "_0"][ip] = weightFactor;
+                }
+            } else if (node->type == PARTITIONED_STATEFUL) {
+                // P_STATEFUL: Assign it to all workers evenly.
+                int index = 0;
+                newFunctionParallelism[userFunc] = groupAllocation.size();
+                for (const auto& [ip, _] : groupAllocation) {
+                    std::string userFuncPar =
+                      userFunc + "_" + std::to_string(index);
+                    newParStateReqWeight[userFunc][index] = weightFactor;
+                    newStateHost[userFuncPar] = ip;
+                    index++;
+                }
+            } else if (node->type == STATEFUL) {
+                // STATEFUL: we assign it to workers with round-robin.
+                int para = node->parallelism;
+                newFunctionParallelism[userFunc] = para;
+                for (int i = 0; i < para; ++i) {
+                    int workerRB = i % groupAllocation.size();
+                    std::string worker = getNthKey(groupAllocation, workerRB);
+                    newStateHost[userFunc + "_" + std::to_string(i)] = worker;
+                }
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 5. Build the scheduledOperatorsMap.
+    //--------------------------------------------------------------------------
+
+    // Update the state host and parallelism info.
+    stateHost = newStateHost;
+    functionParallelism = newFunctionParallelism;
+
+    // Build the scheduledOperatorsMap
+    scheduledOperatorsMap.clear();
+    for (int groupId = 0; groupId < groups.size(); ++groupId) {
+        auto grpMap =
+          buildScheduledOperatorsForGroup(groupId,
+                                          std::get<0>(groups[groupId]),
+                                          {},
                                           newStatelessReqWeight,
                                           newParStateReqWeight);
         scheduledOperatorsMap.insert(grpMap.begin(), grpMap.end());

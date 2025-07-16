@@ -77,6 +77,15 @@ class Node
 // are the destinations.
 using ConnectionInfo = std::map<std::string, std::vector<std::string>>;
 
+struct Connection
+{
+    std::string input;
+    std::string output;
+    int weight;
+};
+using ConnectionInfoWithWeight =
+  std::map<std::string, std::vector<std::pair<std::string, int>>>;
+
 class Application
 {
   private:
@@ -85,6 +94,7 @@ class Application
     std::vector<std::string> inputNodes;
     // Source -> Destination connections
     ConnectionInfo connections;
+    ConnectionInfoWithWeight connectionsWithWeight;
     ConnectionInfo reverseConnections;
 
   public:
@@ -96,7 +106,7 @@ class Application
     void displayApplication() const;
     double computePreWorkloads(); // return total workload
     // TODO - Now we only support homogenous cluster.
-    void quantiseResources(const int numHosts, double totalPreWorkload);
+    void quantiseResources(const int numHosts);
     std::vector<std::shared_ptr<Node>> getSource(const std::string& node) const;
 
     std::map<std::string, std::shared_ptr<Node>>& getNodes()
@@ -115,6 +125,8 @@ class Application
     }
 
     const ConnectionInfo& getConnections() const { return connections; }
+
+    std::vector<Connection> getConnectionsWithWeight();
 
     const void showConnections() const
     {

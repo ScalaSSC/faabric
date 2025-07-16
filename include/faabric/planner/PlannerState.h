@@ -15,6 +15,7 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 #include <shared_mutex>
+#include <unordered_map>
 
 namespace faabric::planner {
 
@@ -361,13 +362,15 @@ struct PlannerState
     // It is used to lock modification for inFlightApps and appResults.
     std::shared_mutex reqStatusMx;
 
-    // MAP<appId, in_flight_counting> Map of inflight requests.
-    std::map<int, int> inFlightApps;
+    // MAP<appId, set<msg_id>> Map of inflight requests.
+    std::unordered_map<int, std::set<int32_t>> inFlightApps;
 
     // Double-map holding the message results. The first key is the app id. For
     // each app id, we keep a map of the message id, and the actual message
     // result
-    std::map<int, std::map<int, std::shared_ptr<faabric::Message>>> appResults;
+    std::unordered_map<int,
+                       std::map<int32_t, std::shared_ptr<faabric::Message>>>
+      appResults;
 
     // Map holding the hosts that have registered interest in getting an app
     // result

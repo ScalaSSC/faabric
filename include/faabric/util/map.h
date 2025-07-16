@@ -1,15 +1,31 @@
 #pragma once
 
 #include <faabric/batch-scheduler/BatchScheduler.h>
+#include <faabric/util/logging.h>
 
 #include <condition_variable>
 #include <iostream>
 #include <map>
 #include <mutex> // For std::unique_lock and std::lock
 #include <shared_mutex>
+#include <sstream>
 #include <utility> // For std::move
 
 namespace faabric::util {
+
+template<typename K, typename V>
+V getOrThrow(const std::map<K, V>& map, const K& key)
+{
+    auto it = map.find(key);
+    if (it == map.end()) {
+        std::stringstream ss;
+        ss << "Cannot find key '" << key << "' in map";
+        // For demonstration without the library, we print to cerr.
+        SPDLOG_ERROR(ss.str());
+        throw std::runtime_error("Key not found in map");
+    }
+    return it->second;
+}
 
 faabric::batch_scheduler::HostMap getFirstNElements(
   const faabric::batch_scheduler::HostMap& originalMap,

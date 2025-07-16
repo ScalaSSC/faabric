@@ -16,6 +16,8 @@
 
 namespace faabric::batch_scheduler {
 
+// // List of map of Nodes.
+// using FaaSFlowNodeGroup = std::map<std::string, std::shared_ptr<Node>>;
 // List of Nodes, and the partition key of the group.
 using NodeGroup = std::tuple<std::vector<std::shared_ptr<Node>>, std::string>;
 inline const std::string NONE_STRING = "None";
@@ -72,6 +74,10 @@ class StateAwareScheduler : public BatchScheduler
 
     virtual ~StateAwareScheduler() = default;
 
+    void setScheduleMode(int mode);
+
+    virtual void resetScheduler();
+
     bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
 
     void initApp(const HostMap& hostMap);
@@ -81,6 +87,11 @@ class StateAwareScheduler : public BatchScheduler
                                            const std::unique_ptr<Message>& msg);
 
     std::string scheduleStatelessMessageApportion(
+      std::string& userFunc,
+      const HostMap& hostMap,
+      const std::unique_ptr<Message>& msg);
+
+    std::string scheduleStatelessMessageFaaSFlow(
       std::string& userFunc,
       const HostMap& hostMap,
       const std::unique_ptr<Message>& msg);
@@ -95,13 +106,12 @@ class StateAwareScheduler : public BatchScheduler
       const HostMap& hostMap,
       const std::vector<std::unique_ptr<faabric::Message>>& msgs);
 
+    /**
+     * Used for runtime rescheduling
+     ***/
     bool repartitionParitionedState(
       std::string userFunction,
       std::shared_ptr<std::map<std::string, std::string>> oldStateHost);
-
-    virtual void resetScheduler();
-
-    void setScheduleMode(int mode);
 
     const std::map<std::string, int>& getFunctionParallelismMap() const
     {
@@ -113,6 +123,13 @@ class StateAwareScheduler : public BatchScheduler
     void updateApp(const std::map<std::string, long>& nodeWorkloads);
 
     void rescheduleApp(const HostMap& hostMap);
+
+    std::tuple<std::vector<NodeGroup>,
+               std::vector<std::map<std::string, double>>,
+               std::map<std::string, double>>
+    groupNodesGreedily(const HostMap& hostMap);
+
+    void rescheduleAppFaaSFlow(const HostMap& hostMap);
 
     const std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>&
     getStateHashRing() const
@@ -208,18 +225,11 @@ class StateAwareScheduler : public BatchScheduler
                          int parallelism = 1);
 
     // Message Type : 0 - Stateless, 1 - Stateful, 2 - Paritioned Stateful
-
     HashAndParallelismInfo getHashAndParallelismIndex(
       const std::string& userFunction,
       const faabric::Message& msg);
 
     void groupNodesHelper(const std::string& nodeName,
-                          std::vector<NodeGroup>& groups,
-                          std::unordered_set<std::string>& visited);
-
-    void groupNodesHelper(const std::string& nodeName,
-                          std::vector<std::shared_ptr<Node>>& currentGroup,
-                          std::string& currentPartition,
                           std::vector<NodeGroup>& groups,
                           std::unordered_set<std::string>& visited);
 };

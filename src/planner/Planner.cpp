@@ -353,6 +353,7 @@ void Planner::setMessageResultBatch(
                          chainedId);
             throw std::runtime_error("Message ID and Chained ID are different");
         }
+        // SPDLOG_DEBUG("Setting message result for app {} msg {}", appId, msgId);
         if (!state.inFlightApps.contains(appId)) {
             SPDLOG_ERROR("App {} is not in flight", appId);
             continue;
@@ -360,9 +361,12 @@ void Planner::setMessageResultBatch(
         state.appResults[appId][msgId] =
           std::make_shared<faabric::Message>(msg);
 
-        state.inFlightApps[appId] += msg.chainedmsgnum();
-        int inFlightAppCount = --state.inFlightApps[appId];
-        if (inFlightAppCount <= 0) {
+        for (int32_t chainedMsgId : msg.chainedmsgids()) {
+            state.inFlightApps[appId].insert(chainedMsgId);
+        }
+        state.inFlightApps[appId].erase(msgId);
+        int inFlightAppCount = state.inFlightApps[appId].size();
+        if (inFlightAppCount == 0) {
             state.inFlightApps.erase(appId);
             int inFlightCount = state.inFlightApps.size();
             // Statistics the fully processed messages
@@ -460,9 +464,12 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
         {
             faabric::util::FullLock reqStatusLock(state.reqStatusMx);
             if (!isChained) {
-                // SPDLOG_ERROR("app Id {} is already running", appid);
                 // Flush the old chainedId
-                state.inFlightApps[appid] = 1;
+                // SPDLOG_DEBUG("Scheduling message with appId {} and msgId {}",
+                //              appid,
+                //              message->id());
+                state.inFlightApps[appid].clear();
+                state.inFlightApps[appid].insert(message->id());
                 message->set_plannerqueuetime(currentTime);
             }
             // state.inFlightApps[appid]++;
@@ -725,6 +732,7 @@ bool Planner::resetParameter(const std::string& key,
         // stateful requests with their requried states and rountrobin for
         // stateless requests).
         // Schedule Mode 2: Centralized Scheduler.
+        // Schedule Mode 3: FaaSFlow Scheduler.
         SPDLOG_INFO("Planner reset schedule mode to {}", value);
         stateAwareScheduler->setScheduleMode(value);
         scheduleMode = value;

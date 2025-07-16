@@ -63,9 +63,54 @@ std::vector<std::shared_ptr<Node>> Application::getSource(
     return sourceNodes;
 }
 
+/**
+ * @brief Transforms a map of connections into a flat vector and sorts it.
+ *
+ * This function takes a map where each key is a source node and the value
+ * is a list of destination nodes with associated weights. It converts this
+ * nested structure into a flat vector of Connection objects and then sorts
+ * this vector in descending order based on the connection weight.
+ *
+ * @param connections The input map representing the graph's weighted
+ * connections.
+ * @return A std::vector<Connection> sorted by weight in descending order.
+ */
+std::vector<Connection> Application::getConnectionsWithWeight()
+{
+    std::vector<Connection> result;
+
+    // Iterate over each key-value pair in the input map.
+    // 'source' is the pair (e.g., {"FuncA", vector_of_connections}).
+    for (const auto& source : connectionsWithWeight) {
+        const std::string& inputNode = source.first;
+        const auto& outputConnections = source.second;
+
+        // Iterate over the vector of destination nodes for the current source
+        // node. 'dest' is the pair (e.g., {"FuncB", 100}).
+        for (const auto& dest : outputConnections) {
+            const std::string& outputNode = dest.first;
+            const int& connectionWeight = dest.second;
+
+            // Create a Connection object and add it to our result vector.
+            result.push_back({ inputNode, outputNode, connectionWeight });
+        }
+    }
+
+    // Sort the resulting vector in descending order based on the 'weight'
+    // member. A lambda function is used to define the custom comparison logic.
+    std::sort(result.begin(),
+              result.end(),
+              [](const Connection& a, const Connection& b) {
+                  return a.weight > b.weight;
+              });
+
+    return result;
+}
+
 void Application::addConnection(const std::string& src, const std::string& dest)
 {
     connections[src].push_back(dest);
+    connectionsWithWeight[src].push_back(std::make_pair(dest, 1));
 }
 
 void Application::buildInvertConnections()
@@ -149,8 +194,10 @@ double Application::computePreWorkloads()
     return totalPreWorkload;
 }
 
-void Application::quantiseResources(const int numHosts, double totalPreWorkload)
+void Application::quantiseResources(const int numHosts)
 {
+    double totalPreWorkload = computePreWorkloads();
+
     // Update the resource required for each operator (number of workers).
     auto& appNodes = nodes;
 
