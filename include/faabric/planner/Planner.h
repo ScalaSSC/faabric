@@ -188,6 +188,8 @@ class Planner
 
     int dispatchPeriod = 20; // ms
 
+    faabric::scheduler::InstancesRuntimeStats runtimeStats;
+
     int runtimeStatsUpdatePeriod = 5000; // ms
 
     void dequeueScheduledMsgs();

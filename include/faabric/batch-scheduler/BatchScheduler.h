@@ -2,6 +2,7 @@
 
 #include <faabric/batch-scheduler/SchedulingDecision.h>
 #include <faabric/util/batch.h>
+#include <faabric/util/config.h>
 
 #include <string>
 
@@ -115,6 +116,8 @@ class BatchScheduler
       const InFlightReqs& inFlightReqs,
       std::shared_ptr<faabric::BatchExecuteRequest> req,
       const DecisionType& decisionType) = 0;
+
+    std::string localHost = faabric::util::getSystemConfig().endpointHost;
 };
 
 std::shared_ptr<BatchScheduler> getBatchScheduler();

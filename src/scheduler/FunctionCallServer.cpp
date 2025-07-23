@@ -235,17 +235,21 @@ FunctionCallServer::recvGetRuntimeStats(std::span<const uint8_t> buffer)
     // Update the new collected stats to scheduler
     // Get the source stats.
     // logRuntimeStatsUpdateRequest(parsedMsg);
-    std::map<std::string, std::map<std::string, int>> sourceCountStats;
+    int totalCount = 0;
+    std::map<std::string, std::map<std::string, int>> observedCountMap;
     for (const auto& result : parsedMsg.collectedstats()) {
         std::string hostIp = result.host();
         for (const auto& instance : result.instancesstats()) {
             std::string instanceName = instance.instancename();
-            int chainedCallCount = instance.chainedcallcount();
-            sourceCountStats[instanceName][hostIp] = chainedCallCount;
+            int executedCount = instance.executedcount();
+            observedCountMap[instanceName][hostIp] = executedCount;
+            totalCount += executedCount;
         }
     }
 
-    scheduler.updateStatelessDist(sourceCountStats);
+    if (totalCount > 0) {
+        scheduler.updateStatelessDist(observedCountMap);
+    }
 
     return std::make_unique<faabric::RuntimeStatsResult>(std::move(response));
 }

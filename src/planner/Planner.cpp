@@ -505,12 +505,24 @@ void Planner::doEnqueueSchedMessages(
   std::vector<std::string> hosts,
   std::vector<std::unique_ptr<faabric::Message>> msgs)
 {
+    std::map<std::string, std::map<std::string, int>> msgCallsCounter;
+
     auto currentTime = faabric::util::getGlobalClock().epochMicros();
     for (int i = 0; i < msgs.size(); i++) {
         auto msg = std::move(msgs[i]);
         auto host = hosts[i];
         msg->set_plannerpoptime(currentTime);
+
+        std::string userFuncPar = faabric::util::getUserFuncPar(*msg);
+        msgCallsCounter[userFuncPar][host]++;
+
         state.scheduledMsgsMap[host].push_back(std::move(msg));
+    }
+
+    for (auto& [instancesName, hostCounter] : msgCallsCounter) {
+        for (auto& [host, count] : hostCounter) {
+            runtimeStats.instanceGenerate(instancesName, host, count);
+        }
     }
 }
 
@@ -852,6 +864,10 @@ void Planner::updateRuntimeStats()
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeStatsUpdatePeriod));
 
+        if (scheduleMode != 0) {
+            continue; // Only run in decentralized scheduler mode
+        }
+
         std::vector<std::future<void>> futures;
         // Iterate over all hosts.
         for (const auto& [ip, hostInfo] : state.batchSchedHostMap) {
@@ -883,16 +899,16 @@ void Planner::updateRuntimeStats()
             newStats->CopyFrom(*stats);
         }
 
-        std::map<std::string, std::map<std::string, int>> sourceCountStats;
-        for (const auto& result : request.collectedstats()) {
-            std::string hostIp = result.host();
-            for (const auto& instance : result.instancesstats()) {
-                std::string instanceName = instance.instancename();
-                int chainedCallCount = instance.chainedcallcount();
-                sourceCountStats[instanceName][hostIp] = chainedCallCount;
-            }
+        int totalCount = 0;
+        auto localStats = runtimeStats.getAllStats();
+        std::map<std::string, std::map<std::string, int>> localChainedMap;
+        for (const auto& [instName, stats] : localStats) {
+            localChainedMap[instName] = stats.chainedCallStats;
+            totalCount += stats.chainedCallStats.size();
         }
-        stateAwareScheduler->runtimeSourceUpdate(sourceCountStats);
+        if (totalCount > 0) {
+            stateAwareScheduler->runtimeDistTune(localChainedMap);
+        }
 
         results.clear();
     }

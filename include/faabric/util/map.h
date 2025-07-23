@@ -6,7 +6,8 @@
 #include <condition_variable>
 #include <iostream>
 #include <map>
-#include <mutex> // For std::unique_lock and std::lock
+#include <mutex>   // For std::unique_lock and std::lock
+#include <numeric> // For std::accumulate
 #include <shared_mutex>
 #include <sstream>
 #include <utility> // For std::move
@@ -14,7 +15,7 @@
 namespace faabric::util {
 
 template<typename K, typename V>
-V getOrThrow(const std::map<K, V>& map, const K& key)
+inline V getOrThrow(const std::map<K, V>& map, const K& key)
 {
     auto it = map.find(key);
     if (it == map.end()) {
@@ -27,7 +28,46 @@ V getOrThrow(const std::map<K, V>& map, const K& key)
     return it->second;
 }
 
-faabric::batch_scheduler::HostMap getFirstNElements(
+
+
+inline std::map<std::string, double> calculateProportions(
+  const std::map<std::string, int>& data)
+{
+    // --- 1. Calculate the total sum of all values in the map ---
+    // We use std::accumulate for a concise way to sum the values.
+    // The initial sum is 0.0 (a double) to ensure floating-point arithmetic.
+    double totalSum = std::accumulate(
+      data.begin(),
+      data.end(),
+      0.0,
+      [](double currentSum, const std::pair<const std::string, int>& pair) {
+          return currentSum + pair.second;
+      });
+
+    // --- 2. Create the map to store the results ---
+    std::map<std::string, double> proportions;
+
+    // --- 3. Handle the edge case where the total sum is zero ---
+    if (totalSum == 0.0) {
+        return proportions; // Return an empty map if total sum is zero.
+    }
+
+    // --- 4. Calculate the proportion for each entry ---
+    for (const auto& pair : data) {
+        // The key from the original map.
+        const std::string& host = pair.first;
+        // The count for that key.
+        const int count = pair.second;
+
+        // Calculate the proportion and store it in the new map.
+        // We cast the count to double to ensure floating-point division.
+        proportions[host] = static_cast<double>(count) / totalSum;
+    }
+
+    return proportions;
+}
+
+inline faabric::batch_scheduler::HostMap getFirstNElements(
   const faabric::batch_scheduler::HostMap& originalMap,
   size_t count)
 {

@@ -3,6 +3,7 @@
 #include <faabric/batch-scheduler/Application.h>
 #include <faabric/util/config.h>
 #include <faabric/util/locks.h>
+#include <faabric/util/map.h>
 #include <faabric/util/string_tools.h>
 
 #include <algorithm>
@@ -189,6 +190,9 @@ class ProbabilisticScheduler
     std::vector<std::pair<double, std::string>> cdf;
 };
 
+// MAP<IP address: ProbabilisticScheduler>
+using MetaScheduler = std::map<std::string, std::shared_ptr<ProbabilisticScheduler>>;
+
 class RuntimeSummary
 {
   public:
@@ -199,8 +203,8 @@ class RuntimeSummary
       const std::map<std::string, ScheduledOperator>& scheduledOperatorsMapIn,
       bool planner = false);
 
-    void updateSourceDist(
-      std::map<std::string, std::map<std::string, int>> sourceCountStats);
+    void requestDistTune(
+      const std::map<std::string, std::map<std::string, int>>& observedDistMap);
 
     // The 'counter' and 'recommended' arguments are no longer needed for
     // probabilistic scheduling but are kept for API compatibility.
@@ -208,28 +212,51 @@ class RuntimeSummary
     std::string getHost(const std::string& instance,
                         const std::string& recommended);
 
+    void reset();
+
   private:
     std::shared_mutex summaryMx;
     std::string localHost = faabric::util::getSystemConfig().endpointHost;
     bool isPlanner = false;
+    const double alpha = 0.2;
 
-    std::map<std::string, std::map<std::string, double>> expectedDist;
-    std::map<std::string, std::map<std::string, double>> sourceDist;
+    // MAP<instance name: operatorType>
+    std::map<std::string, LocalStatelessOperatorType> localOperatorsMap;
+    // The expected distribution of messages around workers.
+    std::map<std::string, std::map<std::string, double>> expectedDistMap;
+    // The current distribution probability of messages around workers.
+    // Higher means more likely to distribute messages to that worker. It
+    // usually means in the past observation, the worker has received messages
+    // less than expected.
+    std::map<std::string, std::map<std::string, double>> implDistMap;
+    std::map<std::string, std::map<std::string, int>> recommendedHostMap;
 
     std::map<std::string, ScheduledOperator> scheduledOperatorsMap;
 
-    // CHANGED: Replaced WindowedRecord with the new ProbabilisticScheduler
+    // Schedulers used for scheduling stateless operators.
     std::map<std::string, std::shared_ptr<ProbabilisticScheduler>>
       probabilisticSchedulers;
+    std::map<std::string, std::shared_ptr<MetaScheduler>> metaSchedulers;
 
-    // ... (other private members and methods are the same) ...
     void initAll(const batch_scheduler::Application& application, bool planner);
 
     void initOpertaor(const batch_scheduler::Application& application,
                       std::string operatorName);
 
     void doInitExpectedDist(ScheduledOperator& schedOp);
-    void doInitSourceDist(ScheduledOperator& schedOp,
-                          const batch_scheduler::Application& application);
+
+    MetaScheduler buildHeadMetaScheduler(const std::string& instanceName);
+
+    MetaScheduler buildBodyMetaScheduler(const std::string& instanceName);
+
+    void TuneImplDist(const std::string instanceName,
+                      const std::map<std::string, int>& observedDist);
+
+    void CollocateHeadTune(const std::string instanceName,
+                           const std::map<std::string, int>& observedDist);
+    void CollocateBodyTune(const std::string instanceName,
+                           const std::map<std::string, int>& observedDist);
+    void RoundRobinBodyTune(const std::string instanceName,
+                            const std::map<std::string, int>& observedDist);
 };
 }

@@ -46,6 +46,7 @@ class InstanceMetrics
         int newWorkerExecuteTime =
           msg->workerexecuteend() - msg->workerexecutestart();
         int newExecuteBatchSize = msg->executebatchsize();
+        bool isSchedLocally = msg->isscheduledlocally();
 
         count++;
 
@@ -79,6 +80,9 @@ class InstanceMetrics
             batchCounter[newExecuteBatchSize] = 0;
         }
 
+        if (isSchedLocally) {
+            numSchedLocally++;
+        }
         std::string host = msg->executedhost();
         hostStats[host]++;
     }
@@ -96,6 +100,9 @@ class InstanceMetrics
           "instanceName", rapidjson::Value(instanceName.c_str(), alloc), alloc);
         doc.AddMember("period", period, alloc);
         doc.AddMember("count", count, alloc);
+        double schedLocallyRate =
+          static_cast<double>(numSchedLocally) / static_cast<double>(count);
+        doc.AddMember("schedLocallyRate", schedLocallyRate, alloc);
         doc.AddMember("avgPlannerScheduleTime", avgPlannerQueueTime, alloc);
         doc.AddMember("avgPlannerDispatchTime", avgPlannerConsumeTime, alloc);
         doc.AddMember("avgWorkerQueueTime", avgWorkerQueueTime, alloc);
@@ -129,6 +136,7 @@ class InstanceMetrics
 
         count = 0;
         batchCount = 0;
+        numSchedLocally = 0;
 
         avgPlannerQueueTime = 0.0;
         avgPlannerConsumeTime = 0.0;
@@ -148,6 +156,7 @@ class InstanceMetrics
     const int period;
     long count = 0;
     long batchCount = 0;
+    long numSchedLocally = 0;
 
     double avgPlannerQueueTime = 0.0;
     double avgPlannerConsumeTime = 0.0;

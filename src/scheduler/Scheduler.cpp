@@ -1237,7 +1237,8 @@ void Scheduler::updateStatelessDist(
   const std::map<std::string, std::map<std::string, int>>& sourceCountStats)
 {
     // TODO - update the source.
-    decentralScheduler.runtimeSourceUpdate(sourceCountStats);
+    SPDLOG_DEBUG("Updating stateless distribution");
+    decentralScheduler.runtimeDistTune(sourceCountStats);
 }
 
 void Scheduler::setLocalPersistentState(

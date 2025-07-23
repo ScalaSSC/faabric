@@ -163,9 +163,8 @@ class StateAwareScheduler : public BatchScheduler
       const std::map<std::string, std::map<int, int>>& newParStateReqWeight)
       const;
 
-    void runtimeSourceUpdate(
-      const std::map<std::string, std::map<std::string, int>>&
-        sourceCountStats);
+    void runtimeDistTune(
+      const std::map<std::string, std::map<std::string, int>>& observeDistMap);
 
     void printScheduleInfomation() const;
 

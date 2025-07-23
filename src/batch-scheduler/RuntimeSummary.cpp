@@ -1,8 +1,154 @@
 #include <faabric/batch-scheduler/RuntimeSummary.h>
 
+#include <algorithm> // For std::max
+
 namespace faabric::batch_scheduler {
 
 // --- Implementation of the new ProbabilisticScheduler ---
+
+MetaScheduler RuntimeSummary::buildHeadMetaScheduler(
+  const std::string& instanceName)
+{
+    SPDLOG_DEBUG("Building head meta-scheduler for instance {}", instanceName);
+
+    auto expectDistribution = util::getOrThrow(expectedDistMap, instanceName);
+    auto implDistribution = util::getOrThrow(implDistMap, instanceName);
+    MetaScheduler metaScheduler;
+
+    // When the implementation distribution is higher than expected
+    // distribution, it means this host received less msgs than expected. So we
+    // want to schedule more msgs to this host.
+    std::vector<std::pair<std::string, double>> underloadedHosts;
+    double totalDeficit = 0.0;
+
+    for (const auto& [host, expectLoad] : expectDistribution) {
+        double implLoad = implDistribution[host];
+        if (implLoad > expectLoad) {
+            double deficit = implLoad - expectLoad;
+            underloadedHosts.emplace_back(host, deficit);
+            totalDeficit += deficit;
+        }
+    }
+
+    for (const auto& [host, expectLoad] : expectDistribution) {
+        std::map<std::string, double> schedulingWeights;
+        double implLoad = implDistribution[host];
+
+        if (implLoad >= expectLoad || underloadedHosts.empty()) {
+            schedulingWeights[host] = 1.0;
+        } else {
+            double keepRatio = implLoad / expectLoad;
+            schedulingWeights[host] = keepRatio;
+
+            // The rest is offloaded to the underloaded hosts
+            double offloadRatio = 1.0 - keepRatio;
+            for (const auto& [underloadedHost, deficit] : underloadedHosts) {
+                double offloadPortion = deficit / totalDeficit;
+                schedulingWeights[underloadedHost] +=
+                  offloadRatio * offloadPortion;
+            }
+        }
+        metaScheduler.emplace(
+          host, std::make_shared<ProbabilisticScheduler>(schedulingWeights));
+    }
+
+    metaSchedulers[instanceName] =
+      std::make_shared<MetaScheduler>(metaScheduler);
+    return metaScheduler;
+}
+
+MetaScheduler RuntimeSummary::buildBodyMetaScheduler(
+  const std::string& instanceName)
+{
+    SPDLOG_DEBUG("Building body meta-scheduler for instance {}", instanceName);
+
+    auto expectDistribution = util::getOrThrow(expectedDistMap, instanceName);
+    auto implDistribution = util::getOrThrow(implDistMap, instanceName);
+
+    MetaScheduler metaScheduler;
+
+    // When the implementation distribution is higher than expected
+    // distribution, it means this host received less msgs than expected. So we
+    // want to schedule more msgs to this host.
+    std::vector<std::pair<std::string, double>> underloadedHosts;
+    double totalDeficit = 0.0;
+
+    for (const auto& [host, expectLoad] : expectDistribution) {
+        double implLoad = implDistribution[host];
+        if (implLoad > expectLoad) {
+            double deficit = implLoad - expectLoad;
+            underloadedHosts.emplace_back(host, deficit);
+            totalDeficit += deficit;
+        }
+    }
+
+    // We prefer to fill local hosts first.
+    double implLocal = implDistribution[localHost];
+    double expectLocal = util::getOrThrow(expectDistribution, localHost);
+    if (implLocal > expectLocal) {
+        std::map<std::string, double> schedulingWeights;
+        for (const auto& [host, expectLoad] : expectDistribution) {
+            schedulingWeights[localHost] = 1.0;
+            metaScheduler.emplace(
+              host,
+              std::make_shared<ProbabilisticScheduler>(schedulingWeights));
+        }
+    } else {
+        std::map<std::string, double> schedulingProp;
+        // Distribute the load across all hosts.
+        double keepRatio = implLocal / expectLocal;
+        schedulingProp[localHost] = keepRatio;
+
+        // The rest is offloaded to the underloaded hosts
+        double offloadRatio = 1.0 - keepRatio;
+        for (const auto& [underloadedHost, deficit] : underloadedHosts) {
+            double offloadPortion = deficit / totalDeficit;
+            schedulingProp[underloadedHost] += offloadRatio * offloadPortion;
+        }
+
+        auto recommendedHost = recommendedHostMap[instanceName];
+        if (recommendedHost.empty()) {
+            recommendedHost[localHost] = 1;
+        }
+        std::map<std::string, double> recoHostProp =
+          util::calculateProportions(recommendedHost);
+
+        std::map<std::string, double> hostsDeflics;
+        double totalDeflic = 0.0;
+        for (const auto& [host, proportion] : schedulingProp) {
+            if (proportion > recoHostProp[host]) {
+                hostsDeflics[host] = proportion - recoHostProp[host];
+                totalDeflic += hostsDeflics[host];
+            }
+        }
+        for (const auto& [host, expectWeight] : expectDistribution) {
+            std::map<std::string, double> schedulingWeights;
+
+            if (recommendedHost.count(host) == 0) {
+                schedulingWeights[localHost] = 1.0;
+            } else {
+                double proportion = schedulingProp[host];
+                if (proportion - recoHostProp[host] >= 0) {
+                    schedulingWeights[host] = 1.0;
+                } else {
+                    schedulingWeights[host] = proportion / recoHostProp[host];
+                    double distributionFactor = 1 - schedulingWeights[host];
+                    for (const auto& [deflicHost, deflic] : hostsDeflics) {
+                        schedulingWeights[deflicHost] =
+                          distributionFactor * deflic / totalDeflic;
+                    }
+                }
+            }
+            metaScheduler.emplace(
+              host,
+              std::make_shared<ProbabilisticScheduler>(schedulingWeights));
+        }
+    }
+
+    metaSchedulers[instanceName] =
+      std::make_shared<MetaScheduler>(metaScheduler);
+    return metaScheduler;
+}
 
 ProbabilisticScheduler::ProbabilisticScheduler(
   const std::map<std::string, double>& weights)
@@ -55,8 +201,9 @@ void RuntimeSummary::initScheduledOperators(
 
     SPDLOG_DEBUG("Initializing scheduled operators distribution ring");
     // Update the expected distribution and source distribution.
-    expectedDist.clear();
-    sourceDist.clear();
+    expectedDistMap.clear();
+    implDistMap.clear();
+    recommendedHostMap.clear();
 
     isPlanner = planner;
     initAll(application, planner);
@@ -149,18 +296,33 @@ void RuntimeSummary::initOpertaor(
 
     std::string instanceName = scheduledOpt.node.name + "_0";
 
-    // localScheduledOperatorsMap[instanceName] = scheduledOpt.localType;
+    localOperatorsMap[instanceName] = scheduledOpt.localType;
     // Update the expected distribution and source distribution.
 
     doInitExpectedDist(scheduledOpt);
-    auto& expDist = expectedDist[instanceName];
-
-    // CHANGED: Create a ProbabilisticScheduler instead of a WindowedRecord.
-    // Note: The complex logic from getBodyWindowedSlots and srcDist is removed
-    // as it's part of the stateful, corrective windowing model. The
-    // probabilistic model simply uses the target expected distribution.
-    probabilisticSchedulers[instanceName] =
-      std::make_shared<ProbabilisticScheduler>(expDist);
+    auto& expDist = expectedDistMap[instanceName];
+    implDistMap[instanceName] = expDist;
+    auto& schedLocalTpye = scheduledOpt.localType;
+    if (schedLocalTpye == LocalStatelessOperatorType::COLLOCATE_BODY) {
+        recommendedHostMap[instanceName][localHost] = 1;
+        buildBodyMetaScheduler(instanceName);
+    } else if (schedLocalTpye == LocalStatelessOperatorType::ROUNDROBIN_BODY) {
+        std::map<std::string, double> schedulingWeights;
+        schedulingWeights[localHost] = 1.0;
+        probabilisticSchedulers[instanceName] =
+          std::make_shared<ProbabilisticScheduler>(schedulingWeights);
+    } else if (schedLocalTpye == LocalStatelessOperatorType::COLLOCATE_HEAD) {
+        buildHeadMetaScheduler(instanceName);
+    } else if (schedLocalTpye == LocalStatelessOperatorType::ROUNDROBIN_HEAD) {
+        std::map<std::string, double> schedulingWeights;
+        schedulingWeights = expDist;
+        probabilisticSchedulers[instanceName] =
+          std::make_shared<ProbabilisticScheduler>(schedulingWeights);
+    } else {
+        SPDLOG_ERROR("Unknown local operator type for instance {}",
+                     instanceName);
+        throw std::runtime_error("Unknown local operator type for instance");
+    }
 }
 
 std::string RuntimeSummary::getHost(const std::string& instance,
@@ -168,20 +330,20 @@ std::string RuntimeSummary::getHost(const std::string& instance,
 {
     // The 'counter' argument is ignored in the probabilistic model.
     faabric::util::SharedLock lock(summaryMx);
-    auto it = probabilisticSchedulers.find(instance);
-    if (it == probabilisticSchedulers.end()) {
-        SPDLOG_ERROR("No scheduler for instance {} found", instance);
-        throw std::runtime_error("No scheduler for instance " + instance);
-    }
+    auto scheduler = util::getOrThrow(probabilisticSchedulers, instance);
     // Directly call the lock-free schedule method
-    return it->second->schedule();
+    return scheduler->schedule();
 }
 
 std::string RuntimeSummary::getHost(const std::string& instance,
                                     const std::string& recommended)
 {
-    // The 'recommended' host is also ignored, as scheduling is purely random.
-    return recommended; // This is a no-op in the probabilistic model.
+    faabric::util::SharedLock lock(summaryMx);
+    recommendedHostMap[instance][recommended]++;
+    auto metaScheduler = util::getOrThrow(metaSchedulers, instance);
+    auto scheduler = util::getOrThrow(*metaScheduler, recommended);
+
+    return scheduler->schedule(); // This is a no-op in the probabilistic model.
 }
 
 void RuntimeSummary::doInitExpectedDist(ScheduledOperator& schedOp)
@@ -199,49 +361,152 @@ void RuntimeSummary::doInitExpectedDist(ScheduledOperator& schedOp)
         SPDLOG_WARN("{}", errorMsg);
         throw std::runtime_error(errorMsg);
     }
-    auto& dist = expectedDist[instanceName];
+    auto& dist = expectedDistMap[instanceName];
     for (const auto& [host, weight] : hostWeight) {
         dist[host] = static_cast<double>(weight) / sumWeight;
     }
 }
 
-void RuntimeSummary::doInitSourceDist(
-  ScheduledOperator& schedOp,
-  const batch_scheduler::Application& application)
+void RuntimeSummary::TuneImplDist(
+  const std::string instanceName,
+  const std::map<std::string, int>& observedDist)
 {
-    std::string instanceName = schedOp.node.name + "_0";
-    int sumWeight = 0;
+    auto implDist = util::getOrThrow(implDistMap, instanceName);
+    const auto& expectedDist = util::getOrThrow(expectedDistMap, instanceName);
 
-    std::map<std::string, int> SourceWeight;
-    for (const auto& sourceNode : application.getSource(schedOp.node.name)) {
-        auto& sourceOpt =
-          getScheduledOperatorOrThrow(scheduledOperatorsMap, sourceNode->name);
-        for (const auto& [host, weight] : sourceOpt.weightDist) {
-            SourceWeight[host] += weight;
-            sumWeight += weight;
+    auto observedProbs = util::calculateProportions(observedDist);
+    if (observedProbs.empty()) {
+        return; // Nothing to tune if observed distribution is empty
+    }
+
+    // Calculate the Error: Error[W]=Target[W]−Observed[W]
+    // Calculate the New Distribution: NewActual[W]=OldActual[W]+α×Error[W]
+    // --- NewActual = OldActual + alpha * (Target - Observed)
+    std::map<std::string, double> newImplDist;
+    double newImplDistSum = 0.0;
+
+    for (const auto& [worker, expectedProb] : expectedDist) {
+        double oldImplProb = implDist[worker];
+        double observedProb = observedProbs[worker];
+
+        double error = expectedProb - observedProb;
+        double newProb = oldImplProb + alpha * error;
+
+        // Ensure the new probability is not negative
+        newProb = std::max(0.0, newProb);
+
+        newImplDist[worker] = newProb;
+        newImplDistSum += newProb;
+    }
+
+    if (newImplDistSum > 0) {
+        for (auto& [worker, prob] : newImplDist) {
+            prob /= newImplDistSum;
         }
     }
-    if (sumWeight <= 0) {
-        std::string errorMsg =
-          "Total weight <= 0 for operator " + schedOp.node.name;
-        SPDLOG_WARN("{}", errorMsg);
-        throw std::runtime_error(errorMsg);
-    }
 
-    auto& dist = sourceDist[instanceName];
-    for (const auto& [host, weight] : SourceWeight) {
-        dist[host] = static_cast<double>(weight) / sumWeight;
-    }
+    implDistMap[instanceName] = newImplDist;
 }
 
-void RuntimeSummary::updateSourceDist(
-  std::map<std::string, std::map<std::string, int>> sourceCountStats)
+void RuntimeSummary::CollocateHeadTune(
+  const std::string instanceName,
+  const std::map<std::string, int>& observedDist)
 {
-    if (isPlanner) {
-        
+    TuneImplDist(instanceName, observedDist);
+    buildHeadMetaScheduler(instanceName);
+}
 
+void RuntimeSummary::CollocateBodyTune(
+  const std::string instanceName,
+  const std::map<std::string, int>& observedDist)
+{
+    TuneImplDist(instanceName, observedDist);
+    buildBodyMetaScheduler(instanceName);
+}
+
+void RuntimeSummary::RoundRobinBodyTune(
+  const std::string instanceName,
+  const std::map<std::string, int>& observedDist)
+{
+    TuneImplDist(instanceName, observedDist);
+
+    const auto& expectedDist = util::getOrThrow(expectedDistMap, instanceName);
+    auto& implDist = implDistMap[instanceName];
+    double implLocalProb = util::getOrThrow(implDist, localHost);
+    double expectedLocalProb = util::getOrThrow(expectedDist, localHost);
+
+    std::map<std::string, double> schedulingWeights;
+    if (implLocalProb >= expectedLocalProb) {
+        schedulingWeights[localHost] = 1.0;
     } else {
-        
+        schedulingWeights[localHost] = implLocalProb / expectedLocalProb;
+
+        std::vector<std::pair<std::string, double>> underloadedHosts;
+        double totalDeficit = 0.0;
+        for (const auto& [host, expectLoad] : expectedDist) {
+            double implLoad = implDist[host];
+            if (implLoad > expectLoad) {
+                double deficit = implLoad - expectLoad;
+                underloadedHosts.emplace_back(host, deficit);
+                totalDeficit += deficit;
+            }
+        }
+
+        double offloadRatio = 1.0 - schedulingWeights[localHost];
+        for (const auto& [underloadedHost, deficit] : underloadedHosts) {
+            double offloadPortion = deficit / totalDeficit;
+            schedulingWeights[underloadedHost] += offloadRatio * offloadPortion;
+        }
     }
+    probabilisticSchedulers[instanceName] =
+      std::make_shared<ProbabilisticScheduler>(schedulingWeights);
+}
+
+// observedDistMap
+// MAP <instance name: <host, count>> number of requests observed executed on
+// each host.
+void RuntimeSummary::requestDistTune(
+  const std::map<std::string, std::map<std::string, int>>& observedDistMap)
+{
+    faabric::util::FullLock lock(summaryMx);
+    SPDLOG_DEBUG("Updating stateless request distribution");
+    if (expectedDistMap.empty()) {
+        return; // Nothing to tune if expected distribution is empty
+    }
+    for (const auto& [instanceName, operatorType] : localOperatorsMap) {
+        if (!observedDistMap.contains(instanceName)) {
+            SPDLOG_DEBUG("No observed distribution for instance {}",
+                         instanceName);
+            continue;
+        }
+        auto observedDist = util::getOrThrow(observedDistMap, instanceName);
+        if (operatorType == LocalStatelessOperatorType::ROUNDROBIN_HEAD) {
+            continue;
+        } else if (operatorType ==
+                   LocalStatelessOperatorType::ROUNDROBIN_BODY) {
+            RoundRobinBodyTune(instanceName, observedDist);
+        } else if (operatorType == LocalStatelessOperatorType::COLLOCATE_HEAD) {
+            CollocateHeadTune(instanceName, observedDist);
+        } else if (operatorType == LocalStatelessOperatorType::COLLOCATE_BODY) {
+            CollocateBodyTune(instanceName, observedDist);
+        } else {
+            SPDLOG_ERROR("Unknown operator type for instance {}", instanceName);
+            throw std::runtime_error("Unknown operator type for instance");
+        }
+    }
+    recommendedHostMap.clear();
+}
+
+void RuntimeSummary::reset()
+{
+    faabric::util::FullLock lock(summaryMx);
+    SPDLOG_DEBUG("Clearing runtime summary");
+    localOperatorsMap.clear();
+    expectedDistMap.clear();
+    implDistMap.clear();
+    recommendedHostMap.clear();
+    scheduledOperatorsMap.clear();
+    probabilisticSchedulers.clear();
+    metaSchedulers.clear();
 }
 }

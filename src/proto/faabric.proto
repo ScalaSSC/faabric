@@ -155,7 +155,7 @@ message Message {
 
     int32 executeBatchSize = 86;
     // Chained Call numbers
-    // int32 chainedMsgNum = 87;
+    bool isScheduledLocally = 87;
     // State
     // Message Type : 0 stateless/ 1 function state / 2 partitioned state
     int32 messageType = 88;

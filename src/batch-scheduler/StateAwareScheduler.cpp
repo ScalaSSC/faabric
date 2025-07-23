@@ -524,6 +524,11 @@ std::string StateAwareScheduler::scheduleMessage(
     if (host == "unknown") {
         throw std::runtime_error("Host is unknown");
     }
+    if (host == localHost) {
+        msg->set_isscheduledlocally(true);
+    } else {
+        msg->set_isscheduledlocally(false);
+    }
     return host;
 }
 
@@ -1514,12 +1519,14 @@ void StateAwareScheduler::printScheduleInfomation() const
     }
 }
 
-void StateAwareScheduler::runtimeSourceUpdate(
-  const std::map<std::string, std::map<std::string, int>>& sourceCountStats)
+void StateAwareScheduler::runtimeDistTune(
+  const std::map<std::string, std::map<std::string, int>>& observeDistMap)
 {
-    faabric::util::FullLock lock(scheduleMx);
-    SPDLOG_DEBUG("Updating runtime source information");
-    runtimeSummary.updateSourceDist(sourceCountStats);
+    // We only schedule when the schedule mode is 0.
+    if (scheduleMode != 0){
+        return;
+    }
+    runtimeSummary.requestDistTune(observeDistMap);
 }
 
 void StateAwareScheduler::setScheduleMode(int mode)
@@ -1541,6 +1548,7 @@ void StateAwareScheduler::resetScheduler()
     stateHashRing.clear();
     statePartitionBy.clear();
     funcStateRegMap.clear();
+    runtimeSummary.reset();
 }
 
 } // namespace faabric::batch_scheduler
