@@ -82,6 +82,12 @@ void FunctionCallClient::sendFlush()
     }
 }
 
+void FunctionCallClient::custom(std::shared_ptr<faabric::CustomRequest> req)
+{
+    faabric::EmptyResponse resp;
+    syncSend(faabric::scheduler::FunctionCalls::Custom, req.get(), &resp);
+}
+
 std::unique_ptr<faabric::RuntimeStatsResult>
 FunctionCallClient::getRuntimeStats(faabric::RuntimeStatsUpdateRequest req)
 {

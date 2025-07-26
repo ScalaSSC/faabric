@@ -63,6 +63,17 @@ std::vector<std::shared_ptr<Node>> Application::getSource(
     return sourceNodes;
 }
 
+void Application::updateConnectionsWithWeight(
+  const ConnectionInfoWithWeight& newConnectionsWithWeight)
+{
+    for (const auto& [source, outputConnections] : newConnectionsWithWeight) {
+        for (const auto& [dest, weight] : outputConnections) {
+            // Add the connection with weight to the connectionsWithWeight map.
+            connectionsWithWeight[source][dest] = weight;
+        }
+    }
+}
+
 /**
  * @brief Transforms a map of connections into a flat vector and sorts it.
  *
@@ -81,18 +92,14 @@ std::vector<Connection> Application::getConnectionsWithWeight()
 
     // Iterate over each key-value pair in the input map.
     // 'source' is the pair (e.g., {"FuncA", vector_of_connections}).
-    for (const auto& source : connectionsWithWeight) {
-        const std::string& inputNode = source.first;
-        const auto& outputConnections = source.second;
-
-        // Iterate over the vector of destination nodes for the current source
-        // node. 'dest' is the pair (e.g., {"FuncB", 100}).
-        for (const auto& dest : outputConnections) {
-            const std::string& outputNode = dest.first;
-            const int& connectionWeight = dest.second;
-
+    for (const auto& [inputNode, outputConnections] : connectionsWithWeight) {
+        for (const auto& [outputNode, weight] : outputConnections) {
             // Create a Connection object and add it to our result vector.
-            result.push_back({ inputNode, outputNode, connectionWeight });
+            result.push_back({ inputNode, outputNode, weight });
+            SPDLOG_DEBUG("Connection: {} -> {} with weight {}",
+                         inputNode,
+                         outputNode,
+                         weight);
         }
     }
 
@@ -110,7 +117,7 @@ std::vector<Connection> Application::getConnectionsWithWeight()
 void Application::addConnection(const std::string& src, const std::string& dest)
 {
     connections[src].push_back(dest);
-    connectionsWithWeight[src].push_back(std::make_pair(dest, 1));
+    connectionsWithWeight[src][dest] = 1;
 }
 
 void Application::buildInvertConnections()

@@ -462,4 +462,15 @@ void State::writePersistentStateBatch(
     persistentState.writeBatch(data);
 }
 
+void State::flushState()
+{
+    // WARNING : This function can cause deadlocks. Be careful when calling it
+    // (no running executors).
+    FullLock fullLock(fsmapMutex);
+
+    for (const auto& [fs, state] : fsMap) {
+        state->flush();
+    }
+}
+
 }

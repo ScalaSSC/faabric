@@ -74,6 +74,9 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::GetRuntimeStats: {
             return recvGetRuntimeStats(message.udata());
         }
+        case faabric::scheduler::FunctionCalls::Custom: {
+            return recvCustom(message.udata());
+        }
         default: {
             throw std::runtime_error(
               fmt::format("Unrecognized sync call header: {}", header));
@@ -158,6 +161,23 @@ FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
     }
 
     scheduler.storeMigrateState(std::move(immiStates));
+
+    return std::make_unique<faabric::EmptyResponse>();
+}
+
+std::unique_ptr<google::protobuf::Message> FunctionCallServer::recvCustom(
+  std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::CustomRequest, buffer.data(), buffer.size());
+    std::string payload = parsedMsg.payload();
+    SPDLOG_DEBUG("Received custom request with payload: {}", payload);
+    if (payload == "flush_state") {
+        scheduler.flushState();
+    } else {
+        SPDLOG_ERROR("Unrecognized custom request payload: {}", payload);
+        throw std::runtime_error(
+          fmt::format("Unrecognized custom request payload"));
+    }
 
     return std::make_unique<faabric::EmptyResponse>();
 }

@@ -71,34 +71,34 @@ void FunctionState::isPartitioned()
     partition = true;
 }
 
-long FunctionState::lockWrite()
+void FunctionState::lockWrite()
 {
-    auto startTime = faabric::util::getGlobalClock().epochMicros();
+    // auto startTime = faabric::util::getGlobalClock().epochMicros();
     sem.acquire();
-    auto endTime = faabric::util::getGlobalClock().epochMicros();
-    tempLockAquireTime = endTime;
-    int timeDiff = static_cast<int>(endTime - startTime);
-    // Record the locking congestion time
-    SPDLOG_TRACE("Gain Lock and Lock Congestion time for {}/{}-{} is {} µs",
-                 user,
-                 function,
-                 parallelismId,
-                 timeDiff);
-    metrics.lockBlockTimeQueue.add(timeDiff);
-    return timeDiff;
+    // auto endTime = faabric::util::getGlobalClock().epochMicros();
+    // tempLockAquireTime = endTime;
+    // int timeDiff = static_cast<int>(endTime - startTime);
+    // // Record the locking congestion time
+    // SPDLOG_TRACE("Gain Lock and Lock Congestion time for {}/{}-{} is {} µs",
+    //              user,
+    //              function,
+    //              parallelismId,
+    //              timeDiff);
+    // metrics.lockBlockTimeQueue.add(timeDiff);
+    // return timeDiff;
 }
 
 void FunctionState::unlockWrite()
 {
-    long long releaseTime = faabric::util::getGlobalClock().epochMicros();
-    int timeDiff = static_cast<int>(releaseTime - tempLockAquireTime);
-    // Record the holding time of the lock
-    SPDLOG_TRACE("Write lock holding time for {}/{}-{} is {} µs",
-                 user,
-                 function,
-                 parallelismId,
-                 timeDiff);
-    metrics.lockHoldTimeQueue.add(timeDiff);
+    // long long releaseTime = faabric::util::getGlobalClock().epochMicros();
+    // int timeDiff = static_cast<int>(releaseTime - tempLockAquireTime);
+    // // Record the holding time of the lock
+    // SPDLOG_TRACE("Write lock holding time for {}/{}-{} is {} µs",
+    //              user,
+    //              function,
+    //              parallelismId,
+    //              timeDiff);
+    // metrics.lockHoldTimeQueue.add(timeDiff);
     sem.release();
 }
 
@@ -357,6 +357,40 @@ void FunctionState::addMigrateState(const std::string& serializedState)
     for (const auto& [key, value] : migrateState) {
         indivStateMap[key].setState(value);
     }
+}
+
+void FunctionState::flush()
+{
+    faabric::util::FullLock lock(funcStateMutex);
+
+    // Unmap the shared memory region if it has been allocated
+    if (sharedMemory != nullptr) {
+        // Use the existing sharedMemSize to unmap correctly before resetting it
+        if (munmap(sharedMemory, sharedMemSize) == -1) {
+            // Log a warning but continue with the flush operation
+            SPDLOG_WARN("Failed to unmap shared memory for {}/{}-{}: {}",
+                        user,
+                        function,
+                        parallelismId,
+                        strerror(errno));
+        }
+    }
+
+    sharedMemSize = 0;
+    sharedMemory = nullptr;
+    stateSize = 0;
+
+    if (!sem.try_acquire()) {
+        SPDLOG_ERROR(
+          "Attempted to flush function state for {}/{} while write lock is "
+          "held.",
+          user,
+          function);
+        throw std::runtime_error("Cannot flush state while write lock is held");
+    }
+
+    indivStateMap.clear();
+    multiKeysLock.flush();
 }
 
 }

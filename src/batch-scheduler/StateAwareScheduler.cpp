@@ -626,7 +626,8 @@ StateAwareScheduler::getStateInfo()
 }
 
 void StateAwareScheduler::updateApp(
-  const std::map<std::string, long>& nodeWorkloads)
+  const std::map<std::string, long>& nodeWorkloads,
+  const std::map<std::string, std::map<std::string, int>> edgeWeightMap)
 {
     if (!application) {
         SPDLOG_WARN("Scheduler: No application registered");
@@ -644,6 +645,8 @@ void StateAwareScheduler::updateApp(
                      nodeName,
                      application->getNodes().at(nodeName)->processedTuples);
     }
+
+    application->updateConnectionsWithWeight(edgeWeightMap);
 }
 
 void StateAwareScheduler::groupNodesHelper(
@@ -1523,7 +1526,7 @@ void StateAwareScheduler::runtimeDistTune(
   const std::map<std::string, std::map<std::string, int>>& observeDistMap)
 {
     // We only schedule when the schedule mode is 0.
-    if (scheduleMode != 0){
+    if (scheduleMode != 0) {
         return;
     }
     runtimeSummary.requestDistTune(observeDistMap);

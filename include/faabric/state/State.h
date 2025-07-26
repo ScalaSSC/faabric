@@ -150,6 +150,8 @@ class State
                   const std::string& func,
                   int32_t parallelismId);
 
+    void flushState();
+
   private:
     const std::string thisIP;
 

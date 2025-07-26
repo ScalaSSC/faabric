@@ -259,7 +259,11 @@ void PlannerEndpointHandler::onRequest(
             std::string value = rawReq.value();
             SPDLOG_DEBUG("Custom request with key {} and value {}", key, value);
             if (key == "reschedule") {
-                faabric::planner::getPlanner().rescheduleApp();
+                if (value.empty()) {
+                    value = "0";
+                }
+                int valueIn = std::stoi(value);
+                faabric::planner::getPlanner().rescheduleApp(valueIn);
             } else {
                 SPDLOG_ERROR("Unrecognized custom request key {}", key);
                 response.result(beast::http::status::bad_request);

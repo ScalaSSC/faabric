@@ -1249,4 +1249,9 @@ void Scheduler::setLocalPersistentState(
     SPDLOG_INFO("Local persistent state set successfully");
 }
 
+void Scheduler::flushState(){
+    SPDLOG_INFO("Flushing state");
+    faabric::state::getGlobalState().flushState();
+}
+
 }

@@ -109,7 +109,7 @@ class Planner
                         const int32_t value,
                         bool plannerParameter = false);
 
-    void rescheduleApp();
+    void rescheduleApp(int rescheduleMode);
 
     void setPersistentState(const faabric::planner::MapMessage& mapMsg);
 
@@ -197,6 +197,8 @@ class Planner
     bool isOutputting = false;
 
     void doDistributeStatesInfo();
+
+    void doDistributeCustomInfo(std::shared_ptr<faabric::CustomRequest> msg);
 
     void doRescheduleMessages();
 

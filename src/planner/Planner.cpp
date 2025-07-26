@@ -649,6 +649,32 @@ void Planner::distributeApp(
     }
 }
 
+void Planner::doDistributeCustomInfo(
+  std::shared_ptr<faabric::CustomRequest> msg)
+{
+    int hostSize = state.hostMap.size();
+    SPDLOG_INFO("Planner distribute custom info to {} hosts", hostSize);
+    std::vector<std::thread> threads;
+    for (const auto& [ip, host] : state.hostMap) {
+        threads.emplace_back([&, ip]() {
+            try {
+                SPDLOG_DEBUG("Planner distributes custom to host {}", ip);
+                faabric::scheduler::getFunctionCallClient(ip)->custom(msg);
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR("Failed to distributes application to host {}: {}",
+                             ip,
+                             e.what());
+                throw e;
+            }
+        });
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+}
+
 void Planner::doDistributeStatesInfo()
 {
     int hostSize = state.hostMap.size();
@@ -778,30 +804,28 @@ bool Planner::resetParameter(const std::string& key,
     return true;
 }
 
-void Planner::rescheduleApp()
+void Planner::rescheduleApp(int rescheduleMode)
 {
     SPDLOG_INFO("Planner reschedules application");
+    // If reschedule mode is 1, we want to wait until no inflight requests and
+    // clear the state.
+    if (rescheduleMode == 1) {
+        // Wait until all in-flight apps are finished
+        while (getInFlightAppsSize() > 0) {
+            SPDLOG_DEBUG(
+              "Waiting for in-flight apps to finish before rescheduling");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
     faabric::util::FullLock lock(plannerMx);
     // Update the application node processed tuples.
     // Fetch the workload from metrics at first.
-    auto instWorkloadMap = state.applicationMetrics->getWorkloads();
-    std::map<std::string, long> operatorWorkloadMap;
-
-    for (const auto& [instName, count] : instWorkloadMap) {
-        SPDLOG_DEBUG("Instance {} has workload {}", instName, count);
-        auto userFuncParTuple = util::splitUserFuncPar(instName);
-        std::string funcName =
-          std::get<0>(userFuncParTuple) + "_" + std::get<1>(userFuncParTuple);
-        SPDLOG_DEBUG("Function name: {}", funcName);
-        operatorWorkloadMap[funcName] += count;
-    }
-
-    // for (const auto& [funcName, count] : operatorWorkloadMap) {
-    //     SPDLOG_DEBUG("Function {} has workload {}", funcName, count);
-    // }
+    auto operatorWorkloadMap = state.applicationMetrics->getOptWorkloads();
+    auto edgeWeightMap = state.applicationMetrics->getEdgeWeightMap();
 
     // Update the processed tuples.
-    stateAwareScheduler->updateApp(operatorWorkloadMap);
+    stateAwareScheduler->updateApp(operatorWorkloadMap, edgeWeightMap);
     stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
     SPDLOG_INFO("Planner reschedules application done");
 
@@ -809,6 +833,14 @@ void Planner::rescheduleApp()
     // stateAwareScheduler->updateReqDist();
     doDistributeStatesInfo();
     doRescheduleMessages();
+
+    if (rescheduleMode == 1) {
+        // Clear the states
+        state.applicationMetrics->reset();
+        auto msgShared = std::make_shared<faabric::CustomRequest>();
+        msgShared->set_payload("flush_state");
+        doDistributeCustomInfo(msgShared);
+    }
 }
 
 void Planner::setPersistentState(const faabric::planner::MapMessage& mapMsg)

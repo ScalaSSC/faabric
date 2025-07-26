@@ -84,7 +84,7 @@ struct Connection
     int weight;
 };
 using ConnectionInfoWithWeight =
-  std::map<std::string, std::vector<std::pair<std::string, int>>>;
+  std::map<std::string, std::map<std::string, int>>;
 
 class Application
 {
@@ -125,6 +125,9 @@ class Application
     }
 
     const ConnectionInfo& getConnections() const { return connections; }
+
+    void updateConnectionsWithWeight(
+      const ConnectionInfoWithWeight& newConnectionsWithWeight);
 
     std::vector<Connection> getConnectionsWithWeight();
 

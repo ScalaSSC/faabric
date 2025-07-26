@@ -75,6 +75,8 @@ class Scheduler
 
     long getFunctionExecutorCount(const faabric::Message& msg);
 
+    void flushState();
+
     // ----------------------------------
     // Message results
     // ----------------------------------

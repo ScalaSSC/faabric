@@ -193,12 +193,24 @@ class ApplicationMetrics
         int64_t tempStartTime = std::numeric_limits<int64_t>::max();
         int64_t tempEndTime = std::numeric_limits<int64_t>::min();
         for (auto& [msgId, msg] : msgMap) {
-            std::string instanceName = getName(msg);
+            std::string operatorName = getOperatorName(msg);
+            std::string instanceName = getInstanceName(msg);
             if (!instances.contains(instanceName)) {
                 instances[instanceName] =
                   std::make_unique<InstanceMetrics>(instanceName, period);
             }
             instances[instanceName]->record(msg);
+
+            // Update the edge weight map based on chained messages.
+            for (int32_t chainedMsgId : msg->chainedmsgids()) {
+                if (!msgMap.contains(chainedMsgId)) {
+                    continue;
+                }
+                auto chainedMsg = msgMap.at(chainedMsgId);
+                std::string chainedOpt = getOperatorName(chainedMsg);
+                edgeWeightMap[operatorName][chainedOpt]++;
+            }
+
             if (msg->plannerqueuetime() < tempStartTime) {
                 tempStartTime = msg->plannerqueuetime();
             }
@@ -227,6 +239,33 @@ class ApplicationMetrics
         }
 
         return workloads;
+    }
+
+    std::map<std::string, long> getOptWorkloads()
+    {
+        faabric::util::FullLock lock(opMx);
+
+        std::map<std::string, long> instWorkloadMap;
+        for (const auto& [instName, instancePtr] : instances) {
+            instWorkloadMap[instName] = instancePtr->getCount();
+        }
+
+        std::map<std::string, long> operatorWorkloadMap;
+
+        for (const auto& [instName, count] : instWorkloadMap) {
+            auto userFuncParTuple = util::splitUserFuncPar(instName);
+            std::string funcName = std::get<0>(userFuncParTuple) + "_" +
+                                   std::get<1>(userFuncParTuple);
+            operatorWorkloadMap[funcName] += count;
+        }
+
+        return operatorWorkloadMap;
+    }
+
+    std::map<std::string, std::map<std::string, int>> getEdgeWeightMap() const
+    {
+        faabric::util::FullLock lock(opMx);
+        return edgeWeightMap;
     }
 
     std::string getMetrics() const
@@ -334,6 +373,8 @@ class ApplicationMetrics
         for (auto& [instName, instancePtr] : instances) {
             instancePtr->reset();
         }
+
+        edgeWeightMap.clear();
     }
 
   private:
@@ -350,10 +391,18 @@ class ApplicationMetrics
     double avgExecutionOperators = 0.0;
     double avgRunningReqs = 0.0;
 
-    std::string getName(const std::shared_ptr<faabric::Message> msg)
+    // MAP<source operator : <successor operator, count>>
+    std::map<std::string, std::map<std::string, int>> edgeWeightMap;
+
+    std::string getInstanceName(const std::shared_ptr<faabric::Message> msg)
     {
         return msg->user() + "_" + msg->function() + "_" +
                std::to_string(msg->parallelismid());
+    }
+
+    std::string getOperatorName(const std::shared_ptr<faabric::Message> msg)
+    {
+        return msg->user() + "_" + msg->function();
     }
 };
 
@@ -400,7 +449,6 @@ struct PlannerState
     std::map<std::string, std::list<std::unique_ptr<Message>>> scheduledMsgsMap;
 
     // Metrics
-    std::shared_mutex metricsMx;
     std::unique_ptr<ApplicationMetrics> applicationMetrics;
 
     PlannerState()

@@ -44,7 +44,7 @@ class FunctionState
     /***
      * Functions used by the Stateful Function Operator
      */
-    long lockWrite();
+    void lockWrite();
     void unlockWrite();
     size_t size() const;
     // void get(uint8_t* buffer);
@@ -68,6 +68,8 @@ class FunctionState
 
     bool getIsPartitioned() { return partition; }
     std::string getUserFunc() { return user + "_" + function; };
+
+    void flush();
 
   private:
     std::shared_mutex funcStateMutex;
@@ -113,14 +115,14 @@ class FunctionState
 
     FunctionStateRegistry& stateRegistry;
 
-    long long tempLockAquireTime = 0;
+    // long long tempLockAquireTime = 0;
 
     // ----------------------------------------
     // Metrics
     // ----------------------------------------
 
     // std::unordered_map<std::string, std::vector<uint8_t>> state;
-    FunctionStateMetrics metrics;
+    // FunctionStateMetrics metrics;
 };
 
 class FunctionStateException : public std::runtime_error

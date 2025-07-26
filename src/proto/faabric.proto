@@ -376,3 +376,7 @@ message RuntimeStatsResult{
 message RuntimeStatsUpdateRequest{
     repeated RuntimeStatsResult collectedStats = 1;
 }
+
+message CustomRequest {
+    string payload = 1;
+}

@@ -120,7 +120,9 @@ class StateAwareScheduler : public BatchScheduler
 
     const std::map<std::string, FunctionStateInfo> getStateInfo();
 
-    void updateApp(const std::map<std::string, long>& nodeWorkloads);
+    void updateApp(
+      const std::map<std::string, long>& nodeWorkloads,
+      const std::map<std::string, std::map<std::string, int>> edgeWeightMap);
 
     void rescheduleApp(const HostMap& hostMap);
 

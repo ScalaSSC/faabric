@@ -254,6 +254,23 @@ class MultiKeyLock
         }
     }
 
+    void flush()
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+
+        if (!lockedKeys.empty()) {
+            SPDLOG_ERROR("Cannot flush MultiKeyLock while keys are locked");
+            throw std::runtime_error(
+              "Flush MultiKeyLock while keys are locked");
+        } else if (!waitingThreads.empty()) {
+            SPDLOG_ERROR("Cannot flush MultiKeyLock while threads are waiting");
+            throw std::runtime_error(
+              "Flush MultiKeyLock while threads are waiting");
+        }
+        waitingThreads.clear();
+        lockedKeys.clear();
+    }
+
   private:
     std::mutex mtx;
     std::map<std::string, ConditionVariableQueue> waitingThreads;

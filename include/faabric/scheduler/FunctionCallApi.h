@@ -15,5 +15,6 @@ enum FunctionCalls
     GetRuntimeStats = 9,
     SetPersistentState = 10,
     RegisterApplication = 11,
+    Custom = 12,
 };
 }
