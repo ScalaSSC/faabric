@@ -96,6 +96,11 @@ class StateAwareScheduler : public BatchScheduler
       const HostMap& hostMap,
       const std::unique_ptr<Message>& msg);
 
+     std::string scheduleStatelessMessageLocal(
+      std::string& userFunc,
+      const HostMap& hostMap,
+      const std::unique_ptr<Message>& msg);
+     
     std::string scheduleStatefulMessage(std::string& userFunc,
                                         const std::unique_ptr<Message>& msg);
 
@@ -174,6 +179,7 @@ class StateAwareScheduler : public BatchScheduler
     // scheduler lock
     std::shared_mutex scheduleMx;
 
+    bool isplanner = true;
     int scheduleMode = 0;
 
     // hostAssign Counter is used when assign states to the hosts.

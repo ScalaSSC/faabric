@@ -429,6 +429,16 @@ std::string StateAwareScheduler::scheduleStatelessMessageFaaSFlow(
     return host;
 }
 
+std::string StateAwareScheduler::scheduleStatelessMessageLocal(
+  std::string& userFunc,
+  const HostMap& hostMap,
+  const std::unique_ptr<Message>& msg)
+{
+    std::string host = localHost;
+    msg->set_messagetype(0);
+    return host;
+}
+
 HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
   const std::string& userFunction,
   const faabric::Message& msg)
@@ -516,6 +526,13 @@ std::string StateAwareScheduler::scheduleMessage(
             host = scheduleStatelessMessageRB(userFunc, hostMap, msg);
         } else if (scheduleMode == 3) {
             host = scheduleStatelessMessageFaaSFlow(userFunc, hostMap, msg);
+        } else if (scheduleMode == 4) {
+            if (isplanner) {
+                host =
+                  scheduleStatelessMessageApportion(userFunc, hostMap, msg);
+            } else {
+                host = scheduleStatelessMessageLocal(userFunc, hostMap, msg);
+            }
         } else {
             SPDLOG_ERROR("Unknown schedule mode: {}", scheduleMode);
             throw std::runtime_error("Unknown schedule mode");
@@ -887,16 +904,17 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
     std::unordered_set<std::string> visited;
 
     for (const auto& inputNode : application->getInputNodes()) {
-        // if (visited.count(inputNode))
-        //     continue;
-
-        // std::vector<std::shared_ptr<Node>> startGroup;
-        // std::string startPartition = NONE_STRING;
-
-        // groupNodesHelper(
-        //   inputNode, startGroup, startPartition, groups, visited);
-
         groupNodesHelper(inputNode, groups, visited);
+    }
+    // Schedule Mode 4 is not supported for stateful operator !!!!
+    if (scheduleMode == 4) {
+        groups.clear();
+        std::vector<std::shared_ptr<Node>> appNodesVec;
+        for (const auto& [nodeName, nodePtr] : appNodes) {
+            appNodesVec.push_back(nodePtr);
+        }
+        NodeGroup singleGroup{ std::move(appNodesVec), NONE_STRING };
+        groups.push_back(singleGroup);
     }
     {
         std::stringstream ss;

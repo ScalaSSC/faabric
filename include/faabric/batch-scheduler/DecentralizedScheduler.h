@@ -9,7 +9,7 @@ class DecentralizedScheduler final : public StateAwareScheduler
   public:
     DecentralizedScheduler()
     {
-        localHost = faabric::util::getSystemConfig().endpointHost;
+        isplanner = false;
     }
 
     virtual ~DecentralizedScheduler() = default;
@@ -22,9 +22,6 @@ class DecentralizedScheduler final : public StateAwareScheduler
     void syncStatesInfo(
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
         statesInfo);
-
-  private:
-    std::string localHost;
 };
 
 }
