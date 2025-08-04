@@ -127,10 +127,25 @@ void FunctionCallClient::resetParameter(
     asyncSend(faabric::scheduler::FunctionCalls::ResetParameter, req.get());
 }
 
+std::string FunctionCallClient::getPersistentState(
+  std::shared_ptr<faabric::planner::MapMessage> req)
+{
+    std::string key = req->payload().at("key");
+    SPDLOG_DEBUG("Getting persistent state for key {} on host {}", key, host);
+    faabric::planner::MapMessage resp;
+    syncSend(
+      faabric::scheduler::FunctionCalls::GetPersistentState, req.get(), &resp);
+    std::string value = resp.payload().at(key);
+    return value;
+}
+
 void FunctionCallClient::setPersistentState(
   std::shared_ptr<faabric::planner::MapMessage> req)
 {
-    asyncSend(faabric::scheduler::FunctionCalls::SetPersistentState, req.get());
+    SPDLOG_DEBUG("Setting persistent state on host {}", host);
+    faabric::planner::EmptyResponse resp;
+    syncSend(
+      faabric::scheduler::FunctionCalls::SetPersistentState, req.get(), &resp);
 }
 
 void FunctionCallClient::registerApplication(

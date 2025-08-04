@@ -837,9 +837,10 @@ void Planner::rescheduleApp(int rescheduleMode)
     if (rescheduleMode == 1) {
         // Clear the states
         state.applicationMetrics->reset();
-        auto msgShared = std::make_shared<faabric::CustomRequest>();
-        msgShared->set_payload("flush_state");
-        doDistributeCustomInfo(msgShared);
+        // Temporary don't need flush. Since we don't migrate state.
+        // auto msgShared = std::make_shared<faabric::CustomRequest>();
+        // msgShared->set_payload("flush_state");
+        // doDistributeCustomInfo(msgShared);
     }
 }
 

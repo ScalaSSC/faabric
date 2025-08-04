@@ -39,9 +39,14 @@ class FunctionCallServer final
 
     std::unique_ptr<google::protobuf::Message> recvCustom(
       std::span<const uint8_t> buffer);
-      
-    void recvRegisterApplication(
+
+    std::unique_ptr<google::protobuf::Message> recvGetPersistentState(
       std::span<const uint8_t> buffer);
+
+    std::unique_ptr<google::protobuf::Message> recvSetPersistentState(
+      std::span<const uint8_t> buffer);
+
+    void recvRegisterApplication(std::span<const uint8_t> buffer);
 
     void recvExecuteFunctions(std::span<const uint8_t> buffer);
 
@@ -50,7 +55,5 @@ class FunctionCallServer final
     void recvResetParameter(std::span<const uint8_t> buffer);
 
     void recvExecuteFunctionsBatch(std::span<const uint8_t> buffer);
-
-    void recvSetPersistentState(std::span<const uint8_t> buffer);
 };
 }

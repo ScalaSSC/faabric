@@ -65,6 +65,9 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
 
     void migrateStates(std::shared_ptr<faabric::StateMigrationRequest> req);
 
+    std::string getPersistentState(
+      std::shared_ptr<faabric::planner::MapMessage> req);
+
     void setPersistentState(std::shared_ptr<faabric::planner::MapMessage> req);
 
     void custom(const std::shared_ptr<faabric::CustomRequest> req);

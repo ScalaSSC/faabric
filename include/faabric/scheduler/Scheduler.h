@@ -149,6 +149,8 @@ class Scheduler
       const std::map<std::string, std::map<std::string, int>>&
         sourceCountStats);
 
+    std::string getLocalPersistentState(std::string key);
+    
     void setLocalPersistentState(
       const std::map<std::string, std::string>& kvMap);
 

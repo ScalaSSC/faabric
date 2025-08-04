@@ -125,15 +125,19 @@ class State
     // Persistent State API
     //---------------------
 
-    std::string readPersistentState(std::string& key);
+    std::string readPersistentState(const std::string& key);
 
     std::vector<std::string> readPersistentStateBatch(
       const std::vector<std::string>& keys);
+
+    std::string readPersistentStateRemote(const std::string& key);
 
     void writePersistentState(std::string& key, std::string& value);
 
     void writePersistentStateBatch(
       const std::map<std::string, std::string>& data);
+
+    void writePersistentStateRemote(std::string& key, std::string& value);
 
     std::string getThisIP();
 
@@ -152,8 +156,12 @@ class State
 
     void flushState();
 
+    void updateHosts(faabric::batch_scheduler::HostMap hostMap);
+
   private:
     const std::string thisIP;
+
+    faabric::batch_scheduler::HostMap hosts;
 
     std::unordered_map<std::string, std::shared_ptr<StateKeyValue>> kvMap;
     std::unordered_map<std::string, std::shared_ptr<FunctionState>> fsMap;

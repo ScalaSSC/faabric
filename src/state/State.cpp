@@ -1,9 +1,12 @@
+#include <faabric/scheduler/FunctionCallClient.h>
 #include <faabric/state/InMemoryStateKeyValue.h>
 #include <faabric/state/RedisStateKeyValue.h>
 #include <faabric/state/State.h>
 #include <faabric/util/config.h>
 #include <faabric/util/locks.h>
 #include <faabric/util/logging.h>
+#include <faabric/util/map.h>
+#include <faabric/util/random.h>
 #include <faabric/util/serialization.h>
 #include <faabric/util/state.h>
 
@@ -29,6 +32,10 @@ State& getGlobalState()
 State::State(std::string thisIPIn)
   : thisIP(thisIPIn)
 {}
+
+void State::updateHosts(faabric::batch_scheduler::HostMap hostMap) {
+    hosts = hostMap;
+}
 
 void State::backupAll()
 {
@@ -438,7 +445,7 @@ void State::deleteFS(const std::string& user,
     }
 }
 
-std::string State::readPersistentState(std::string& key)
+std::string State::readPersistentState(const std::string& key)
 {
     std::string value = persistentState.read(key);
     return value;
@@ -451,6 +458,31 @@ std::vector<std::string> State::readPersistentStateBatch(
     return values;
 }
 
+std::string State::readPersistentStateRemote(const std::string& key)
+{
+    // This function is only used for test and background experiment.
+    // randomly select a host from hosts.
+    int hostMapSize = hosts.size();
+    if (hostMapSize <= 1) {
+        SPDLOG_DEBUG("No remote hosts available, reading from local state");
+        return readPersistentState(key);
+    }
+
+    int randomInt = faabric::util::randomInt(0, 100);
+    while (faabric::util::getNthKey(hosts, (randomInt) % hostMapSize) ==
+           thisIP) {
+        randomInt++;
+    }
+    std::string remoteHost =
+      faabric::util::getNthKey(hosts, (randomInt) % hostMapSize);
+    SPDLOG_DEBUG("Reading persistent state from remote host: {}", remoteHost);
+    auto req = std::make_shared<faabric::planner::MapMessage>();
+    req->mutable_payload()->insert({ "key", key });
+    std::string value = faabric::scheduler::getFunctionCallClient(remoteHost)
+                          ->getPersistentState(req);
+    return value;
+}
+
 void State::writePersistentState(std::string& key, std::string& value)
 {
     persistentState.write(key, value);
@@ -460,6 +492,31 @@ void State::writePersistentStateBatch(
   const std::map<std::string, std::string>& data)
 {
     persistentState.writeBatch(data);
+}
+
+void State::writePersistentStateRemote(std::string& key, std::string& value)
+{
+    // This function is only used for test and background experiment.
+    // randomly select a host from hosts.
+    persistentState.write(key, value);
+
+    int hostMapSize = hosts.size();
+    if (hostMapSize <= 1) {
+        return writePersistentState(key, value);
+    }
+
+    int randomInt = faabric::util::randomInt(0, 100);
+    while (faabric::util::getNthKey(hosts, (randomInt) % hostMapSize) ==
+           thisIP) {
+        randomInt++;
+    }
+    std::string remoteHost =
+      faabric::util::getNthKey(hosts, (randomInt) % hostMapSize);
+
+    auto req = std::make_shared<faabric::planner::MapMessage>();
+    req->mutable_payload()->insert({ key, value });
+    faabric::scheduler::getFunctionCallClient(remoteHost)
+      ->setPersistentState(req);
 }
 
 void State::flushState()

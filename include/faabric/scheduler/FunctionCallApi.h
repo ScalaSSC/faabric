@@ -13,8 +13,9 @@ enum FunctionCalls
     SyncStatesInfo = 7,
     MigrateStates = 8,
     GetRuntimeStats = 9,
-    SetPersistentState = 10,
-    RegisterApplication = 11,
-    Custom = 12,
+    GetPersistentState = 10,
+    SetPersistentState = 11,
+    RegisterApplication = 12,
+    Custom = 13,
 };
 }

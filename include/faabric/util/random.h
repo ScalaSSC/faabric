@@ -7,4 +7,7 @@ namespace faabric::util {
 std::string randomString(int len);
 
 std::string randomStringFromSet(const std::unordered_set<std::string>& s);
+
+int randomInt(int min, int max);
+
 }

@@ -1056,6 +1056,7 @@ void Scheduler::updateHosts(const std::vector<std::string>& hosts)
     SPDLOG_INFO("updateHosts: {}", oss.str());
 
     hostMap = convertHostMap(registeredHostsMap);
+    faabric::state::getGlobalState().updateHosts(hostMap);
 }
 
 void Scheduler::storeMigrateState(
@@ -1182,7 +1183,10 @@ void Scheduler::updateStatesInfo(
             oss << "Key: " << key << " -> Value Size: " << value.size() << "\n";
         }
         SPDLOG_INFO("{}", oss.str());
-        stateServer.loadMigrateState(tempMigrateStateMap);
+        // TODO - there is a bug here !
+        // For stateful operator, it can cause the state to be lost. (unstop running)
+        // maybe loadMigrateState or maybe the flush state has bugs.
+        // stateServer.loadMigrateState(tempMigrateStateMap);
 
         tempMigrateStateMap.clear();
         stateServer.cleanBackup();
@@ -1244,12 +1248,22 @@ void Scheduler::updateStatelessDist(
 void Scheduler::setLocalPersistentState(
   const std::map<std::string, std::string>& kvMap)
 {
-    SPDLOG_INFO("Setting local persistent state");
+    SPDLOG_DEBUG("Setting local persistent state");
     faabric::state::getGlobalState().writePersistentStateBatch(kvMap);
-    SPDLOG_INFO("Local persistent state set successfully");
+    SPDLOG_DEBUG("Local persistent state set successfully");
 }
 
-void Scheduler::flushState(){
+std::string Scheduler::getLocalPersistentState(std::string key)
+{
+    SPDLOG_DEBUG("Getting local persistent state for key: {}", key);
+    std::string value;
+    value = faabric::state::getGlobalState().readPersistentState(key);
+
+    return value;
+}
+
+void Scheduler::flushState()
+{
     SPDLOG_INFO("Flushing state");
     faabric::state::getGlobalState().flushState();
 }

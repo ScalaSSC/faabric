@@ -28,8 +28,6 @@ inline V getOrThrow(const std::map<K, V>& map, const K& key)
     return it->second;
 }
 
-
-
 inline std::map<std::string, double> calculateProportions(
   const std::map<std::string, int>& data)
 {
@@ -90,6 +88,18 @@ inline faabric::batch_scheduler::HostMap getFirstNElements(
     }
 
     return filteredMap;
+}
+
+template<typename K, typename V>
+inline K getNthKey(const std::map<K, V>& map, std::size_t n)
+{
+    if (n >= map.size()) {
+        throw std::out_of_range("Index out of range");
+    }
+
+    auto it = map.begin();
+    std::advance(it, n);
+    return it->first;
 }
 
 template<typename K, typename V>

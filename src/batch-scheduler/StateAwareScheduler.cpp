@@ -63,18 +63,6 @@ std::vector<Host> StateAwareScheduler::getSortedHosts(
 // The following functions are implemented in StateAwareScheduler
 // ------------------------------------------
 
-template<typename K, typename V>
-K getNthKey(const std::map<K, V>& map, std::size_t n)
-{
-    if (n >= map.size()) {
-        throw std::out_of_range("Index out of range");
-    }
-
-    auto it = map.begin();
-    std::advance(it, n);
-    return it->first;
-}
-
 std::string to_string(const faabric::batch_scheduler::FunctionStateInfo& info)
 {
     std::ostringstream oss;
@@ -245,7 +233,7 @@ void StateAwareScheduler::doRegisterState(const HostMap& hostMap,
     // Assign state to a host.
     int hostIdx =
       stateRbCounter.fetch_add(1, std::memory_order_relaxed) % hostMap.size();
-    std::string host = getNthKey(hostMap, hostIdx);
+    std::string host = faabric::util::getNthKey(hostMap, hostIdx);
     stateHost[funcParaId] = host;
     // If it is partitioned state, register it.
     std::string partitionBy = std::get<0>(funcStateRegMap[userFunc]);
@@ -376,7 +364,7 @@ std::string StateAwareScheduler::scheduleStatelessMessageRB(
 {
     auto counter = getNextCounter(userFunc);
     int hostIdx = counter % hostMap.size();
-    std::string host = getNthKey(hostMap, hostIdx);
+    std::string host = faabric::util::getNthKey(hostMap, hostIdx);
     msg->set_messagetype(0);
     return host;
 }
@@ -1431,7 +1419,8 @@ void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
                 newFunctionParallelism[userFunc] = para;
                 for (int i = 0; i < para; ++i) {
                     int workerRB = i % groupAllocation.size();
-                    std::string worker = getNthKey(groupAllocation, workerRB);
+                    std::string worker =
+                      faabric::util::getNthKey(groupAllocation, workerRB);
                     newStateHost[userFunc + "_" + std::to_string(i)] = worker;
                 }
             }

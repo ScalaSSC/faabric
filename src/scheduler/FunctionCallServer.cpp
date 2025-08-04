@@ -43,10 +43,6 @@ void FunctionCallServer::doAsyncRecv(transport::Message& message)
             recvRegisterApplication(message.udata());
             break;
         }
-        case faabric::scheduler::FunctionCalls::SetPersistentState: {
-            recvSetPersistentState(message.udata());
-            break;
-        }
         default: {
             throw std::runtime_error(
               fmt::format("Unrecognized async call header: {}", header));
@@ -68,9 +64,12 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::MigrateStates: {
             return recvMigrateStates(message.udata());
         }
-        // case faabric::scheduler::FunctionCalls::GetWorkerLoad: {
-        //     return recvGetWorkerLoad(message.udata());
-        // }
+        case faabric::scheduler::FunctionCalls::GetPersistentState: {
+            return recvGetPersistentState(message.udata());
+        }
+        case faabric::scheduler::FunctionCalls::SetPersistentState: {
+            return recvSetPersistentState(message.udata());
+        }
         case faabric::scheduler::FunctionCalls::GetRuntimeStats: {
             return recvGetRuntimeStats(message.udata());
         }
@@ -336,7 +335,30 @@ void FunctionCallServer::recvRegisterApplication(
     faabric::scheduler::getScheduler().registerApp(std::move(applicationPtr));
 }
 
-void FunctionCallServer::recvSetPersistentState(std::span<const uint8_t> buffer)
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvGetPersistentState(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::planner::MapMessage, buffer.data(), buffer.size())
+    const auto& protoMap = parsedMsg.payload();
+
+    std::map<std::string, std::string> kvMap;
+    for (const auto& entry : protoMap) {
+        kvMap.emplace(entry.first, entry.second);
+    }
+
+    std::string key = kvMap["key"];
+
+    std::string value =
+      faabric::scheduler::getScheduler().getLocalPersistentState(key);
+
+    faabric::planner::MapMessage response;
+    response.mutable_payload()->insert({ key, value });
+    SPDLOG_DEBUG("Getting persistent state: {} -> {}", key, value);
+    return std::make_unique<faabric::planner::MapMessage>(std::move(response));
+}
+
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvSetPersistentState(std::span<const uint8_t> buffer)
 {
     PARSE_MSG(faabric::planner::MapMessage, buffer.data(), buffer.size())
     const auto& protoMap = parsedMsg.payload();
@@ -349,6 +371,8 @@ void FunctionCallServer::recvSetPersistentState(std::span<const uint8_t> buffer)
     }
 
     faabric::scheduler::getScheduler().setLocalPersistentState(kvMap);
+
+    return std::make_unique<faabric::EmptyResponse>();
 }
 
 }
