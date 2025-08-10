@@ -371,7 +371,22 @@ void RuntimeSummary::TuneImplDist(
   const std::string instanceName,
   const std::map<std::string, int>& observedDist)
 {
+    SPDLOG_DEBUG(
+      "Tuning implementation distribution for instance {} with observed "
+      "distribution",
+      instanceName);
+
+    if (implDistMap.count(instanceName) == 0) {
+        SPDLOG_ERROR(
+          "No implementation distribution for instance {}, skipping tuning",
+          instanceName);
+    }
     auto implDist = util::getOrThrow(implDistMap, instanceName);
+    if (expectedDistMap.count(instanceName) == 0) {
+        SPDLOG_ERROR(
+          "No expectedDistMap distribution for instance {}, skipping tuning",
+          instanceName);
+    }
     const auto& expectedDist = util::getOrThrow(expectedDistMap, instanceName);
 
     auto observedProbs = util::calculateProportions(observedDist);
@@ -413,6 +428,9 @@ void RuntimeSummary::CollocateHeadTune(
   const std::map<std::string, int>& observedDist)
 {
     TuneImplDist(instanceName, observedDist);
+    SPDLOG_DEBUG(
+      "Tuning collocate head for instance {} with observed distribution",
+      instanceName);
     buildHeadMetaScheduler(instanceName);
 }
 
@@ -421,6 +439,9 @@ void RuntimeSummary::CollocateBodyTune(
   const std::map<std::string, int>& observedDist)
 {
     TuneImplDist(instanceName, observedDist);
+    SPDLOG_DEBUG(
+      "Tuning collocate body for instance {} with observed distribution",
+      instanceName);
     buildBodyMetaScheduler(instanceName);
 }
 
@@ -429,6 +450,10 @@ void RuntimeSummary::RoundRobinBodyTune(
   const std::map<std::string, int>& observedDist)
 {
     TuneImplDist(instanceName, observedDist);
+
+    SPDLOG_DEBUG(
+      "Tuning round-robin body for instance {} with observed distribution",
+      instanceName);
 
     const auto& expectedDist = util::getOrThrow(expectedDistMap, instanceName);
     auto& implDist = implDistMap[instanceName];
@@ -479,6 +504,8 @@ void RuntimeSummary::requestDistTune(
                          instanceName);
             continue;
         }
+        SPDLOG_DEBUG("finding the observed distribution for instance {}",
+                     instanceName);
         auto observedDist = util::getOrThrow(observedDistMap, instanceName);
         if (operatorType == LocalStatelessOperatorType::ROUNDROBIN_HEAD) {
             continue;

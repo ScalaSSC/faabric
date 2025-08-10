@@ -504,7 +504,7 @@ std::string StateAwareScheduler::scheduleMessage(
     }
     // stateless operator
     else {
-        if (scheduleMode == 0) {
+        if (scheduleMode == 0 || scheduleMode == 5) {
             // If schedule mode is 0 (The scheduler should dispatch stateless
             // messages in accordance with the expected proportions).
             host = scheduleStatelessMessageApportion(userFunc, hostMap, msg);
@@ -720,6 +720,87 @@ void StateAwareScheduler::groupNodesHelper(
     }
 }
 
+void StateAwareScheduler::groupNodesStrictHelper(
+  const std::string& nodeName,
+  std::vector<NodeGroup>& groups,
+  std::unordered_set<std::string>& visited)
+{
+    if (visited.count(nodeName)) {
+        return;
+    }
+
+    std::vector<std::shared_ptr<Node>> currentGroup;
+    std::string currentPartition = NONE_STRING;
+
+    // Start a stack for DFS
+    std::vector<std::string> stack;
+    stack.push_back(nodeName);
+
+    while (!stack.empty()) {
+        std::string current = stack.back();
+        stack.pop_back();
+
+        if (visited.count(current)) {
+            continue;
+        }
+
+        auto node = application->getNodes().at(current);
+        currentGroup.push_back(node);
+        visited.insert(current);
+
+        if (node->type == PARTITIONED_STATEFUL) {
+            currentPartition = node->partitionBy;
+        }
+
+        // Find all successors
+        auto connIt = application->getConnections().find(current);
+        if (connIt != application->getConnections().end()) {
+            for (const auto& succName : connIt->second) {
+                auto succ = application->getNodes().at(succName);
+                bool canJoin = false;
+
+                if (succ->type == STATELESS) {
+                    canJoin = true;
+                }
+                if (succ->type == PARTITIONED_STATEFUL) {
+                    std::string succPartition = succ->partitionBy;
+                    bool violate = false;
+
+                    if (currentPartition != NONE_STRING &&
+                        currentPartition != succPartition) {
+                        violate = true;
+                    }
+                    for (auto node : currentGroup) {
+                        if (!node->inputFeilds.contains(succPartition)) {
+                            violate = true;
+                        }
+                    }
+                    if (!violate) {
+                        canJoin = true;
+                    }
+                }
+
+                if (node->type == STATEFUL) {
+                    canJoin = false;
+                }
+
+                if (canJoin && !visited.count(succName)) {
+                    // Joinable and not visited: add to this group and DFS next
+                    stack.push_back(succName);
+                } else if (!visited.count(succName)) {
+                    // Not joinable: start as a new group
+                    groupNodesStrictHelper(succName, groups, visited);
+                }
+            }
+        }
+    }
+
+    // Add the group if not empty
+    if (!currentGroup.empty()) {
+        groups.emplace_back(currentGroup, currentPartition);
+    }
+}
+
 bool StateAwareScheduler::nodeCollocation(
   const std::string& current,
   const std::string& partitionKey,
@@ -861,6 +942,7 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
         rescheduleAppFaaSFlow(hostMap);
         return;
     }
+
     SPDLOG_INFO("StateAwareScheduler: Reschedule the application according to "
                 "the metrics");
 
@@ -891,19 +973,24 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
     std::vector<NodeGroup> groups;
     std::unordered_set<std::string> visited;
 
-    for (const auto& inputNode : application->getInputNodes()) {
-        groupNodesHelper(inputNode, groups, visited);
-    }
-    // Schedule Mode 4 is not supported for stateful operator !!!!
     if (scheduleMode == 4) {
-        groups.clear();
         std::vector<std::shared_ptr<Node>> appNodesVec;
         for (const auto& [nodeName, nodePtr] : appNodes) {
             appNodesVec.push_back(nodePtr);
         }
         NodeGroup singleGroup{ std::move(appNodesVec), NONE_STRING };
         groups.push_back(singleGroup);
+    } else if (scheduleMode == 5) {
+        for (const auto& inputNode : application->getInputNodes()) {
+            groupNodesStrictHelper(inputNode, groups, visited);
+        }
+
+    } else {
+        for (const auto& inputNode : application->getInputNodes()) {
+            groupNodesHelper(inputNode, groups, visited);
+        }
     }
+
     {
         std::stringstream ss;
         for (size_t i = 0; i < groups.size(); ++i) {
@@ -1532,8 +1619,8 @@ void StateAwareScheduler::printScheduleInfomation() const
 void StateAwareScheduler::runtimeDistTune(
   const std::map<std::string, std::map<std::string, int>>& observeDistMap)
 {
-    // We only schedule when the schedule mode is 0.
-    if (scheduleMode != 0) {
+    // We only schedule when the schedule mode is 0 and 5.
+    if (scheduleMode != 0 && scheduleMode != 5) {
         return;
     }
     runtimeSummary.requestDistTune(observeDistMap);
@@ -1549,8 +1636,10 @@ void StateAwareScheduler::resetScheduler()
     SPDLOG_INFO("Flushing state information");
     stateRbCounter.store(0);
 
-    redis::Redis& redis = redis::Redis::getState();
-    redis.flushAll();
+    if (isplanner) {
+        redis::Redis& redis = redis::Redis::getState();
+        redis.flushAll();
+    }
     functionParallelism.clear();
     counterTable.clear();
     scheduledOperatorsMap.clear();

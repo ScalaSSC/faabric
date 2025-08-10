@@ -1115,6 +1115,8 @@ void Scheduler::updateStatesInfo(
         throw std::runtime_error("maxReplicas is less than 1");
     }
 
+    decentralScheduler.resetScheduler();
+
     decentralScheduler.setScheuduledOperatorMap(scheuduledOperatorMap);
 
     // Update the states info in decentralized scheduler

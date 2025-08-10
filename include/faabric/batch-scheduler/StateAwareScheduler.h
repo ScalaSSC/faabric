@@ -239,5 +239,9 @@ class StateAwareScheduler : public BatchScheduler
     void groupNodesHelper(const std::string& nodeName,
                           std::vector<NodeGroup>& groups,
                           std::unordered_set<std::string>& visited);
+
+    void groupNodesStrictHelper(const std::string& nodeName,
+                          std::vector<NodeGroup>& groups,
+                          std::unordered_set<std::string>& visited);                          
 };
 }
