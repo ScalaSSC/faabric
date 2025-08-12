@@ -104,9 +104,9 @@ class Application
     void addConnection(const std::string& src, const std::string& dest);
     void buildInvertConnections();
     void displayApplication() const;
-    double computePreWorkloads(); // return total workload
+    double computePreWorkloads(int scheduleMode); // return total workload
     // TODO - Now we only support homogenous cluster.
-    void quantiseResources(const int numHosts);
+    void quantiseResources(const int numHosts, int scheduleMode);
     std::vector<std::shared_ptr<Node>> getSource(const std::string& node) const;
 
     std::map<std::string, std::shared_ptr<Node>>& getNodes()

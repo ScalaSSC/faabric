@@ -927,7 +927,7 @@ void Planner::updateRuntimeStats()
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeStatsUpdatePeriod));
 
-        if (scheduleMode != 0 && scheduleMode != 5) {
+        if (scheduleMode != 0 && scheduleMode != 5 && scheduleMode != 6) {
             continue; // Only run in decentralized scheduler mode
         }
 

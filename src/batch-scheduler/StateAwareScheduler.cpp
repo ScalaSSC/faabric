@@ -504,7 +504,7 @@ std::string StateAwareScheduler::scheduleMessage(
     }
     // stateless operator
     else {
-        if (scheduleMode == 0 || scheduleMode == 5) {
+        if (scheduleMode == 0 || scheduleMode == 5 || scheduleMode == 6) {
             // If schedule mode is 0 (The scheduler should dispatch stateless
             // messages in accordance with the expected proportions).
             host = scheduleStatelessMessageApportion(userFunc, hostMap, msg);
@@ -801,6 +801,73 @@ void StateAwareScheduler::groupNodesStrictHelper(
     }
 }
 
+void StateAwareScheduler::groupNodesLooseHelper(
+  const std::string& nodeName,
+  std::vector<NodeGroup>& groups,
+  std::unordered_set<std::string>& visited)
+{
+    if (visited.count(nodeName)) {
+        return;
+    }
+
+    std::vector<std::shared_ptr<Node>> currentGroup;
+    std::string currentPartition = NONE_STRING;
+
+    // Start a stack for DFS
+    std::vector<std::string> stack;
+    stack.push_back(nodeName);
+
+    while (!stack.empty()) {
+        std::string current = stack.back();
+        stack.pop_back();
+
+        if (visited.count(current)) {
+            continue;
+        }
+
+        auto node = application->getNodes().at(current);
+        currentGroup.push_back(node);
+        visited.insert(current);
+
+        if (node->type == PARTITIONED_STATEFUL) {
+            currentPartition = node->partitionBy;
+        }
+
+        // Find all successors
+        auto connIt = application->getConnections().find(current);
+        if (connIt != application->getConnections().end()) {
+            for (const auto& succName : connIt->second) {
+                auto succ = application->getNodes().at(succName);
+                bool canJoin = false;
+
+                if (succ->type == STATELESS) {
+                    canJoin = true;
+                }
+                if (succ->type == PARTITIONED_STATEFUL) {
+                    canJoin = true;
+                }
+
+                if (node->type == STATEFUL) {
+                    canJoin = false;
+                }
+
+                if (canJoin && !visited.count(succName)) {
+                    // Joinable and not visited: add to this group and DFS next
+                    stack.push_back(succName);
+                } else if (!visited.count(succName)) {
+                    // Not joinable: start as a new group
+                    groupNodesLooseHelper(succName, groups, visited);
+                }
+            }
+        }
+    }
+
+    // Add the group if not empty
+    if (!currentGroup.empty()) {
+        groups.emplace_back(currentGroup, currentPartition);
+    }
+}
+
 bool StateAwareScheduler::nodeCollocation(
   const std::string& current,
   const std::string& partitionKey,
@@ -963,7 +1030,7 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
     }
 
     // TODO - scale the number of hosts.
-    application->quantiseResources(hostMap.size());
+    application->quantiseResources(hostMap.size(), scheduleMode);
     application->showConnections();
 
     //--------------------------------------------------------------------------
@@ -984,8 +1051,12 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
         for (const auto& inputNode : application->getInputNodes()) {
             groupNodesStrictHelper(inputNode, groups, visited);
         }
-
-    } else {
+    } else if (scheduleMode == 6){
+        for (const auto& inputNode : application->getInputNodes()) {
+            groupNodesLooseHelper(inputNode, groups, visited);
+        }
+    } 
+    else {
         for (const auto& inputNode : application->getInputNodes()) {
             groupNodesHelper(inputNode, groups, visited);
         }
@@ -1186,11 +1257,12 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
 
         for (const auto& psNode : psNodes) {
             const auto& psName = psNode->name;
+            auto psNodePartition = psNode->partitionBy;
             auto sources = application->getSource(psName);
             for (const auto& srcNode : sources) {
                 collectCollocation(srcNode->name,
                                    psName,
-                                   groupPartition,
+                                   psNodePartition,
                                    newOptsCollocateMap,
                                    groupNodeNames);
             }
@@ -1416,7 +1488,7 @@ void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
         return;
     }
 
-    application->quantiseResources(hostMap.size());
+    application->quantiseResources(hostMap.size(), scheduleMode);
     application->showConnections();
 
     //--------------------------------------------------------------------------
@@ -1620,7 +1692,7 @@ void StateAwareScheduler::runtimeDistTune(
   const std::map<std::string, std::map<std::string, int>>& observeDistMap)
 {
     // We only schedule when the schedule mode is 0 and 5.
-    if (scheduleMode != 0 && scheduleMode != 5) {
+    if (scheduleMode != 0 && scheduleMode != 5 && scheduleMode != 6) {
         return;
     }
     runtimeSummary.requestDistTune(observeDistMap);

@@ -166,7 +166,7 @@ void Application::displayApplication() const
     SPDLOG_INFO("{}", logStream.str());
 }
 
-double Application::computePreWorkloads()
+double Application::computePreWorkloads(int scheduleMode)
 {
     // Get the minimum processed tuples operator in the application.
     long minimizedInput = std::numeric_limits<long>::max();
@@ -188,8 +188,18 @@ double Application::computePreWorkloads()
     // Preworkload is quantified by number of requests processed.
     double totalPreWorkload = 0;
     for (auto& [nodeName, node] : nodes) {
-        node->preWorkload = std::round(
-          static_cast<double>(node->processedTuples) / minimizedInput);
+        double estimateWork = static_cast<double>(node->processedTuples);
+        if (scheduleMode != 3 && connectionsWithWeight.count(nodeName) > 0) {
+            for (const auto& [_, weight] : connectionsWithWeight.at(nodeName)) {
+                if (minimizedInput == 1) {
+                    estimateWork += 0.1;
+                } else {
+                    estimateWork += 0.1 * static_cast<double>(weight);
+                }
+            }
+        }
+
+        node->preWorkload = std::round(estimateWork / minimizedInput);
 
         // It should never be less than 1.0, just in case.
         if (node->preWorkload < 1.0) {
@@ -201,9 +211,9 @@ double Application::computePreWorkloads()
     return totalPreWorkload;
 }
 
-void Application::quantiseResources(const int numHosts)
+void Application::quantiseResources(const int numHosts, int scheduleMode)
 {
-    double totalPreWorkload = computePreWorkloads();
+    double totalPreWorkload = computePreWorkloads(scheduleMode);
 
     // Update the resource required for each operator (number of workers).
     auto& appNodes = nodes;

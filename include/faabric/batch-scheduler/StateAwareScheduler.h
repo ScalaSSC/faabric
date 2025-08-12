@@ -96,11 +96,11 @@ class StateAwareScheduler : public BatchScheduler
       const HostMap& hostMap,
       const std::unique_ptr<Message>& msg);
 
-     std::string scheduleStatelessMessageLocal(
+    std::string scheduleStatelessMessageLocal(
       std::string& userFunc,
       const HostMap& hostMap,
       const std::unique_ptr<Message>& msg);
-     
+
     std::string scheduleStatefulMessage(std::string& userFunc,
                                         const std::unique_ptr<Message>& msg);
 
@@ -241,7 +241,11 @@ class StateAwareScheduler : public BatchScheduler
                           std::unordered_set<std::string>& visited);
 
     void groupNodesStrictHelper(const std::string& nodeName,
-                          std::vector<NodeGroup>& groups,
-                          std::unordered_set<std::string>& visited);                          
+                                std::vector<NodeGroup>& groups,
+                                std::unordered_set<std::string>& visited);
+
+    void groupNodesLooseHelper(const std::string& nodeName,
+                               std::vector<NodeGroup>& groups,
+                               std::unordered_set<std::string>& visited);
 };
 }
