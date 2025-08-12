@@ -74,12 +74,20 @@ const long Clock::timeDiffNano(const TimePoint& t1, const TimePoint& t2)
     return age;
 }
 
-const int64_t getCpuTimeNano(clockid_t clk)
+const int64_t getCpuTimeNano()
+{
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return -1; // error
+    }
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+const int64_t getCpuTimeNano(const clockid_t clk)
 {
     timespec ts{};
     if (clock_gettime(clk, &ts) != 0) {
-        perror("clock_gettime");
-        return -1;
+        return -1; // error
     }
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }

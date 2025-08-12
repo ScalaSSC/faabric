@@ -37,6 +37,9 @@ class FunctionCallServer final
     std::unique_ptr<google::protobuf::Message> recvGetRuntimeStats(
       std::span<const uint8_t> buffer);
 
+    std::unique_ptr<google::protobuf::Message> recvGetWorkerStats(
+      std::span<const uint8_t> buffer);
+
     std::unique_ptr<google::protobuf::Message> recvCustom(
       std::span<const uint8_t> buffer);
 

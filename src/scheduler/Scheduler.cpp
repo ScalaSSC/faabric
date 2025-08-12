@@ -56,6 +56,7 @@ Scheduler::Scheduler()
   , conf(faabric::util::getSystemConfig())
   , reg(faabric::snapshot::getSnapshotRegistry())
   , broker(faabric::transport::getPointToPointBroker())
+  , cpuRecordStart(std::chrono::steady_clock::now())
 //   , instancesLoadState(maxSamples)
 {
     executeBatchsize = conf.batchSize;
@@ -183,6 +184,16 @@ void Scheduler::reset()
         }
     }
     executors.clear();
+
+    faabric::util::FullLock cpuLock(cpuRecordMx);
+    cpuScheduleTime = 0;
+    cpuRecordStart = std::chrono::steady_clock::now();
+    while (!cpuRecordHistory.empty()) {
+        cpuRecordHistory.pop();
+    }
+    runningThreads.clear();
+    threadClockStartMap.clear();
+    cpuLock.unlock();
 
     // Clear the point to point broker
     broker.clear();
@@ -482,7 +493,11 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                      userFuncPar,
                      newReq->messages_size());
         // Execute the BatchRequest
-        e->executeBatchTasks(newReq, std::move(stateLock));
+        auto threadClockId = e->executeBatchTasks(newReq, std::move(stateLock));
+        {
+            faabric::util::FullLock cpuLock(cpuRecordMx);
+            runningThreads.emplace(threadClockId);
+        }
         // Quit if no executor is available. Otherwise, execute the next batch.
         if (!executorAvailable(funcStr)) {
             break;
@@ -658,6 +673,58 @@ void Scheduler::dispatchChainedMsgs()
             break;
         }
 
+        faabric::util::FullLock cpuLock(cpuRecordMx);
+        auto nowWall = std::chrono::steady_clock::now();
+        if (nowWall - cpuRecordStart >= cpuRecordWindow) {
+            const auto wallNs =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                nowWall - cpuRecordStart)
+                .count();
+            long long totalDeltaNs = 0;
+
+            for (const auto& [clk, startNs] : threadClockStartMap) {
+                const int64_t endNs = faabric::util::getCpuTimeNano(clk);
+                if (endNs >= 0 && startNs >= 0 && endNs >= startNs) {
+                    const int64_t deltaNs = endNs - startNs;
+
+                    totalDeltaNs += deltaNs;
+                    SPDLOG_DEBUG(
+                      "Thread clk {} CPU delta: {} ns", (int)clk, deltaNs);
+                }
+            }
+
+            if (wallNs > 0 && totalDeltaNs > 0) {
+                const double cpuExecutePct =
+                  100.0 * (double)totalDeltaNs / (double)wallNs;
+                const int64_t cpuScheduleNs =
+                  cpuScheduleTime.exchange(0, std::memory_order_acq_rel);
+                const double cpuSchedulePct =
+                  100.0 * (double)cpuScheduleNs / (double)wallNs;
+
+                SPDLOG_DEBUG(
+                  "CPU execute percentage: {:.2f}%, CPU schedule percentage: "
+                  "{:.2f}%",
+                  cpuExecutePct,
+                  cpuSchedulePct);
+
+                cpuRecordHistory.emplace(
+                  std::make_tuple(cpuExecutePct, cpuSchedulePct));
+                while (cpuRecordHistory.size() > historyCap) {
+                    cpuRecordHistory.pop();
+                }
+            }
+            threadClockStartMap.clear();
+
+            for (const clockid_t clk : runningThreads) {
+                const int64_t nowNs = faabric::util::getCpuTimeNano(clk);
+                if (nowNs >= 0) {
+                    threadClockStartMap.emplace(clk, nowNs);
+                }
+            }
+            cpuRecordStart = nowWall;
+        }
+        cpuLock.unlock();
+
         // if scheduleMode is 2 (centralized), we need to transfer the chained
         // calls to planner
         if (scheduleMode == 2) {
@@ -685,7 +752,6 @@ void Scheduler::dispatchChainedMsgs()
         // Schedule the chained calls
         // MAP<instanceName, <host, count>>
         std::map<std::string, std::map<std::string, int>> chainedCallsCounter;
-
         std::vector<std::unique_ptr<faabric::Message>> localChainedCallMsgs;
         {
             faabric::util::FullLock chainedCallLock(chainedCallMsgsMx);
@@ -695,8 +761,16 @@ void Scheduler::dispatchChainedMsgs()
             }
         }
         if (!localChainedCallMsgs.empty()) {
+            // Schedule the chained calls
+            auto start = faabric::util::getCpuTimeNano();
             auto hosts = decentralScheduler.scheduleMessagesBatch(
               hostMap, localChainedCallMsgs);
+            auto end = faabric::util::getCpuTimeNano();
+            if (start > 0 && end >= start) {
+                cpuScheduleTime.fetch_add(end - start,
+                                          std::memory_order_relaxed);
+            }
+
             // Statistics the chained calls
             for (int i = 0; i < localChainedCallMsgs.size(); i++) {
                 auto msg = localChainedCallMsgs[i].get();
@@ -1186,8 +1260,8 @@ void Scheduler::updateStatesInfo(
         }
         SPDLOG_INFO("{}", oss.str());
         // TODO - there is a bug here !
-        // For stateful operator, it can cause the state to be lost. (unstop running)
-        // maybe loadMigrateState or maybe the flush state has bugs.
+        // For stateful operator, it can cause the state to be lost. (unstop
+        // running) maybe loadMigrateState or maybe the flush state has bugs.
         // stateServer.loadMigrateState(tempMigrateStateMap);
 
         tempMigrateStateMap.clear();
@@ -1268,6 +1342,11 @@ void Scheduler::flushState()
 {
     SPDLOG_INFO("Flushing state");
     faabric::state::getGlobalState().flushState();
+}
+
+std::queue<std::tuple<double, double>> Scheduler::getCpuRecordHistory()
+{
+    return cpuRecordHistory;
 }
 
 }

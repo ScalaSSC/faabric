@@ -150,9 +150,11 @@ class Scheduler
         sourceCountStats);
 
     std::string getLocalPersistentState(std::string key);
-    
+
     void setLocalPersistentState(
       const std::map<std::string, std::string>& kvMap);
+
+    std::queue<std::tuple<double, double>> getCpuRecordHistory();
 
   private:
     std::string thisHost;
@@ -267,6 +269,16 @@ class Scheduler
                           std::vector<std::unique_ptr<faabric::Message>> msgs);
 
     void dispatchChainedMsgs();
+
+    std::shared_mutex cpuRecordMx;
+    std::atomic<std::int64_t> cpuScheduleTime{ 0 };
+    std::chrono::steady_clock::time_point cpuRecordStart{};
+    std::chrono::seconds cpuRecordWindow{ 10 };
+    size_t historyCap = 60;
+    std::queue<std::tuple<double, double>> cpuRecordHistory;
+    // std::map<std::string, clockid_t> runningThreads;
+    std::set<clockid_t> runningThreads;
+    std::map<clockid_t, int64_t> threadClockStartMap;
 };
 
 }

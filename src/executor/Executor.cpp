@@ -110,7 +110,7 @@ Executor::~Executor()
     }
 }
 
-void Executor::executeBatchTasks(
+clockid_t Executor::executeBatchTasks(
   std::shared_ptr<faabric::BatchExecuteRequest> req,
   std::unique_ptr<std::shared_lock<std::shared_mutex>> stateLock)
 {
@@ -184,6 +184,14 @@ void Executor::executeBatchTasks(
         threadPoolThreads.at(threadPoolIdx) = std::make_shared<std::jthread>(
           std::bind_front(&Executor::threadPoolThread, this), threadPoolIdx);
     }
+
+    clockid_t cid{};
+    if (pthread_getcpuclockid(
+          threadPoolThreads.at(threadPoolIdx)->native_handle(), &cid) != 0) {
+        perror("pthread_getcpuclockid");
+        // Handle error: maybe return an invalid value or throw
+    }
+    return cid;
 }
 
 long Executor::getMillisSinceLastExec()

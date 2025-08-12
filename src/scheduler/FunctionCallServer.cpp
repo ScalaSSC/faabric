@@ -73,6 +73,9 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::GetRuntimeStats: {
             return recvGetRuntimeStats(message.udata());
         }
+        case faabric::scheduler::FunctionCalls::GetWorkerStats: {
+            return recvGetWorkerStats(message.udata());
+        }
         case faabric::scheduler::FunctionCalls::Custom: {
             return recvCustom(message.udata());
         }
@@ -271,6 +274,29 @@ FunctionCallServer::recvGetRuntimeStats(std::span<const uint8_t> buffer)
     }
 
     return std::make_unique<faabric::RuntimeStatsResult>(std::move(response));
+}
+
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
+
+    SPDLOG_DEBUG("Getting worker stats for host");
+    auto snapshot = scheduler.getCpuRecordHistory();
+
+    WorkerStats out;
+    out.set_ip(faabric::util::getSystemConfig().endpointHost);
+
+    while (!snapshot.empty()) {
+        auto [execPct, schedPct] = snapshot.front();
+        snapshot.pop();
+
+        auto* rec = out.add_history();
+        rec->set_cpuexecutepct(execPct);
+        rec->set_cpuschedulepct(schedPct);
+    }
+
+    return std::make_unique<faabric::WorkerStats>(std::move(out));
 }
 
 void FunctionCallServer::recvExecuteFunctions(std::span<const uint8_t> buffer)

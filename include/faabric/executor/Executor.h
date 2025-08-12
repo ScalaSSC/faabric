@@ -29,7 +29,7 @@ class Executor
     virtual ~Executor();
 
     // Execute all the messages in this request in one invocation.
-    void executeBatchTasks(
+    clockid_t executeBatchTasks(
       std::shared_ptr<faabric::BatchExecuteRequest> req,
       std::unique_ptr<std::shared_lock<std::shared_mutex>> stateLock);
 

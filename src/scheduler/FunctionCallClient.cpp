@@ -98,6 +98,14 @@ FunctionCallClient::getRuntimeStats(faabric::RuntimeStatsUpdateRequest req)
     return std::make_unique<faabric::RuntimeStatsResult>(resp);
 }
 
+std::unique_ptr<faabric::WorkerStats> FunctionCallClient::getWorkerStats()
+{
+    faabric::EmptyRequest req;
+    faabric::WorkerStats resp;
+    syncSend(faabric::scheduler::FunctionCalls::GetWorkerStats, &req, &resp);
+    return std::make_unique<faabric::WorkerStats>(resp);
+}
+
 void FunctionCallClient::executeFunctions(
   const std::shared_ptr<faabric::BatchExecuteRequest> req)
 {

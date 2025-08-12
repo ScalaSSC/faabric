@@ -877,9 +877,39 @@ std::string Planner::outputResult()
     faabric::util::FullLock reqStatusLock(state.reqStatusMx);
     isOutputting = true;
     // We have to unlock, since the output operation may take a long time
-    std::string result = state.applicationMetrics->getMetrics();
-    SPDLOG_INFO("Outputting result: {}", result);
-    return result;
+    auto doc = state.applicationMetrics->getMetrics();
+    reqStatusLock.unlock();
+
+    SPDLOG_INFO("Planner fetch worker statistics");
+
+    auto& alloc = doc.GetAllocator();
+    rapidjson::Value workerStatsObj(rapidjson::kObjectType);
+    for (const auto& [ip, host] : state.hostMap) {
+        SPDLOG_DEBUG("Planner fetch stats from host {}", ip);
+        auto stats =
+          faabric::scheduler::getFunctionCallClient(ip)->getWorkerStats();
+
+        rapidjson::Value historyArr(rapidjson::kArrayType);
+        for (const auto& rec : stats->history()) {
+            rapidjson::Value recObj(rapidjson::kObjectType);
+            recObj.AddMember("cpuExecutePct", rec.cpuexecutepct(), alloc);
+            recObj.AddMember("cpuSchedulePct", rec.cpuschedulepct(), alloc);
+            historyArr.PushBack(recObj, alloc);
+        }
+
+        // Add to workerStatsObj under the IP key
+        workerStatsObj.AddMember(
+          rapidjson::Value(ip.c_str(), alloc).Move(), historyArr, alloc);
+    }
+
+    doc.AddMember("workerStats", workerStatsObj, alloc);
+
+    isOutputting = false;
+    // Write out the JSON document to a string.
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+    return buffer.GetString();
 }
 
 void Planner::updateRuntimeStats()

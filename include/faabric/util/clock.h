@@ -26,9 +26,12 @@ class Clock
     const long timeDiffNano(const TimePoint& t1, const TimePoint& t2);
 
     const long timeDiffMicro(const TimePoint& t1, const TimePoint& t2);
-
-    const int64_t getCpuTimeNano(clockid_t clk);
 };
 
 Clock& getGlobalClock();
+
+const int64_t getCpuTimeNano();
+
+const int64_t getCpuTimeNano(const clockid_t clk);
+
 }

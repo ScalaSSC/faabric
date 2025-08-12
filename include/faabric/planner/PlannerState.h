@@ -268,7 +268,7 @@ class ApplicationMetrics
         return edgeWeightMap;
     }
 
-    std::string getMetrics() const
+    rapidjson::Document getMetrics() const
     {
         faabric::util::FullLock lock(opMx);
 
@@ -353,12 +353,7 @@ class ApplicationMetrics
               alloc);
         }
         doc.AddMember("instances", instancesObj, alloc);
-
-        // Write out the JSON document to a string.
-        rapidjson::StringBuffer buffer;
-        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-        doc.Accept(writer);
-        return buffer.GetString();
+        return doc;
     }
 
     void reset()

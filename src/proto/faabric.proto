@@ -380,3 +380,13 @@ message RuntimeStatsUpdateRequest{
 message CustomRequest {
     string payload = 1;
 }
+
+message CpuRecord {
+    double cpuExecutePct = 1;
+    double cpuSchedulePct = 2;
+}
+
+message WorkerStats{
+    string ip = 1;
+    repeated CpuRecord history = 2;
+}
