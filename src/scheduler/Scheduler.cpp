@@ -230,6 +230,7 @@ void Scheduler::reset()
     }
 
     scheduledMsgsMap.clear();
+    maxReplicasMap.clear();
 
     // This function is called when planner flush executors. In this case,
     // planner didn't flush the hostmap, the scheduler also should not flush it.
@@ -391,6 +392,10 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
         int messageType = msg.messagetype();
         if (messageType == 2) {
             size_t hash = msg.hash();
+            int maxReplicas =
+              util::getOrThrow(maxReplicasMap,
+                               msg.user() + "/" + msg.function() + "/" +
+                                 std::to_string(msg.parallelismid()));
             auto [iterator, inserted] = partitionedWaitingQueues.emplace(
               waitingQueueName,
               std::make_unique<faabric::util::PartitionedStateMessageQueue>(
@@ -688,8 +693,8 @@ void Scheduler::dispatchChainedMsgs()
                     const int64_t deltaNs = endNs - startNs;
 
                     totalDeltaNs += deltaNs;
-                    SPDLOG_DEBUG(
-                      "Thread clk {} CPU delta: {} ns", (int)clk, deltaNs);
+                    // SPDLOG_DEBUG(
+                    //   "Thread clk {} CPU delta: {} ns", (int)clk, deltaNs);
                 }
             }
 
@@ -858,10 +863,12 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         plannerCallInterval = value;
         SPDLOG_INFO("Reset plannerCallInterval parameter to : {}",
                     plannerCallInterval);
-    } else if (key == "max_replicas") {
-        maxReplicas = value;
-        SPDLOG_INFO("Reset maxReplicas parameter to : {}", maxReplicas);
-    } else if (key == "batch_size") {
+    }
+    // else if (key == "max_replicas") {
+    //     maxReplicas = value;
+    //     SPDLOG_INFO("Reset maxReplicas parameter to : {}", maxReplicas);
+    // }
+    else if (key == "batch_size") {
         executeBatchsize = value;
         // change the batch size of all waiting queues
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
@@ -912,6 +919,7 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
     // max replicas are limited. Total number of executors won't exceed the
     // maxExecutors. If current current replicas is less than the max size,
     // return true.
+    int maxReplicas = util::getOrThrow(maxReplicasMap, funcStr);
     if (thisExecutors.size() < maxReplicas) {
         return true;
     } else {
@@ -1156,37 +1164,68 @@ void Scheduler::updateStatesInfo(
     faabric::util::FullLock stateLock(stateUpdateMx);
     SPDLOG_DEBUG("updateStatesInfo: state lock acquired");
 
-    // reset max replicas based on number of instances assigned loccally.
-    int localInstanceCount = 0;
+    maxReplicasMap.clear();
+    // reset max replicas based on resource requirements.
+    std::map<std::string, int> tempMaxReplicasMap;
     for (const auto& [operatorName, operatorInfo] : scheuduledOperatorMap) {
+        if (operatorInfo.weightDist.count(thisHost) <= 0) {
+            continue;
+        }
+        std::string userFunc = util::splitUserFunc(operatorName).first + "/" +
+                               util::splitUserFunc(operatorName).second;
+        // If operator is stateless
         if (operatorInfo.node.type == faabric::batch_scheduler::STATELESS) {
-            // For distributed scheduler (default) and centralized scheduler,
-            // stateless operator are distributed in RB across all hosts.
-            if (scheduleMode == 1 || scheduleMode == 2) {
-                localInstanceCount++;
-            } else if (operatorInfo.weightDist.count(thisHost) > 0) {
-                localInstanceCount++;
-            }
-        } else {
-            for (const auto& [_, ip] : operatorInfo.parallelismDist) {
+            int maxReplica =
+              std::round(operatorInfo.weightDist.at(thisHost) * maxExecutors);
+            tempMaxReplicasMap[userFunc + "/0"] = maxReplica;
+        }
+        // If operator is stateful
+        else if (operatorInfo.node.type == faabric::batch_scheduler::STATEFUL) {
+            double totalWeight = operatorInfo.weightDist.at(thisHost);
+            int totalInstsances = 0;
+            for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
                 if (ip == thisHost) {
-                    localInstanceCount++;
+                    totalInstsances++;
+                }
+            }
+            double instanceWeight =
+              totalWeight / static_cast<double>(totalInstsances);
+            for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
+                if (ip == thisHost) {
+                    int maxReplica = std::round(instanceWeight * maxExecutors);
+                    tempMaxReplicasMap[userFunc + "/" + std::to_string(parId)] =
+                      maxReplica;
+                }
+            }
+        }
+        // If operator is partitioned stateful
+        else if (operatorInfo.node.type ==
+                 faabric::batch_scheduler::PARTITIONED_STATEFUL) {
+            for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
+                if (ip == thisHost) {
+                    double weight = operatorInfo.weightDist.at(thisHost);
+                    int maxReplica = std::round(weight * maxExecutors);
+                    tempMaxReplicasMap[userFunc + "/" + std::to_string(parId)] =
+                      maxReplica;
                 }
             }
         }
     }
-    if (localInstanceCount == 0) {
-        localInstanceCount = maxExecutors;
+    // We then scale, make sure the total replicas are not larger than
+    // maxExecutors.
+    int totalReplicas = 0;
+    for (const auto& [funcStr, maxReplica] : tempMaxReplicasMap) {
+        totalReplicas += maxReplica;
     }
-    maxReplicas = maxExecutors / localInstanceCount;
-    SPDLOG_INFO("updateStatesInfo: localInstanceCount is {}, maxReplicas is "
-                "{}, maxExecutors is {}",
-                localInstanceCount,
-                maxReplicas,
-                maxExecutors);
-    if (maxReplicas < 1) {
-        SPDLOG_ERROR("maxReplicas is less than 1, too many instances");
-        throw std::runtime_error("maxReplicas is less than 1");
+    double scaleFactor =
+      static_cast<double>(maxExecutors) / static_cast<double>(totalReplicas);
+    for (const auto& [funcStr, maxReplica] : tempMaxReplicasMap) {
+        int scaledMaxReplica =
+          std::round(static_cast<double>(maxReplica) * scaleFactor);
+        maxReplicasMap[funcStr] = scaledMaxReplica;
+        SPDLOG_DEBUG("updateStatesInfo: {} max replicas set to {}",
+                     funcStr,
+                     scaledMaxReplica);
     }
 
     decentralScheduler.resetScheduler();
@@ -1347,6 +1386,11 @@ void Scheduler::flushState()
 std::queue<std::tuple<double, double>> Scheduler::getCpuRecordHistory()
 {
     return cpuRecordHistory;
+}
+
+std::map<std::string, int> Scheduler::getMaxReplicasMap()
+{
+    return maxReplicasMap;
 }
 
 }

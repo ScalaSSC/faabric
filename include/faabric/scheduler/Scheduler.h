@@ -156,6 +156,8 @@ class Scheduler
 
     std::queue<std::tuple<double, double>> getCpuRecordHistory();
 
+    std::map<std::string, int> getMaxReplicasMap();
+
   private:
     std::string thisHost;
 
@@ -168,7 +170,9 @@ class Scheduler
     int scheduleMode = 0;
 
     // Maximum number of replicas per function
-    int maxReplicas = 8;
+    // int maxReplicas = 8;
+
+    std::map<std::string, int> maxReplicasMap;
 
     // Maximum number of concurrent executors in the worker
     int maxExecutors = 40;

@@ -351,7 +351,7 @@ void RuntimeSummary::doInitExpectedDist(ScheduledOperator& schedOp)
     std::string instanceName = schedOp.node.name + "_0";
     auto hostWeight = schedOp.weightDist;
 
-    int sumWeight = 0;
+    double sumWeight = 0;
     for (const auto& [host, weight] : hostWeight) {
         sumWeight += weight;
     }
@@ -363,7 +363,7 @@ void RuntimeSummary::doInitExpectedDist(ScheduledOperator& schedOp)
     }
     auto& dist = expectedDistMap[instanceName];
     for (const auto& [host, weight] : hostWeight) {
-        dist[host] = static_cast<double>(weight) / sumWeight;
+        dist[host] = weight / sumWeight;
     }
 }
 

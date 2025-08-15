@@ -57,7 +57,7 @@ void DecentralizedScheduler::syncStatesInfo(
           getScheduledOperatorOrThrow(scheduledOperatorsMap, userFunc);
         auto parallelismDist = scheduledOpt.parallelismDist;
         auto weightDist = scheduledOpt.weightDist;
-        std::map<int, int> parStateReqWeight;
+        std::map<int, double> parStateReqWeight;
         for (const auto& [idx, ip] : parallelismDist) {
             if (weightDist.contains(ip)) {
                 parStateReqWeight[idx] = weightDist.at(ip);

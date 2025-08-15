@@ -165,7 +165,7 @@ message ScheduledOperator {
   bool is_collocate = 3;
   string collocate_with = 4;
   int32 parallelism = 5;
-  map<string, int32> weight_dist = 6;
+  map<string, double> weight_dist = 6;
   map<int32, string> parallelism_dist = 7;
   LocalStatelessOperatorType local_type = 8;
 }

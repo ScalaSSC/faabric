@@ -910,9 +910,10 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
   int groupId,
   const std::vector<std::shared_ptr<Node>>& group,
   const std::map<std::string, std::string>& newOptsCollocateMap,
-  const std::map<std::string, std::map<std::string, int>>&
+  const std::map<std::string, std::map<std::string, double>>&
     newStatelessReqWeight,
-  const std::map<std::string, std::map<int, int>>& newParStateReqWeight) const
+  const std::map<std::string, std::map<int, double>>& newParStateReqWeight)
+  const
 {
     std::map<std::string, ScheduledOperator> scheduledOperatorsGroup;
     // If the source of the group is not in the same group, it is the head.
@@ -924,7 +925,7 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
         std::string collocatewith = "None";
         int parallelism = 1;
         // IP to weight distribution.
-        std::map<std::string, int> weightDist;
+        std::map<std::string, double> weightDist;
         // State instance id to IP Mapping. Only used for stateful
         // operators.
         std::map<int, std::string> parallelismDist;
@@ -965,6 +966,8 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
             }
         }
         if (type == STATEFUL) {
+            auto instReqRes =
+              node->reqResource / static_cast<double>(node->parallelism);
             for (int i = 0; i < parallelism; ++i) {
                 std::string userFuncPar =
                   userFunction + "_" + std::to_string(i);
@@ -976,7 +979,7 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
                 parallelismDist[i] = assignedIp;
                 // Assuming the weight distribution for each stateful
                 // parallelism instance is the same
-                weightDist[assignedIp] = weightFactor / parallelism;
+                weightDist[assignedIp] += instReqRes;
             }
         }
 
@@ -1051,12 +1054,11 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
         for (const auto& inputNode : application->getInputNodes()) {
             groupNodesStrictHelper(inputNode, groups, visited);
         }
-    } else if (scheduleMode == 6){
+    } else if (scheduleMode == 6) {
         for (const auto& inputNode : application->getInputNodes()) {
             groupNodesLooseHelper(inputNode, groups, visited);
         }
-    } 
-    else {
+    } else {
         for (const auto& inputNode : application->getInputNodes()) {
             groupNodesHelper(inputNode, groups, visited);
         }
@@ -1147,9 +1149,9 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
     std::map<std::string, std::string> newStateHost;
     std::map<std::string, int> newFunctionParallelism;
     // MAP <USER_FUNC_PARALLELISM, MAP<IP, proportion>>
-    std::map<std::string, std::map<std::string, int>> newStatelessReqWeight;
+    std::map<std::string, std::map<std::string, double>> newStatelessReqWeight;
     // MAP <USER_FUNC, MAP<PARALLELISM_IDX, proportion>>
-    std::map<std::string, std::map<int, int>> newParStateReqWeight;
+    std::map<std::string, std::map<int, double>> newParStateReqWeight;
 
     // For each group, statistics its states and assigns states to workers.
     for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
@@ -1198,30 +1200,57 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
             }
         }
 
-        // We quantify the total weight for an operator is weightFactor (1000).
-        std::map<std::string, int> ipWeight;
-        for (const auto& [ip, alloc] : groupAllocation) {
-            ipWeight[ip] = std::lround(alloc * weightFactor);
-        }
         // Do assign the stateless and partitioned stateful operators.
+        double groupResource = 0;
+        for (const auto& node : group) {
+            groupResource += node->reqResource;
+        }
+
         for (const auto& node : group) {
             std::string userFunc = node->name;
             if (node->type == STATELESS) {
-                // Stateless operator, assign it to all workers.
-                newStatelessReqWeight[userFunc + "_0"] = ipWeight;
+                double nodeReqResource = node->reqResource;
+                double scale = nodeReqResource / groupResource;
+                std::map<std::string, double> nodeAllocation;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
+                    double nodeAlloc = groupWeight * scale;
+                    if (nodeAlloc > 0) {
+                        nodeAllocation[ip] = nodeAlloc;
+                    }
+                }
+                newStatelessReqWeight[userFunc + "_0"] = nodeAllocation;
             }
             if (node->type == PARTITIONED_STATEFUL) {
                 int index = 0;
-                newFunctionParallelism[userFunc] = ipWeight.size();
-                for (const auto& [ip, weight] : ipWeight) {
+                newFunctionParallelism[userFunc] = groupAllocation.size();
+                double nodeReqResource = node->reqResource;
+                double scale = nodeReqResource / groupResource;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
                     std::string userFuncPar =
                       userFunc + "_" + std::to_string(index);
-                    newParStateReqWeight[userFunc][index] = weight;
+                    newParStateReqWeight[userFunc][index] = groupWeight * scale;
                     newStateHost[userFuncPar] = ip;
                     index++;
                 }
             }
         }
+    }
+
+    if (scheduleMode == 1 || scheduleMode == 2) {
+        std::map<std::string, std::map<std::string, double>>
+          tempNewStatelessReqWeight;
+        for (const auto& [userFuncPar, weightMap] : newStatelessReqWeight) {
+            double weightSum = 0;
+            for (const auto& [ip, weight] : weightMap) {
+                weightSum += weight;
+            }
+            double hostNum = static_cast<double>(hostMap.size());
+            double weightPerHost = weightSum / hostNum;
+            for (const auto& [ip, _] : hostMap) {
+                tempNewStatelessReqWeight[userFuncPar][ip] = weightPerHost;
+            }
+        }
+        newStatelessReqWeight = std::move(tempNewStatelessReqWeight);
     }
 
     //--------------------------------------------------------------------------
@@ -1328,9 +1357,9 @@ NodeGroup& groupContainingNode(std::vector<NodeGroup>& groups,
     throw std::runtime_error("Node not found in any group");
 }
 
-int getRequireResource(const NodeGroup& group)
+double getRequireResource(const NodeGroup& group)
 {
-    int totalResource = 0;
+    double totalResource = 0;
     const auto& nodeVector = std::get<0>(group);
     for (const auto& nodePtr : nodeVector) {
         totalResource += nodePtr->reqResource;
@@ -1401,9 +1430,16 @@ StateAwareScheduler::groupNodesGreedily(const HostMap& hostMap)
                 continue;
             }
 
-            int inputResource = getRequireResource(inputGroup);
-            int outputResource = getRequireResource(outputGroup);
-            if (inputResource + outputResource > 1) {
+            double inputResource = getRequireResource(inputGroup);
+            double outputResource = getRequireResource(outputGroup);
+
+            SPDLOG_DEBUG("Checking merge for node {} ({} group resources) and "
+                         "node {} ({} group resources)",
+                         conn.input,
+                         inputResource,
+                         conn.output,
+                         outputResource);
+            if (inputResource + outputResource > 1.0) {
                 continue;
             }
 
@@ -1498,6 +1534,30 @@ void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
     auto [groups, groupAllocations, workerRemaining] =
       groupNodesGreedily(hostMap);
 
+    {
+        std::stringstream ss;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            const auto& [nodes, partition] = groups[i];
+
+            if (i > 0) {
+                ss << "; ";
+            }
+
+            ss << "Group " << i << "(partition=\"" << partition << "\"): [";
+
+            bool first = true;
+            for (const auto& nodePtr : nodes) {
+                if (!first)
+                    ss << ", ";
+                ss << nodePtr->name;
+                first = false;
+            }
+            ss << "]";
+        }
+
+        SPDLOG_INFO("All groups:\n {}", ss.str());
+    }
+
     // --------------------------------------------------------------------------
     // 3. Allocate the unused workers to the groups.
     //---------------------------------------------------------------------------
@@ -1510,11 +1570,11 @@ void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
 
         // Find the group with the most nodes. This will be our target.
         int targetIdx = -1;
-        double maxResource = 0.0;
+        double maxResource = std::numeric_limits<double>::lowest();
         for (int i = 0; i < groupAllocations.size(); ++i) {
             const auto& groupAllocation = groupAllocations[i];
             for (const auto& [workerIp, resource] : groupAllocation) {
-                if (resource > maxResource) {
+                if (resource >= maxResource) {
                     maxResource = resource;
                     targetIdx = i;
                 }
@@ -1547,28 +1607,43 @@ void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
     std::map<std::string, std::string> newStateHost;
     std::map<std::string, int> newFunctionParallelism;
     // MAP <USER_FUNC_PARALLELISM, MAP<IP, proportion>>
-    std::map<std::string, std::map<std::string, int>> newStatelessReqWeight;
+    std::map<std::string, std::map<std::string, double>> newStatelessReqWeight;
     // MAP <USER_FUNC, MAP<PARALLELISM_IDX, proportion>>
-    std::map<std::string, std::map<int, int>> newParStateReqWeight;
+    std::map<std::string, std::map<int, double>> newParStateReqWeight;
 
     for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
         const auto& group = std::get<0>(groups[groupIndex]);
         auto groupAllocation = groupAllocations[groupIndex];
+
+        double groupResource = 0;
+        for (const auto& node : group) {
+            groupResource += node->reqResource;
+        }
+
         for (const auto& node : group) {
             std::string userFunc = node->name;
             if (node->type == STATELESS) {
                 // STATELESS: Assign it to all workers evenly.
-                for (const auto& [ip, weight] : groupAllocation) {
-                    newStatelessReqWeight[userFunc + "_0"][ip] = weightFactor;
+                double nodeReqResource = node->reqResource;
+                double scale = nodeReqResource / groupResource;
+                std::map<std::string, double> nodeAllocation;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
+                    double nodeAlloc = groupWeight * scale;
+                    if (nodeAlloc > 0) {
+                        nodeAllocation[ip] = nodeAlloc;
+                    }
                 }
+                newStatelessReqWeight[userFunc + "_0"] = nodeAllocation;
             } else if (node->type == PARTITIONED_STATEFUL) {
                 // P_STATEFUL: Assign it to all workers evenly.
                 int index = 0;
                 newFunctionParallelism[userFunc] = groupAllocation.size();
-                for (const auto& [ip, _] : groupAllocation) {
+                double nodeReqResource = node->reqResource;
+                double scale = nodeReqResource / groupResource;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
                     std::string userFuncPar =
                       userFunc + "_" + std::to_string(index);
-                    newParStateReqWeight[userFunc][index] = weightFactor;
+                    newParStateReqWeight[userFunc][index] = groupWeight * scale;
                     newStateHost[userFuncPar] = ip;
                     index++;
                 }

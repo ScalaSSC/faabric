@@ -283,6 +283,7 @@ FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
 
     SPDLOG_DEBUG("Getting worker stats for host");
     auto snapshot = scheduler.getCpuRecordHistory();
+    auto maxReplicas = scheduler.getMaxReplicasMap();
 
     WorkerStats out;
     out.set_ip(faabric::util::getSystemConfig().endpointHost);
@@ -294,6 +295,12 @@ FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
         auto* rec = out.add_history();
         rec->set_cpuexecutepct(execPct);
         rec->set_cpuschedulepct(schedPct);
+    }
+
+    for (const auto& [instanceName, count] : maxReplicas) {
+        auto* rec = out.add_instancereplicas();
+        rec->set_instancename(instanceName);
+        rec->set_replicas(count);
     }
 
     return std::make_unique<faabric::WorkerStats>(std::move(out));

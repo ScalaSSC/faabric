@@ -76,7 +76,7 @@ struct ScheduledOperator
                       bool isCollocateIn,
                       std::string collocateWithIn,
                       int parallelismIn,
-                      std::map<std::string, int> weightDistIn,
+                      std::map<std::string, double> weightDistIn,
                       std::map<int, std::string> parallelismDistIn,
                       LocalStatelessOperatorType localTypeIn)
       : node(std::move(nodeIn))
@@ -101,7 +101,7 @@ struct ScheduledOperator
     // The parallelism in node maybe changed by the scheduler.
     int parallelism;
     // IP -> weight distribution.
-    std::map<std::string, int> weightDist;
+    std::map<std::string, double> weightDist;
     // Idx -> IP distribution. (only for partitioned stateful operators)
     std::map<int, std::string> parallelismDist;
     enum LocalStatelessOperatorType localType = UNKNOWN;

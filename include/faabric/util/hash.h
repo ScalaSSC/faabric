@@ -60,6 +60,35 @@ class ConsistentHashRing
         rebuildRing();
     }
 
+    explicit ConsistentHashRing(const std::map<int, double>& nodeWeightMap = {})
+    {
+        faabric::util::FullLock lock(ringMutex);
+
+        double totalWeight = 0.0;
+        for (const auto& [id, w] : nodeWeightMap) {
+            totalWeight += w;
+        }
+        for (const auto& [id, w] : nodeWeightMap) {
+            nodeWeights[id] = static_cast<int>(std::round(
+              w / totalWeight * static_cast<double>(totalVirtualNodes)));
+            SPDLOG_DEBUG(
+              "ConsistentHashRing: node ID {} with weight {}", id, w);
+        }
+        // Double check, node should start from 0 until n-1
+        for (int i = 0; i < nodeWeights.size(); ++i) {
+            if (nodeWeights.find(i) == nodeWeights.end()) {
+                SPDLOG_WARN(
+                  "ConsistentHashRing: node ID {} not found in node weights",
+                  i);
+                throw std::runtime_error("ConsistentHashRing: node ID " +
+                                         std::to_string(i) +
+                                         " not found in node weights");
+            }
+        }
+
+        rebuildRing();
+    }
+
     /// Return the physical node responsible for an arbitrary key
     int getNode(const std::vector<uint8_t>& keyBytes)
     {

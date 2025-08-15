@@ -165,9 +165,9 @@ class StateAwareScheduler : public BatchScheduler
       int groupId,
       const std::vector<std::shared_ptr<Node>>& group,
       const std::map<std::string, std::string>& newOptsCollocateMap,
-      const std::map<std::string, std::map<std::string, int>>&
+      const std::map<std::string, std::map<std::string, double>>&
         newStatelessReqWeight,
-      const std::map<std::string, std::map<int, int>>& newParStateReqWeight)
+      const std::map<std::string, std::map<int, double>>& newParStateReqWeight)
       const;
 
     void runtimeDistTune(

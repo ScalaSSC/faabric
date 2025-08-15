@@ -884,11 +884,14 @@ std::string Planner::outputResult()
 
     auto& alloc = doc.GetAllocator();
     rapidjson::Value workerStatsObj(rapidjson::kObjectType);
+    rapidjson::Value maxReplicaObj(rapidjson::kObjectType);
+
     for (const auto& [ip, host] : state.hostMap) {
         SPDLOG_DEBUG("Planner fetch stats from host {}", ip);
         auto stats =
           faabric::scheduler::getFunctionCallClient(ip)->getWorkerStats();
 
+        // ===== history =====
         rapidjson::Value historyArr(rapidjson::kArrayType);
         for (const auto& rec : stats->history()) {
             rapidjson::Value recObj(rapidjson::kObjectType);
@@ -900,9 +903,24 @@ std::string Planner::outputResult()
         // Add to workerStatsObj under the IP key
         workerStatsObj.AddMember(
           rapidjson::Value(ip.c_str(), alloc).Move(), historyArr, alloc);
+
+        // ===== instance replicas =====
+        rapidjson::Value replicasArr(rapidjson::kArrayType);
+        for (const auto& inst : stats->instancereplicas()) {
+            rapidjson::Value instObj(rapidjson::kObjectType);
+            instObj.AddMember(
+              "instanceName",
+              rapidjson::Value(inst.instancename().c_str(), alloc).Move(),
+              alloc);
+            instObj.AddMember("replicas", inst.replicas(), alloc);
+            replicasArr.PushBack(instObj, alloc);
+        }
+        maxReplicaObj.AddMember(
+          rapidjson::Value(ip.c_str(), alloc).Move(), replicasArr, alloc);
     }
 
     doc.AddMember("workerStats", workerStatsObj, alloc);
+    doc.AddMember("maxReplicaInfo", maxReplicaObj, alloc);
 
     isOutputting = false;
     // Write out the JSON document to a string.
