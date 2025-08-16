@@ -392,14 +392,17 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
         int messageType = msg.messagetype();
         if (messageType == 2) {
             size_t hash = msg.hash();
-            int maxReplicas =
-              util::getOrThrow(maxReplicasMap,
-                               msg.user() + "/" + msg.function() + "/" +
-                                 std::to_string(msg.parallelismid()));
+            // int maxReplicas =
+            //   util::getOrThrow(maxReplicasMap,
+            //                    msg.user() + "/" + msg.function() + "/" +
+            //                      std::to_string(msg.parallelismid()));
+            // We don't want to the state access setting interfere scheduling
+            // performance. So, all set to 10.
+            int queueSearchLength = 10;
             auto [iterator, inserted] = partitionedWaitingQueues.emplace(
               waitingQueueName,
               std::make_unique<faabric::util::PartitionedStateMessageQueue>(
-                waitingQueueName, maxReplicas, executeBatchsize));
+                waitingQueueName, queueSearchLength, executeBatchsize));
             int waitMsgs = iterator->second->getMessagesCount();
             (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
             iterator->second->addMessage(
@@ -671,7 +674,7 @@ void Scheduler::dispatchChainedMsgs()
         // Lock only for copying and clearing `scheduledMsgsMap`
 
         // SPDLOG_DEBUG("dispatchChainedMsgs: trying to acquire mx lock");
-        faabric::util::FullLock mxLock(mx);
+        // faabric::util::FullLock mxLock(mx);
         // SPDLOG_DEBUG("dispatchChainedMsgs: acquired mx lock");
 
         if (stopThreadTimer) {
