@@ -233,6 +233,7 @@ class Scheduler
 
     // ----- Scheduling Info -----
     int dispatchPeriod = 20; // ms
+    int batchCheckPeriod = 5; // ms
 
     // stateUpdateMx is used to prevent central scheduler update state when
     // the executor is running.

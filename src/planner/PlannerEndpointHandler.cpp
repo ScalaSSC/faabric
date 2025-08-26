@@ -294,9 +294,6 @@ void PlannerEndpointHandler::onRequest(
                 maxInflightApps = value;
             } else if (parameter == "max_executors") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
-            } else if (parameter == "dispatch_period") {
-                faabric::planner::getPlanner().resetParameter(
-                  parameter, value, true);
             } else if (parameter == "batch_size") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "max_replicas") {
@@ -311,6 +308,10 @@ void PlannerEndpointHandler::onRequest(
             } else if (parameter == "num_hosts_scheduled") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
+            } else if (parameter == "dispatch_period") {
+                faabric::planner::getPlanner().resetParameter(parameter, value);
+            } else if (parameter == "batch_check_period") {
+                faabric::planner::getPlanner().resetParameter(parameter, value);
             } else {
                 SPDLOG_ERROR("Unrecognized parameter {}", parameter);
                 response.result(beast::http::status::bad_request);

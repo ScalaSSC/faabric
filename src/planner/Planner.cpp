@@ -764,9 +764,7 @@ bool Planner::resetParameter(const std::string& key,
     // Reset the parameter of planner
     if (plannerParameter) {
         SPDLOG_INFO("Planner reset parameter {} to {}", key, value);
-        if (key == "dispatch_period") {
-            dispatchPeriod = value;
-        } else if (key == "is_outputting") {
+        if (key == "is_outputting") {
             isOutputting = value == 1;
         } else if (key == "num_hosts_scheduled") {
             numHostsScheduled = value;
@@ -780,9 +778,13 @@ bool Planner::resetParameter(const std::string& key,
         // stateless requests).
         // Schedule Mode 2: Centralized Scheduler.
         // Schedule Mode 3: FaaSFlow Scheduler.
+        // Scheduler Mode 5: Our Method.
         SPDLOG_INFO("Planner reset schedule mode to {}", value);
         stateAwareScheduler->setScheduleMode(value);
         scheduleMode = value;
+    }
+    if (key == "dispatch_period") {
+        dispatchPeriod = value;
     }
 
     // Reset the parameter of the worker hosts

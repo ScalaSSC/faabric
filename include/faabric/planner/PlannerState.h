@@ -41,6 +41,8 @@ class InstanceMetrics
           msg->plannerpoptime() - msg->plannerqueuetime();
         int newPlannerConsumeTime =
           msg->plannerdispatchtime() - msg->plannerpoptime();
+        int newDistpatchTime =
+          msg->dispatchreceivetime() - msg->plannerdispatchtime();
         int newWorkerQueueTime = msg->workerqueuewaittime();
         int newExecutorPrepTime = msg->executorpreparetime();
         int newWorkerExecuteTime =
@@ -57,6 +59,10 @@ class InstanceMetrics
         avgPlannerConsumeTime =
           avgPlannerConsumeTime +
           (static_cast<double>(newPlannerConsumeTime) - avgPlannerConsumeTime) /
+            static_cast<double>(count);
+        avgDispatchTime =
+          avgDispatchTime +
+          (static_cast<double>(newDistpatchTime) - avgDispatchTime) /
             static_cast<double>(count);
         avgWorkerQueueTime =
           avgWorkerQueueTime +
@@ -105,6 +111,7 @@ class InstanceMetrics
         doc.AddMember("schedLocallyRate", schedLocallyRate, alloc);
         doc.AddMember("avgPlannerScheduleTime", avgPlannerQueueTime, alloc);
         doc.AddMember("avgPlannerDispatchTime", avgPlannerConsumeTime, alloc);
+        doc.AddMember("avgDispatchTime", avgDispatchTime, alloc);
         doc.AddMember("avgWorkerQueueTime", avgWorkerQueueTime, alloc);
         doc.AddMember("avgExecutorPrepTime", avgExecutorPrepTime, alloc);
         doc.AddMember("avgWorkerExecuteTime", avgWorkerExecuteTime, alloc);
@@ -140,6 +147,7 @@ class InstanceMetrics
 
         avgPlannerQueueTime = 0.0;
         avgPlannerConsumeTime = 0.0;
+        avgDispatchTime = 0.0;
         avgWorkerQueueTime = 0.0;
         avgExecutorPrepTime = 0.0;
         avgWorkerExecuteTime = 0.0;
@@ -160,6 +168,7 @@ class InstanceMetrics
 
     double avgPlannerQueueTime = 0.0;
     double avgPlannerConsumeTime = 0.0;
+    double avgDispatchTime = 0.0;
     double avgWorkerQueueTime = 0.0;
     double avgExecutorPrepTime = 0.0;
     double avgWorkerExecuteTime = 0.0;

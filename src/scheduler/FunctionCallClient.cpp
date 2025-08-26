@@ -172,6 +172,7 @@ void FunctionCallClient::executeFunctionsBatch(
       "Batch execute call {} with Batch size: {}", host, msgs.size());
     batchMsgsList->set_invokehost(
       faabric::util::getSystemConfig().endpointHost);
+  
     for (auto& msg : msgs) {
         batchMsgsList->add_messages()->CopyFrom(*msg);
     }

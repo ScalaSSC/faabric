@@ -341,20 +341,7 @@ void FunctionCallServer::recvResetParameter(std::span<const uint8_t> buffer)
     std::string key = parsedMsg.parameter();
     int32_t value = parsedMsg.value();
     SPDLOG_INFO("FunctionCall Server Resetting parameter {} to {}", key, value);
-    if (key == "max_executors") {
-        faabric::scheduler::getScheduler().resetParameter(key, value);
-    } else if (key == "planner_call_interval") {
-        faabric::scheduler::getScheduler().resetParameter(key, value);
-    } else if (key == "batch_size") {
-        faabric::scheduler::getScheduler().resetParameter(key, value);
-    } else if (key == "max_replicas") {
-        faabric::scheduler::getScheduler().resetParameter(key, value);
-    } else if (key == "schedule_mode") {
-        faabric::scheduler::getScheduler().resetParameter(key, value);
-    } else {
-        throw std::runtime_error(
-          fmt::format("Unrecognized parameter key: {}", key));
-    }
+    faabric::scheduler::getScheduler().resetParameter(key, value);
 }
 
 void FunctionCallServer::recvRegisterApplication(

@@ -153,6 +153,7 @@ message Message {
     // map<string, int32> intExecGraphDetails = 37;
     // map<string, string> execGraphDetails = 38;
 
+    int64 dispatchReceiveTime = 85;
     int32 executeBatchSize = 86;
     // Chained Call numbers
     bool isScheduledLocally = 87;

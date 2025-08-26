@@ -385,6 +385,7 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
         instancesCounter[waitingQueueName]++;
         (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_TIME_KEY] = current;
         msg.set_starttimestamp(currentMillis);
+        msg.set_dispatchreceivetime(current);
         msg.set_executedhost(endPoint);
 
         // Add messages to the waiting queue
@@ -559,7 +560,7 @@ void Scheduler::batchTimerCheck()
 {
     while (!stopBatchTimer) {
         std::this_thread::sleep_for(
-          std::chrono::milliseconds(conf.batchCheckInterval));
+          std::chrono::milliseconds(batchCheckPeriod));
 
         // SPDLOG_DEBUG("batchTimerCheck: trying to acquire mx lock");
         faabric::util::FullLock lock(mx);
@@ -867,10 +868,6 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         SPDLOG_INFO("Reset plannerCallInterval parameter to : {}",
                     plannerCallInterval);
     }
-    // else if (key == "max_replicas") {
-    //     maxReplicas = value;
-    //     SPDLOG_INFO("Reset maxReplicas parameter to : {}", maxReplicas);
-    // }
     else if (key == "batch_size") {
         executeBatchsize = value;
         // change the batch size of all waiting queues
@@ -886,7 +883,15 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         decentralScheduler.setScheduleMode(value);
         scheduleMode = value;
         SPDLOG_INFO("Reset schedule_mode parameter to : {}", value);
-    } else {
+    } else if (key == "dispatch_period"){
+        dispatchPeriod = value;
+        SPDLOG_INFO("Reset dispatchPeriod parameter to : {}", dispatchPeriod);
+    } else if (key == "batch_check_period"){
+        batchCheckPeriod = value;
+        SPDLOG_INFO("Reset batchCheckPeriod parameter to : {}",
+                    batchCheckPeriod);
+    }
+    else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }
