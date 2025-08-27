@@ -13,13 +13,17 @@ if(NOT CONAN_CMD)
     message(FATAL_ERROR "Please install Conan 2.x and add it to your PATH.")
 endif()
 
-set(CONANFILE ${CMAKE_SOURCE_DIR}/faabric/conanfile.txt)
+set(CONANFILE ${CMAKE_CURRENT_LIST_DIR}/../conanfile.txt)
+set(CONAN_PROFILE_HOST ${CMAKE_CURRENT_LIST_DIR}/../conan-profile.txt)
+set(CONAN_PROFILE_BUILD ${CONAN_PROFILE_HOST}) 
 set(CONAN_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
 execute_process(
     COMMAND ${CONAN_CMD} install ${CONANFILE} 
     --output-folder=${CONAN_OUTPUT_DIR} 
     --build=missing 
+    --profile:host=${CONAN_PROFILE_HOST}
+    --profile:build=${CONAN_PROFILE_BUILD}
     -s build_type=${CMAKE_BUILD_TYPE} 
     -s compiler.cppstd=20
     RESULT_VARIABLE CONAN_RESULT
