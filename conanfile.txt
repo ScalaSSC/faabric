@@ -28,4 +28,3 @@ boost/*:without_mpi=True
 boost/*:without_python=True
 boost/*:without_test=True
 boost/*:without_wave=True
-boost/*:with_cobalt=True
