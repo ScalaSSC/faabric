@@ -1,5 +1,5 @@
 # It is used for github test (actions workflow). So we do not build it now.
-FROM tqiunimelb/faabric-base:0.0.1
+FROM tqiunimelb/faabric-base:0.0.2
 ARG FAABRIC_VERSION
 
 # faabic-base image is not re-built often, so tag may be behind

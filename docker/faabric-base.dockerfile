@@ -59,11 +59,8 @@ RUN apt remove --purge --auto-remove cmake \
     && apt clean autoclean -y \
     && apt autoremove -y
 
-# Install Conan
-RUN curl -s -L -o \
-        /tmp/conan-latest.deb https://github.com/conan-io/conan/releases/download/1.63.0/conan-ubuntu-64.deb \
-    && sudo dpkg -i /tmp/conan-latest.deb \
-    && rm -f /tmp/conan-latest.deb
+# Install Conan 2.x
+RUN pip3 install --no-cache-dir conan==2.19.1
 
 # Tidy up
 RUN apt clean autoclean -y \
