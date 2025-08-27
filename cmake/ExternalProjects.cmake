@@ -33,7 +33,7 @@ endif()
 conan_cmake_configure(
     REQUIRES
         "abseil/20220623.0@#732381dc99db29b4cfd293684891da56"
-        "boost/1.84.0@#7604ce1e7485780469dffb6430f232ea"
+        "boost/1.84.0"
         "catch2/2.13.9@#8793d3e6287d3684201418de556d98fe"
         "flatbuffers/23.5.26@#b153646f6546daab4c7326970b6cd89c"
         "hiredis/1.0.2@#370dad964286cadb1f15dc90252e8ef3"
