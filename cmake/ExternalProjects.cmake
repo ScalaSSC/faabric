@@ -18,6 +18,8 @@ set(CONAN_PROFILE_HOST ${CMAKE_CURRENT_LIST_DIR}/../conan-profile.txt)
 set(CONAN_PROFILE_BUILD ${CONAN_PROFILE_HOST}) 
 set(CONAN_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
+execute_process(COMMAND ${CONAN_CMD} remote add conancenter https://center2.conan.io --force)
+
 execute_process(
     COMMAND ${CONAN_CMD} install ${CONANFILE} 
     --output-folder=${CONAN_OUTPUT_DIR} 
