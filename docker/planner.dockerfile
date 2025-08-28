@@ -1,4 +1,4 @@
-FROM tqiunimelb/faabric-base:0.0.1
+FROM tqiunimelb/faabric-base:0.0.2
 ARG FAABRIC_VERSION
 
 # Flag to say we're in a container

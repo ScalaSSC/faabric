@@ -38,7 +38,7 @@ endif()
 include(${CMAKE_CURRENT_BINARY_DIR}/conan_toolchain.cmake)
 
 find_package(absl REQUIRED)
-find_package(Boost 1.80.0 REQUIRED)
+find_package(Boost CONFIG REQUIRED COMPONENTS program_options filesystem system thread regex chrono date_time)
 find_package(Catch2 REQUIRED)
 find_package(flatbuffers REQUIRED)
 find_package(fmt REQUIRED)
@@ -107,7 +107,13 @@ target_link_libraries(faabric_common_dependencies INTERFACE
     absl::flat_hash_map
     absl::strings
     # Boost::Boost
+    Boost::program_options
+    Boost::filesystem
     Boost::system
+    Boost::thread
+    Boost::regex
+    Boost::chrono
+    Boost::date_time
     flatbuffers::flatbuffers
     hiredis::hiredis
     nng::nng
