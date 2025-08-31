@@ -60,10 +60,14 @@ class InstanceMetrics
           avgPlannerConsumeTime +
           (static_cast<double>(newPlannerConsumeTime) - avgPlannerConsumeTime) /
             static_cast<double>(count);
-        avgDispatchTime =
-          avgDispatchTime +
-          (static_cast<double>(newDistpatchTime) - avgDispatchTime) /
-            static_cast<double>(count);
+        // Dispatch time is calculated cross workers, if the platform does not
+        // support ntp. It can be negative.
+        if (newDistpatchTime >= 0) {
+            avgDispatchTime =
+              avgDispatchTime +
+              (static_cast<double>(newDistpatchTime) - avgDispatchTime) /
+                static_cast<double>(count);
+        }
         avgWorkerQueueTime =
           avgWorkerQueueTime +
           (static_cast<double>(newWorkerQueueTime) - avgWorkerQueueTime) /

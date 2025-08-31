@@ -38,6 +38,20 @@ const long long Clock::epochMicros()
     return microseconds;
 }
 
+const long long Clock::ntpMicros()
+{
+    auto now = std::chrono::system_clock::now();
+    
+    // This calculation is correct
+    uint64_t timestamp_microseconds =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+        now.time_since_epoch())
+        .count();
+
+    // Return the calculated integer value, not the time_point object
+    return timestamp_microseconds;
+}
+
 const long long Clock::epochNanos()
 {
     // Get the current time_point from the high_resolution_clock

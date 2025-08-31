@@ -539,7 +539,7 @@ void Planner::dequeueScheduledMsgs()
             lock.unlock();
             continue;
         }
-        auto currentTime = faabric::util::getGlobalClock().epochMicros();
+        auto currentTime = faabric::util::getGlobalClock().ntpMicros();
 
         // Create a local filtered copy of scheduledRequestsMap
         std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>
@@ -549,7 +549,11 @@ void Planner::dequeueScheduledMsgs()
                 continue;
             }
             for (auto& msg : msgsList) {
-                msg->set_plannerdispatchtime(currentTime);
+                // We only set the dispatch time for input.
+                // For chained message, dispatch time is set from worker (it is not zero).
+                if (msg->plannerdispatchtime() == 0){
+                    msg->set_plannerdispatchtime(currentTime);
+                }
             }
             msgsCallMap[hostIp] = std::move(msgsList); // Move ownership
         }
@@ -768,6 +772,8 @@ bool Planner::resetParameter(const std::string& key,
             isOutputting = value == 1;
         } else if (key == "num_hosts_scheduled") {
             numHostsScheduled = value;
+        } else if (key == "runtime_reconfig"){
+            runtimeReconfig = value == 1;
         }
         return true;
     }
@@ -949,6 +955,10 @@ void Planner::updateRuntimeStats()
 
         if (scheduleMode != 0 && scheduleMode != 5 && scheduleMode != 6) {
             continue; // Only run in decentralized scheduler mode
+        }
+
+        if(!runtimeReconfig){
+            continue;
         }
 
         std::vector<std::future<void>> futures;

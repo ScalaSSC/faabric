@@ -745,7 +745,9 @@ void Scheduler::dispatchChainedMsgs()
                 continue;
             }
             auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
+            auto currentTime = faabric::util::getGlobalClock().ntpMicros();
             for (auto& msg : chainedCallMsgs) {
+                msg->set_plannerdispatchtime(currentTime);
                 auto* message = req->add_messages();
                 *message = std::move(*msg);
             }
@@ -802,7 +804,7 @@ void Scheduler::dispatchChainedMsgs()
         }
 
         // Create a local filtered copy of scheduledRequestsMap
-        auto currentTime = faabric::util::getGlobalClock().epochMicros();
+        auto currentTime = faabric::util::getGlobalClock().ntpMicros();
         std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>
           msgsCallMap;
         for (auto& [hostIp, msgsList] : scheduledMsgsMap) {
@@ -825,28 +827,29 @@ void Scheduler::dispatchChainedMsgs()
                          msgs.size());
             // If locally, we put the messages into a batch directly
             if (hostIp == thisHost) {
-                auto batchMsgs = std::make_unique<faabric::MessageBatch>();
-                batchMsgs->set_invokehost(thisHost);
-                SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
-                             thisHost,
-                             msgs.size());
-                for (auto& msg : msgs) {
-                    batchMsgs->add_messages()->CopyFrom(*msg);
-                }
+                threads.emplace_back([this,
+                                      hostIn = thisHost,
+                                      msgsIn = std::move(msgs)]() mutable {
+                    auto batchMsgs = std::make_unique<faabric::MessageBatch>();
+                    batchMsgs->set_invokehost(hostIn);
+                    SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
+                                 hostIn,
+                                 msgsIn.size());
+                    for (auto& msg : msgsIn) {
+                        batchMsgs->add_messages()->CopyFrom(*msg);
+                    }
+                    enqueueMessageBatch(std::move(batchMsgs));
+                });
+            } else {
+                // Otherwise, we send the messages to the remote host
                 threads.emplace_back(
-                  [this, batch = std::move(batchMsgs)]() mutable {
-                      enqueueMessageBatch(std::move(batch));
-                  });
-                continue;
+                  [hostIp](std::list<std::unique_ptr<faabric::Message>>
+                             msgsIn) mutable {
+                      faabric::scheduler::getFunctionCallClient(hostIp)
+                        ->executeFunctionsBatch(std::move(msgsIn));
+                  },
+                  std::move(msgs));
             }
-            // Otherwise, we send the messages to the remote host
-            threads.emplace_back(
-              [hostIp](
-                std::list<std::unique_ptr<faabric::Message>> msgsIn) mutable {
-                  faabric::scheduler::getFunctionCallClient(hostIp)
-                    ->executeFunctionsBatch(std::move(msgsIn));
-              },
-              std::move(msgs));
         }
         // Join all threads to ensure they complete before next iteration
         for (auto& t : threads) {
@@ -867,8 +870,7 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         plannerCallInterval = value;
         SPDLOG_INFO("Reset plannerCallInterval parameter to : {}",
                     plannerCallInterval);
-    }
-    else if (key == "batch_size") {
+    } else if (key == "batch_size") {
         executeBatchsize = value;
         // change the batch size of all waiting queues
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
@@ -883,15 +885,14 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         decentralScheduler.setScheduleMode(value);
         scheduleMode = value;
         SPDLOG_INFO("Reset schedule_mode parameter to : {}", value);
-    } else if (key == "dispatch_period"){
+    } else if (key == "dispatch_period") {
         dispatchPeriod = value;
         SPDLOG_INFO("Reset dispatchPeriod parameter to : {}", dispatchPeriod);
-    } else if (key == "batch_check_period"){
+    } else if (key == "batch_check_period") {
         batchCheckPeriod = value;
         SPDLOG_INFO("Reset batchCheckPeriod parameter to : {}",
                     batchCheckPeriod);
-    }
-    else {
+    } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }

@@ -312,6 +312,9 @@ void PlannerEndpointHandler::onRequest(
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "batch_check_period") {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
+            } else if (parameter == "runtime_reconfig") {
+                faabric::planner::getPlanner().resetParameter(
+                  parameter, value, true);
             } else {
                 SPDLOG_ERROR("Unrecognized parameter {}", parameter);
                 response.result(beast::http::status::bad_request);

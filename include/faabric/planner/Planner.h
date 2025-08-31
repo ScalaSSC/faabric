@@ -153,6 +153,7 @@ class Planner
     std::thread updateRuntimeStatsThread;
 
     int scheduleMode = 0;
+    bool runtimeReconfig = true;
     bool streamMode = faabric::util::getSystemConfig().streamMode;
     long lastParallelismUpdate;
     int parallelismUpdateInterval;
