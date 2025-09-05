@@ -44,6 +44,8 @@ class Scheduler
 
     void enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs);
 
+    void setMessageResults();
+
     // Check the waiting queue peroiodically.
     void batchTimerCheck();
 
@@ -228,8 +230,8 @@ class Scheduler
     std::thread batchTimerThread;
     bool stopBatchTimer = false;
 
-    long lastPlannerCallCheck = 0;
-    int plannerCallInterval = 20;
+    std::thread setResultThread;
+    int plannerCallInterval = 100; // ms
 
     // ----- Scheduling Info -----
     int dispatchPeriod = 20; // ms

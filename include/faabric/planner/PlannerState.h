@@ -195,6 +195,9 @@ class ApplicationMetrics
         if (msgMapSize == 0) {
             return;
         }
+
+        faabric::util::FullLock lock(opMx);
+
         avgExecutionOperators =
           avgExecutionOperators +
           (static_cast<double>(msgMapSize) - avgExecutionOperators) /
@@ -202,7 +205,7 @@ class ApplicationMetrics
         avgRunningReqs =
           avgRunningReqs +
           (static_cast<double>(runningReqs) - avgRunningReqs) / (count + 1);
-        faabric::util::FullLock lock(opMx);
+
         int64_t tempStartTime = std::numeric_limits<int64_t>::max();
         int64_t tempEndTime = std::numeric_limits<int64_t>::min();
         for (auto& [msgId, msg] : msgMap) {
@@ -239,6 +242,12 @@ class ApplicationMetrics
         }
         if (tempEndTime > endTime) {
             endTime = tempEndTime;
+        }
+
+        if (tempEndTime != std::numeric_limits<int64_t>::min()) {
+            // tempEndTime is in microseconds.
+            int64_t secondKey = tempEndTime / 1000000;
+            runtimeCountHistory[secondKey]++;
         }
     }
 
@@ -346,6 +355,44 @@ class ApplicationMetrics
         doc.AddMember("p95Latency", p95Latency, alloc);
         doc.AddMember("p99Latency", p99Latency, alloc);
 
+        // MODIFICATION: Add the runtime count history as a JSON array.
+        rapidjson::Value historyArray(rapidjson::kArrayType);
+
+        // Check if the history map is not empty to avoid errors.
+        if (!runtimeCountHistory.empty()) {
+            // Get an iterator to the first element in the map.
+            auto it = runtimeCountHistory.begin();
+
+            // Initialize by adding the first count and tracking its timestamp.
+            int64_t lastTimestamp = it->first;
+            historyArray.PushBack(it->second, alloc);
+
+            // Move the iterator to the second element.
+            it++;
+
+            // Loop through the rest of the map.
+            while (it != runtimeCountHistory.end()) {
+                int64_t currentTimestamp = it->first;
+                int currentCount = it->second;
+
+                // Fill in any missing seconds between the last timestamp and
+                // the current one. The loop runs for `gap - 1` seconds.
+                for (int64_t i = 1; i < (currentTimestamp - lastTimestamp);
+                     ++i) {
+                    historyArray.PushBack(0, alloc);
+                }
+
+                // Add the actual count for the current timestamp.
+                historyArray.PushBack(currentCount, alloc);
+
+                // Update the last seen timestamp for the next iteration.
+                lastTimestamp = currentTimestamp;
+                it++;
+            }
+        }
+
+        doc.AddMember("runtimeCountHistory", historyArray, alloc);
+
         // Optionally, if you want to include per-instance metrics, add them
         // here.
         rapidjson::Value instancesObj(rapidjson::kObjectType);
@@ -383,6 +430,7 @@ class ApplicationMetrics
         }
 
         edgeWeightMap.clear();
+        runtimeCountHistory.clear();
     }
 
   private:
@@ -398,6 +446,7 @@ class ApplicationMetrics
     int64_t endTime = std::numeric_limits<int64_t>::min();
     double avgExecutionOperators = 0.0;
     double avgRunningReqs = 0.0;
+    std::map<int64_t, int> runtimeCountHistory;
 
     // MAP<source operator : <successor operator, count>>
     std::map<std::string, std::map<std::string, int>> edgeWeightMap;

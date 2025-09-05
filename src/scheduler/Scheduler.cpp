@@ -63,6 +63,8 @@ Scheduler::Scheduler()
     // Start the reaper thread
     reaperThread.start(conf.reaperIntervalSeconds);
     batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
+    setResultThread = std::thread(&Scheduler::setMessageResults, this);
+
     dispatchChainedMsgsThread =
       std::thread(&Scheduler::dispatchChainedMsgs, this);
 }
@@ -76,6 +78,9 @@ Scheduler::~Scheduler()
     stopBatchTimer = true;
     if (batchTimerThread.joinable()) {
         batchTimerThread.join();
+    }
+    if (setResultThread.joinable()) {
+        setResultThread.join();
     }
     stopThreadTimer = true;
     if (dispatchChainedMsgsThread.joinable()) {
@@ -171,6 +176,9 @@ void Scheduler::reset()
     if (batchTimerThread.joinable()) {
         batchTimerThread.join();
     }
+    if (setResultThread.joinable()) {
+        setResultThread.join();
+    }
 
     stopThreadTimer = true;
     if (dispatchChainedMsgsThread.joinable()) {
@@ -239,6 +247,7 @@ void Scheduler::reset()
 
     stopBatchTimer = false;
     batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
+    setResultThread = std::thread(&Scheduler::setMessageResults, this);
 
     stopThreadTimer = false;
     dispatchChainedMsgsThread =
@@ -542,6 +551,33 @@ void Scheduler::enqueueChainedCalls(
     SPDLOG_DEBUG("Enqueueing chained calls finished");
 }
 
+void Scheduler::setMessageResults()
+{
+    while (!stopBatchTimer) {
+        std::this_thread::sleep_for(
+          std::chrono::milliseconds(plannerCallInterval));
+
+        if (stopBatchTimer) {
+            break;
+        }
+
+        auto& plannerCli = faabric::planner::getPlannerClient();
+
+        faabric::util::FullLock setResultMsgsLock(setResultMsgsMx);
+        if (!setResultMsgs.empty()) {
+            auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
+            for (auto& msg : setResultMsgs) {
+                auto* message = req->add_messages();
+                *message = std::move(*msg);
+            }
+            SPDLOG_DEBUG("Set result batch size: {}", req->messages_size());
+            plannerCli.setMessageResultBatch(req);
+            setResultMsgs.clear();
+        }
+        setResultMsgsLock.unlock();
+    }
+}
+
 void Scheduler::enqueueSetResults(
   std::shared_ptr<faabric::BatchExecuteRequest> req)
 {
@@ -625,29 +661,6 @@ void Scheduler::batchTimerCheck()
                 executeBatchForQueue(userFuncPar, *waitingBatch, lock);
             }
         }
-
-        // SPDLOG_DEBUG("batchTimerCheck: send message results back");
-
-        auto currentMillis = faabric::util::getGlobalClock().epochMillis();
-
-        if (currentMillis - lastPlannerCallCheck < plannerCallInterval) {
-            continue;
-        }
-        lastPlannerCallCheck = currentMillis;
-        auto& plannerCli = faabric::planner::getPlannerClient();
-
-        faabric::util::FullLock setResultMsgsLock(setResultMsgsMx);
-        if (!setResultMsgs.empty()) {
-            auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
-            for (auto& msg : setResultMsgs) {
-                auto* message = req->add_messages();
-                *message = std::move(*msg);
-            }
-            SPDLOG_DEBUG("Set result batch size: {}", req->messages_size());
-            plannerCli.setMessageResultBatch(req);
-            setResultMsgs.clear();
-        }
-        setResultMsgsLock.unlock();
 
         // SPDLOG_DEBUG("batchTimerCheck: finished");
     }
