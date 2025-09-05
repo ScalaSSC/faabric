@@ -231,7 +231,7 @@ class Scheduler
     bool stopBatchTimer = false;
 
     std::thread setResultThread;
-    int plannerCallInterval = 100; // ms
+    int plannerCallInterval = 20; // ms
 
     // ----- Scheduling Info -----
     int dispatchPeriod = 20; // ms

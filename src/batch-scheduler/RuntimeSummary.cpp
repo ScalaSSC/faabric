@@ -284,24 +284,32 @@ void RuntimeSummary::initOpertaor(
             break; // Only break the inner for loop
         }
     }
+
+    std::string instanceName = scheduledOpt.node.name + "_0";
+
+    doInitExpectedDist(scheduledOpt);
+    auto& expDist = expectedDistMap[instanceName];
+    implDistMap[instanceName] = expDist;
+
     if (isBody && isCollocate) {
         scheduledOpt.localType = LocalStatelessOperatorType::COLLOCATE_BODY;
+        if (implDistMap[instanceName].count(localHost) == 0) {
+            scheduledOpt.localType = LocalStatelessOperatorType::COLLOCATE_HEAD;
+        }
     } else if (isBody && !isCollocate) {
         scheduledOpt.localType = LocalStatelessOperatorType::ROUNDROBIN_BODY;
+        if (implDistMap[instanceName].count(localHost) == 0) {
+            scheduledOpt.localType = LocalStatelessOperatorType::ROUNDROBIN_HEAD;
+        }
     } else if (!isBody && isCollocate) {
         scheduledOpt.localType = LocalStatelessOperatorType::COLLOCATE_HEAD;
     } else if (!isBody && !isCollocate) {
         scheduledOpt.localType = LocalStatelessOperatorType::ROUNDROBIN_HEAD;
     }
 
-    std::string instanceName = scheduledOpt.node.name + "_0";
-
     localOperatorsMap[instanceName] = scheduledOpt.localType;
     // Update the expected distribution and source distribution.
 
-    doInitExpectedDist(scheduledOpt);
-    auto& expDist = expectedDistMap[instanceName];
-    implDistMap[instanceName] = expDist;
     auto& schedLocalTpye = scheduledOpt.localType;
     if (schedLocalTpye == LocalStatelessOperatorType::COLLOCATE_BODY) {
         recommendedHostMap[instanceName][localHost] = 1;

@@ -235,8 +235,17 @@ class ApplicationMetrics
             }
         }
         count++;
-        int tempLatency = (tempEndTime - tempStartTime) / 1000;
-        latencies[tempLatency]++;
+        int64_t tempLatencyMicro = tempEndTime - tempStartTime;
+
+        // Latency in microseconds is less than 10ms (10,000 us)
+        if (tempLatencyMicro < 10000) {
+            latenciesUnderTen[static_cast<int>(tempLatencyMicro)]++;
+        } else {
+            // Otherwise, record in milliseconds
+            int tempLatencyMilli = tempLatencyMicro / 1000;
+            latenciesOverTen[tempLatencyMilli]++;
+        }
+
         if (tempStartTime < startTime) {
             startTime = tempStartTime;
         }
@@ -318,8 +327,13 @@ class ApplicationMetrics
         doc.AddMember("throughput", throughput, alloc);
 
         // Compute percentiles from the latencies histogram.
+        std::map<int, int> combinedLatencies = latenciesUnderTen;
+        for (const auto& [latencyMilli, freq] : latenciesOverTen) {
+            combinedLatencies[latencyMilli * 1000] += freq;
+        }
+
         long totalCount = 0;
-        for (const auto& [latency, freq] : latencies) {
+        for (const auto& [latency, freq] : combinedLatencies) {
             totalCount += freq;
         }
 
@@ -334,18 +348,17 @@ class ApplicationMetrics
             double p95Threshold = totalCount * 0.95;
             double p99Threshold = totalCount * 0.99;
 
-            for (const auto& [latency, freq] : latencies) {
+            for (const auto& [latencyMicro, freq] : combinedLatencies) {
                 cumCount += freq;
                 if (medianLatency == 0 && cumCount >= medianThreshold) {
-                    medianLatency = latency;
+                    medianLatency = latencyMicro;
                 }
                 if (p95Latency == 0 && cumCount >= p95Threshold) {
-                    p95Latency = latency;
+                    p95Latency = latencyMicro;
                 }
                 if (p99Latency == 0 && cumCount >= p99Threshold) {
-                    p99Latency = latency;
-                    // Once we have p99, we can break out early.
-                    break;
+                    p99Latency = latencyMicro;
+                    break; // Optimization: exit once all percentiles are found.
                 }
             }
         }
@@ -423,7 +436,8 @@ class ApplicationMetrics
         count = 0;
         startTime = std::numeric_limits<int64_t>::max();
         endTime = std::numeric_limits<int64_t>::min();
-        latencies.clear();
+        latenciesUnderTen.clear();
+        latenciesOverTen.clear();
 
         for (auto& [instName, instancePtr] : instances) {
             instancePtr->reset();
@@ -440,7 +454,9 @@ class ApplicationMetrics
     int period;
     std::map<std::string, std::unique_ptr<InstanceMetrics>> instances;
     // Recorded Metrics
-    std::map<int, int> latencies;
+    std::map<int, int> latenciesOverTen; // Latencies in milliseconds
+    std::map<int, int>
+      latenciesUnderTen; // Latencies under 10ms, recorded in microseconds
     long count = 0;
     int64_t startTime = std::numeric_limits<int64_t>::max();
     int64_t endTime = std::numeric_limits<int64_t>::min();

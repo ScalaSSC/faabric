@@ -25,21 +25,6 @@ const long Clock::epochMillis()
 
 const long long Clock::epochMicros()
 {
-    // Get the current time_point from the high_resolution_clock
-    auto now = std::chrono::high_resolution_clock::now();
-
-    // Convert the time_point to a duration in microseconds since epoch
-    auto duration = now.time_since_epoch();
-
-    // Convert the duration to microseconds
-    long long microseconds =
-      std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-
-    return microseconds;
-}
-
-const long long Clock::ntpMicros()
-{
     auto now = std::chrono::system_clock::now();
     
     // This calculation is correct
@@ -52,20 +37,20 @@ const long long Clock::ntpMicros()
     return timestamp_microseconds;
 }
 
-const long long Clock::epochNanos()
-{
-    // Get the current time_point from the high_resolution_clock
-    auto now = std::chrono::high_resolution_clock::now();
+// const long long Clock::epochNanos()
+// {
+//     // Get the current time_point from the high_resolution_clock
+//     auto now = std::chrono::high_resolution_clock::now();
 
-    // Convert the time_point to a duration in nanoseconds since epoch
-    auto duration = now.time_since_epoch();
+//     // Convert the time_point to a duration in nanoseconds since epoch
+//     auto duration = now.time_since_epoch();
 
-    // Convert the duration to nanoseconds
-    long long nanoseconds =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+//     // Convert the duration to nanoseconds
+//     long long nanoseconds =
+//       std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
 
-    return nanoseconds;
-}
+//     return nanoseconds;
+// }
 
 const long Clock::timeDiff(const TimePoint& t1, const TimePoint& t2)
 {

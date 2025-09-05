@@ -561,20 +561,26 @@ void Scheduler::setMessageResults()
             break;
         }
 
-        auto& plannerCli = faabric::planner::getPlannerClient();
-
         faabric::util::FullLock setResultMsgsLock(setResultMsgsMx);
+        std::vector<std::unique_ptr<faabric::Message>> tempSetResultMsgs;
         if (!setResultMsgs.empty()) {
+            tempSetResultMsgs = std::move(setResultMsgs);
+            setResultMsgs.clear();
+        }
+        setResultMsgsLock.unlock();
+
+        if (!tempSetResultMsgs.empty()) {
+            auto& plannerCli = faabric::planner::getPlannerClient();
+
             auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
-            for (auto& msg : setResultMsgs) {
+            for (auto& msg : tempSetResultMsgs) {
                 auto* message = req->add_messages();
                 *message = std::move(*msg);
             }
             SPDLOG_DEBUG("Set result batch size: {}", req->messages_size());
             plannerCli.setMessageResultBatch(req);
-            setResultMsgs.clear();
+            tempSetResultMsgs.clear();
         }
-        setResultMsgsLock.unlock();
     }
 }
 
@@ -758,7 +764,7 @@ void Scheduler::dispatchChainedMsgs()
                 continue;
             }
             auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
-            auto currentTime = faabric::util::getGlobalClock().ntpMicros();
+            auto currentTime = faabric::util::getGlobalClock().epochMicros();
             for (auto& msg : chainedCallMsgs) {
                 msg->set_plannerdispatchtime(currentTime);
                 auto* message = req->add_messages();
@@ -817,7 +823,7 @@ void Scheduler::dispatchChainedMsgs()
         }
 
         // Create a local filtered copy of scheduledRequestsMap
-        auto currentTime = faabric::util::getGlobalClock().ntpMicros();
+        auto currentTime = faabric::util::getGlobalClock().epochMicros();
         std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>
           msgsCallMap;
         for (auto& [hostIp, msgsList] : scheduledMsgsMap) {
@@ -840,9 +846,9 @@ void Scheduler::dispatchChainedMsgs()
                          msgs.size());
             // If locally, we put the messages into a batch directly
             if (hostIp == thisHost) {
-                threads.emplace_back([this,
-                                      hostIn = thisHost,
-                                      msgsIn = std::move(msgs)]() mutable {
+                std::thread([this,
+                             hostIn = thisHost,
+                             msgsIn = std::move(msgs)]() mutable {
                     auto batchMsgs = std::make_unique<faabric::MessageBatch>();
                     batchMsgs->set_invokehost(hostIn);
                     SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
@@ -852,7 +858,7 @@ void Scheduler::dispatchChainedMsgs()
                         batchMsgs->add_messages()->CopyFrom(*msg);
                     }
                     enqueueMessageBatch(std::move(batchMsgs));
-                });
+                }).detach();
             } else {
                 // Otherwise, we send the messages to the remote host
                 threads.emplace_back(
@@ -1414,5 +1420,4 @@ std::map<std::string, int> Scheduler::getMaxReplicasMap()
 {
     return maxReplicasMap;
 }
-
 }

@@ -539,7 +539,7 @@ void Planner::dequeueScheduledMsgs()
             lock.unlock();
             continue;
         }
-        auto currentTime = faabric::util::getGlobalClock().ntpMicros();
+        auto currentTime = faabric::util::getGlobalClock().epochMicros();
 
         // Create a local filtered copy of scheduledRequestsMap
         std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>
