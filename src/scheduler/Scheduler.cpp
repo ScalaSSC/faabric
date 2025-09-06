@@ -666,6 +666,26 @@ void Scheduler::batchTimerCheck()
             }
         }
 
+        // auto currentMillis = faabric::util::getGlobalClock().epochMillis();
+
+        // if (currentMillis - lastPlannerCallCheck < plannerCallInterval) {
+        //     continue;
+        // }
+        // lastPlannerCallCheck = currentMillis;
+        // auto& plannerCli = faabric::planner::getPlannerClient();
+
+        // faabric::util::FullLock setResultMsgsLock(setResultMsgsMx);
+        // if (!setResultMsgs.empty()) {
+        //     auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
+        //     for (auto& msg : setResultMsgs) {
+        //         auto* message = req->add_messages();
+        //         *message = std::move(*msg);
+        //     }
+        //     SPDLOG_DEBUG("Set result batch size: {}", req->messages_size());
+        //     plannerCli.setMessageResultBatch(req);
+        //     setResultMsgs.clear();
+        // }
+        // setResultMsgsLock.unlock();
         // SPDLOG_DEBUG("batchTimerCheck: finished");
     }
 }
@@ -690,6 +710,7 @@ void Scheduler::dispatchChainedMsgs()
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
+        faabric::util::FullLock mxLock(mx);
 
         if (stopThreadTimer) {
             break;

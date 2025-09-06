@@ -246,6 +246,17 @@ class ApplicationMetrics
             latenciesOverTen[tempLatencyMilli]++;
         }
 
+        int64_t tempTotalLatencyMicro =
+          faabric::util::getGlobalClock().epochMicros() - tempStartTime;
+        // Latency in microseconds is less than 10ms (10,000 us)
+        if (tempTotalLatencyMicro < 10000) {
+            totalLatenciesUnderTen[static_cast<int>(tempTotalLatencyMicro)]++;
+        } else {
+            // Otherwise, record in milliseconds
+            int tempLatencyMilli = tempTotalLatencyMicro / 1000;
+            totalLatenciesOverTen[tempLatencyMilli]++;
+        }
+
         if (tempStartTime < startTime) {
             startTime = tempStartTime;
         }
@@ -368,6 +379,48 @@ class ApplicationMetrics
         doc.AddMember("p95Latency", p95Latency, alloc);
         doc.AddMember("p99Latency", p99Latency, alloc);
 
+        // Compute percentiles from the latencies histogram.
+        std::map<int, int> combinedTotalLatencies = totalLatenciesUnderTen;
+        for (const auto& [latencyMilli, freq] : totalLatenciesOverTen) {
+            combinedTotalLatencies[latencyMilli * 1000] += freq;
+        }
+
+        long totalLatencyCount = 0;
+        for (const auto& [latency, freq] : combinedTotalLatencies) {
+            totalLatencyCount += freq;
+        }
+
+        int medianTotalLatency = 0;
+        int p95TotalLatency = 0;
+        int p99TotalLatency = 0;
+
+        if (totalLatencyCount > 0) {
+            long cumCount = 0;
+            // Calculate thresholds for each percentile.
+            double medianTotalThreshold = totalLatencyCount * 0.50;
+            double p95TotalThreshold = totalLatencyCount * 0.95;
+            double p99TotalThreshold = totalLatencyCount * 0.99;
+
+            for (const auto& [latencyMicro, freq] : combinedTotalLatencies) {
+                cumCount += freq;
+                if (medianTotalLatency == 0 && cumCount >= medianTotalThreshold) {
+                    medianTotalLatency = latencyMicro;
+                }
+                if (p95TotalLatency == 0 && cumCount >= p95TotalThreshold) {
+                    p95TotalLatency = latencyMicro;
+                }
+                if (p99TotalLatency == 0 && cumCount >= p99TotalThreshold) {
+                    p99TotalLatency = latencyMicro;
+                    break; // Optimization: exit once all percentiles are found.
+                }
+            }
+        }
+
+                // Add computed percentiles to the JSON document.
+        doc.AddMember("medianTotalLatency", medianTotalLatency, alloc);
+        doc.AddMember("p95TotalLatency", p95TotalLatency, alloc);
+        doc.AddMember("p99TotalLatency", p99TotalLatency, alloc);
+
         // MODIFICATION: Add the runtime count history as a JSON array.
         rapidjson::Value historyArray(rapidjson::kArrayType);
 
@@ -438,6 +491,8 @@ class ApplicationMetrics
         endTime = std::numeric_limits<int64_t>::min();
         latenciesUnderTen.clear();
         latenciesOverTen.clear();
+        totalLatenciesUnderTen.clear();
+        totalLatenciesOverTen.clear();
 
         for (auto& [instName, instancePtr] : instances) {
             instancePtr->reset();
@@ -457,6 +512,10 @@ class ApplicationMetrics
     std::map<int, int> latenciesOverTen; // Latencies in milliseconds
     std::map<int, int>
       latenciesUnderTen; // Latencies under 10ms, recorded in microseconds
+    std::map<int, int> totalLatenciesOverTen; // Latencies in milliseconds
+    std::map<int, int>
+      totalLatenciesUnderTen; // Latencies under 10ms, recorded in microseconds
+
     long count = 0;
     int64_t startTime = std::numeric_limits<int64_t>::max();
     int64_t endTime = std::numeric_limits<int64_t>::min();
