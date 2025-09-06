@@ -57,8 +57,7 @@ class Scheduler
     void enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> req);
 
     void executeBatchForQueue(const std::string& userFuncPar,
-                              util::BatchQueueBase& waitingQueue,
-                              faabric::util::FullLock& lock);
+                              util::BatchQueueBase& waitingQueue);
 
     void resetParameter(std::string key, int32_t value);
 
@@ -202,8 +201,9 @@ class Scheduler
     bool executorAvailable(const std::string& funcStr);
 
     std::shared_ptr<faabric::executor::Executor> claimExecutor(
-      faabric::Message& msg,
-      faabric::util::FullLock& schedulerLock);
+      faabric::Message& msg
+      // ,faabric::util::FullLock& schedulerLock
+    );
 
     // ---- Accounting and debugging ----
     std::vector<faabric::Message> recordedMessages;
@@ -233,8 +233,10 @@ class Scheduler
     std::thread setResultThread;
     int plannerCallInterval = 20; // ms
 
+    int batchInterval = 20; // ms
+
     // ----- Scheduling Info -----
-    int dispatchPeriod = 20; // ms
+    int dispatchPeriod = 20;  // ms
     int batchCheckPeriod = 5; // ms
 
     // stateUpdateMx is used to prevent central scheduler update state when

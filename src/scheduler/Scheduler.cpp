@@ -439,8 +439,7 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
 }
 
 void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
-                                     util::BatchQueueBase& waitingQueue,
-                                     faabric::util::FullLock& lock)
+                                     util::BatchQueueBase& waitingQueue)
 {
     auto firstMsg = waitingQueue.queueFront();
     std::string user = firstMsg->user();
@@ -500,7 +499,7 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
         faabric::Message& localMsg = newReq->mutable_messages()->at(0);
         auto timeFlag1 = faabric::util::getGlobalClock().epochMicros();
         std::shared_ptr<faabric::executor::Executor> e =
-          claimExecutor(localMsg, lock);
+          claimExecutor(localMsg);
         auto timeFlag2 = faabric::util::getGlobalClock().epochMicros();
         int elapsed = static_cast<int>(timeFlag2 - timeFlag1);
         for (int i = 0; i < newReq->messages_size(); i++) {
@@ -512,7 +511,7 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                      newReq->messages_size());
         // Execute the BatchRequest
         auto threadClockId = e->executeBatchTasks(newReq, std::move(stateLock));
-        {
+        if (!runningThreads.contains(threadClockId)) {
             faabric::util::FullLock cpuLock(cpuRecordMx);
             runningThreads.emplace(threadClockId);
         }
@@ -626,45 +625,44 @@ void Scheduler::batchTimerCheck()
             enqueueSchedMsgs(hosts, std::move(msgsVec));
         }
 
-        // long totalWaitingMessages = 0;
-        // for (auto const& [userFuncPar, waitingBatch] : waitingQueues) {
-        //     totalWaitingMessages += waitingBatch->getMessagesCount();
-        // }
-        // SPDLOG_DEBUG(
-        //   "batchTimerCheck: Checking waitingQueues. Total messages: {}",
-        //   totalWaitingMessages);
+        std::vector<std::pair<std::string, util::BatchQueueBase*>> workItems;
+        workItems.reserve(waitingQueues.size() +
+                          partitionedWaitingQueues.size());
 
+        // Queue for stateless and stateful operators.
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
             if (waitingBatch->getMessagesCount() == 0) {
                 continue;
             }
             if (waitingBatch->getMessagesCount() >= executeBatchsize ||
-                waitingBatch->getTimeInterval() >= conf.batchInterval) {
-                executeBatchForQueue(userFuncPar, *waitingBatch, lock);
+                waitingBatch->getTimeInterval() >= batchInterval) {
+                workItems.emplace_back(userFuncPar, waitingBatch.get());
             }
         }
-
-        // NEW DEBUGGING CODE
-        // ==================================
-        // long totalPartitionedMessages = 0;
-        // for (auto const& [userFuncPar, waitingBatch] :
-        //      partitionedWaitingQueues) {
-        //     totalPartitionedMessages += waitingBatch->getMessagesCount();
-        // }
-        // SPDLOG_DEBUG("batchTimerCheck: Checking partitionedWaitingQueues. "
-        //              "Total messages: {}",
-        //              totalPartitionedMessages);
-        // ==================================
-
-        // if Repartitioned, parititioned state functions are in the
-        // partitionedWaitingQueues.
+        // Queue for partitioned stateful operator Queues.
         for (auto& [userFuncPar, waitingBatch] : partitionedWaitingQueues) {
             if (waitingBatch->getMessagesCount() == 0) {
                 continue;
             }
             if (waitingBatch->getMessagesCount() >= executeBatchsize ||
-                waitingBatch->getTimeInterval() >= conf.batchInterval) {
-                executeBatchForQueue(userFuncPar, *waitingBatch, lock);
+                waitingBatch->getTimeInterval() >= batchInterval) {
+                workItems.emplace_back(userFuncPar, waitingBatch.get());
+            }
+        }
+
+        // 2. LAUNCH a thread for each work item.
+        std::vector<std::thread> workerThreads;
+        workerThreads.reserve(workItems.size());
+        for (auto& work : workItems) {
+            workerThreads.emplace_back(
+              [this, userFuncPar = work.first, waitingBatch = work.second] {
+                  this->executeBatchForQueue(userFuncPar, *waitingBatch);
+              });
+        }
+
+        for (auto& t : workerThreads) {
+            if (t.joinable()) {
+                t.join();
             }
         }
 
@@ -693,10 +691,6 @@ void Scheduler::dispatchChainedMsgs()
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
 
-        // SPDLOG_DEBUG("dispatchChainedMsgs: trying to acquire mx lock");
-        // faabric::util::FullLock mxLock(mx);
-        // SPDLOG_DEBUG("dispatchChainedMsgs: acquired mx lock");
-
         if (stopThreadTimer) {
             break;
         }
@@ -714,10 +708,7 @@ void Scheduler::dispatchChainedMsgs()
                 const int64_t endNs = faabric::util::getCpuTimeNano(clk);
                 if (endNs >= 0 && startNs >= 0 && endNs >= startNs) {
                     const int64_t deltaNs = endNs - startNs;
-
                     totalDeltaNs += deltaNs;
-                    // SPDLOG_DEBUG(
-                    //   "Thread clk {} CPU delta: {} ns", (int)clk, deltaNs);
                 }
             }
 
@@ -836,6 +827,7 @@ void Scheduler::dispatchChainedMsgs()
             msgsCallMap[hostIp] = std::move(msgsList); // Move ownership
         }
         scheduledMsgsMap.clear();
+        lock.unlock();
 
         // Parallel execution of function calls for each host
         std::vector<std::thread> threads;
@@ -962,8 +954,9 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
 }
 
 std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
-  faabric::Message& msg,
-  faabric::util::FullLock& schedulerLock)
+  faabric::Message& msg
+  //   ,faabric::util::FullLock& schedulerLock
+)
 {
     std::string funcStr = faabric::util::funcParToString(msg, false);
 
@@ -994,9 +987,9 @@ std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
 
         // Spinning up a new executor can be lengthy, allow other things
         // to run in parallel
-        schedulerLock.unlock();
+        // schedulerLock.unlock();
         auto executor = factory->createExecutor(msg);
-        schedulerLock.lock();
+        // schedulerLock.lock();
         thisExecutors.push_back(std::move(executor));
         claimed = thisExecutors.back();
 

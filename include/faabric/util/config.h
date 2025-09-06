@@ -41,8 +41,6 @@ class SystemConfig
     bool streamMode;
     std::string batchProcess;
     int batchSize;
-    // batchInterval unit: ms
-    int batchInterval;
     int maxParallelism;
     bool preloadParallelism;
     std::string preloadParallelismInfo;

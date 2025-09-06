@@ -51,7 +51,6 @@ void SystemConfig::initialise()
     streamMode = getEnvVar("STREAM_MODE", "on") == "on";
     batchProcess = getEnvVar("BATCH_PROCESS", "on");
     batchSize = this->getSystemConfIntParam("BATCH_SIZE", "10");
-    batchInterval = this->getSystemConfIntParam("BATCH_INTERVAL", "20");
     preloadParallelism = getEnvVar("PRELOAD_PARALLELISM", "on") == "on";
     preloadParallelismInfo =
       getEnvVar("PRELOAD_PARALLELISM_INFO",
@@ -140,7 +139,6 @@ void SystemConfig::print()
     SPDLOG_INFO("--- STREAM ---");
     SPDLOG_INFO("BATCH_PROCESS              {}", batchProcess);
     SPDLOG_INFO("BATCH_SIZE                 {}", batchSize);
-    SPDLOG_INFO("BATCH_INTERVAL             {}", batchInterval);
     SPDLOG_INFO("MAX_PARALLELISM            {}", maxParallelism);
     SPDLOG_INFO("PARALLELISM_UPDATE_INTERVAL {}", parallelismUpdateInterval);
 
