@@ -216,9 +216,9 @@ class Scheduler
       waitingQueues;
 
     // MAP<UserFuncPar, Queue>
-    std::map<std::string,
-             std::unique_ptr<faabric::util::PartitionedStateMessageQueue>>
-      partitionedWaitingQueues;
+    // std::map<std::string,
+    //          std::unique_ptr<faabric::util::PartitionedStateMessageQueue>>
+    //   partitionedWaitingQueues;
 
     std::shared_mutex chainedCallMsgsMx;
     std::vector<std::unique_ptr<faabric::Message>> chainedCallMsgs;

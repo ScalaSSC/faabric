@@ -227,7 +227,7 @@ void Scheduler::reset()
     reaperThread.start(conf.reaperIntervalSeconds);
 
     waitingQueues.clear();
-    partitionedWaitingQueues.clear();
+    // partitionedWaitingQueues.clear();
     {
         faabric::util::FullLock chainedCallMsgslock(chainedCallMsgsMx);
         chainedCallMsgs.clear();
@@ -399,34 +399,43 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
 
         // Add messages to the waiting queue
         // SPDLOG_DEBUG("Enqueueing messages for {}", waitingQueueName);
-        int messageType = msg.messagetype();
-        if (messageType == 2) {
-            size_t hash = msg.hash();
-            // int maxReplicas =
-            //   util::getOrThrow(maxReplicasMap,
-            //                    msg.user() + "/" + msg.function() + "/" +
-            //                      std::to_string(msg.parallelismid()));
-            // We don't want to the state access setting interfere scheduling
-            // performance. So, all set to 10.
-            int queueSearchLength = 10;
-            auto [iterator, inserted] = partitionedWaitingQueues.emplace(
-              waitingQueueName,
-              std::make_unique<faabric::util::PartitionedStateMessageQueue>(
-                waitingQueueName, queueSearchLength, executeBatchsize));
-            int waitMsgs = iterator->second->getMessagesCount();
-            (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
-            iterator->second->addMessage(
-              hash, std::make_unique<faabric::Message>(std::move(msg)));
-        } else {
-            auto [iterator, inserted] =
-              waitingQueues.emplace(waitingQueueName,
-                                    std::make_unique<faabric::util::BatchQueue>(
-                                      waitingQueueName, executeBatchsize));
-            int waitMsgs = iterator->second->getMessagesCount();
-            (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
-            iterator->second->addMessage(
-              std::make_unique<faabric::Message>(std::move(msg)));
-        }
+        // int messageType = msg.messagetype();
+        // if (messageType == 2) {
+        //     size_t hash = msg.hash();
+        //     // int maxReplicas =
+        //     //   util::getOrThrow(maxReplicasMap,
+        //     //                    msg.user() + "/" + msg.function() + "/" +
+        //     //                      std::to_string(msg.parallelismid()));
+        //     // We don't want to the state access setting interfere scheduling
+        //     // performance. So, all set to 10.
+        //     int queueSearchLength = 10;
+        //     auto [iterator, inserted] = partitionedWaitingQueues.emplace(
+        //       waitingQueueName,
+        //       std::make_unique<faabric::util::PartitionedStateMessageQueue>(
+        //         waitingQueueName, queueSearchLength, executeBatchsize));
+        //     int waitMsgs = iterator->second->getMessagesCount();
+        //     (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] =
+        //     waitMsgs; iterator->second->addMessage(
+        //       hash, std::make_unique<faabric::Message>(std::move(msg)));
+        // } else {
+        //     auto [iterator, inserted] =
+        //       waitingQueues.emplace(waitingQueueName,
+        //                             std::make_unique<faabric::util::BatchQueue>(
+        //                               waitingQueueName, executeBatchsize));
+        //     int waitMsgs = iterator->second->getMessagesCount();
+        //     (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] =
+        //     waitMsgs; iterator->second->addMessage(
+        //       std::make_unique<faabric::Message>(std::move(msg)));
+        // }
+
+        auto [iterator, inserted] =
+          waitingQueues.emplace(waitingQueueName,
+                                std::make_unique<faabric::util::BatchQueue>(
+                                  waitingQueueName, executeBatchsize));
+        int waitMsgs = iterator->second->getMessagesCount();
+        (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
+        iterator->second->addMessage(
+          std::make_unique<faabric::Message>(std::move(msg)));
     }
 
     // Update the instances runtime stats
@@ -625,9 +634,9 @@ void Scheduler::batchTimerCheck()
             enqueueSchedMsgs(hosts, std::move(msgsVec));
         }
 
-        std::vector<std::pair<std::string, util::BatchQueueBase*>> workItems;
-        workItems.reserve(waitingQueues.size() +
-                          partitionedWaitingQueues.size());
+        // std::vector<std::pair<std::string, util::BatchQueueBase*>> workItems;
+        // workItems.reserve(waitingQueues.size() +
+        //                   partitionedWaitingQueues.size());
 
         // Queue for stateless and stateful operators.
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
@@ -636,57 +645,19 @@ void Scheduler::batchTimerCheck()
             }
             if (waitingBatch->getMessagesCount() >= executeBatchsize ||
                 waitingBatch->getTimeInterval() >= batchInterval) {
-                workItems.emplace_back(userFuncPar, waitingBatch.get());
+                executeBatchForQueue(userFuncPar, *waitingBatch);
             }
         }
         // Queue for partitioned stateful operator Queues.
-        for (auto& [userFuncPar, waitingBatch] : partitionedWaitingQueues) {
-            if (waitingBatch->getMessagesCount() == 0) {
-                continue;
-            }
-            if (waitingBatch->getMessagesCount() >= executeBatchsize ||
-                waitingBatch->getTimeInterval() >= batchInterval) {
-                workItems.emplace_back(userFuncPar, waitingBatch.get());
-            }
-        }
-
-        // 2. LAUNCH a thread for each work item.
-        std::vector<std::thread> workerThreads;
-        workerThreads.reserve(workItems.size());
-        for (auto& work : workItems) {
-            workerThreads.emplace_back(
-              [this, userFuncPar = work.first, waitingBatch = work.second] {
-                  this->executeBatchForQueue(userFuncPar, *waitingBatch);
-              });
-        }
-
-        for (auto& t : workerThreads) {
-            if (t.joinable()) {
-                t.join();
-            }
-        }
-
-        // auto currentMillis = faabric::util::getGlobalClock().epochMillis();
-
-        // if (currentMillis - lastPlannerCallCheck < plannerCallInterval) {
-        //     continue;
-        // }
-        // lastPlannerCallCheck = currentMillis;
-        // auto& plannerCli = faabric::planner::getPlannerClient();
-
-        // faabric::util::FullLock setResultMsgsLock(setResultMsgsMx);
-        // if (!setResultMsgs.empty()) {
-        //     auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
-        //     for (auto& msg : setResultMsgs) {
-        //         auto* message = req->add_messages();
-        //         *message = std::move(*msg);
+        // for (auto& [userFuncPar, waitingBatch] : partitionedWaitingQueues) {
+        //     if (waitingBatch->getMessagesCount() == 0) {
+        //         continue;
         //     }
-        //     SPDLOG_DEBUG("Set result batch size: {}", req->messages_size());
-        //     plannerCli.setMessageResultBatch(req);
-        //     setResultMsgs.clear();
+        //     if (waitingBatch->getMessagesCount() >= executeBatchsize ||
+        //         waitingBatch->getTimeInterval() >= batchInterval) {
+        //         workItems.emplace_back(userFuncPar, waitingBatch.get());
+        //     }
         // }
-        // setResultMsgsLock.unlock();
-        // SPDLOG_DEBUG("batchTimerCheck: finished");
     }
 }
 
@@ -859,19 +830,15 @@ void Scheduler::dispatchChainedMsgs()
                          msgs.size());
             // If locally, we put the messages into a batch directly
             if (hostIp == thisHost) {
-                std::thread([this,
-                             hostIn = thisHost,
-                             msgsIn = std::move(msgs)]() mutable {
-                    auto batchMsgs = std::make_unique<faabric::MessageBatch>();
-                    batchMsgs->set_invokehost(hostIn);
-                    SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
-                                 hostIn,
-                                 msgsIn.size());
-                    for (auto& msg : msgsIn) {
-                        batchMsgs->add_messages()->CopyFrom(*msg);
-                    }
-                    enqueueMessageBatch(std::move(batchMsgs));
-                }).detach();
+                auto batchMsgs = std::make_unique<faabric::MessageBatch>();
+                batchMsgs->set_invokehost(thisHost);
+                SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
+                             thisHost,
+                             msgs.size());
+                for (auto& msg : msgs) {
+                    batchMsgs->add_messages()->CopyFrom(*msg);
+                }
+                enqueueMessageBatch(std::move(batchMsgs));
             } else {
                 // Otherwise, we send the messages to the remote host
                 threads.emplace_back(
@@ -908,9 +875,9 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
             waitingBatch->resetBatchSize(executeBatchsize);
         }
-        for (auto& [userFuncPar, waitingBatch] : partitionedWaitingQueues) {
-            waitingBatch->resetBatchSize(executeBatchsize);
-        }
+        // for (auto& [userFuncPar, waitingBatch] : partitionedWaitingQueues) {
+        //     waitingBatch->resetBatchSize(executeBatchsize);
+        // }
         SPDLOG_INFO("Reset executeBatchsize parameter to : {}",
                     executeBatchsize);
     } else if (key == "schedule_mode") {
@@ -1363,15 +1330,15 @@ void Scheduler::updateStatesInfo(
             rescheduleMsgs.emplace_back(std::move(msg));
         }
     }
-    for (auto& [queueKey, queuePtr] : partitionedWaitingQueues) {
-        if (queuePtr->getMessagesCount() == 0) {
-            continue;
-        }
-        auto messages = queuePtr->drainMessages();
-        for (auto& msg : messages) {
-            rescheduleMsgs.emplace_back(std::move(msg));
-        }
-    }
+    // for (auto& [queueKey, queuePtr] : partitionedWaitingQueues) {
+    //     if (queuePtr->getMessagesCount() == 0) {
+    //         continue;
+    //     }
+    //     auto messages = queuePtr->drainMessages();
+    //     for (auto& msg : messages) {
+    //         rescheduleMsgs.emplace_back(std::move(msg));
+    //     }
+    // }
     // Reschedule the scheduled messages in scheduledMsgsMap
     for (auto& [hostIp, msgs] : scheduledMsgsMap) {
         for (auto& msg : msgs) {
