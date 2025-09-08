@@ -179,6 +179,7 @@ void Planner::flushSchedulingState()
     state.appResultWaiters.clear();
     state.numMigrations = 0;
     state.inFlightApps.clear();
+    state.appStartTimes.clear();
     state.applicationMetrics =
       std::make_unique<ApplicationMetrics>("defaultApp", 1);
 
@@ -377,11 +378,13 @@ void Planner::setMessageResultBatch(
         if (state.inFlightApps.at(appId).empty()) {
             int inFlightCount = state.inFlightApps.size() - 1;
             // Record metrics before erasing the results
-            state.applicationMetrics->record(state.appResults.at(appId),
-                                             inFlightCount);
+            auto recordStartTime = state.appStartTimes[appId];
+            state.applicationMetrics->record(
+              state.appResults.at(appId), inFlightCount, recordStartTime);
             // Erase the app from tracking
             state.appResults.erase(appId);
             state.inFlightApps.erase(appId);
+            state.appStartTimes.erase(appId);
         }
     }
     SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
@@ -479,6 +482,8 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
                 //              message->id());
                 state.inFlightApps[appid].clear();
                 state.inFlightApps[appid].insert(message->id());
+                state.appStartTimes[appid] =
+                  faabric::util::getGlobalClock().epochMicros();
                 message->set_plannerqueuetime(currentTime);
             }
             // state.inFlightApps[appid]++;
@@ -550,8 +555,9 @@ void Planner::dequeueScheduledMsgs()
             }
             for (auto& msg : msgsList) {
                 // We only set the dispatch time for input.
-                // For chained message, dispatch time is set from worker (it is not zero).
-                if (msg->plannerdispatchtime() == 0){
+                // For chained message, dispatch time is set from worker (it is
+                // not zero).
+                if (msg->plannerdispatchtime() == 0) {
                     msg->set_plannerdispatchtime(currentTime);
                 }
             }
@@ -772,7 +778,7 @@ bool Planner::resetParameter(const std::string& key,
             isOutputting = value == 1;
         } else if (key == "num_hosts_scheduled") {
             numHostsScheduled = value;
-        } else if (key == "runtime_reconfig"){
+        } else if (key == "runtime_reconfig") {
             runtimeReconfig = value == 1;
         }
         return true;
@@ -957,7 +963,7 @@ void Planner::updateRuntimeStats()
             continue; // Only run in decentralized scheduler mode
         }
 
-        if(!runtimeReconfig){
+        if (!runtimeReconfig) {
             continue;
         }
 

@@ -189,7 +189,8 @@ class ApplicationMetrics
       , period(periodIn) {};
 
     void record(const std::map<int, std::shared_ptr<faabric::Message>>& msgMap,
-                int runningReqs)
+                int runningReqs,
+                int recordStartTime)
     {
         int msgMapSize = msgMap.size();
         if (msgMapSize == 0) {
@@ -246,8 +247,14 @@ class ApplicationMetrics
             latenciesOverTen[tempLatencyMilli]++;
         }
 
-        int64_t tempTotalLatencyMicro =
-          faabric::util::getGlobalClock().epochMicros() - tempStartTime;
+        int64_t tempTotalLatencyMicro;
+        if (recordStartTime > 0) {
+            tempTotalLatencyMicro =
+              faabric::util::getGlobalClock().epochMicros() - recordStartTime;
+        } else {
+            tempTotalLatencyMicro =
+              faabric::util::getGlobalClock().epochMicros() - tempStartTime;
+        }
         // Latency in microseconds is less than 10ms (10,000 us)
         if (tempTotalLatencyMicro < 10000) {
             totalLatenciesUnderTen[static_cast<int>(tempTotalLatencyMicro)]++;
@@ -403,7 +410,8 @@ class ApplicationMetrics
 
             for (const auto& [latencyMicro, freq] : combinedTotalLatencies) {
                 cumCount += freq;
-                if (medianTotalLatency == 0 && cumCount >= medianTotalThreshold) {
+                if (medianTotalLatency == 0 &&
+                    cumCount >= medianTotalThreshold) {
                     medianTotalLatency = latencyMicro;
                 }
                 if (p95TotalLatency == 0 && cumCount >= p95TotalThreshold) {
@@ -416,7 +424,7 @@ class ApplicationMetrics
             }
         }
 
-                // Add computed percentiles to the JSON document.
+        // Add computed percentiles to the JSON document.
         doc.AddMember("medianTotalLatency", medianTotalLatency, alloc);
         doc.AddMember("p95TotalLatency", p95TotalLatency, alloc);
         doc.AddMember("p99TotalLatency", p99TotalLatency, alloc);
@@ -554,6 +562,8 @@ struct PlannerState
 
     // MAP<appId, set<msg_id>> Map of inflight requests.
     std::unordered_map<int, std::set<int32_t>> inFlightApps;
+
+    std::unordered_map<int, int64_t> appStartTimes;
 
     // Double-map holding the message results. The first key is the app id. For
     // each app id, we keep a map of the message id, and the actual message

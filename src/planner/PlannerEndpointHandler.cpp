@@ -173,9 +173,15 @@ void PlannerEndpointHandler::onRequest(
         }
         case faabric::planner::HttpMessage_Type_GET_IN_FLIGHT_APPS: {
             SPDLOG_DEBUG("Planner received GET_IN_FLIGHT_APPS request");
-            SPDLOG_ERROR("GET_IN_FLIGHT_APPS not implemented");
-            response.result(beast::http::status::internal_server_error);
-            response.body() = std::string("Not implemented");
+            // Prepare response
+            faabric::planner::GetInFlightAppsResponse inFlightAppsResponse;
+            int numInFlightApp =
+              faabric::planner::getPlanner().getInFlightAppsSize();
+            inFlightAppsResponse.set_numinflightapp(numInFlightApp);
+
+            response.result(beast::http::status::ok);
+            response.body() =
+              faabric::util::messageToJson(inFlightAppsResponse);
             return ctx.sendFunction(std::move(response));
         }
         case faabric::planner::HttpMessage_Type_EXECUTE_BATCH: {
@@ -292,34 +298,17 @@ void PlannerEndpointHandler::onRequest(
                         value);
             if (parameter == "max_inflight_reqs") {
                 maxInflightApps = value;
-            } else if (parameter == "max_executors") {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
-            } else if (parameter == "batch_size") {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
-            } else if (parameter == "max_replicas") {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
-            } else if (parameter == "planner_call_interval") {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
-            } else if (parameter == "schedule_mode") {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "is_outputting") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
             } else if (parameter == "num_hosts_scheduled") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
-            } else if (parameter == "dispatch_period") {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
-            } else if (parameter == "batch_check_period") {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
             } else if (parameter == "runtime_reconfig") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
             } else {
-                SPDLOG_ERROR("Unrecognized parameter {}", parameter);
-                response.result(beast::http::status::bad_request);
-                response.body() = std::string("Unrecognized parameter");
-                return ctx.sendFunction(std::move(response));
+                faabric::planner::getPlanner().resetParameter(parameter, value);
             }
 
             return ctx.sendFunction(std::move(response));

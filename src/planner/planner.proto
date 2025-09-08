@@ -72,6 +72,7 @@ message GetInFlightAppsResponse {
 
     repeated InFlightApp apps = 1;
     int32 numMigrations = 2;
+    int32 numInFlightApp = 3;
 }
 
 message NumMigrationsResponse {

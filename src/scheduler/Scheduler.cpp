@@ -681,7 +681,11 @@ void Scheduler::dispatchChainedMsgs()
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
-        faabric::util::FullLock mxLock(mx);
+        std::unique_lock<std::shared_mutex> mxLock(mx, std::defer_lock);
+
+        if (requireLock) {
+            mxLock.lock();
+        }
 
         if (stopThreadTimer) {
             break;
@@ -891,6 +895,12 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         batchCheckPeriod = value;
         SPDLOG_INFO("Reset batchCheckPeriod parameter to : {}",
                     batchCheckPeriod);
+    } else if (key == "require_lock") {
+        if (value == 1) {
+            requireLock = true;
+        } else {
+            requireLock = false;
+        }
     } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
@@ -1230,7 +1240,10 @@ void Scheduler::updateStatesInfo(
       static_cast<double>(maxExecutors) / static_cast<double>(totalReplicas);
     for (const auto& [funcStr, maxReplica] : tempMaxReplicasMap) {
         int scaledMaxReplica =
-          std::round(static_cast<double>(maxReplica) * scaleFactor);
+          std::ceil(static_cast<double>(maxReplica) * scaleFactor);
+        if (scaledMaxReplica <= 0) {
+            scaledMaxReplica = 1;
+        }
         maxReplicasMap[funcStr] = scaledMaxReplica;
         SPDLOG_DEBUG("updateStatesInfo: {} max replicas set to {}",
                      funcStr,
@@ -1248,29 +1261,29 @@ void Scheduler::updateStatesInfo(
     // planner's new scheduling decision.
     auto& stateServer = faabric::state::getGlobalState();
 
-    stateServer.backupAll();
-    auto& hashRings = decentralScheduler.getStateHashRing();
-    auto migrationStatesMap =
-      stateServer.schedulePreStates(hashRings, statesInfo);
+    // stateServer.backupAll();
+    // auto& hashRings = decentralScheduler.getStateHashRing();
+    // auto migrationStatesMap =
+    //   stateServer.schedulePreStates(hashRings, statesInfo);
 
     // Migrate the states.
-    SPDLOG_INFO("updateStatesInfo: transferring states to other hosts");
-    std::vector<std::thread> threads;
-    for (const auto& [ip, migrStates] : migrationStatesMap) {
-        auto req = std::make_shared<faabric::StateMigrationRequest>();
-        for (const auto& [userFuncPar, serializedState] : migrStates) {
-            auto* migrateState = req->add_migratestates();
-            migrateState->set_userfuncpar(userFuncPar);
-            migrateState->set_serializedstate(serializedState);
-        }
-        threads.emplace_back(
-          [ip, req]() { getFunctionCallClient(ip)->migrateStates(req); });
-    }
-    for (auto& t : threads) {
-        if (t.joinable()) {
-            t.join();
-        }
-    }
+    // SPDLOG_INFO("updateStatesInfo: transferring states to other hosts");
+    // std::vector<std::thread> threads;
+    // for (const auto& [ip, migrStates] : migrationStatesMap) {
+    //     auto req = std::make_shared<faabric::StateMigrationRequest>();
+    //     for (const auto& [userFuncPar, serializedState] : migrStates) {
+    //         auto* migrateState = req->add_migratestates();
+    //         migrateState->set_userfuncpar(userFuncPar);
+    //         migrateState->set_serializedstate(serializedState);
+    //     }
+    //     threads.emplace_back(
+    //       [ip, req]() { getFunctionCallClient(ip)->migrateStates(req); });
+    // }
+    // for (auto& t : threads) {
+    //     if (t.joinable()) {
+    //         t.join();
+    //     }
+    // }
 
     SPDLOG_INFO(
       "updateStatesInfo: states update complete, reallocate states now");
