@@ -825,6 +825,21 @@ void Scheduler::dispatchChainedMsgs()
         scheduledMsgsMap.clear();
         lock.unlock();
 
+        if (msgsCallMap.size() == 1 && msgsCallMap.contains(thisHost)){
+            auto& msgs = msgsCallMap.at(thisHost);
+
+            auto batchMsgs = std::make_unique<faabric::MessageBatch>();
+            batchMsgs->set_invokehost(thisHost);
+            SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
+                         thisHost,
+                         msgs.size());
+            for (auto& msg : msgs) {
+                batchMsgs->add_messages()->CopyFrom(*msg);
+            }
+            enqueueMessageBatch(std::move(batchMsgs));
+            continue;
+        }
+
         // Parallel execution of function calls for each host
         std::vector<std::thread> threads;
         for (auto& [hostIp, msgs] : msgsCallMap) {
@@ -834,15 +849,19 @@ void Scheduler::dispatchChainedMsgs()
                          msgs.size());
             // If locally, we put the messages into a batch directly
             if (hostIp == thisHost) {
-                auto batchMsgs = std::make_unique<faabric::MessageBatch>();
-                batchMsgs->set_invokehost(thisHost);
-                SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
-                             thisHost,
-                             msgs.size());
-                for (auto& msg : msgs) {
-                    batchMsgs->add_messages()->CopyFrom(*msg);
-                }
-                enqueueMessageBatch(std::move(batchMsgs));
+                std::thread([this,
+                             hostIn = thisHost,
+                             msgsIn = std::move(msgs)]() mutable {
+                    auto batchMsgs = std::make_unique<faabric::MessageBatch>();
+                    batchMsgs->set_invokehost(hostIn);
+                    SPDLOG_DEBUG("Batch execute {} locally with Batch size: {}",
+                                 hostIn,
+                                 msgsIn.size());
+                    for (auto& msg : msgsIn) {
+                        batchMsgs->add_messages()->CopyFrom(*msg);
+                    }
+                    enqueueMessageBatch(std::move(batchMsgs));
+                }).detach();
             } else {
                 // Otherwise, we send the messages to the remote host
                 threads.emplace_back(
