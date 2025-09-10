@@ -72,7 +72,7 @@ void DecentralizedScheduler::syncStatesInfo(
     }
 
     runtimeSummary.initScheduledOperators(
-      *application, scheduledOperatorsMap, false);
+      *application, scheduledOperatorsMap, false, scheduleMode);
 
     printScheduleInfomation();
 }

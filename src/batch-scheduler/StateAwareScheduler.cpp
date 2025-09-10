@@ -512,7 +512,7 @@ std::string StateAwareScheduler::scheduleMessage(
             // If schedule mode is 1 or 2 (The scheduler dispatch stateless
             // messages in round-robin).
             host = scheduleStatelessMessageRB(userFunc, hostMap, msg);
-        } else if (scheduleMode == 3) {
+        } else if (scheduleMode == 3 || scheduleMode == 7) {
             host = scheduleStatelessMessageFaaSFlow(userFunc, hostMap, msg);
         } else if (scheduleMode == 4) {
             if (isplanner) {
@@ -1008,7 +1008,7 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
  * ***/
 void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
 {
-    if (scheduleMode == 3) {
+    if (scheduleMode == 3 || scheduleMode == 7) {
         rescheduleAppFaaSFlow(hostMap);
         return;
     }
@@ -1316,7 +1316,7 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
 
     // Init the runtime summary.
     runtimeSummary.initScheduledOperators(
-      *application, scheduledOperatorsMap, true);
+      *application, scheduledOperatorsMap, true, scheduleMode);
 
     // Initialize the State Information for stateful and partitioned stateful
     // operators.
@@ -1683,7 +1683,7 @@ void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
 
     // Init the runtime summary.
     runtimeSummary.initScheduledOperators(
-      *application, scheduledOperatorsMap, true);
+      *application, scheduledOperatorsMap, true, scheduleMode);
 
     // Initialize the State Information for stateful and partitioned stateful
     // operators.
@@ -1766,6 +1766,9 @@ void StateAwareScheduler::printScheduleInfomation() const
 void StateAwareScheduler::runtimeDistTune(
   const std::map<std::string, std::map<std::string, int>>& observeDistMap)
 {
+    if (!runtimeReconfig) {
+        return;
+    }
     // We only schedule when the schedule mode is 0 and 5.
     if (scheduleMode != 0 && scheduleMode != 5 && scheduleMode != 6) {
         return;
@@ -1776,6 +1779,10 @@ void StateAwareScheduler::runtimeDistTune(
 void StateAwareScheduler::setScheduleMode(int mode)
 {
     scheduleMode = mode;
+}
+
+void StateAwareScheduler::setRuntimeReconfig(bool value) {
+    runtimeReconfig = value;
 }
 
 void StateAwareScheduler::resetScheduler()

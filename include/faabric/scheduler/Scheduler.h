@@ -44,6 +44,9 @@ class Scheduler
 
     void enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs);
 
+    void enqueueMessageBatch(std::list<std::unique_ptr<faabric::Message>> msgs,
+                             std::string invokeHost);
+
     void setMessageResults();
 
     // Check the waiting queue peroiodically.

@@ -378,7 +378,7 @@ void Planner::setMessageResultBatch(
         if (state.inFlightApps.at(appId).empty()) {
             int inFlightCount = state.inFlightApps.size() - 1;
             // Record metrics before erasing the results
-            auto recordStartTime = state.appStartTimes[appId];
+            int64_t recordStartTime = state.appStartTimes[appId];
             state.applicationMetrics->record(
               state.appResults.at(appId), inFlightCount, recordStartTime);
             // Erase the app from tracking
@@ -778,8 +778,6 @@ bool Planner::resetParameter(const std::string& key,
             isOutputting = value == 1;
         } else if (key == "num_hosts_scheduled") {
             numHostsScheduled = value;
-        } else if (key == "runtime_reconfig") {
-            runtimeReconfig = value == 1;
         }
         return true;
     }
@@ -791,12 +789,16 @@ bool Planner::resetParameter(const std::string& key,
         // Schedule Mode 2: Centralized Scheduler.
         // Schedule Mode 3: FaaSFlow Scheduler.
         // Scheduler Mode 5: Our Method.
+        // Scheduler Mode 7: Centralized Scheduler With FaaSFlow
         SPDLOG_INFO("Planner reset schedule mode to {}", value);
         stateAwareScheduler->setScheduleMode(value);
         scheduleMode = value;
     }
     if (key == "dispatch_period") {
         dispatchPeriod = value;
+    }
+    if (key == "runtime_reconfig") {
+        stateAwareScheduler->setRuntimeReconfig(value == 1);
     }
 
     // Reset the parameter of the worker hosts
@@ -949,7 +951,6 @@ void Planner::updateRuntimeStats()
     // It doesn't need to be thread-safe, since all the stats in each worker
     // are thread-safe. Map to accumulate the runtime stats from each host.
     std::map<std::string, std::unique_ptr<faabric::RuntimeStatsResult>> results;
-    std::mutex resultsMutex; // Protects access to results.
     faabric::RuntimeStatsUpdateRequest request;
 
     // We fetch the runtime stats periodically. Each iteration sends the stats
@@ -959,33 +960,13 @@ void Planner::updateRuntimeStats()
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeStatsUpdatePeriod));
 
-        if (scheduleMode != 0 && scheduleMode != 5 && scheduleMode != 6) {
-            continue; // Only run in decentralized scheduler mode
-        }
-
-        if (!runtimeReconfig) {
-            continue;
-        }
-
-        std::vector<std::future<void>> futures;
         // Iterate over all hosts.
         for (const auto& [ip, hostInfo] : state.batchSchedHostMap) {
-            // Launch an asynchronous task for each host.
-            futures.emplace_back(std::async(
-              std::launch::async, [&results, &resultsMutex, &request, ip]() {
-                  // Fetch the runtime stats for the host using its IP.
-                  auto stats = faabric::scheduler::getFunctionCallClient(ip)
-                                 ->getRuntimeStats(request);
-
-                  // Lock the results map before writing.
-                  std::lock_guard<std::mutex> lock(resultsMutex);
-                  results[ip] = std::move(stats);
-              }));
-        }
-
-        // Wait for all the async tasks to complete.
-        for (auto& fut : futures) {
-            fut.get();
+            // Fetch the runtime stats for the host using its IP.
+            auto stats =
+              faabric::scheduler::getFunctionCallClient(ip)->getRuntimeStats(
+                request);
+            results[ip] = std::move(stats);
         }
 
         // Update the request with the results.

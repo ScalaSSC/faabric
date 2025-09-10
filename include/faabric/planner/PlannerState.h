@@ -190,7 +190,7 @@ class ApplicationMetrics
 
     void record(const std::map<int, std::shared_ptr<faabric::Message>>& msgMap,
                 int runningReqs,
-                int recordStartTime)
+                int64_t recordStartTime)
     {
         int msgMapSize = msgMap.size();
         if (msgMapSize == 0) {

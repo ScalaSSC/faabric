@@ -304,9 +304,6 @@ void PlannerEndpointHandler::onRequest(
             } else if (parameter == "num_hosts_scheduled") {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
-            } else if (parameter == "runtime_reconfig") {
-                faabric::planner::getPlanner().resetParameter(
-                  parameter, value, true);
             } else {
                 faabric::planner::getPlanner().resetParameter(parameter, value);
             }

@@ -20,12 +20,6 @@ struct InstanceStatsResult
     std::map<std::string, int> chainedCallStats;
 };
 
-struct TimedEntry
-{
-    TimePoint timestamp;
-    int count;
-};
-
 class InstanceStats
 {
   public:
@@ -34,8 +28,8 @@ class InstanceStats
     {}
     const std::string instanceName;
     // Change these maps to store a deque of events per stat key.
-    std::map<std::string, std::deque<TimedEntry>> sourceStats;
-    std::map<std::string, std::deque<TimedEntry>> chainedCallStats;
+    std::map<std::string, std::map<time_t, int>> sourceStats;
+    std::map<std::string, std::map<time_t, int>> chainedCallStats;
 };
 
 class InstancesRuntimeStats
@@ -50,34 +44,39 @@ class InstancesRuntimeStats
                                              const TimePoint now)
     {
         InstanceStatsResult result{};
+
+        // 1. Calculate the cutoff time.
         auto cutoff = now - std::chrono::seconds(statsTimeout);
+        auto cutoffSeconds =
+          std::chrono::time_point_cast<std::chrono::seconds>(cutoff);
+        time_t cutoffT = cutoffSeconds.time_since_epoch().count();
 
         // Process sourceStats.
-        for (auto& [source, events] : stats.sourceStats) {
-            // Prune outdated events.
-            while (!events.empty() && events.front().timestamp < cutoff) {
-                events.pop_front();
-            }
-            // Sum up remaining events.
+        for (auto const& [source, events] : stats.sourceStats) {
             int sum = 0;
-            for (const auto& entry : events) {
-                sum += entry.count;
+            for (auto const& [timestamp, count] : events) {
+                if (timestamp >= cutoffT) {
+                    sum += count;
+                }
             }
-            result.sourceStats[source] = sum;
-            result.executedCount += sum;
+            if (sum > 0) {
+                result.sourceStats[source] = sum;
+                result.executedCount += sum;
+            }
         }
 
         // Process chainedCallStats similarly.
-        for (auto& [dest, events] : stats.chainedCallStats) {
-            while (!events.empty() && events.front().timestamp < cutoff) {
-                events.pop_front();
-            }
+        for (auto const& [dest, events] : stats.chainedCallStats) {
             int sum = 0;
-            for (const auto& entry : events) {
-                sum += entry.count;
+            for (auto const& [timestamp, count] : events) {
+                if (timestamp >= cutoffT) {
+                    sum += count;
+                }
             }
-            result.chainedCallStats[dest] = sum;
-            result.chainedCallCount += sum;
+            if (sum > 0) {
+                result.chainedCallStats[dest] = sum;
+                result.chainedCallCount += sum;
+            }
         }
 
         return result;
@@ -89,21 +88,29 @@ class InstancesRuntimeStats
                      int count)
     {
         std::unique_lock lock(statsMx);
-        auto now = std::chrono::steady_clock::now();
-        auto cutoff = now - std::chrono::seconds(statsTimeout);
 
-        // Try to emplace a new InstanceStats if it doesn't already exist.
-        auto [it, inserted] =
-          instanceStatsMap.emplace(instanceName, InstanceStats(instanceName));
-        InstanceStats& stats = it->second;
+        // Get current time truncated to seconds.
+        auto now = Clock::now();
+        auto nowSeconds =
+          std::chrono::time_point_cast<std::chrono::seconds>(now);
+        time_t currentTimeT = nowSeconds.time_since_epoch().count();
 
-        // Prune outdated events before adding the new one.
-        auto& events = stats.sourceStats[source];
-        while (!events.empty() && events.front().timestamp < cutoff) {
-            events.pop_front();
+        // Get or create the main stats object for the instance.
+        auto& stats = instanceStatsMap.try_emplace(instanceName, instanceName)
+                        .first->second;
+
+        // Get the specific map for the source.
+        auto& eventMap = stats.sourceStats[source];
+
+        // --- Core Optimization ---
+        // 1. Aggregate: Add the count to the current second's entry.
+        eventMap[currentTimeT] += count;
+
+        // 2. Prune: Efficiently remove outdated seconds from the map.
+        time_t cutoffT = currentTimeT - statsTimeout;
+        while (!eventMap.empty() && eventMap.begin()->first < cutoffT) {
+            eventMap.erase(eventMap.begin());
         }
-
-        events.push_back({ now, count });
     }
 
     // Record a chained call event.
@@ -112,32 +119,24 @@ class InstancesRuntimeStats
                           int count)
     {
         std::unique_lock lock(statsMx);
-        auto now = std::chrono::steady_clock::now();
-        auto cutoff = now - std::chrono::seconds(statsTimeout);
 
-        // Try to emplace a new InstanceStats if it doesn't already exist.
-        auto [it, inserted] =
-          instanceStatsMap.emplace(instanceName, InstanceStats(instanceName));
-        InstanceStats& stats = it->second;
+        auto now = Clock::now();
+        auto nowSeconds =
+          std::chrono::time_point_cast<std::chrono::seconds>(now);
+        time_t currentTimeT = nowSeconds.time_since_epoch().count();
 
-        // Prune outdated events before adding the new one.
-        auto& events = stats.chainedCallStats[dest];
-        while (!events.empty() && events.front().timestamp < cutoff) {
-            events.pop_front();
+        auto& stats = instanceStatsMap.try_emplace(instanceName, instanceName)
+                        .first->second;
+
+        auto& eventMap = stats.chainedCallStats[dest];
+
+        // --- Core Optimization ---
+        eventMap[currentTimeT] += count;
+
+        time_t cutoffT = currentTimeT - statsTimeout;
+        while (!eventMap.empty() && eventMap.begin()->first < cutoffT) {
+            eventMap.erase(eventMap.begin());
         }
-
-        events.push_back({ now, count });
-    }
-
-    InstanceStatsResult getInstanceStats(const std::string& instanceName)
-    {
-        std::unique_lock lock(statsMx);
-        auto it = instanceStatsMap.find(instanceName);
-        if (it == instanceStatsMap.end()) {
-            return InstanceStatsResult{};
-        }
-        auto now = std::chrono::steady_clock::now();
-        return computeInstanceStats(it->second, now);
     }
 
     // Refactored getAllStats iterates over the map only once while holding the
@@ -148,6 +147,7 @@ class InstancesRuntimeStats
         std::map<std::string, InstanceStatsResult> allStats;
         auto now = std::chrono::steady_clock::now();
         for (auto& [instanceName, stats] : instanceStatsMap) {
+            // Pass 'now' to the compute function.
             allStats[instanceName] = computeInstanceStats(stats, now);
         }
         return allStats;

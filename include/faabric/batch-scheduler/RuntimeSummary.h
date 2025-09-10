@@ -191,7 +191,8 @@ class ProbabilisticScheduler
 };
 
 // MAP<IP address: ProbabilisticScheduler>
-using MetaScheduler = std::map<std::string, std::shared_ptr<ProbabilisticScheduler>>;
+using MetaScheduler =
+  std::map<std::string, std::shared_ptr<ProbabilisticScheduler>>;
 
 class RuntimeSummary
 {
@@ -201,7 +202,8 @@ class RuntimeSummary
     void initScheduledOperators(
       const batch_scheduler::Application& application,
       const std::map<std::string, ScheduledOperator>& scheduledOperatorsMapIn,
-      bool planner = false);
+      bool planner,
+      int scheduleMode);
 
     void requestDistTune(
       const std::map<std::string, std::map<std::string, int>>& observedDistMap);
@@ -238,19 +240,25 @@ class RuntimeSummary
       probabilisticSchedulers;
     std::map<std::string, std::shared_ptr<MetaScheduler>> metaSchedulers;
 
-    void initAll(const batch_scheduler::Application& application, bool planner);
+    void initAll(const batch_scheduler::Application& application,
+                 bool planner,
+                 int scheduleMode);
 
     void initOpertaor(const batch_scheduler::Application& application,
                       std::string operatorName);
 
     void doInitExpectedDist(ScheduledOperator& schedOp);
 
-    MetaScheduler buildHeadMetaScheduler(const std::string& instanceName);
-
-    MetaScheduler buildBodyMetaScheduler(const std::string& instanceName);
+    MetaScheduler buildMetaScheduler(
+      const std::string& instanceName,
+      std::map<std::string, double> schedulingWeights);
 
     void TuneImplDist(const std::string instanceName,
                       const std::map<std::string, int>& observedDist);
+
+    std::map<std::string, double> calculateBodyWeights(
+      const std::string instanceName,
+      const std::map<std::string, int>& observedDist);
 
     void CollocateHeadTune(const std::string instanceName,
                            const std::map<std::string, int>& observedDist);

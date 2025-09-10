@@ -189,7 +189,7 @@ double Application::computePreWorkloads(int scheduleMode)
     double totalPreWorkload = 0;
     for (auto& [nodeName, node] : nodes) {
         double estimateWork = static_cast<double>(node->processedTuples);
-        if (scheduleMode != 3 && connectionsWithWeight.count(nodeName) > 0) {
+        if (scheduleMode != 3 && scheduleMode != 7 && connectionsWithWeight.count(nodeName) > 0) {
             for (const auto& [_, weight] : connectionsWithWeight.at(nodeName)) {
                 if (minimizedInput == 1) {
                     estimateWork += 0.1;

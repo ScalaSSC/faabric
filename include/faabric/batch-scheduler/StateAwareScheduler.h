@@ -175,6 +175,8 @@ class StateAwareScheduler : public BatchScheduler
 
     void printScheduleInfomation() const;
 
+    void setRuntimeReconfig(bool value);
+
   protected:
     // scheduler lock
     std::shared_mutex scheduleMx;
@@ -188,6 +190,8 @@ class StateAwareScheduler : public BatchScheduler
     int weightFactor = 1000;
 
     RuntimeSummary runtimeSummary;
+
+    std::atomic<bool> runtimeReconfig = true;
 
     /***
      * The following maps are used to store the state of the functions.

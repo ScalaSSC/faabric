@@ -15,6 +15,7 @@
 namespace faabric::util {
 
 template<typename K, typename V>
+// getOrThrow function returns a copy of value.
 inline V getOrThrow(const std::map<K, V>& map, const K& key)
 {
     auto it = map.find(key);
