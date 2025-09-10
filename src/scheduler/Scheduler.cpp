@@ -422,7 +422,7 @@ void Scheduler::enqueueMessageBatch(
     // This function is called by planner and other workers. Deadlocks happens
     // if lock(mx) is required. Our BatchQueue is thread-safe.
 
-    int nMessages = msgs.size();
+    [[maybe_unused]] int nMessages = msgs.size();
     auto current = faabric::util::getGlobalClock().epochMicros();
     auto currentMillis = faabric::util::getGlobalClock().epochMillis();
     auto endPoint = faabric::util::getSystemConfig().endpointHost;
