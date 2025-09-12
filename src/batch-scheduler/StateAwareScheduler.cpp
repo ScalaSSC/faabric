@@ -1785,6 +1785,11 @@ void StateAwareScheduler::setRuntimeReconfig(bool value) {
     runtimeReconfig = value;
 }
 
+void StateAwareScheduler::setAlpha(double value){
+    runtimeSummary.setAlpha(value);
+}
+
+
 void StateAwareScheduler::resetScheduler()
 {
     SPDLOG_INFO("Flushing state information");

@@ -930,7 +930,12 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         }
     } else if (key == "runtime_reconfig") {
         decentralScheduler.setRuntimeReconfig(value == 1);
-    } else {
+    } else if (key == "alpha"){
+        double newAlpha = value / 1000.0; 
+        SPDLOG_INFO("Alpha is set to {}", newAlpha);
+        decentralScheduler.setAlpha(newAlpha);
+    }
+    else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }

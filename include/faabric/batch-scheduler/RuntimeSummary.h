@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <atomic>
 
 namespace faabric::batch_scheduler {
 
@@ -213,6 +214,8 @@ class RuntimeSummary
     std::string getHost(const std::string& instance, unsigned int counter);
     std::string getHost(const std::string& instance,
                         const std::string& recommended);
+    
+    void setAlpha(double value);
 
     void reset();
 
@@ -220,7 +223,7 @@ class RuntimeSummary
     std::shared_mutex summaryMx;
     std::string localHost = faabric::util::getSystemConfig().endpointHost;
     bool isPlanner = false;
-    const double alpha = 0.2;
+    std::atomic<double> alpha = 0.2;
 
     // MAP<instance name: operatorType>
     std::map<std::string, LocalStatelessOperatorType> localOperatorsMap;

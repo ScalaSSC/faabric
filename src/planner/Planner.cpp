@@ -805,6 +805,11 @@ bool Planner::resetParameter(const std::string& key,
     if (key == "runtime_reconfig") {
         stateAwareScheduler->setRuntimeReconfig(value == 1);
     }
+    if (key == "alpha"){
+        double newAlpha = value / 1000.0; 
+        SPDLOG_INFO("Alpha is set to {}", newAlpha);
+        stateAwareScheduler->setAlpha(newAlpha);
+    }
 
     // Reset the parameter of the worker hosts
     auto availableHosts = getAvailableHosts(true);

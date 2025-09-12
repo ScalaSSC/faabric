@@ -301,7 +301,7 @@ void RuntimeSummary::TuneImplDist(
         double observedProb = observedProbs[worker];
 
         double error = expectedProb - observedProb;
-        double newProb = oldImplProb + alpha * error;
+        double newProb = oldImplProb + alpha.load() * error;
 
         // Ensure the new probability is not negative
         newProb = std::max(0.0, newProb);
@@ -486,6 +486,10 @@ void RuntimeSummary::requestDistTune(
         }
     }
     recommendedHostMap.clear();
+}
+
+void RuntimeSummary::setAlpha(double value){
+    alpha.store(value);
 }
 
 void RuntimeSummary::reset()

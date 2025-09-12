@@ -177,6 +177,8 @@ class StateAwareScheduler : public BatchScheduler
 
     void setRuntimeReconfig(bool value);
 
+    void setAlpha(double value);
+
   protected:
     // scheduler lock
     std::shared_mutex scheduleMx;
