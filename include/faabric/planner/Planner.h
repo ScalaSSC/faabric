@@ -134,6 +134,7 @@ class Planner
     // Two mutex are used where plannerMx is used for message info collect, e.g.
     // inFlightReqs, message results, etc.
     std::shared_mutex plannerMx;
+    std::shared_mutex reconfigMx;
     // plannerStateMx is used for function scheduling.
     // std::shared_mutex plannerStateMx;
 
@@ -190,7 +191,7 @@ class Planner
 
     faabric::scheduler::InstancesRuntimeStats runtimeStats;
 
-    int runtimeStatsUpdatePeriod = 5000; // ms
+    int runtimeReconfigPeriod = 5000; // ms
 
     void dequeueScheduledMsgs();
 

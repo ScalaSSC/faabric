@@ -456,7 +456,7 @@ void RuntimeSummary::requestDistTune(
   const std::map<std::string, std::map<std::string, int>>& observedDistMap)
 {
     SPDLOG_DEBUG("Updating stateless request distribution");
-    if (expectedDistMap.empty()) {
+    if (expectedDistMap.empty() || implDistMap.empty()) {
         return; // Nothing to tune if expected distribution is empty
     }
 

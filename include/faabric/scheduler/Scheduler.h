@@ -286,6 +286,9 @@ class Scheduler
 
     bool requireLock = true;
 
+    bool parallelDispatch = true;
+    std::shared_mutex reconfigMx;
+
     std::shared_mutex cpuRecordMx;
     std::atomic<std::int64_t> cpuScheduleTime{ 0 };
     std::chrono::steady_clock::time_point cpuRecordStart{};

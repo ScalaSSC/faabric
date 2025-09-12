@@ -158,6 +158,7 @@ void Planner::flushHosts()
 void Planner::flushExecutors()
 {
     faabric::util::FullLock lock(plannerMx);
+    faabric::util::FullLock rflock(reconfigMx);
 
     if (stateAwareScheduler) {
         stateAwareScheduler->resetScheduler();
@@ -173,6 +174,7 @@ void Planner::flushExecutors()
 void Planner::flushSchedulingState()
 {
     faabric::util::FullLock lock(plannerMx);
+    faabric::util::FullLock rflock(reconfigMx);
 
     state.inFlightReqs.clear();
     state.appResults.clear();
@@ -778,6 +780,8 @@ bool Planner::resetParameter(const std::string& key,
             isOutputting = value == 1;
         } else if (key == "num_hosts_scheduled") {
             numHostsScheduled = value;
+        } else if (key == "runtime_reconfig_period") {
+            runtimeReconfigPeriod = value;
         }
         return true;
     }
@@ -952,21 +956,36 @@ void Planner::updateRuntimeStats()
     // are thread-safe. Map to accumulate the runtime stats from each host.
     std::map<std::string, std::unique_ptr<faabric::RuntimeStatsResult>> results;
     faabric::RuntimeStatsUpdateRequest request;
+    std::mutex resultsMutex; // Protects access to results.
 
     // We fetch the runtime stats periodically. Each iteration sends the stats
     // in the last iteration and feteches the new stats.
     while (!stopThreadTimer) {
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(
-          std::chrono::milliseconds(runtimeStatsUpdatePeriod));
+          std::chrono::milliseconds(runtimeReconfigPeriod));
 
+        faabric::util::FullLock rflock(reconfigMx);
+
+        std::vector<std::future<void>> futures;
         // Iterate over all hosts.
         for (const auto& [ip, hostInfo] : state.batchSchedHostMap) {
-            // Fetch the runtime stats for the host using its IP.
-            auto stats =
-              faabric::scheduler::getFunctionCallClient(ip)->getRuntimeStats(
-                request);
-            results[ip] = std::move(stats);
+            // Launch an asynchronous task for each host.
+            futures.emplace_back(std::async(
+              std::launch::async, [&results, &resultsMutex, &request, ip]() {
+                  // Fetch the runtime stats for the host using its IP.
+                  auto stats = faabric::scheduler::getFunctionCallClient(ip)
+                                 ->getRuntimeStats(request);
+
+                  // Lock the results map before writing.
+                  std::lock_guard<std::mutex> lock(resultsMutex);
+                  results[ip] = std::move(stats);
+              }));
+        }
+
+        // Wait for all the async tasks to complete.
+        for (auto& fut : futures) {
+            fut.get();
         }
 
         // Update the request with the results.

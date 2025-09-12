@@ -296,12 +296,15 @@ void PlannerEndpointHandler::onRequest(
             SPDLOG_INFO("Planner Handler Resetting parameter {} to value {}",
                         parameter,
                         value);
+            static const std::unordered_set<std::string> plannerParams = {
+                "is_outputting",
+                "num_hosts_scheduled",
+                "runtime_reconfig_period",
+            };
+
             if (parameter == "max_inflight_reqs") {
                 maxInflightApps = value;
-            } else if (parameter == "is_outputting") {
-                faabric::planner::getPlanner().resetParameter(
-                  parameter, value, true);
-            } else if (parameter == "num_hosts_scheduled") {
+            } else if (plannerParams.contains(parameter)) {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
             } else {

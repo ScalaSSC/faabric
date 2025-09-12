@@ -253,6 +253,7 @@ void Scheduler::reset()
     dispatchChainedMsgsThread =
       std::thread(&Scheduler::dispatchChainedMsgs, this);
 
+    faabric::util::FullLock rflock(reconfigMx);
     decentralScheduler.resetScheduler();
 }
 
@@ -360,6 +361,8 @@ bool Scheduler::registerApp(std::unique_ptr<batch_scheduler::Application> app)
 {
     SPDLOG_INFO("Scheduler registers application {}", app->getName());
     faabric::util::FullLock lock(mx);
+    faabric::util::FullLock rflock(reconfigMx);
+
     decentralScheduler.registerApp(std::move(app));
     return true;
 }
@@ -822,20 +825,60 @@ void Scheduler::dispatchChainedMsgs()
         scheduledMsgsMap.clear();
         lock.unlock();
 
-        // Parallel execution of function calls for each host
-        for (auto& [hostIp, msgs] : msgsCallMap) {
-            // SPDLOG_DEBUG the hosts and messages
-            SPDLOG_DEBUG("Dispatching messages to host {} with message size {}",
-                         hostIp,
-                         msgs.size());
-            // If locally, we put the messages into a batch directly
-            if (hostIp == thisHost) {
+        if (parallelDispatch) {
+            if (msgsCallMap.size() == 1 && msgsCallMap.contains(thisHost)) {
                 auto& msgs = msgsCallMap.at(thisHost);
                 enqueueMessageBatch(std::move(msgs), thisHost);
-            } else {
-                // Otherwise, we send the messages to the remote host
-                faabric::scheduler::getFunctionCallClient(hostIp)
-                  ->executeFunctionsBatch(std::move(msgs));
+                continue;
+            }
+
+            // Parallel execution of function calls for each host
+            std::vector<std::thread> threads;
+            for (auto& [hostIp, msgs] : msgsCallMap) {
+                // SPDLOG_DEBUG the hosts and messages
+                SPDLOG_DEBUG(
+                  "Dispatching messages to host {} with message size {}",
+                  hostIp,
+                  msgs.size());
+                // If locally, we put the messages into a batch directly
+                if (hostIp == thisHost) {
+                    threads.emplace_back(
+                      [this, msgsIn = std::move(msgs)]() mutable {
+                          enqueueMessageBatch(std::move(msgsIn), thisHost);
+                      });
+                } else {
+                    // Otherwise, we send the messages to the remote host
+                    threads.emplace_back(
+                      [hostIp](std::list<std::unique_ptr<faabric::Message>>
+                                 msgsIn) mutable {
+                          faabric::scheduler::getFunctionCallClient(hostIp)
+                            ->executeFunctionsBatch(std::move(msgsIn));
+                      },
+                      std::move(msgs));
+                }
+            }
+            // Join all threads to ensure they complete before next iteration
+            for (auto& t : threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+
+        } else {
+            for (auto& [hostIp, msgs] : msgsCallMap) {
+                // SPDLOG_DEBUG the hosts and messages
+                SPDLOG_DEBUG(
+                  "Dispatching messages to host {} with message size {}",
+                  hostIp,
+                  msgs.size());
+                // If locally, we put the messages into a batch directly
+                if (hostIp == thisHost) {
+                    enqueueMessageBatch(std::move(msgs), thisHost);
+                } else {
+                    // Otherwise, we send the messages to the remote host
+                    faabric::scheduler::getFunctionCallClient(hostIp)
+                      ->executeFunctionsBatch(std::move(msgs));
+                }
             }
         }
     }
@@ -878,6 +921,12 @@ void Scheduler::resetParameter(std::string key, int32_t value)
             requireLock = true;
         } else {
             requireLock = false;
+        }
+    } else if (key == "parallel_dispatch") {
+        if (value == 1) {
+            parallelDispatch = true;
+        } else {
+            parallelDispatch = false;
         }
     } else if (key == "runtime_reconfig") {
         decentralScheduler.setRuntimeReconfig(value == 1);
@@ -1224,6 +1273,7 @@ void Scheduler::updateStatesInfo(
                      scaledMaxReplica);
     }
 
+    faabric::util::FullLock rflock(reconfigMx);
     decentralScheduler.resetScheduler();
 
     decentralScheduler.setScheuduledOperatorMap(scheuduledOperatorMap);
@@ -1353,6 +1403,7 @@ void Scheduler::updateStatelessDist(
 {
     // TODO - update the source.
     SPDLOG_DEBUG("Updating stateless distribution");
+    faabric::util::FullLock rflock(reconfigMx);
     decentralScheduler.runtimeDistTune(sourceCountStats);
 }
 
