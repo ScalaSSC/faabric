@@ -235,6 +235,7 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
 
     bool requireHostSync = false;
     faabric::util::FullLock lock(plannerMx);
+    faabric::util::FullLock rflock(reconfigMx);
     auto it = state.hostMap.find(hostIn.ip());
     if (it == state.hostMap.end() || isHostExpired(it->second)) {
         // If the host entry has expired, we remove it and treat the host
