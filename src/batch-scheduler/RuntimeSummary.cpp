@@ -171,19 +171,14 @@ void RuntimeSummary::initOpertaor(
             continue;
         }
         auto sourceOpt = scheduledOperatorsMap.at(sourceNode->name);
-        if (sourceOpt.groupId != scheduledOpt.groupId)
+        if (sourceOpt.groupId != scheduledOpt.groupId) {
             continue;
-        if (!sourceOpt.weightDist.contains(localHost))
+        }
+        if (!sourceOpt.weightDist.contains(localHost)) {
             continue;
-        if (isCollocate && sourceOpt.isCollocate &&
-            sourceOpt.collocateWith == collocateWith) {
-            isBody = true;
-            break;
         }
-        if (!isCollocate) {
-            isBody = true;
-            break; // Only break the inner for loop
-        }
+        isBody = true;
+        break; // Only break the inner for loop
     }
 
     std::string instanceName = scheduledOpt.node.name + "_0";
@@ -356,7 +351,7 @@ MetaScheduler RuntimeSummary::buildMetaScheduler(
   const std::string& instanceName,
   std::map<std::string, double> schedulingWeights)
 {
-    SPDLOG_DEBUG("Building body meta-scheduler for instance {}", instanceName);
+    SPDLOG_DEBUG("Building meta-scheduler for instance {}", instanceName);
 
     std::map<std::string, double> recoHostProp;
     if (recommendedHostMap.contains(instanceName)) {
@@ -381,8 +376,12 @@ MetaScheduler RuntimeSummary::buildMetaScheduler(
         double recoWeight = recoHostProp[host];
         // For deficit operator, schedule it locally only
         std::map<std::string, double> hostScheduleWeight;
-        if (schedulingWeight > recoWeight) {
-            hostScheduleWeight[host] = recoWeight / schedulingWeight;
+        if (schedulingWeight < recoWeight) {
+            if (recoWeight == 0) {
+                hostScheduleWeight[host] = 0;
+            } else {
+                hostScheduleWeight[host] = schedulingWeight / recoWeight;
+            }
             double offloadRatio = 1 - hostScheduleWeight[host];
 
             for (const auto& [deficitHost, deficit] :
@@ -391,8 +390,7 @@ MetaScheduler RuntimeSummary::buildMetaScheduler(
                 hostScheduleWeight[deficitHost] +=
                   offloadRatio * offloadPortion;
             }
-        }
-        if (schedulingWeight <= recoWeight) {
+        } else if (schedulingWeight >= recoWeight) {
             hostScheduleWeight[host] = 1.0;
         }
         metaScheduler.emplace(
@@ -488,7 +486,8 @@ void RuntimeSummary::requestDistTune(
     recommendedHostMap.clear();
 }
 
-void RuntimeSummary::setAlpha(double value){
+void RuntimeSummary::setAlpha(double value)
+{
     alpha.store(value);
 }
 
