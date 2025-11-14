@@ -504,26 +504,12 @@ std::string StateAwareScheduler::scheduleMessage(
     }
     // stateless operator
     else {
-        if (scheduleMode == 0 || scheduleMode == 5 || scheduleMode == 6) {
-            // If schedule mode is 0 (The scheduler should dispatch stateless
-            // messages in accordance with the expected proportions).
+        if (scheduleMode == 5) {
             host = scheduleStatelessMessageApportion(userFunc, hostMap, msg);
-        } else if (scheduleMode == 1 || scheduleMode == 2) {
-            // If schedule mode is 1 or 2 (The scheduler dispatch stateless
-            // messages in round-robin).
-            host = scheduleStatelessMessageRB(userFunc, hostMap, msg);
         } else if (scheduleMode == 3 || scheduleMode == 7) {
             host = scheduleStatelessMessageFaaSFlow(userFunc, hostMap, msg);
-        } else if (scheduleMode == 4) {
-            if (isplanner) {
-                host =
-                  scheduleStatelessMessageApportion(userFunc, hostMap, msg);
-            } else {
-                host = scheduleStatelessMessageLocal(userFunc, hostMap, msg);
-            }
         } else {
-            SPDLOG_ERROR("Unknown schedule mode: {}", scheduleMode);
-            throw std::runtime_error("Unknown schedule mode");
+            host = scheduleStatelessMessageRB(userFunc, hostMap, msg);
         }
     }
     if (host == "unknown") {
@@ -1043,20 +1029,9 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
     std::vector<NodeGroup> groups;
     std::unordered_set<std::string> visited;
 
-    if (scheduleMode == 4) {
-        std::vector<std::shared_ptr<Node>> appNodesVec;
-        for (const auto& [nodeName, nodePtr] : appNodes) {
-            appNodesVec.push_back(nodePtr);
-        }
-        NodeGroup singleGroup{ std::move(appNodesVec), NONE_STRING };
-        groups.push_back(singleGroup);
-    } else if (scheduleMode == 5) {
+    if (scheduleMode == 5) {
         for (const auto& inputNode : application->getInputNodes()) {
             groupNodesStrictHelper(inputNode, groups, visited);
-        }
-    } else if (scheduleMode == 6) {
-        for (const auto& inputNode : application->getInputNodes()) {
-            groupNodesLooseHelper(inputNode, groups, visited);
         }
     } else {
         for (const auto& inputNode : application->getInputNodes()) {
@@ -1234,23 +1209,6 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
                 }
             }
         }
-    }
-
-    if (scheduleMode == 1 || scheduleMode == 2) {
-        std::map<std::string, std::map<std::string, double>>
-          tempNewStatelessReqWeight;
-        for (const auto& [userFuncPar, weightMap] : newStatelessReqWeight) {
-            double weightSum = 0;
-            for (const auto& [ip, weight] : weightMap) {
-                weightSum += weight;
-            }
-            double hostNum = static_cast<double>(hostMap.size());
-            double weightPerHost = weightSum / hostNum;
-            for (const auto& [ip, _] : hostMap) {
-                tempNewStatelessReqWeight[userFuncPar][ip] = weightPerHost;
-            }
-        }
-        newStatelessReqWeight = std::move(tempNewStatelessReqWeight);
     }
 
     //--------------------------------------------------------------------------
@@ -1769,8 +1727,8 @@ void StateAwareScheduler::runtimeDistTune(
     if (!runtimeReconfig) {
         return;
     }
-    // We only schedule when the schedule mode is 0 and 5.
-    if (scheduleMode != 0 && scheduleMode != 5 && scheduleMode != 6) {
+    // We only schedule when the schedule mode is 5.
+    if (scheduleMode != 5) {
         return;
     }
     runtimeSummary.requestDistTune(observeDistMap);
@@ -1781,14 +1739,15 @@ void StateAwareScheduler::setScheduleMode(int mode)
     scheduleMode = mode;
 }
 
-void StateAwareScheduler::setRuntimeReconfig(bool value) {
+void StateAwareScheduler::setRuntimeReconfig(bool value)
+{
     runtimeReconfig = value;
 }
 
-void StateAwareScheduler::setAlpha(double value){
+void StateAwareScheduler::setAlpha(double value)
+{
     runtimeSummary.setAlpha(value);
 }
-
 
 void StateAwareScheduler::resetScheduler()
 {

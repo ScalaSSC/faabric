@@ -284,8 +284,6 @@ class Scheduler
 
     void dispatchChainedMsgs();
 
-    bool requireLock = true;
-
     bool parallelDispatch = true;
     std::shared_mutex reconfigMx;
 

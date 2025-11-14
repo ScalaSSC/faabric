@@ -681,11 +681,7 @@ void Scheduler::dispatchChainedMsgs()
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
         // Lock only for copying and clearing `scheduledMsgsMap`
-        std::unique_lock<std::shared_mutex> mxLock(mx, std::defer_lock);
-
-        if (requireLock) {
-            mxLock.lock();
-        }
+        faabric::util::FullLock mxLock(mx);
 
         if (stopThreadTimer) {
             break;
@@ -740,9 +736,9 @@ void Scheduler::dispatchChainedMsgs()
         }
         cpuLock.unlock();
 
-        // if scheduleMode is 2, 7 (centralized), we need to transfer the
+        // if scheduleMode is 7 (centralized faasflow), we need to transfer the
         // chained calls to planner
-        if (scheduleMode == 2 || scheduleMode == 7) {
+        if (scheduleMode == 7) {
             auto& plannerCli = faabric::planner::getPlannerClient();
 
             faabric::util::FullLock chainedCallLock(chainedCallMsgsMx);
@@ -916,12 +912,6 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         batchCheckPeriod = value;
         SPDLOG_INFO("Reset batchCheckPeriod parameter to : {}",
                     batchCheckPeriod);
-    } else if (key == "require_lock") {
-        if (value == 1) {
-            requireLock = true;
-        } else {
-            requireLock = false;
-        }
     } else if (key == "parallel_dispatch") {
         if (value == 1) {
             parallelDispatch = true;
@@ -930,12 +920,11 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         }
     } else if (key == "runtime_reconfig") {
         decentralScheduler.setRuntimeReconfig(value == 1);
-    } else if (key == "alpha"){
-        double newAlpha = value / 1000.0; 
+    } else if (key == "alpha") {
+        double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
         decentralScheduler.setAlpha(newAlpha);
-    }
-    else {
+    } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
     }
