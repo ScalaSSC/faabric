@@ -185,6 +185,8 @@ class StateAwareScheduler : public BatchScheduler
 
     void setRuntimeReconfig(bool value);
 
+    bool getRuntimeReconfig() const;
+
     void setAlpha(double value);
 
   protected:

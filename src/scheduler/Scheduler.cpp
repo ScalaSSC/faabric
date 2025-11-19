@@ -680,13 +680,14 @@ void Scheduler::dispatchChainedMsgs()
     while (!stopThreadTimer) {
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
-        // Lock only for copying and clearing `scheduledMsgsMap`
-        faabric::util::FullLock mxLock(mx);
 
         if (stopThreadTimer) {
             break;
         }
 
+        /***
+         * CPU usage recording
+         ***/
         faabric::util::FullLock cpuLock(cpuRecordMx);
         auto nowWall = std::chrono::steady_clock::now();
         if (nowWall - cpuRecordStart >= cpuRecordWindow) {
@@ -735,6 +736,9 @@ void Scheduler::dispatchChainedMsgs()
             cpuRecordStart = nowWall;
         }
         cpuLock.unlock();
+        /***
+         * End of CPU usage recording
+         ***/
 
         // if scheduleMode is 7 (centralized faasflow), we need to transfer the
         // chained calls to planner
@@ -760,10 +764,7 @@ void Scheduler::dispatchChainedMsgs()
             continue;
         }
 
-        // Otherwise, decentralized scheduler is used
-
-        // Schedule the chained calls
-        // MAP<instanceName, <host, count>>
+        // Otherwise, decentralized scheduler is used, we schedule the chained
         std::map<std::string, std::map<std::string, int>> chainedCallsCounter;
         std::vector<std::unique_ptr<faabric::Message>> localChainedCallMsgs;
         {
@@ -821,60 +822,18 @@ void Scheduler::dispatchChainedMsgs()
         scheduledMsgsMap.clear();
         lock.unlock();
 
-        if (parallelDispatch) {
-            if (msgsCallMap.size() == 1 && msgsCallMap.contains(thisHost)) {
-                auto& msgs = msgsCallMap.at(thisHost);
+        for (auto& [hostIp, msgs] : msgsCallMap) {
+            // SPDLOG_DEBUG the hosts and messages
+            SPDLOG_DEBUG("Dispatching messages to host {} with message size {}",
+                         hostIp,
+                         msgs.size());
+            // If locally, we put the messages into a batch directly
+            if (hostIp == thisHost) {
                 enqueueMessageBatch(std::move(msgs), thisHost);
-                continue;
-            }
-
-            // Parallel execution of function calls for each host
-            std::vector<std::thread> threads;
-            for (auto& [hostIp, msgs] : msgsCallMap) {
-                // SPDLOG_DEBUG the hosts and messages
-                SPDLOG_DEBUG(
-                  "Dispatching messages to host {} with message size {}",
-                  hostIp,
-                  msgs.size());
-                // If locally, we put the messages into a batch directly
-                if (hostIp == thisHost) {
-                    threads.emplace_back(
-                      [this, msgsIn = std::move(msgs)]() mutable {
-                          enqueueMessageBatch(std::move(msgsIn), thisHost);
-                      });
-                } else {
-                    // Otherwise, we send the messages to the remote host
-                    threads.emplace_back(
-                      [hostIp](std::list<std::unique_ptr<faabric::Message>>
-                                 msgsIn) mutable {
-                          faabric::scheduler::getFunctionCallClient(hostIp)
-                            ->executeFunctionsBatch(std::move(msgsIn));
-                      },
-                      std::move(msgs));
-                }
-            }
-            // Join all threads to ensure they complete before next iteration
-            for (auto& t : threads) {
-                if (t.joinable()) {
-                    t.join();
-                }
-            }
-
-        } else {
-            for (auto& [hostIp, msgs] : msgsCallMap) {
-                // SPDLOG_DEBUG the hosts and messages
-                SPDLOG_DEBUG(
-                  "Dispatching messages to host {} with message size {}",
-                  hostIp,
-                  msgs.size());
-                // If locally, we put the messages into a batch directly
-                if (hostIp == thisHost) {
-                    enqueueMessageBatch(std::move(msgs), thisHost);
-                } else {
-                    // Otherwise, we send the messages to the remote host
-                    faabric::scheduler::getFunctionCallClient(hostIp)
-                      ->executeFunctionsBatch(std::move(msgs));
-                }
+            } else {
+                // Otherwise, we send the messages to the remote host
+                faabric::scheduler::getFunctionCallClient(hostIp)
+                  ->executeFunctionsBatch(std::move(msgs));
             }
         }
     }

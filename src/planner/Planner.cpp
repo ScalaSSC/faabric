@@ -801,8 +801,8 @@ bool Planner::resetParameter(const std::string& key,
     if (key == "runtime_reconfig") {
         stateAwareScheduler->setRuntimeReconfig(value == 1);
     }
-    if (key == "alpha"){
-        double newAlpha = value / 1000.0; 
+    if (key == "alpha") {
+        double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
         stateAwareScheduler->setAlpha(newAlpha);
     }
@@ -966,6 +966,10 @@ void Planner::updateRuntimeStats()
         // Sleep for a while to batch the scheduled requests
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeReconfigPeriod));
+
+        if (stateAwareScheduler->getRuntimeReconfig() == false) {
+            continue;
+        }
 
         faabric::util::FullLock rflock(reconfigMx);
 

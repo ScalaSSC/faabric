@@ -1925,6 +1925,11 @@ void StateAwareScheduler::setRuntimeReconfig(bool value)
     runtimeReconfig = value;
 }
 
+bool StateAwareScheduler::getRuntimeReconfig() const
+{
+    return runtimeReconfig;
+}
+
 void StateAwareScheduler::setAlpha(double value)
 {
     runtimeSummary.setAlpha(value);
