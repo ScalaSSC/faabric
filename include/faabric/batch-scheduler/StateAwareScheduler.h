@@ -82,16 +82,17 @@ class StateAwareScheduler : public BatchScheduler
 
     void initApp(const HostMap& hostMap);
 
-    std::string scheduleStatelessMessageRB(std::string& userFunc,
-                                           const HostMap& hostMap,
-                                           const std::unique_ptr<Message>& msg);
+    // std::string scheduleStatelessMessageRBHost(std::string& userFunc,
+    //                                        const HostMap& hostMap,
+    //                                        const std::unique_ptr<Message>&
+    //                                        msg);
 
     std::string scheduleStatelessMessageApportion(
       std::string& userFunc,
       const HostMap& hostMap,
       const std::unique_ptr<Message>& msg);
 
-    std::string scheduleStatelessMessageFaaSFlow(
+    std::string scheduleStatelessMessageRoundRobin(
       std::string& userFunc,
       const HostMap& hostMap,
       const std::unique_ptr<Message>& msg);
@@ -135,6 +136,13 @@ class StateAwareScheduler : public BatchScheduler
                std::vector<std::map<std::string, double>>,
                std::map<std::string, double>>
     groupNodesGreedily(const HostMap& hostMap);
+
+    std::tuple<std::vector<NodeGroup>,
+               std::vector<std::map<std::string, double>>,
+               std::map<std::string, double>>
+    groupNodesTopo(const HostMap& hostMap);
+
+    void rescheduleAppBinpack(const HostMap& hostMap);
 
     void rescheduleAppFaaSFlow(const HostMap& hostMap);
 

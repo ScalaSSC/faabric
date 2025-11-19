@@ -20,6 +20,7 @@
 #endif
 
 #include <spdlog/spdlog.h>
+#include <spdlog/fmt/ranges.h>
 
 namespace faabric::util {
 void initLogging();

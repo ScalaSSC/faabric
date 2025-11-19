@@ -787,13 +787,9 @@ bool Planner::resetParameter(const std::string& key,
         return true;
     }
     if (key == "schedule_mode") {
-        // Schedule Mode 0: Decentralized Scheduler.
-        // Schedule Mode 1: Decentralized Scheduler with Default Logic (colocate
-        // stateful requests with their requried states and rountrobin for
-        // stateless requests).
-        // Schedule Mode 2: Centralized Scheduler.
+        // Schedule Mode 0: Decentralized Scheduler with Binpack.
         // Schedule Mode 3: FaaSFlow Scheduler.
-        // Scheduler Mode 5: Our Method.
+        // Scheduler Mode 5: LcSched.
         // Scheduler Mode 7: Centralized Scheduler With FaaSFlow
         SPDLOG_INFO("Planner reset schedule mode to {}", value);
         stateAwareScheduler->setScheduleMode(value);

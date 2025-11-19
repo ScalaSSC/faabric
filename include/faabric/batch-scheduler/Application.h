@@ -98,6 +98,9 @@ class Application
     ConnectionInfo reverseConnections;
 
   public:
+    using NodePair = std::pair<std::string, std::shared_ptr<Node>>;
+    using NodeList = std::vector<NodePair>;
+
     std::string getName() const { return name; }
     Application(const std::string& appName);
     void addNode(std::shared_ptr<Node> node, bool isInput = false);
@@ -107,7 +110,13 @@ class Application
     double computePreWorkloads(int scheduleMode); // return total workload
     // TODO - Now we only support homogenous cluster.
     void quantiseResources(const int numHosts, int scheduleMode);
+
     std::vector<std::shared_ptr<Node>> getSource(const std::string& node) const;
+
+    void dfsVisit(const std::string& nodeName,
+                  std::set<std::string>& visited,
+                  NodeList& orderedNodes) const;
+    NodeList getNodesDFSOrder();
 
     std::map<std::string, std::shared_ptr<Node>>& getNodes()
     {

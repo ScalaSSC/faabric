@@ -189,7 +189,8 @@ double Application::computePreWorkloads(int scheduleMode)
     double totalPreWorkload = 0;
     for (auto& [nodeName, node] : nodes) {
         double estimateWork = static_cast<double>(node->processedTuples);
-        if (scheduleMode != 3 && scheduleMode != 7 && connectionsWithWeight.count(nodeName) > 0) {
+        if (scheduleMode != 0 && scheduleMode != 3 && scheduleMode != 7 &&
+            connectionsWithWeight.count(nodeName) > 0) {
             for (const auto& [_, weight] : connectionsWithWeight.at(nodeName)) {
                 if (minimizedInput == 1) {
                     estimateWork += 0.1;
@@ -209,6 +210,75 @@ double Application::computePreWorkloads(int scheduleMode)
     }
 
     return totalPreWorkload;
+}
+
+void Application::dfsVisit(const std::string& nodeName,
+                           std::set<std::string>& visited,
+                           NodeList& orderedNodes) const
+{
+    visited.insert(nodeName);
+
+    // 2. --- (THIS IS THE KEY CHANGE) ---
+    //    Get the node pointer using the const getNodes()
+    auto nodeIt = nodes.find(nodeName);
+    if (nodeIt == nodes.end()) {
+        SPDLOG_ERROR("DFS: Node '{}' not found in application nodes.",
+                     nodeName);
+        // This case should ideally not be hit if graph is consistent
+        return;
+    }
+
+    orderedNodes.push_back({ nodeName, nodeIt->second });
+
+    // 3. Find successors (this part is unchanged)
+    const auto& allConnections = getConnections();
+    auto connIt = allConnections.find(nodeName);
+
+    if (connIt != allConnections.end()) {
+        const std::vector<std::string>& successors = connIt->second;
+
+        // 4. Recurse for each successor (this part is unchanged)
+        for (const std::string& successorName : successors) {
+            if (visited.find(successorName) == visited.end()) {
+                dfsVisit(successorName, visited, orderedNodes);
+            }
+        }
+    }
+}
+
+Application::NodeList Application::getNodesDFSOrder()
+{
+    NodeList orderedNodes;
+    std::set<std::string> visited;
+
+    const auto& inputNodes = getInputNodes();
+    if (inputNodes.empty()) {
+        SPDLOG_WARN("Cannot get DFS order, application has no input nodes.");
+        return orderedNodes;
+    }
+
+    // Start a DFS from each input node
+    for (const std::string& inputNodeName : inputNodes) {
+        if (visited.find(inputNodeName) == visited.end()) {
+            dfsVisit(inputNodeName, visited, orderedNodes);
+        }
+    }
+
+    SPDLOG_INFO("--- DFS Ordered NodeList Start (Size: {}) ---",
+                orderedNodes.size());
+
+    for (size_t i = 0; i < orderedNodes.size(); ++i) {
+        const auto& [nodeName, nodePtr] = orderedNodes[i];
+        SPDLOG_INFO("[{}] Name: {}, Ptr: {:p}, Resource: {}",
+                    i,
+                    nodeName,
+                    (void*)nodePtr.get(),
+                    nodePtr ? nodePtr->reqResource : 0.0);
+    }
+
+    SPDLOG_INFO("--- DFS Ordered NodeList End ---");
+
+    return orderedNodes;
 }
 
 void Application::quantiseResources(const int numHosts, int scheduleMode)
