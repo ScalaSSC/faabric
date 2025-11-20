@@ -1478,7 +1478,7 @@ StateAwareScheduler::groupNodesTopo(const HostMap& hostMap)
     }
 
     auto it = hostMap.begin();
-    const double EPSILON = std::numeric_limits<double>::epsilon();
+    const double TOLERANCE = 1e-9;
 
     // Estimate the resource requirement for each node.
     for (const auto& [nodeName, node] : appNodes) {
@@ -1486,20 +1486,32 @@ StateAwareScheduler::groupNodesTopo(const HostMap& hostMap)
         std::map<std::string, double> currentNodeAllocation;
         double remainReqResource = node->reqResource;
 
-        while (remainReqResource > EPSILON) {
+        while (remainReqResource > TOLERANCE) {
             if (it == hostMap.end()) {
-                SPDLOG_ERROR("Insufficient cluster capacity. "
-                             "Failed to allocate remaining {} for node {}",
-                             remainReqResource,
-                             nodeName);
-                throw std::runtime_error(
-                  "Insufficient cluster resources for topo grouping");
+                if (hostMap.empty()) {
+                    SPDLOG_ERROR("Host map is empty, cannot schedule.");
+                    throw std::runtime_error("Host map is empty");
+                }
+
+                // RECOVERY: Assign the "floating point dust" to the last host
+                // in the list
+                std::string lastIp = hostMap.rbegin()->first;
+
+                SPDLOG_WARN("Floating point precision drift detected. "
+                            "Forcing remaining {} to last host {}",
+                            remainReqResource,
+                            lastIp);
+
+                currentNodeAllocation[lastIp] += remainReqResource;
+                workerRemaining[lastIp] -= remainReqResource;
+                remainReqResource = 0.0;
+                continue;
             }
 
             std::string ip = it->first;
             double workerAvail = workerRemaining[ip];
             // 4e. Check if the current host has any capacity left
-            if (workerAvail > EPSILON) {
+            if (workerAvail > TOLERANCE) {
                 if (workerAvail >= remainReqResource) {
                     // Case 1: Host has *enough* capacity for the remainder.
                     // Allocate, update, and we're done with this node.
