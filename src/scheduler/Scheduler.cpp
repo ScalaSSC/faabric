@@ -498,26 +498,20 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
         SPDLOG_DEBUG("statelock is acquired for {}", userFuncPar);
         auto msgVec = waitingQueue.getMessages();
         // int msgVecSize = msgVec.size();
-        for (auto& msgPointer : msgVec) {
+
+        auto now = faabric::util::getGlobalClock().epochMicros();
+        for (auto& src : msgVec) {
             auto* message = newReq->add_messages();
-            *message = std::move(*msgPointer);
-            long workerQueueTime =
-              (*message->mutable_metricrecorder())[WORKER_ENQUEUE_TIME_KEY];
-            message->mutable_metricrecorder()->erase(WORKER_ENQUEUE_TIME_KEY);
-            int workerQueueWaitingTime =
-              faabric::util::getGlobalClock().epochMicros() - workerQueueTime;
-            // int workerQueueSize =
-            //   (*message->mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY];
-            message->mutable_metricrecorder()->erase(WORKER_ENQUEUE_SIZE_KEY);
-            message->set_workerqueuewaittime(workerQueueWaitingTime);
-            // Record the message waiting time in the queue while waiting for an
-            // available executor. If the msgVecSize is smaller than batchsize,
-            // it means this Batch is dispatched when window expired. It should
-            // not be recorded.
-            // if (msgVecSize >= executeBatchsize) {
-            //     instancesLoadState.addWaitTime(
-            //       userFuncPar, workerQueueWaitingTime, workerQueueSize);
-            // }
+            *message = std::move(*src);
+
+            auto* metrics = message->mutable_metricrecorder();
+            int workerQueueTime = now - (*metrics)[WORKER_ENQUEUE_TIME_KEY];
+            message->set_workerqueuewaittime(workerQueueTime);
+
+            runtimeStats.instanceWorkerQueueTime(userFuncPar, workerQueueTime);
+
+            metrics->erase(WORKER_ENQUEUE_TIME_KEY);
+            metrics->erase(WORKER_ENQUEUE_SIZE_KEY);
         }
         // Claim new Executor, we can bound the first msg here, since claim
         // only needs the user and function of Message.
@@ -556,6 +550,10 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
     if (waitingQueue.getMessagesCount() == 0) {
         waitingQueue.resetLastTime();
     }
+
+    // TODO - DEBUG CODE: TO BE DELETE
+    runtimeStats.logAverageQueuingTimes();
+
 }
 
 void Scheduler::enqueueChainedCalls(

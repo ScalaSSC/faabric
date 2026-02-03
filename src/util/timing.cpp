@@ -91,4 +91,14 @@ void nanosToTimespec(uint64_t nanos, struct timespec* nativeTimespec)
     nativeTimespec->tv_sec = nanos / 1000000000;
     nativeTimespec->tv_nsec = nanos % 1000000000;
 }
+
+time_t getEpochSeconds()
+{
+    auto now = std::chrono::steady_clock::now();
+
+    return std::chrono::time_point_cast<std::chrono::seconds>(now)
+      .time_since_epoch()
+      .count();
+}
+
 }

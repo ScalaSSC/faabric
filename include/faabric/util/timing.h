@@ -2,6 +2,7 @@
 
 #include <faabric/util/clock.h>
 #include <string>
+#include <chrono>
 
 #ifdef TRACE_ALL
 #define PROF_BEGIN faabric::util::startGlobalTimer();
@@ -35,4 +36,7 @@ void printTimerTotals();
 uint64_t timespecToNanos(struct timespec* nativeTimespec);
 
 void nanosToTimespec(uint64_t nanos, struct timespec* nativeTimespec);
+
+time_t getEpochSeconds();
+
 }

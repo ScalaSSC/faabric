@@ -267,16 +267,6 @@ class Scheduler
 
     util::ThreadSafeQueue<std::unique_ptr<faabric::MessageBatch>> unschedMsgs;
 
-    // Worker workload update timer
-    // long lastWorkersUpdate = 0;
-    // int workerUpdateInterval = 3000; // ms
-
-    // long lastPlannerCallCheck = 0;
-
-    // Statistics the loads of workers
-    // size_t maxSamples = 10000;
-    // InstancesLoadState instancesLoadState;
-
     InstancesRuntimeStats runtimeStats;
 
     void enqueueSchedMsgs(std::vector<std::string> hosts,
