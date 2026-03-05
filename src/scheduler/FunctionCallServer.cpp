@@ -172,7 +172,7 @@ FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
 
     PARSE_MSG(faabric::StateMigrationRequest, buffer.data(), buffer.size())
 
-    const std::string& source = parsedMsg.sourcehost();
+    [[maybe_unused]] const std::string& source = parsedMsg.sourcehost();
 
     std::ostringstream oss;
     for (const auto& state : parsedMsg.migratestates()) {
