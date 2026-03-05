@@ -69,10 +69,14 @@ std::map<std::string, std::map<std::string, std::string>> deserializeNestedMap(
 // Helper function to append an unsigned 32-bit integer to the buffer
 void appendUint32(std::vector<uint8_t>& buffer, uint32_t value);
 
-std::string serializeParStateMap(
+// Helper to append data to the vector
+template<typename T>
+void appendToBuffer(std::vector<uint8_t>& buffer, const T& value);
+
+std::vector<uint8_t> serializeParStateMap(
   const std::map<std::string, std::vector<uint8_t>>& m);
 
 std::map<std::string, std::vector<uint8_t>> deserializeParStateMap(
-  const std::string& data);
+  const std::vector<uint8_t>& data);
 
 }

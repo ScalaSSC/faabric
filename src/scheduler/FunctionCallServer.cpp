@@ -134,7 +134,33 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
                      faabric::batch_scheduler::to_string(info));
     }
 
-    scheduler.updateStatesInfo(scheuduledOperatorMap, tempStatesInfoMap);
+    int migrationVersion = parsedMsg.migrationversion();
+    bool isInitialization = parsedMsg.is_initialize();
+
+    std::map<std::string, std::set<std::string>> transDestinationMap;
+    for (const auto& [ip, hostList] : parsedMsg.transdestinationmap()) {
+        std::set<std::string> hosts;
+        for (const auto& host : hostList.hosts()) {
+            hosts.emplace(host);
+        }
+        transDestinationMap[ip] = std::move(hosts);
+    }
+
+    std::map<std::string, std::set<std::string>> transSourceMap;
+    for (const auto& [ip, hostList] : parsedMsg.transsourcemap()) {
+        std::set<std::string> hosts;
+        for (const auto& host : hostList.hosts()) {
+            hosts.emplace(host);
+        }
+        transSourceMap[ip] = std::move(hosts);
+    }
+
+    scheduler.updateStatesInfo(scheuduledOperatorMap,
+                               tempStatesInfoMap,
+                               migrationVersion,
+                               isInitialization,
+                               transDestinationMap,
+                               transSourceMap);
 
     return std::make_unique<planner::SyncStatesInfoResponse>();
 }
@@ -142,9 +168,11 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
 std::unique_ptr<google::protobuf::Message>
 FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
 {
-    SPDLOG_DEBUG("RECEIVE Migrating states");
+    SPDLOG_DEBUG("RECEIVE migrating state and relevant messages");
 
     PARSE_MSG(faabric::StateMigrationRequest, buffer.data(), buffer.size())
+
+    const std::string& source = parsedMsg.sourcehost();
 
     std::ostringstream oss;
     for (const auto& state : parsedMsg.migratestates()) {
@@ -152,17 +180,13 @@ FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
             << "/";
     }
 
-    SPDLOG_DEBUG("Migrating {} states to local host {}: {}",
+    SPDLOG_DEBUG("Migrating {} states from host {} to local host {}: {}",
                  parsedMsg.migratestates_size(),
+                 source,
                  faabric::util::getSystemConfig().endpointHost,
                  oss.str());
 
-    std::multimap<std::string, std::string> immiStates;
-    for (const auto& state : parsedMsg.migratestates()) {
-        immiStates.emplace(state.userfuncpar(), state.serializedstate());
-    }
-
-    scheduler.storeMigrateState(std::move(immiStates));
+    scheduler.processMigrationData(parsedMsg);
 
     return std::make_unique<faabric::EmptyResponse>();
 }
@@ -284,6 +308,7 @@ FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
     SPDLOG_DEBUG("Getting worker stats for host");
     auto snapshot = scheduler.getCpuRecordHistory();
     auto maxReplicas = scheduler.getMaxReplicasMap();
+    auto migrationHistory = scheduler.getMigrationHistory();
 
     WorkerStats out;
     out.set_ip(faabric::util::getSystemConfig().endpointHost);
@@ -303,6 +328,11 @@ FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
         rec->set_replicas(count);
     }
 
+    auto* protoMigrationHistory = out.mutable_migrationhistory();
+    for (const auto& [version, duration] : migrationHistory) {
+        (*protoMigrationHistory)[version] = duration;
+    }
+
     return std::make_unique<faabric::WorkerStats>(std::move(out));
 }
 
@@ -319,7 +349,7 @@ void FunctionCallServer::recvExecuteFunctionsBatch(
 {
     PARSE_MSG(faabric::MessageBatch, buffer.data(), buffer.size())
 
-    SPDLOG_DEBUG("Batch execute call Batch size: {}",
+    SPDLOG_DEBUG("Batch execute call received batch size: {}",
                  parsedMsg.messages_size());
 
     scheduler.enqueueMessageBatch(

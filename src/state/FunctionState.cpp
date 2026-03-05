@@ -234,6 +234,15 @@ void FunctionState::doSet(const std::string& data)
     std::copy(data.data(), data.data() + data.size(), BYTES(sharedMemory));
 }
 
+void FunctionState::doSet(const std::vector<uint8_t>& data)
+{
+    // Set up storage
+    allocateChunk(0, sharedMemSize);
+
+    // Copy data into the shared memory region
+    std::copy(data.begin(), data.end(), BYTES(sharedMemory));
+}
+
 // Only the Master node can return its data, otherwise pull at first.
 // void FunctionState::get(uint8_t* buffer)
 // {
@@ -302,48 +311,36 @@ void FunctionState::writePartitionStateUnlocks(std::vector<uint8_t>& states)
     multiKeysLock.release(keys);
 }
 
-std::map<int, std::string> FunctionState::scheduleParState(
-  const std::shared_ptr<faabric::util::ConsistentHashRing>& hashRing,
-  const std::map<int, std::string>& stateHost)
+std::map<int, std::vector<uint8_t>> FunctionState::redirectLocalState()
 {
     faabric::util::FullLock lock(funcStateMutex);
-    if (!partition) {
-        auto bytePtr = BYTES(sharedMemory);
-        std::string result(reinterpret_cast<const char*>(bytePtr), stateSize);
-        return { { 0, result } };
-    }
-    // MAP<ParallelismIdx, <key, value>>
-    std::map<int, std::map<std::string, std::vector<uint8_t>>>
-      rescheduleStatesMap;
+    auto bytePtr = BYTES(sharedMemory);
+    return { { 0, std::vector<uint8_t>(bytePtr, bytePtr + stateSize) } };
+}
+
+std::map<int, std::vector<uint8_t>> FunctionState::redirectLocalParState(
+  const HashRingPtr& hashRing)
+{
+    faabric::util::FullLock lock(funcStateMutex);
+    // MAP <Parallelism Idx, <key, value>>
+    std::map<int, std::map<std::string, std::vector<uint8_t>>> redirectStateMap;
     // Calculation the new location of the state.
     for (const auto& [key, state] : indivStateMap) {
         std::vector<uint8_t> keyVec = faabric::util::stringToBytes(key);
         auto hashAndNode = hashRing->getHashAndNode(keyVec);
         int paraIdx = hashAndNode.second;
-        rescheduleStatesMap[paraIdx].emplace(key, state.getState());
+        redirectStateMap[paraIdx].emplace(key, state.getState());
     }
 
-    // MAP<parallelismIdx, serialized <key, value>>
-    std::map<int, std::string> returnMap;
-    for (const auto& [paraIdx, state] : rescheduleStatesMap) {
-        // Look up the corresponding IP address from stateHost
-        if (!stateHost.contains(paraIdx)) {
-            SPDLOG_ERROR(
-              "Cannot find the IP address for the parallelism {} in {}",
-              paraIdx,
-              getUserFunc());
-            throw std::runtime_error("Cannot find the IP address for the "
-                                     "parallelism");
-        }
-        // Insert or merge the state for this IP.
-        auto serializedState = faabric::util::serializeParStateMap(state);
-        returnMap[paraIdx] = std::move(serializedState);
+    // MAP <parallelismIdx, serialized <key, value>>
+    std::map<int, std::vector<uint8_t>> returnMap;
+    for (const auto& [paraIdx, state] : redirectStateMap) {
+        returnMap[paraIdx] = faabric::util::serializeParStateMap(state);
     }
-
     return returnMap;
 }
 
-void FunctionState::addMigrateState(const std::string& serializedState)
+void FunctionState::addMigrateState(const std::vector<uint8_t>& serializedState)
 {
     faabric::util::FullLock lock(funcStateMutex);
 

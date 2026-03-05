@@ -100,8 +100,7 @@ class Planner
     // Function State public API
     // ----------
     bool registerApp(faabric::planner::RegisterApplicationRequest& rawReq,
-                     std::unique_ptr<batch_scheduler::Application> app,
-                     bool init = false);
+                     std::unique_ptr<batch_scheduler::Application> app);
 
     void distributeApp(faabric::planner::RegisterApplicationRequest& rawReq);
 
@@ -109,7 +108,7 @@ class Planner
                         const int32_t value,
                         bool plannerParameter = false);
 
-    void rescheduleApp(int rescheduleMode);
+    void rescheduleApp(int rescheduleMode, int hostNum = 0);
 
     void setPersistentState(const faabric::planner::MapMessage& mapMsg);
 
@@ -121,8 +120,6 @@ class Planner
     std::map<std::string, FunctionMetrics> collectMetrics();
 
     std::string outputResult();
-
-    bool migratingComplete();
 
   private:
     std::shared_ptr<batch_scheduler::StateAwareScheduler> stateAwareScheduler =
@@ -159,6 +156,14 @@ class Planner
     int parallelismUpdateInterval;
     bool isPreloadParallelism;
 
+    // Migration is used to track the number of migrations that have happened
+    // since the last reset. This is nessecary to make sure worker knows when it
+    // has received all the migrated messages and states.
+    int migrationVersion = 0;
+
+    // Record migration duration for each migration version.
+    std::map<int, int> migrationDurations;
+
     // std::atomic<unsigned int> atomicChainedCounter{ 1 };
 
     // Snapshot registry to distribute snapshots in THREADS requests
@@ -185,7 +190,7 @@ class Planner
     // Request scheduling private API
     // ----------
     // bool isUpdateState = false;
-    int numHostsScheduled = 0;
+    int schedHostNum = 0;
 
     int dispatchPeriod = 20; // ms
 
@@ -197,13 +202,15 @@ class Planner
 
     bool isOutputting = false;
 
-    void doDistributeStatesInfo();
+    void doDistributeStatesInfo(
+      int curVersion,
+      const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>
+        preOperatorsMap,
+      bool initialize = false);
 
     void doDistributeCustomInfo(std::shared_ptr<faabric::CustomRequest> msg);
 
     void doRescheduleMessages();
-
-    std::atomic<int> migratingHostNum{ 0 };
 
     void updateRuntimeStats();
 };

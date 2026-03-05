@@ -555,7 +555,7 @@ struct PlannerState
     // id for redundancy
     std::map<std::string, std::shared_ptr<Host>> hostMap;
 
-    faabric::batch_scheduler::HostMap batchSchedHostMap;
+    faabric::batch_scheduler::HostMap activeHosts;
 
     // It is used to lock modification for inFlightApps and appResults.
     std::shared_mutex reqStatusMx;

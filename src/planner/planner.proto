@@ -173,7 +173,14 @@ message ScheduledOperator {
 
 message SyncStatesInfoRequest {
     repeated FunctionStateInfo statesInfo = 1;
-    repeated ScheduledOperator scheduled_operators = 2; 
+    repeated ScheduledOperator scheduled_operators = 2;
+    message HostList {
+        repeated string hosts = 1;
+    }
+    int32 migrationVersion = 3;
+    bool is_initialize = 4;
+    map<string, HostList> transDestinationMap = 5;
+    map<string, HostList> transSourceMap = 6;
 }
 
 message SyncStatesInfoResponse {

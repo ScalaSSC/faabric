@@ -105,6 +105,9 @@ class StateAwareScheduler : public BatchScheduler
     std::string scheduleStatefulMessage(std::string& userFunc,
                                         const std::unique_ptr<Message>& msg);
 
+    std::string scheduleMessage(const HostMap& hostMap,
+                                const faabric::Message& msg);
+
     virtual std::string scheduleMessage(const HostMap& hostMap,
                                         const std::unique_ptr<Message>& msg);
 

@@ -44,7 +44,7 @@ namespace faabric::planner {
 // Static methods
 // ----------------------
 
-static faabric::batch_scheduler::HostMap convertToBatchSchedHostMap(
+static faabric::batch_scheduler::HostMap convertToHostMap(
   std::map<std::string, std::shared_ptr<Host>> hostMapIn)
 {
     faabric::batch_scheduler::HostMap hostMap;
@@ -86,7 +86,9 @@ Planner::Planner()
     dequeueScheduledMsgsThread =
       std::thread(&Planner::dequeueScheduledMsgs, this);
 
-    updateRuntimeStatsThread = std::thread(&Planner::updateRuntimeStats, this);
+    // Currently, runtime reconfiguration is not triggered.
+    // updateRuntimeStatsThread = std::thread(&Planner::updateRuntimeStats,
+    // this);
 }
 
 Planner::~Planner()
@@ -96,9 +98,9 @@ Planner::~Planner()
     if (dequeueScheduledMsgsThread.joinable()) {
         dequeueScheduledMsgsThread.join();
     }
-    if (updateRuntimeStatsThread.joinable()) {
-        updateRuntimeStatsThread.join();
-    }
+    // if (updateRuntimeStatsThread.joinable()) {
+    //     updateRuntimeStatsThread.join();
+    // }
 }
 
 PlannerConfig Planner::getConfig()
@@ -152,7 +154,7 @@ void Planner::flushHosts()
     faabric::util::FullLock lock(plannerMx);
 
     state.hostMap.clear();
-    state.batchSchedHostMap.clear();
+    state.activeHosts.clear();
 }
 
 void Planner::flushExecutors()
@@ -163,6 +165,9 @@ void Planner::flushExecutors()
     if (stateAwareScheduler) {
         stateAwareScheduler->resetScheduler();
     }
+
+    migrationVersion = 0;
+    migrationDurations.clear();
 
     auto availableHosts = getAvailableHosts(true);
     for (const auto& host : availableHosts) {
@@ -185,8 +190,8 @@ void Planner::flushSchedulingState()
     state.applicationMetrics =
       std::make_unique<ApplicationMetrics>("defaultApp", 1);
 
-    state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
-    numHostsScheduled = 0;
+    state.activeHosts = convertToHostMap(state.hostMap);
+    schedHostNum = 0;
 }
 
 std::vector<std::shared_ptr<Host>> Planner::getAvailableHosts(bool locked)
@@ -276,7 +281,7 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
         for (const auto& [ip, host] : state.hostMap) {
             host->set_hostsync(true);
         }
-        state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
+        state.activeHosts = convertToHostMap(state.hostMap);
     }
 
     // Irrespective, set the timestamp
@@ -320,7 +325,7 @@ void Planner::removeHost(const Host& hostIn)
         SPDLOG_DEBUG("Planner removing host {}", hostIn.ip());
         state.hostMap.erase(it);
     }
-    state.batchSchedHostMap = convertToBatchSchedHostMap(state.hostMap);
+    state.activeHosts = convertToHostMap(state.hostMap);
 }
 
 bool Planner::isHostExpired(std::shared_ptr<Host> host, long epochTimeMs)
@@ -503,8 +508,8 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
           std::make_unique<faabric::Message>(*req->mutable_messages(i));
         messages.push_back(std::move(message));
     }
-    auto hosts = stateAwareScheduler->scheduleMessagesBatch(
-      state.batchSchedHostMap, messages);
+    auto hosts =
+      stateAwareScheduler->scheduleMessagesBatch(state.activeHosts, messages);
 
     doEnqueueSchedMessages(hosts, std::move(messages)); // Move ownership
 }
@@ -612,24 +617,23 @@ std::map<std::string, FunctionMetrics> Planner::collectMetrics()
  ***/
 
 bool Planner::registerApp(faabric::planner::RegisterApplicationRequest& rawReq,
-                          std::unique_ptr<batch_scheduler::Application> app,
-                          bool init)
+                          std::unique_ptr<batch_scheduler::Application> app)
 {
     SPDLOG_INFO("Planner registers application {}", app->getName());
     faabric::util::FullLock lock(plannerMx);
     stateAwareScheduler->registerApp(std::move(app));
     distributeApp(rawReq);
-    if (init) {
-        if (numHostsScheduled != 0 &&
-            numHostsScheduled < state.batchSchedHostMap.size()) {
-            state.batchSchedHostMap = faabric::util::getFirstNElements(
-              state.batchSchedHostMap, numHostsScheduled);
-        }
-        stateAwareScheduler->initApp(state.batchSchedHostMap);
-        stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
-        doDistributeStatesInfo();
-        doRescheduleMessages();
+
+    if (schedHostNum != 0 && schedHostNum < state.hostMap.size()) {
+        auto tempHostMap = convertToHostMap(state.hostMap);
+        state.activeHosts =
+          faabric::util::getFirstNElements(tempHostMap, schedHostNum);
     }
+    stateAwareScheduler->initApp(state.activeHosts);
+    stateAwareScheduler->rescheduleApp(state.activeHosts);
+    int curVersion = migrationVersion++;
+    doDistributeStatesInfo(curVersion, {}, true);
+
     return true;
 }
 
@@ -688,12 +692,45 @@ void Planner::doDistributeCustomInfo(
     }
 }
 
-void Planner::doDistributeStatesInfo()
+void logMigrationMap(std::string_view title,
+                     const std::map<std::string, std::set<std::string>>& map,
+                     const char* arrow)
+{
+    std::stringstream ss;
+    ss << title << ": ";
+    for (const auto& [key, valSet] : map) {
+        ss << "[" << key << " " << arrow << " { ";
+        for (const auto& item : valSet) {
+            ss << item << " ";
+        }
+        ss << "}] ";
+    }
+    SPDLOG_INFO("{}", ss.str());
+}
+
+template<typename ProtoMapType>
+void fillProtoMap(ProtoMapType* protoMap,
+                  const std::map<std::string, std::set<std::string>>& srcMap)
+{
+    if (!protoMap)
+        return;
+
+    for (const auto& [ip, hosts] : srcMap) {
+        auto& hostList = (*protoMap)[ip];
+        for (const auto& host : hosts) {
+            hostList.add_hosts(host);
+        }
+    }
+}
+
+void Planner::doDistributeStatesInfo(
+  int curVersion,
+  const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>
+    preOperatorsMap,
+  bool initialize)
 {
     int hostSize = state.hostMap.size();
     SPDLOG_INFO("Planner distribute state info to {} hosts", hostSize);
-    // Stores the number of workers needed to migrate the state info
-    migratingHostNum.store(hostSize);
 
     // Prepare state info sync request
     auto registStatesInfo = stateAwareScheduler->getStateInfo();
@@ -713,6 +750,42 @@ void Planner::doDistributeStatesInfo()
       stateAwareScheduler->getScheduledOperatorsMap();
 
     faabric::util::serializeScheduledOperatorMap(req, scheduledOperatorsMap);
+
+    long startTime = faabric::util::getGlobalClock().epochMillis();
+
+    // If not initialize, workers has to migration state and messages.
+    if (!initialize) {
+        std::map<std::string, std::set<std::string>> transDestinationMap;
+        std::map<std::string, std::set<std::string>> transSourceMap;
+
+        for (const auto& [userFunc, preState] : preOperatorsMap) {
+            auto it = scheduledOperatorsMap.find(userFunc);
+            if (it == scheduledOperatorsMap.end()) {
+                SPDLOG_ERROR(
+                  "Scheduled operator map does not contain user function {}",
+                  userFunc);
+                throw std::runtime_error(
+                  "Scheduled operator map does not contain user function");
+            }
+
+            const auto& currentHosts = it->second.weightDist;
+            for (const auto& [oldHost, _] : preState.weightDist) {
+                for (const auto& [curHost, _] : currentHosts) {
+                    transDestinationMap[oldHost].insert(curHost);
+                    transSourceMap[curHost].insert(oldHost);
+                }
+            }
+        }
+
+        logMigrationMap("Migration Destination Map", transDestinationMap, "->");
+        logMigrationMap("Migration Source Map", transSourceMap, "<-");
+
+        fillProtoMap(req->mutable_transdestinationmap(), transDestinationMap);
+        fillProtoMap(req->mutable_transsourcemap(), transSourceMap);
+    }
+
+    req->set_migrationversion(curVersion);
+    req->set_is_initialize(initialize);
 
     SPDLOG_INFO("Planner begin sending states");
     std::vector<std::thread> threads;
@@ -734,6 +807,10 @@ void Planner::doDistributeStatesInfo()
             t.join();
         }
     }
+
+    long endTime = faabric::util::getGlobalClock().epochMillis();
+    int migrationDuration = endTime - startTime;
+    migrationDurations[curVersion] = migrationDuration;
 
     SPDLOG_INFO("Planner distributes state info finished");
 }
@@ -760,8 +837,8 @@ void Planner::doRescheduleMessages()
 
     // Recalculate scheduling decisions using the updated batch scheduler host
     // map.
-    auto newHosts = stateAwareScheduler->scheduleMessagesBatch(
-      state.batchSchedHostMap, messages);
+    auto newHosts =
+      stateAwareScheduler->scheduleMessagesBatch(state.activeHosts, messages);
 
     // Re-enqueue the messages: this sets a new planner pop time and assigns
     // them to the new hosts.
@@ -780,7 +857,7 @@ bool Planner::resetParameter(const std::string& key,
         if (key == "is_outputting") {
             isOutputting = value == 1;
         } else if (key == "num_hosts_scheduled") {
-            numHostsScheduled = value;
+            schedHostNum = value;
         } else if (key == "runtime_reconfig_period") {
             runtimeReconfigPeriod = value;
         }
@@ -826,11 +903,19 @@ bool Planner::resetParameter(const std::string& key,
     return true;
 }
 
-void Planner::rescheduleApp(int rescheduleMode)
+void Planner::rescheduleApp(int rescheduleMode, int hostNum)
 {
     SPDLOG_INFO("Planner reschedules application");
+    // rescheduleMode == 0 means reschedule immediately and clean the state.
+    // rescheduleMode == 1 means wait until all running messages are finished.
+
+    if (hostNum > 0 && hostNum < state.hostMap.size()) {
+        state.activeHosts = faabric::util::getFirstNElements(
+          convertToHostMap(state.hostMap), hostNum);
+    }
+
     // If reschedule mode is 1, we want to wait until no inflight requests and
-    // clear the state.
+    // clear the state. It happens during the pre-warm phase.
     if (rescheduleMode == 1) {
         // Wait until all in-flight apps are finished
         while (getInFlightAppsSize() > 0) {
@@ -846,23 +931,22 @@ void Planner::rescheduleApp(int rescheduleMode)
     auto operatorWorkloadMap = state.applicationMetrics->getOptWorkloads();
     auto edgeWeightMap = state.applicationMetrics->getEdgeWeightMap();
 
+    auto preOperatorsMap = stateAwareScheduler->getScheduledOperatorsMap();
     // Update the processed tuples.
     stateAwareScheduler->updateApp(operatorWorkloadMap, edgeWeightMap);
-    stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
+    stateAwareScheduler->rescheduleApp(state.activeHosts);
     SPDLOG_INFO("Planner reschedules application done");
 
     // Reschedule the states and messages in queue
     // stateAwareScheduler->updateReqDist();
-    doDistributeStatesInfo();
+    int curVersion = migrationVersion++;
+    bool initialize = (rescheduleMode == 1) ? true : false;
+    doDistributeStatesInfo(curVersion, preOperatorsMap, initialize);
     doRescheduleMessages();
 
+    // If reschedule mode is pre-warm, clear the statistics
     if (rescheduleMode == 1) {
-        // Clear the states
         state.applicationMetrics->reset();
-        // Temporary don't need flush. Since we don't migrate state.
-        // auto msgShared = std::make_shared<faabric::CustomRequest>();
-        // msgShared->set_payload("flush_state");
-        // doDistributeCustomInfo(msgShared);
     }
 }
 
@@ -879,21 +963,6 @@ void Planner::setPersistentState(const faabric::planner::MapMessage& mapMsg)
     }
 }
 
-bool Planner::migratingComplete()
-{
-    int oldValue = migratingHostNum.fetch_sub(1);
-    if (oldValue == 1) {
-        migratingHostNum.notify_all();
-    } else {
-        int current = migratingHostNum.load();
-        while (current != 0) {
-            migratingHostNum.wait(current);
-            current = migratingHostNum.load();
-        }
-    }
-    return true;
-}
-
 std::string Planner::outputResult()
 {
     faabric::util::FullLock reqStatusLock(state.reqStatusMx);
@@ -907,12 +976,15 @@ std::string Planner::outputResult()
     auto& alloc = doc.GetAllocator();
     rapidjson::Value workerStatsObj(rapidjson::kObjectType);
     rapidjson::Value maxReplicaObj(rapidjson::kObjectType);
+    rapidjson::Value migrationHistoryObj(rapidjson::kObjectType);
+    rapidjson::Value migrationDurationsObj(rapidjson::kObjectType);
 
     for (const auto& [ip, host] : state.hostMap) {
         SPDLOG_DEBUG("Planner fetch stats from host {}", ip);
         auto stats =
           faabric::scheduler::getFunctionCallClient(ip)->getWorkerStats();
 
+        SPDLOG_DEBUG("Planner parse cpu stats from host {}", ip);
         // ===== history =====
         rapidjson::Value historyArr(rapidjson::kArrayType);
         for (const auto& rec : stats->history()) {
@@ -926,6 +998,7 @@ std::string Planner::outputResult()
         workerStatsObj.AddMember(
           rapidjson::Value(ip.c_str(), alloc).Move(), historyArr, alloc);
 
+        SPDLOG_DEBUG("Planner parse replica stats from host {}", ip);
         // ===== instance replicas =====
         rapidjson::Value replicasArr(rapidjson::kArrayType);
         for (const auto& inst : stats->instancereplicas()) {
@@ -939,10 +1012,33 @@ std::string Planner::outputResult()
         }
         maxReplicaObj.AddMember(
           rapidjson::Value(ip.c_str(), alloc).Move(), replicasArr, alloc);
+
+        SPDLOG_DEBUG("Planner parse migration history from host {}", ip);
+        // ===== migration history =====
+        rapidjson::Value migrationArr(rapidjson::kArrayType);
+        for (const auto& [version, count] : stats->migrationhistory()) {
+            SPDLOG_DEBUG(
+              "Migration version {} with duration {}", version, count);
+            rapidjson::Value migObj(rapidjson::kObjectType);
+            migObj.AddMember("version", version, alloc);
+            migObj.AddMember("duration", count, alloc);
+            migrationArr.PushBack(migObj, alloc);
+        }
+        // Add to migrationHistoryObj under the IP key
+        migrationHistoryObj.AddMember(
+          rapidjson::Value(ip.c_str(), alloc).Move(), migrationArr, alloc);
+    }
+
+    for (const auto& [version, duration] : migrationDurations) {
+        std::string versionStr = std::to_string(version);
+        rapidjson::Value k(versionStr.c_str(), alloc);
+        migrationDurationsObj.AddMember(k, duration, alloc);
     }
 
     doc.AddMember("workerStats", workerStatsObj, alloc);
     doc.AddMember("maxReplicaInfo", maxReplicaObj, alloc);
+    doc.AddMember("migrationHistory", migrationHistoryObj, alloc);
+    doc.AddMember("migrationDurations", migrationDurationsObj, alloc);
 
     isOutputting = false;
     // Write out the JSON document to a string.
@@ -952,6 +1048,7 @@ std::string Planner::outputResult()
     return buffer.GetString();
 }
 
+// This function is not running in the new research.
 void Planner::updateRuntimeStats()
 {
     // It doesn't need to be thread-safe, since all the stats in each worker
@@ -975,7 +1072,7 @@ void Planner::updateRuntimeStats()
 
         std::vector<std::future<void>> futures;
         // Iterate over all hosts.
-        for (const auto& [ip, hostInfo] : state.batchSchedHostMap) {
+        for (const auto& [ip, hostInfo] : state.activeHosts) {
             // Launch an asynchronous task for each host.
             futures.emplace_back(std::async(
               std::launch::async, [&results, &resultsMutex, &request, ip]() {

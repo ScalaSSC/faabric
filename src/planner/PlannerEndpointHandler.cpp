@@ -265,11 +265,43 @@ void PlannerEndpointHandler::onRequest(
             std::string value = rawReq.value();
             SPDLOG_DEBUG("Custom request with key {} and value {}", key, value);
             if (key == "reschedule") {
+                // value looks like "0-5".
+                // The first number means schedule mode,
+                // value == 0 means reschedule immediately.
+                // value == 1 means wait until all running messages are
+                // finished.
+                // The second number means the number of hosts to schedule. 0
+                // means no change.
                 if (value.empty()) {
-                    value = "0";
+                    value = "0-0";
                 }
-                int valueIn = std::stoi(value);
-                faabric::planner::getPlanner().rescheduleApp(valueIn);
+
+                int scheduleMode = 0;
+                int numHosts = 0;
+                size_t dashPos = value.find('-');
+                if (dashPos != std::string::npos) {
+                    try {
+                        scheduleMode = std::stoi(value.substr(0, dashPos));
+                        numHosts = std::stoi(value.substr(dashPos + 1));
+                        SPDLOG_DEBUG("Parsed reschedule: mode={}, hosts={}",
+                                     scheduleMode,
+                                     numHosts);
+                    } catch (const std::exception& e) {
+                        SPDLOG_ERROR(
+                          "Failed to parse reschedule integers from '{}': {}",
+                          value,
+                          e.what());
+                        scheduleMode = 0;
+                        numHosts = 0;
+                    }
+                } else {
+                    SPDLOG_ERROR("Malformed reschedule value. Expected format "
+                                 "'X-Y', got: {}",
+                                 value);
+                }
+
+                faabric::planner::getPlanner().rescheduleApp(scheduleMode,
+                                                             numHosts);
             } else {
                 SPDLOG_ERROR("Unrecognized custom request key {}", key);
                 response.result(beast::http::status::bad_request);
@@ -341,7 +373,7 @@ void PlannerEndpointHandler::onRequest(
 
             // Distribute the application to the workers.
             faabric::planner::getPlanner().registerApp(
-              rawReq, std::move(applicationPtr), true);
+              rawReq, std::move(applicationPtr));
 
             return ctx.sendFunction(std::move(response));
         }

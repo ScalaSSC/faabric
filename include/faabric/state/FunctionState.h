@@ -16,6 +16,8 @@
 
 namespace faabric::state {
 
+using HashRingPtr = std::shared_ptr<faabric::util::ConsistentHashRing>;
+
 class IndivState
 {
   public:
@@ -59,12 +61,12 @@ class FunctionState
       std::set<std::string>& keys);
     void writePartitionStateUnlocks(std::vector<uint8_t>& states);
 
-    // Reschedule partition states
-    // MAP<IP, serialized state>
-    std::map<int, std::string> scheduleParState(
-      const std::shared_ptr<faabric::util::ConsistentHashRing>& hashRing,
-      const std::map<int, std::string>& stateHost);
-    void addMigrateState(const std::string& serializedState);
+    // MAP<Parallelism ID (0), serialized state> : reschedule state
+    std::map<int, std::vector<uint8_t>> redirectLocalState();
+    // MAP<Parallelism ID, serialized state> : reschedule partitioned state
+    std::map<int, std::vector<uint8_t>> redirectLocalParState(
+      const HashRingPtr& hashRing);
+    void addMigrateState(const std::vector<uint8_t>& serializedState);
 
     bool getIsPartitioned() { return partition; }
     std::string getUserFunc() { return user + "_" + function; };
@@ -104,6 +106,7 @@ class FunctionState
     void reSize(long length);
     void doSet(const uint8_t* data);
     void doSet(const std::string& data);
+    void doSet(const std::vector<uint8_t>& data);
 
     // ----------------------------------------
     // Partitioned Function State

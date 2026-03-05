@@ -244,6 +244,7 @@ void Scheduler::reset()
     // planner didn't flush the hostmap, the scheduler also should not flush it.
     // registeredHostsMap.clear();
     // hostMap.clear();
+    activeHosts = hostMap;
 
     stopBatchTimer = false;
     batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
@@ -255,6 +256,10 @@ void Scheduler::reset()
 
     faabric::util::FullLock rflock(reconfigMx);
     decentralScheduler.resetScheduler();
+
+    currentMigrationVersion = 0;
+    receivedMigrationSources.clear();
+    migrationHistory.clear();
 }
 
 void Scheduler::shutdown()
@@ -377,6 +382,11 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
         return;
     }
 
+    if (msgs->messages_size() == 0) {
+        SPDLOG_DEBUG("Scheduler received an empty message batch");
+        return;
+    }
+
     // 2. Prepare the destination list and get the invokeHost
     std::list<std::unique_ptr<faabric::Message>> msgList;
     std::string invokeHost = msgs->invokehost();
@@ -414,13 +424,22 @@ void Scheduler::enqueueMessageBatch(
   std::string invokeHost)
 {
     // If the scheduler is updating state information, we may need to transfer
-    // them to other nodes. So, just enqueue them temporarily.
+    // them to other nodes. So, just enqueue them in chained call temporarily.
     if (isUpdateState) {
         SPDLOG_DEBUG("Enqueueing messages while updating state");
         auto msgsBatch = convertListToBatch(msgs, invokeHost);
-        unschedMsgs.enqueue(std::move(msgsBatch));
+        faabric::util::FullLock lock(chainedCallMsgsMx);
+        for (int i = 0; i < msgsBatch->messages_size(); i++) {
+            auto* msgPtr = msgsBatch->mutable_messages(i);
+            chainedCallMsgs.push_back(
+              std::make_unique<faabric::Message>(std::move(*msgPtr)));
+        }
         return;
     }
+
+    SPDLOG_DEBUG("Enqueueing message batch with size {} from host {}",
+                 msgs.size(),
+                 invokeHost);
 
     // This function is called by planner and other workers. Deadlocks happens
     // if lock(mx) is required. Our BatchQueue is thread-safe.
@@ -501,8 +520,18 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
 
         auto now = faabric::util::getGlobalClock().epochMicros();
         for (auto& src : msgVec) {
+            // Before executing, we need to double check if the message is
+            // scheduled to execute here.
+            std::string host =
+              decentralScheduler.scheduleMessage(activeHosts, *src);
+            if (host != thisHost) {
+                faabric::util::FullLock lock(chainedCallMsgsMx);
+                chainedCallMsgs.push_back(std::move(src));
+                continue;
+            }
+            // If the message is scheduled to execute here, we execute it.
             auto* message = newReq->add_messages();
-            *message = std::move(*src);
+            message->Swap(src.get());
 
             auto* metrics = message->mutable_metricrecorder();
             int workerQueueTime = now - (*metrics)[WORKER_ENQUEUE_TIME_KEY];
@@ -513,26 +542,30 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             metrics->erase(WORKER_ENQUEUE_TIME_KEY);
             metrics->erase(WORKER_ENQUEUE_SIZE_KEY);
         }
-        // Claim new Executor, we can bound the first msg here, since claim
-        // only needs the user and function of Message.
-        faabric::Message& localMsg = newReq->mutable_messages()->at(0);
-        auto timeFlag1 = faabric::util::getGlobalClock().epochMicros();
-        std::shared_ptr<faabric::executor::Executor> e =
-          claimExecutor(localMsg);
-        auto timeFlag2 = faabric::util::getGlobalClock().epochMicros();
-        int elapsed = static_cast<int>(timeFlag2 - timeFlag1);
-        for (int i = 0; i < newReq->messages_size(); i++) {
-            newReq->mutable_messages()->at(i).set_executorpreparetime(elapsed);
-        }
-        SPDLOG_DEBUG("Claimed executor {} for {} with message size {}",
-                     e->id,
-                     userFuncPar,
-                     newReq->messages_size());
-        // Execute the BatchRequest
-        auto threadClockId = e->executeBatchTasks(newReq, std::move(stateLock));
-        if (!runningThreads.contains(threadClockId)) {
-            faabric::util::FullLock cpuLock(cpuRecordMx);
-            runningThreads.emplace(threadClockId);
+        if (newReq->messages_size() != 0) {
+            // Claim new Executor, we can bound the first msg here, since claim
+            // only needs the user and function of Message.
+            faabric::Message& localMsg = newReq->mutable_messages()->at(0);
+            auto timeFlag1 = faabric::util::getGlobalClock().epochMicros();
+            std::shared_ptr<faabric::executor::Executor> e =
+              claimExecutor(localMsg);
+            auto timeFlag2 = faabric::util::getGlobalClock().epochMicros();
+            int elapsed = static_cast<int>(timeFlag2 - timeFlag1);
+            for (int i = 0; i < newReq->messages_size(); i++) {
+                newReq->mutable_messages()->at(i).set_executorpreparetime(
+                  elapsed);
+            }
+            SPDLOG_DEBUG("Claimed executor {} for {} with message size {}",
+                         e->id,
+                         userFuncPar,
+                         newReq->messages_size());
+            // Execute the BatchRequest
+            auto threadClockId =
+              e->executeBatchTasks(newReq, std::move(stateLock));
+            if (!runningThreads.contains(threadClockId)) {
+                faabric::util::FullLock cpuLock(cpuRecordMx);
+                runningThreads.emplace(threadClockId);
+            }
         }
         // Quit if no executor is available. Otherwise, execute the next batch.
         if (!executorAvailable(funcStr)) {
@@ -553,7 +586,6 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
 
     // TODO - DEBUG CODE: TO BE DELETE
     runtimeStats.logAverageQueuingTimes();
-
 }
 
 void Scheduler::enqueueChainedCalls(
@@ -632,19 +664,19 @@ void Scheduler::batchTimerCheck()
             break;
         }
 
-        // If we have some unScheduled messages, schedule them.
-        while (!unschedMsgs.empty()) {
-            SPDLOG_DEBUG("Processing unscheduled messages");
-            auto msgs = unschedMsgs.dequeue()->messages();
-            std::vector<std::unique_ptr<faabric::Message>> msgsVec;
-            msgsVec.reserve(msgs.size());
-            for (auto& msg : msgs) {
-                msgsVec.push_back(std::make_unique<faabric::Message>(msg));
-            }
-            auto hosts =
-              decentralScheduler.scheduleMessagesBatch(hostMap, msgsVec);
-            enqueueSchedMsgs(hosts, std::move(msgsVec));
-        }
+        // // If we have some unScheduled messages, schedule them.
+        // while (!migratedMsgs.empty()) {
+        //     SPDLOG_DEBUG("Processing unscheduled messages");
+        //     auto msgs = migratedMsgs.dequeue()->messages();
+        //     std::vector<std::unique_ptr<faabric::Message>> msgsVec;
+        //     msgsVec.reserve(msgs.size());
+        //     for (auto& msg : msgs) {
+        //         msgsVec.push_back(std::make_unique<faabric::Message>(msg));
+        //     }
+        //     auto hosts =
+        //       decentralScheduler.scheduleMessagesBatch(hostMap, msgsVec);
+        //     enqueueSchedMsgs(hosts, std::move(msgsVec));
+        // }
 
         // Queue for stateless and stateful operators.
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
@@ -762,6 +794,7 @@ void Scheduler::dispatchChainedMsgs()
             continue;
         }
 
+        faabric::util::FullLock mxlock(mx);
         // Otherwise, decentralized scheduler is used, we schedule the chained
         std::map<std::string, std::map<std::string, int>> chainedCallsCounter;
         std::vector<std::unique_ptr<faabric::Message>> localChainedCallMsgs;
@@ -776,7 +809,7 @@ void Scheduler::dispatchChainedMsgs()
             // Schedule the chained calls
             auto start = faabric::util::getCpuTimeNano();
             auto hosts = decentralScheduler.scheduleMessagesBatch(
-              hostMap, localChainedCallMsgs);
+              activeHosts, localChainedCallMsgs);
             auto end = faabric::util::getCpuTimeNano();
             if (start > 0 && end >= start) {
                 cpuScheduleTime.fetch_add(end - start,
@@ -917,7 +950,15 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
     // max replicas are limited. Total number of executors won't exceed the
     // maxExecutors. If current current replicas is less than the max size,
     // return true.
-    int maxReplicas = util::getOrThrow(maxReplicasMap, funcStr);
+
+    int maxReplicas;
+    try {
+        maxReplicas = util::getOrThrow(maxReplicasMap, funcStr);
+    } catch (const std::runtime_error& e) {
+        SPDLOG_WARN("Key {} not found in maxReplicasMap, defaulting to 1",
+                    funcStr);
+        maxReplicas = 1;
+    }
     if (thisExecutors.size() < maxReplicas) {
         return true;
     } else {
@@ -932,9 +973,7 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
 }
 
 std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
-  faabric::Message& msg
-  //   ,faabric::util::FullLock& schedulerLock
-)
+  faabric::Message& msg)
 {
     std::string funcStr = faabric::util::funcParToString(msg, false);
 
@@ -1135,32 +1174,192 @@ void Scheduler::updateHosts(const std::vector<std::string>& hosts)
 }
 
 void Scheduler::storeMigrateState(
-  std::multimap<std::string, std::string>&& migrateState)
+  std::map<std::string, std::vector<uint8_t>>&& migrateState)
 {
-    faabric::util::FullLock lock(tempMigrateStateMapMx);
-    tempMigrateStateMap.merge(migrateState);
+    faabric::util::FullLock lock(migratedStateMapMx);
+    if (migrateState.empty()) {
+        SPDLOG_DEBUG("Received empty migrate state, nothing to store");
+        return;
+    }
+    migratedStateMap.merge(migrateState);
+}
+
+void Scheduler::updateActiveHosts(
+  const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
+    scheduledOperatorMap)
+{
+    std::set<std::string> uniqueIps;
+    for (const auto& [opName, op] : scheduledOperatorMap) {
+        for (const auto& [ip, weight] : op.weightDist) {
+            if (!ip.empty()) {
+                uniqueIps.insert(ip);
+            }
+        }
+    }
+
+    if (!uniqueIps.empty()) {
+        std::stringstream ss;
+        ss << "Active IPs (" << uniqueIps.size() << "): [";
+        for (auto it = uniqueIps.begin(); it != uniqueIps.end(); ++it) {
+            ss << *it << (std::next(it) != uniqueIps.end() ? ", " : "");
+        }
+
+        ss << "]";
+        SPDLOG_DEBUG(ss.str());
+    } else {
+        SPDLOG_DEBUG("No active IPs found.");
+        activeHosts = hostMap;
+    }
+
+    activeHosts.clear();
+    for (const auto& ip : uniqueIps) {
+        auto it = hostMap.find(ip);
+        if (it != hostMap.end()) {
+            activeHosts[ip] = it->second;
+        } else {
+            SPDLOG_WARN("Operator scheduled on unknown host IP: {}", ip);
+        }
+    }
 }
 
 void Scheduler::updateStatesInfo(
   const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
-    scheuduledOperatorMap,
+    scheduledOperatorMap,
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
-    statesInfo)
+    statesInfo,
+  int migrationVersion,
+  bool isInitialization,
+  std::map<std::string, std::set<std::string>>& transDestinationMap,
+  std::map<std::string, std::set<std::string>>& transSourceMap)
 {
-    SPDLOG_DEBUG("updateStatesInfo: Update states info starts");
+    SPDLOG_DEBUG("State Update: Start");
+
+    auto startTime = faabric::util::getGlobalClock().epochMillis();
+
     isUpdateState = true;
     // Update the states info in decentralized scheduler
-    // To update states, we must ensure that no executors are running.
-    // Otherwise, it might cannot update the states correctly.
+    // To update states, we must ensure that no executors are running (hold
+    // state lock).
     faabric::util::FullLock lock(mx);
-    SPDLOG_DEBUG("updateStatesInfo: scheduler lock acquired");
+    SPDLOG_DEBUG("State Update: scheduler lock acquired");
     faabric::util::FullLock stateLock(stateUpdateMx);
-    SPDLOG_DEBUG("updateStatesInfo: state lock acquired");
+    SPDLOG_DEBUG("State Update: state lock acquired");
 
+    // 1. Update the local max replicas map based on the new scheduling
+    // decision.
+    calculateMaxReplicas(scheduledOperatorMap);
+
+    // 2. Update the local scheduler and update the states info in decentralized
+    // scheduler
+    faabric::util::FullLock rflock(reconfigMx);
+
+    SPDLOG_DEBUG("State Update: decentralized scheduler states update");
+    updateActiveHosts(scheduledOperatorMap);
+    decentralScheduler.resetScheduler();
+    decentralScheduler.setScheuduledOperatorMap(scheduledOperatorMap);
+    // update runtime summary and states info.
+    decentralScheduler.syncStatesInfo(statesInfo);
+
+    // If it's initialization, we don't need to migrate. Just return after
+    // updating the states info.
+    if (isInitialization) {
+        createLocalState(statesInfo);
+        isUpdateState = false;
+        SPDLOG_DEBUG(
+          "State Update: initialization complete, no migration needed");
+        return;
+    }
+
+    // Update the version, state destionation map and state source map.
+    currentMigrationVersion = migrationVersion;
+    std::set<std::string> migrationDestinations = transDestinationMap[thisHost];
+    std::set<std::string> migrationSources = transSourceMap[thisHost];
+
+    // 3. Prepare the migration request: state and in-flight messages
+
+    SPDLOG_DEBUG("State Update: Migration data start");
+
+    auto migrationStatesMap = packState(statesInfo);
+
+    auto migrationMessagesMap = packMessage();
+
+    // Transfer the state and message to the new host.
+
+    transferData(migrationVersion,
+                 migrationStatesMap,
+                 std::move(migrationMessagesMap),
+                 migrationDestinations);
+
+    SPDLOG_DEBUG("State Update: Migration hurdle");
+
+    // 4. Wait until migration is completed.
+    size_t expectedCount = migrationSources.size();
+
+    SPDLOG_DEBUG("Migration Version {}: Waiting for data from {} hosts",
+                 migrationVersion,
+                 expectedCount);
+
+    if (expectedCount > 0) {
+        std::unique_lock<std::mutex> lock(migrationMx);
+        bool success = migrationCv.wait_for(
+          lock,
+          std::chrono::seconds(10),
+          [this, migrationVersion, expectedCount] {
+              return receivedMigrationSources[migrationVersion].size() >=
+                     expectedCount;
+          });
+        if (!success) {
+            SPDLOG_DEBUG("Migration timed out! Received {}/{} sources",
+                         receivedMigrationSources[migrationVersion].size(),
+                         expectedCount);
+        } else {
+            SPDLOG_DEBUG("Migration completed successfully for version {}",
+                         migrationVersion);
+        }
+    } else {
+        SPDLOG_DEBUG("No migration sources for this host, proceeding.");
+    }
+
+    // 5. Head to next step after migration. (sync state and messages)
+    // Create state in state server
+    SPDLOG_DEBUG("State Update: create states based on new states info");
+
+    createLocalState(statesInfo);
+
+    // Update the states from migratedStateMap to state
+    faabric::util::FullLock migrateStateLock(migratedStateMapMx);
+    auto& stateServer = faabric::state::getGlobalState();
+    stateServer.loadMigrateState(migratedStateMap);
+
+    SPDLOG_DEBUG(
+      "State Update: states reallocation complete, reschedule requests now");
+
+    isUpdateState = false;
+
+    while (!migratedMsgs.empty()) {
+        SPDLOG_DEBUG("Processing migrated messages");
+        auto msgBatch = migratedMsgs.dequeue();
+        enqueueMessageBatch(std::move(msgBatch));
+    }
+
+    // Clean up the migration sources
+    receivedMigrationSources.erase(migrationVersion);
+
+    auto endTime = faabric::util::getGlobalClock().epochMillis();
+    int totalTimeMillis = endTime - startTime;
+    SPDLOG_DEBUG("State Update: completed in {} ms", totalTimeMillis);
+
+    migrationHistory[migrationVersion] = totalTimeMillis;
+}
+
+void Scheduler::calculateMaxReplicas(
+  const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
+    scheduledOperatorMap)
+{
     maxReplicasMap.clear();
     // reset max replicas based on resource requirements.
     std::map<std::string, int> tempMaxReplicasMap;
-    for (const auto& [operatorName, operatorInfo] : scheuduledOperatorMap) {
+    for (const auto& [operatorName, operatorInfo] : scheduledOperatorMap) {
         if (operatorInfo.weightDist.count(thisHost) <= 0) {
             continue;
         }
@@ -1223,47 +1422,14 @@ void Scheduler::updateStatesInfo(
                      funcStr,
                      scaledMaxReplica);
     }
+}
 
-    faabric::util::FullLock rflock(reconfigMx);
-    decentralScheduler.resetScheduler();
-
-    decentralScheduler.setScheuduledOperatorMap(scheuduledOperatorMap);
-
-    // Update the states info in decentralized scheduler
-    decentralScheduler.syncStatesInfo(statesInfo);
-
-    // We migrate the old state and create the new state according to the
-    // planner's new scheduling decision.
+void Scheduler::createLocalState(
+  const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+    statesInfo)
+{
     auto& stateServer = faabric::state::getGlobalState();
-
-    // stateServer.backupAll();
-    // auto& hashRings = decentralScheduler.getStateHashRing();
-    // auto migrationStatesMap =
-    //   stateServer.schedulePreStates(hashRings, statesInfo);
-
-    // Migrate the states.
-    // SPDLOG_INFO("updateStatesInfo: transferring states to other hosts");
-    // std::vector<std::thread> threads;
-    // for (const auto& [ip, migrStates] : migrationStatesMap) {
-    //     auto req = std::make_shared<faabric::StateMigrationRequest>();
-    //     for (const auto& [userFuncPar, serializedState] : migrStates) {
-    //         auto* migrateState = req->add_migratestates();
-    //         migrateState->set_userfuncpar(userFuncPar);
-    //         migrateState->set_serializedstate(serializedState);
-    //     }
-    //     threads.emplace_back(
-    //       [ip, req]() { getFunctionCallClient(ip)->migrateStates(req); });
-    // }
-    // for (auto& t : threads) {
-    //     if (t.joinable()) {
-    //         t.join();
-    //     }
-    // }
-
-    SPDLOG_INFO(
-      "updateStatesInfo: states update complete, reallocate states now");
-
-    // Intialize new allocated state
+    stateServer.clearFS();
     for (const auto& [stateKey, stateInfo] : statesInfo) {
         for (const auto& [id, ip] : stateInfo.stateHost) {
             if (ip != thisHost) {
@@ -1272,76 +1438,155 @@ void Scheduler::updateStatesInfo(
             auto [user, func] = faabric::util::splitUserFunc(stateKey);
             bool isPartitionable =
               stateInfo.partitionBy != "" && stateInfo.partitionBy != "None";
-
-            // Create the state locally if the state is on this host
             stateServer.createFS(user, func, id, isPartitionable);
         }
     }
+}
 
-    SPDLOG_INFO(
-      "updateStatesInfo: create states complete, waiting for other hosts");
+// MAP <HOST, function parallelism, serialized state>
+std::map<std::string, std::map<std::string, std::vector<uint8_t>>>
+Scheduler::packState(
+  const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+    statesInfo)
+{
+    SPDLOG_DEBUG("Packing state for migration");
+    // Migrate the state according to new scheduling decision.
+    auto& stateServer = faabric::state::getGlobalState();
 
-    // Hurdle - waiting for other hosts to finish the migration
-    faabric::planner::getPlannerClient().migrationComplete();
+    auto& hashRings = decentralScheduler.getStateHashRing();
+    auto migrationStatesMap = stateServer.redirectState(hashRings, statesInfo);
 
-    SPDLOG_INFO("updateStatesInfo: migration complete, update the states now");
+    return migrationStatesMap;
+}
 
-    // Update the states from tempMigrateStateMap to state
-    {
-        faabric::util::FullLock migrateStateLock(tempMigrateStateMapMx);
-        std::ostringstream oss;
-        oss << "tempMigrateStateMap contents:\n";
-        for (const auto& [key, value] : tempMigrateStateMap) {
-            oss << "Key: " << key << " -> Value Size: " << value.size() << "\n";
-        }
-        SPDLOG_INFO("{}", oss.str());
-        // TODO - there is a bug here !
-        // For stateful operator, it can cause the state to be lost. (unstop
-        // running) maybe loadMigrateState or maybe the flush state has bugs.
-        // stateServer.loadMigrateState(tempMigrateStateMap);
-
-        tempMigrateStateMap.clear();
-        stateServer.cleanBackup();
-    }
-
-    SPDLOG_INFO("updateStatesInfo: states reallocation complete, reschedule "
-                "requests now");
-
-    // Reschedule all the messages in unprocessed queue and scheduled queue.
-    std::vector<std::unique_ptr<faabric::Message>> rescheduleMsgs;
-    for (auto& [queueKey, queuePtr] : waitingQueues) {
-        if (queuePtr->getMessagesCount() == 0) {
+// MAP <HOST, message batch>
+std::map<std::string, std::unique_ptr<faabric::MessageBatch>>
+Scheduler::packMessage()
+{
+    SPDLOG_DEBUG("Packing messages for migration");
+    std::map<std::string, std::unique_ptr<faabric::MessageBatch>>
+      packedMessageMap;
+    // Migrate the in-flight messages according to new scheduling decision.
+    std::vector<std::unique_ptr<faabric::Message>> localMsgs;
+    for (auto& [_, queuePtr] : waitingQueues) {
+        auto messages = queuePtr->drainMessages();
+        if (messages.empty()) {
             continue;
         }
-        auto messages = queuePtr->drainMessages();
-        for (auto& msg : messages) {
-            rescheduleMsgs.emplace_back(std::move(msg));
-        }
+        localMsgs.insert(localMsgs.end(),
+                         std::make_move_iterator(messages.begin()),
+                         std::make_move_iterator(messages.end()));
     }
-    // for (auto& [queueKey, queuePtr] : partitionedWaitingQueues) {
-    //     if (queuePtr->getMessagesCount() == 0) {
-    //         continue;
-    //     }
-    //     auto messages = queuePtr->drainMessages();
-    //     for (auto& msg : messages) {
-    //         rescheduleMsgs.emplace_back(std::move(msg));
-    //     }
-    // }
-    // Reschedule the scheduled messages in scheduledMsgsMap
-    for (auto& [hostIp, msgs] : scheduledMsgsMap) {
+    faabric::util::FullLock lock(scheduledMsgsMapMx);
+    for (auto& [_, msgs] : scheduledMsgsMap) {
         for (auto& msg : msgs) {
-            rescheduleMsgs.emplace_back(std::move(msg));
+            localMsgs.emplace_back(std::move(msg));
         }
-        scheduledMsgsMap.erase(hostIp);
     }
-    // Reschedule the messages
-    if (!rescheduleMsgs.empty()) {
-        auto hosts =
-          decentralScheduler.scheduleMessagesBatch(hostMap, rescheduleMsgs);
-        enqueueSchedMsgs(hosts, std::move(rescheduleMsgs));
+    scheduledMsgsMap.clear();
+    lock.unlock();
+
+    SPDLOG_DEBUG("Total local messages to migrate: {}", localMsgs.size());
+
+    // Schedule the local messages according to the new scheduling decision.
+    auto hosts =
+      decentralScheduler.scheduleMessagesBatch(activeHosts, localMsgs);
+
+    for (size_t i = 0; i < localMsgs.size(); ++i) {
+        const std::string& destinationHost = hosts[i];
+        auto& msg = localMsgs[i];
+
+        if (packedMessageMap.find(destinationHost) == packedMessageMap.end()) {
+            packedMessageMap[destinationHost] =
+              std::make_unique<faabric::MessageBatch>();
+        }
+        auto* newMsg = packedMessageMap[destinationHost]->add_messages();
+        *newMsg = std::move(*msg);
     }
-    isUpdateState = false;
-    SPDLOG_INFO("updateStatesInfo: reschedule complete");
+
+    return packedMessageMap;
+}
+
+void Scheduler::transferData(int migrationVersion,
+                             StateMigrationMap stateMap,
+                             MessageMigrationMap msgMap,
+                             std::set<std::string> migrationDestinations)
+{
+    SPDLOG_INFO("Transferring data for migration version {}, number of "
+                "destination hosts: {}",
+                migrationVersion,
+                migrationDestinations.size());
+    // Prepare Message
+    // Map <Destination host, StateMigrationRequest>
+    std::map<std::string, std::shared_ptr<faabric::StateMigrationRequest>>
+      migrationRequestMap;
+
+    for (const auto& destHost : migrationDestinations) {
+        migrationRequestMap[destHost] =
+          std::make_shared<faabric::StateMigrationRequest>();
+        migrationRequestMap[destHost]->set_sourcehost(thisHost);
+        migrationRequestMap[destHost]->set_migrationversion(migrationVersion);
+    }
+
+    for (auto& [destHost, funcData] : stateMap) {
+        if (migrationRequestMap.find(destHost) == migrationRequestMap.end()) {
+            SPDLOG_ERROR("Destination host {} not in migrationRequestMap",
+                         destHost);
+            throw std::runtime_error(fmt::format(
+              "Destination host {} not in migrationRequestMap", destHost));
+        }
+        auto& requestPtr = migrationRequestMap[destHost];
+
+        for (auto& [funcPar, state] : funcData) {
+            auto* migrateState = requestPtr->add_migratestates();
+            migrateState->set_userfuncpar(funcPar);
+            migrateState->set_serializedstate(state.data(), state.size());
+        }
+    }
+
+    for (auto& [destHost, batchPtr] : msgMap) {
+        if (!batchPtr)
+            continue;
+
+        auto& request = migrationRequestMap[destHost];
+        request->set_allocated_messagebatch(batchPtr.release());
+    }
+
+    // Transfer data to the new host
+    for (auto& [destHost, requestPtr] : migrationRequestMap) {
+        if (destHost == thisHost) {
+            processMigrationData(*requestPtr);
+        } else {
+            faabric::scheduler::getFunctionCallClient(destHost)->migrateStates(
+              requestPtr);
+        }
+    }
+}
+
+void Scheduler::processMigrationData(const faabric::StateMigrationRequest& req)
+{
+    std::unique_lock<std::mutex> lock(migrationMx);
+
+    const std::string& source = req.sourcehost();
+
+    std::map<std::string, std::vector<uint8_t>> immiStates;
+    for (const auto& stateEntry : req.migratestates()) {
+        const std::string& key = stateEntry.userfuncpar();
+        const std::string& data = stateEntry.serializedstate();
+        std::vector<uint8_t> stateData(data.begin(), data.end());
+        immiStates[key] = std::move(stateData);
+    }
+    this->storeMigrateState(std::move(immiStates));
+
+    if (req.messagebatch().messages_size() > 0) {
+        migratedMsgs.enqueue(
+          std::make_unique<faabric::MessageBatch>(req.messagebatch()));
+    }
+
+    int migrationVersion = req.migrationversion();
+    receivedMigrationSources[migrationVersion].insert(source);
+
+    migrationCv.notify_all();
 }
 
 std::map<std::string, InstanceStatsResult> Scheduler::getRuntimeStats()
@@ -1390,4 +1635,26 @@ std::map<std::string, int> Scheduler::getMaxReplicasMap()
 {
     return maxReplicasMap;
 }
+
+std::map<int, int> Scheduler::getMigrationHistory()
+{
+    SPDLOG_DEBUG("Retrieving migration history with {} records",
+                 migrationHistory.size());
+    if (migrationHistory.empty()) {
+        SPDLOG_DEBUG("No migration history records found.");
+    } else {
+        std::stringstream ss;
+        ss << "Migration History: {";
+        for (auto it = migrationHistory.begin(); it != migrationHistory.end();
+             ++it) {
+            ss << it->first << ": " << it->second
+               << (std::next(it) != migrationHistory.end() ? ", " : "");
+        }
+        ss << "}";
+        SPDLOG_DEBUG(ss.str());
+    }
+
+    return migrationHistory;
+}
+
 }

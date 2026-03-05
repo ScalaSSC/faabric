@@ -136,14 +136,18 @@ class Scheduler
 
     void updateStatesInfo(
       const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
-        scheuduledOperatorMap,
+        scheduledOperatorMap,
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
-        statesInfo);
+        statesInfo,
+      int migrationVersion,
+      bool isInitialization,
+      std::map<std::string, std::set<std::string>>& transDestinationMap,
+      std::map<std::string, std::set<std::string>>& transSourceMap);
 
     void storeMigrateState(
-      std::multimap<std::string, std::string>&& migrateState);
+      std::map<std::string, std::vector<uint8_t>>&& migrateState);
 
-    // std::map<std::string, int> statsLocalLoad();
+    void processMigrationData(const faabric::StateMigrationRequest& req);
 
     // void updateWorkersLoad();
 
@@ -162,6 +166,8 @@ class Scheduler
 
     std::map<std::string, int> getMaxReplicasMap();
 
+    std::map<int, int> getMigrationHistory();
+
   private:
     std::string thisHost;
 
@@ -175,7 +181,6 @@ class Scheduler
 
     // Maximum number of replicas per function
     // int maxReplicas = 8;
-
     std::map<std::string, int> maxReplicasMap;
 
     // Maximum number of concurrent executors in the worker
@@ -218,11 +223,6 @@ class Scheduler
     std::map<std::string, std::unique_ptr<faabric::util::BatchQueue>>
       waitingQueues;
 
-    // MAP<UserFuncPar, Queue>
-    // std::map<std::string,
-    //          std::unique_ptr<faabric::util::PartitionedStateMessageQueue>>
-    //   partitionedWaitingQueues;
-
     std::shared_mutex chainedCallMsgsMx;
     std::vector<std::unique_ptr<faabric::Message>> chainedCallMsgs;
 
@@ -246,12 +246,17 @@ class Scheduler
     // the executor is running.
     std::shared_mutex stateUpdateMx;
 
-    // scheduledMsgsMapMx is used for scheduledMsgsMap
+    // scheduledMsgsMapMx is used for scheduledMsgsMap which are the chained
+    // call messages to be dispatched.
     std::shared_mutex scheduledMsgsMapMx;
     std::map<std::string, std::list<std::unique_ptr<Message>>> scheduledMsgsMap;
 
-    std::shared_mutex tempMigrateStateMapMx;
-    std::multimap<std::string, std::string> tempMigrateStateMap;
+    // The migrated messages received from other hosts.
+    util::ThreadSafeQueue<std::unique_ptr<faabric::MessageBatch>> migratedMsgs;
+
+    // The migrated state received from other hosts.
+    std::shared_mutex migratedStateMapMx;
+    std::multimap<std::string, std::vector<uint8_t>> migratedStateMap;
 
     faabric::batch_scheduler::DecentralizedScheduler decentralScheduler;
 
@@ -259,13 +264,13 @@ class Scheduler
 
     faabric::batch_scheduler::HostMap hostMap;
 
+    faabric::batch_scheduler::HostMap activeHosts;
+
     bool stopThreadTimer = false;
 
     std::thread dispatchChainedMsgsThread;
 
     bool isUpdateState = false;
-
-    util::ThreadSafeQueue<std::unique_ptr<faabric::MessageBatch>> unschedMsgs;
 
     InstancesRuntimeStats runtimeStats;
 
@@ -286,6 +291,44 @@ class Scheduler
     // std::map<std::string, clockid_t> runningThreads;
     std::set<clockid_t> runningThreads;
     std::map<clockid_t, int64_t> threadClockStartMap;
+
+    std::mutex migrationMx;
+    int currentMigrationVersion = 0;
+    // MAP<migration version, set of updated states>
+    std::map<int, std::set<std::string>> receivedMigrationSources;
+    std::condition_variable migrationCv;
+    // MAP<migration version, migration time>
+    std::map<int, int> migrationHistory;
+
+    using StateMigrationMap =
+      std::map<std::string, std::map<std::string, std::vector<uint8_t>>>;
+    using MessageMigrationMap =
+      std::map<std::string, std::unique_ptr<faabric::MessageBatch>>;
+
+    void calculateMaxReplicas(
+      const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
+        scheduledOperatorMap);
+
+    void createLocalState(
+      const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+        statesInfo);
+
+    // State and Message Migration
+    // MAP<HOST IP, <FUNCTION_PAR, Serialized Data>>
+    StateMigrationMap packState(
+      const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+        statesInfo);
+
+    MessageMigrationMap packMessage();
+
+    void transferData(int migrationVersion,
+                      StateMigrationMap stateMap,
+                      MessageMigrationMap msgMap,
+                      std::set<std::string> migrationDestinations);
+
+    void updateActiveHosts(
+      const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
+        scheduledOperatorMap);
 };
 
 }

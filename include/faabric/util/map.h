@@ -24,6 +24,18 @@ inline V getOrThrow(const std::map<K, V>& map, const K& key)
         ss << "Cannot find key '" << key << "' in map";
         // For demonstration without the library, we print to cerr.
         SPDLOG_ERROR(ss.str());
+
+        // Build a comma-separated list of all available keys
+        std::string available_keys;
+        for (const auto& pair : map) {
+            if (!available_keys.empty()) {
+                available_keys += ", ";
+            }
+            available_keys += pair.first;
+        }
+
+        SPDLOG_INFO("Available keys in map: [{}]", available_keys);
+
         throw std::runtime_error("Key not found in map");
     }
     return it->second;

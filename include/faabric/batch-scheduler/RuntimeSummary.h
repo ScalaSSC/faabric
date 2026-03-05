@@ -7,6 +7,7 @@
 #include <faabric/util/string_tools.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <random>
@@ -14,7 +15,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <atomic>
 
 namespace faabric::batch_scheduler {
 
@@ -164,6 +164,16 @@ inline ScheduledOperator& getScheduledOperatorOrThrow(
     if (it == ops.end()) {
         SPDLOG_ERROR("Source node {} not found in scheduled operators map",
                      nodeName);
+
+        std::string available_keys;
+        for (const auto& pair : ops) {
+            if (!available_keys.empty()) {
+                available_keys += ", ";
+            }
+            available_keys += pair.first;
+        }
+
+        SPDLOG_INFO("Available keys in map: [{}]", available_keys);
         throw std::runtime_error(
           "Source node not found in scheduled operators map");
     }
@@ -214,7 +224,7 @@ class RuntimeSummary
     std::string getHost(const std::string& instance, unsigned int counter);
     std::string getHost(const std::string& instance,
                         const std::string& recommended);
-    
+
     void setAlpha(double value);
 
     void reset();

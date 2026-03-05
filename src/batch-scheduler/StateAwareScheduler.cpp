@@ -490,6 +490,18 @@ std::string StateAwareScheduler::scheduleStatefulMessage(
 
 std::string StateAwareScheduler::scheduleMessage(
   const HostMap& hostMap,
+  const faabric::Message& msg)
+{
+    auto* nonConstMsg = const_cast<faabric::Message*>(&msg);
+    std::unique_ptr<faabric::Message> tempWrapper(nonConstMsg);
+    std::string host = scheduleMessage(hostMap, tempWrapper);
+    tempWrapper.release();
+
+    return host;
+}
+
+std::string StateAwareScheduler::scheduleMessage(
+  const HostMap& hostMap,
   const std::unique_ptr<faabric::Message>& msg)
 {
     if (msg->user().empty() || msg->function().empty()) {

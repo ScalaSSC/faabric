@@ -33,63 +33,49 @@ State::State(std::string thisIPIn)
   : thisIP(thisIPIn)
 {}
 
-void State::updateHosts(faabric::batch_scheduler::HostMap hostMap) {
+void State::updateHosts(faabric::batch_scheduler::HostMap hostMap)
+{
     hosts = hostMap;
 }
 
-void State::backupAll()
-{
-    faabric::util::FullLock fsmaplock(fsmapMutex);
-    faabric::util::FullLock backupMaplock(backupMapMutex);
-    backupMap = std::move(fsMap);
-    fsMap.clear();
-}
-
-void State::cleanBackup()
-{
-    faabric::util::FullLock lock(backupMapMutex);
-    backupMap.clear();
-}
-
-std::map<std::string, std::multimap<std::string, std::string>>
-State::schedulePreStates(
-  const std::map<std::string,
-                 std::shared_ptr<faabric::util::ConsistentHashRing>>& hashRings,
+std::map<std::string, std::map<std::string, std::vector<uint8_t>>>
+State::redirectState(
+  const std::map<std::string, HashRingPtr>& hashRings,
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
     statesInfo)
 {
-    // state migration map
-    // MAP <IP, <UserFuncPar ,serialized states>>
-    std::map<std::string, std::multimap<std::string, std::string>>
-      migrationStatesMap;
-    for (const auto& [preFuncName, state] : backupMap) {
+    // state migration map : MAP <IP, <UserFuncPar, serialized states>>
+    std::map<std::string, std::map<std::string, std::vector<uint8_t>>>
+      migrationStateMap;
+    for (const auto& [preFuncName, state] : fsMap) {
         std::string userFunc = state->getUserFunc();
         if (!statesInfo.contains(userFunc)) {
             SPDLOG_ERROR("Function {} not found in states info", userFunc);
             throw std::runtime_error("Function not found in states info");
         }
         const auto& info = statesInfo.at(userFunc);
-        std::shared_ptr<faabric::util::ConsistentHashRing> hashRing;
+        std::map<int, std::vector<uint8_t>> migratedState;
         if (state->getIsPartitioned()) {
             if (!hashRings.contains(userFunc)) {
                 SPDLOG_ERROR("Hash ring not found for function {}", userFunc);
                 throw std::runtime_error("Hash ring not found for function");
             }
-            hashRing = hashRings.at(userFunc);
+            HashRingPtr hashRing = hashRings.at(userFunc);
+            auto migratedState = state->redirectLocalParState(hashRing);
+        } else {
+            auto migratedState = state->redirectLocalState();
         }
-        auto migratedStates = state->scheduleParState(hashRing, info.stateHost);
-        // Add migratedStates to migrationStatesMap
-        for (const auto& [parIdx, serializedState] : migratedStates) {
+        for (const auto& [parIdx, serializedState] : migratedState) {
             std::string ip = info.stateHost.at(parIdx);
             std::string userFuncPar = userFunc + "_" + std::to_string(parIdx);
-            migrationStatesMap[ip].emplace(userFuncPar,
-                                           std::move(serializedState));
+            migrationStateMap[ip].emplace(userFuncPar,
+                                          std::move(serializedState));
         }
     }
 
     std::ostringstream oss;
     oss << "MigrationStatesMap contents: \n";
-    for (const auto& [ip, innerMap] : migrationStatesMap) {
+    for (const auto& [ip, innerMap] : migrationStateMap) {
         oss << "IP: " << ip << " | Keys: ";
         for (const auto& [userFuncPar, serializedState] : innerMap) {
             oss << userFuncPar << " ";
@@ -98,11 +84,11 @@ State::schedulePreStates(
     }
     SPDLOG_INFO("{}", oss.str());
 
-    return migrationStatesMap;
+    return migrationStateMap;
 }
 
 void State::loadMigrateState(
-  const std::multimap<std::string, std::string>& migrateStates)
+  const std::multimap<std::string, std::vector<uint8_t>>& migrateStates)
 {
     faabric::util::FullLock lock(fsmapMutex);
 
@@ -134,6 +120,11 @@ void State::forceClearAll(bool global)
         faabric::util::FullLock lock(fsmapMutex);
         fsMap.clear();
     }
+}
+
+void State::clearFS(){
+    faabric::util::FullLock lock(fsmapMutex);
+    fsMap.clear();
 }
 
 size_t State::getStateSize(const std::string& user, const std::string& keyIn)

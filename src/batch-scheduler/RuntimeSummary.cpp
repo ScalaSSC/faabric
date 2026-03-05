@@ -111,41 +111,49 @@ void RuntimeSummary::initAll(const batch_scheduler::Application& application,
                              int scheduleMode)
 {
     std::set<std::string> initOperators;
-    // For planner, we need to initialize the schedule for input opeartors.
-    if (planner) {
-        for (const auto& [optName, scheduledOpt] : scheduledOperatorsMap) {
-            if (scheduledOpt.node.type !=
-                batch_scheduler::NodeType::STATELESS) {
-                continue; // Only stateless operators are considered
-            }
-            if (scheduledOpt.node.isInput || scheduleMode == 7) {
-                initOperators.insert(optName);
-            }
+    // // For planner, we need to initialize the schedule for input opeartors.
+    // if (planner) {
+    //     for (const auto& [optName, scheduledOpt] : scheduledOperatorsMap) {
+    //         if (scheduledOpt.node.type !=
+    //             batch_scheduler::NodeType::STATELESS) {
+    //             continue; // Only stateless operators are considered
+    //         }
+    //         if (scheduledOpt.node.isInput || scheduleMode == 7) {
+    //             initOperators.insert(optName);
+    //         }
+    //     }
+    // }
+    // // Otherwise, we just initialize the distribution ring for successor
+    // // operators (whose source is in this node).
+    // else {
+    //     for (const auto& [optName, scheduledOpt] : scheduledOperatorsMap) {
+    //         if (scheduledOpt.node.type !=
+    //             batch_scheduler::NodeType::STATELESS) {
+    //             continue; // Only stateless operators are considered
+    //         }
+    //         // If the source node of optName is in this node, we need to
+    //         // shcedule it.
+    //         auto sourceNodes = application.getSource(optName);
+    //         for (const auto& sourceNode : sourceNodes) {
+    //             if (!scheduledOperatorsMap.contains(sourceNode->name)) {
+    //                 continue;
+    //             }
+    //             auto sourceOpt =
+    //               util::getOrThrow(scheduledOperatorsMap, sourceNode->name);
+    //             if (sourceOpt.weightDist.contains(localHost)) {
+    //                 initOperators.insert(optName);
+    //                 break; // Only break the inner for loop
+    //             }
+    //         }
+    //     }
+    // }
+
+    // Temporarily, we initialize all operators due to runtime reschedule.
+    for (const auto& [optName, scheduledOpt] : scheduledOperatorsMap) {
+        if (scheduledOpt.node.type != batch_scheduler::NodeType::STATELESS) {
+            continue; // Only stateless operators are considered
         }
-    }
-    // Otherwise, we just initialize the distribution ring for successor
-    // operators (whose source is in this node).
-    else {
-        for (const auto& [optName, scheduledOpt] : scheduledOperatorsMap) {
-            if (scheduledOpt.node.type !=
-                batch_scheduler::NodeType::STATELESS) {
-                continue; // Only stateless operators are considered
-            }
-            // If the source node of optName is in this node, we need to
-            // shcedule it.
-            auto sourceNodes = application.getSource(optName);
-            for (const auto& sourceNode : sourceNodes) {
-                if (!scheduledOperatorsMap.contains(sourceNode->name)) {
-                    continue;
-                }
-                auto sourceOpt =
-                  util::getOrThrow(scheduledOperatorsMap, sourceNode->name);
-                if (sourceOpt.weightDist.contains(localHost)) {
-                    initOperators.insert(optName);
-                    break; // Only break the inner for loop
-                }
-            }
-        }
+        initOperators.insert(optName);
     }
     for (const auto& optName : initOperators) {
         initOpertaor(application, optName);

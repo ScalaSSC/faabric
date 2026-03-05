@@ -358,7 +358,10 @@ message MigrateState{
 }
 
 message StateMigrationRequest{
-    repeated MigrateState migrateStates = 1;
+    string sourceHost = 1;
+    int32 migrationVersion = 2;
+    repeated MigrateState migrateStates = 3;
+    MessageBatch messageBatch = 4;
 }
 
 message InstanceStatsPayload{
@@ -396,4 +399,5 @@ message WorkerStats{
     string ip = 1;
     repeated CpuRecord history = 2;
     repeated InstanceReplicas instanceReplicas = 3;
+    map<int32, int32> migrationHistory = 4;
 }

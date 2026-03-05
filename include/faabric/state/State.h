@@ -51,20 +51,14 @@ class State
     std::shared_ptr<StateKeyValue> getKV(const std::string& user,
                                          const std::string& key);
 
-    void backupAll();
-
-    void cleanBackup();
-
-    std::map<std::string, std::multimap<std::string, std::string>>
-    schedulePreStates(
-      const std::map<std::string,
-                     std::shared_ptr<faabric::util::ConsistentHashRing>>&
-        hashRings,
+    std::map<std::string, std::map<std::string, std::vector<uint8_t>>>
+    redirectState(
+      const std::map<std::string, HashRingPtr>& hashRings,
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
         statesInfo);
 
     void loadMigrateState(
-      const std::multimap<std::string, std::string>& migrateStates);
+      const std::multimap<std::string, std::vector<uint8_t>>& migrateStates);
 
     void forceClearAll(bool global);
 
@@ -154,6 +148,8 @@ class State
                   const std::string& func,
                   int32_t parallelismId);
 
+    void clearFS();
+
     void flushState();
 
     void updateHosts(faabric::batch_scheduler::HostMap hostMap);
@@ -165,12 +161,10 @@ class State
 
     std::unordered_map<std::string, std::shared_ptr<StateKeyValue>> kvMap;
     std::unordered_map<std::string, std::shared_ptr<FunctionState>> fsMap;
-    std::unordered_map<std::string, std::shared_ptr<FunctionState>> backupMap;
     PersistentState persistentState;
 
     std::shared_mutex mapMutex;
     std::shared_mutex fsmapMutex;
-    std::shared_mutex backupMapMutex;
 
     std::shared_ptr<StateKeyValue> doGetKV(const std::string& user,
                                            const std::string& key,
