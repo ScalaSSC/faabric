@@ -153,18 +153,20 @@ message Message {
     // map<string, int32> intExecGraphDetails = 37;
     // map<string, string> execGraphDetails = 38;
 
-    int64 dispatchReceiveTime = 85;
-    int32 executeBatchSize = 86;
+    bool isMigrate = 83;
+    int64 dispatchReceiveTime = 84;
+    int32 executeBatchSize = 85;
     // Chained Call numbers
-    bool isScheduledLocally = 87;
+    bool isScheduledLocally = 86;
     // State
     // Message Type : 0 stateless/ 1 function state / 2 partitioned state
-    int32 messageType = 88;
+    int32 messageType = 87;
     // Hint the Parallelism Id of this task
-    int64 plannerQueueTime = 89;
-    int64 plannerPopTime = 90;
-    int64 plannerDispatchTime = 91;
-    map<string, int64> metricRecorder = 92;
+    int64 plannerQueueTime = 88;
+    int64 plannerPopTime = 89;
+    int64 plannerDispatchTime = 90;
+    map<string, int64> metricRecorder = 91;
+    int32 workerQueueNum = 92;
     int32 workerQueueWaitTime = 93;
     // Time for claiming executor
     int32 ExecutorPrepareTime = 94;
@@ -395,9 +397,26 @@ message InstanceReplicas{
     int32 replicas = 2;
 }
 
+message AverageAndCount {
+    int32 average = 1;
+    int32 count = 2;
+}
+
+message InstanceMetricsResultProto {
+    map<int64, AverageAndCount> workerQueueTimeStats = 1;
+    map<int64, AverageAndCount> workerQueueNumStats = 2;
+    map<int64, AverageAndCount> workerExecTimeStats = 3;
+}
+
 message WorkerStats{
     string ip = 1;
     repeated CpuRecord history = 2;
     repeated InstanceReplicas instanceReplicas = 3;
     map<int32, int32> migrationHistory = 4;
+    // <Timestamp, version>
+    map<int64, int32> versionTimestamp = 5;
+    map<string, InstanceMetricsResultProto> workerMetrics = 6;
+    map<string, int32> instanceQueueNum = 7;
+    int32 executorsNum = 8;
+    double cpuLoad = 9;
 }

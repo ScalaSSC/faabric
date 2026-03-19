@@ -21,6 +21,7 @@
 #include <faabric/util/string_tools.h>
 #include <faabric/util/testing.h>
 
+#include <fstream>
 #include <sstream>
 #include <unordered_set>
 
@@ -31,6 +32,40 @@ constexpr int DEFAULT_SLOT_NUM = 100;
 
 const std::string WORKER_ENQUEUE_TIME_KEY = "worker_queue_time_key";
 const std::string WORKER_ENQUEUE_SIZE_KEY = "worker_queue_size_key";
+
+struct VmCpuData
+{
+    long long idleTime;
+    long long totalTime;
+};
+
+static VmCpuData readVmCpuData()
+{
+    std::ifstream file("/proc/stat");
+    std::string line;
+    std::getline(file, line);
+
+    long long user, nice, system, idle, iowait, irq, softirq, steal, guest,
+      guest_nice;
+    sscanf(line.c_str(),
+           "cpu %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld",
+           &user,
+           &nice,
+           &system,
+           &idle,
+           &iowait,
+           &irq,
+           &softirq,
+           &steal,
+           &guest,
+           &guest_nice);
+
+    long long idleTime = idle + iowait;
+    long long nonIdleTime = user + nice + system + irq + softirq + steal;
+    long long totalTime = idleTime + nonIdleTime;
+
+    return { idleTime, totalTime };
+}
 
 namespace faabric::scheduler {
 
@@ -64,6 +99,8 @@ Scheduler::Scheduler()
     reaperThread.start(conf.reaperIntervalSeconds);
     batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
     setResultThread = std::thread(&Scheduler::setMessageResults, this);
+    stopCpuMonitor = false;
+    cpuMonitorThread = std::thread(&Scheduler::cpuMonitorLoop, this);
 
     dispatchChainedMsgsThread =
       std::thread(&Scheduler::dispatchChainedMsgs, this);
@@ -81,6 +118,10 @@ Scheduler::~Scheduler()
     }
     if (setResultThread.joinable()) {
         setResultThread.join();
+    }
+    stopCpuMonitor = true;
+    if (cpuMonitorThread.joinable()) {
+        cpuMonitorThread.join();
     }
     stopThreadTimer = true;
     if (dispatchChainedMsgsThread.joinable()) {
@@ -193,6 +234,8 @@ void Scheduler::reset()
     }
     executors.clear();
 
+    runningExecutors.store(0);
+
     faabric::util::FullLock cpuLock(cpuRecordMx);
     cpuScheduleTime = 0;
     cpuRecordStart = std::chrono::steady_clock::now();
@@ -260,6 +303,8 @@ void Scheduler::reset()
     currentMigrationVersion = 0;
     receivedMigrationSources.clear();
     migrationHistory.clear();
+
+    runtimeStats.reset();
 }
 
 void Scheduler::shutdown()
@@ -456,20 +501,21 @@ void Scheduler::enqueueMessageBatch(
         std::unique_ptr<faabric::Message> msgPtr = std::move(msgs.front());
         msgs.pop_front();
         faabric::Message& msg = *msgPtr;
-        std::string waitingQueueName = msg.user() + "_" + msg.function() + "_" +
-                                       std::to_string(msg.parallelismid());
-        instancesCounter[waitingQueueName]++;
+        std::string userFuncPar = msg.user() + "_" + msg.function() + "_" +
+                                  std::to_string(msg.parallelismid());
+        instancesCounter[userFuncPar]++;
         (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_TIME_KEY] = current;
         msg.set_starttimestamp(currentMillis);
         msg.set_dispatchreceivetime(current);
         msg.set_executedhost(endPoint);
 
         auto [iterator, inserted] =
-          waitingQueues.emplace(waitingQueueName,
+          waitingQueues.emplace(userFuncPar,
                                 std::make_unique<faabric::util::BatchQueue>(
-                                  waitingQueueName, executeBatchsize));
+                                  userFuncPar, executeBatchsize));
         int waitMsgs = iterator->second->getMessagesCount();
         (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
+        runtimeStats.instanceWorkerQueueNum(userFuncPar, waitMsgs);
         iterator->second->addMessage(
           std::make_unique<faabric::Message>(std::move(msg)));
     }
@@ -585,7 +631,7 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
     }
 
     // TODO - DEBUG CODE: TO BE DELETE
-    runtimeStats.logAverageQueuingTimes();
+    // runtimeStats.logAverageQueuingTimes();
 }
 
 void Scheduler::enqueueChainedCalls(
@@ -647,6 +693,10 @@ void Scheduler::enqueueSetResults(
 
     for (int i = 0; i < req->messages_size(); i++) {
         faabric::Message& msg = req->mutable_messages()->at(i);
+        int workerExecuteTime =
+          msg.workerexecuteend() - msg.workerexecutestart();
+        std::string userFuncPar = faabric::util::getUserFuncPar(msg);
+        runtimeStats.instanceWorkerExecTime(userFuncPar, workerExecuteTime);
         setResultMsgs.emplace_back(std::make_unique<faabric::Message>(msg));
     }
     SPDLOG_DEBUG("Enqueueing set results finished");
@@ -972,6 +1022,27 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
     return false;
 }
 
+void Scheduler::notifyExecutorStart()
+{
+    runningExecutors++;
+}
+
+void Scheduler::notifyExecutorFinished()
+{
+    int current = runningExecutors.load();
+
+    while (current > 0) {
+        if (runningExecutors.compare_exchange_weak(current, current - 1)) {
+            break;
+        }
+    }
+}
+
+int Scheduler::getRunningExecutorsCount() const
+{
+    return runningExecutors.load();
+}
+
 std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
   faabric::Message& msg)
 {
@@ -1259,6 +1330,8 @@ void Scheduler::updateStatesInfo(
     decentralScheduler.setScheuduledOperatorMap(scheduledOperatorMap);
     // update runtime summary and states info.
     decentralScheduler.syncStatesInfo(statesInfo);
+
+    runtimeStats.versionUpdate(migrationVersion);
 
     // If it's initialization, we don't need to migrate. Just return after
     // updating the states info.
@@ -1657,4 +1730,77 @@ std::map<int, int> Scheduler::getMigrationHistory()
     return migrationHistory;
 }
 
+std::map<time_t, int> Scheduler::getVersionTimestamps()
+{
+    return runtimeStats.getVersionTimestamps();
+}
+
+std::map<std::string, InstanceMetricsResult> Scheduler::getWorkerMetrics(
+  bool isRuntime)
+{
+    return runtimeStats.getWorkerMetrics(isRuntime);
+}
+
+std::tuple<std::map<std::string, int>, int, double>
+Scheduler::getStatsSnapshot()
+{
+    std::map<std::string, int> queueSizes;
+    for (const auto& [userFuncPar, waitingBatch] : waitingQueues) {
+        queueSizes[userFuncPar] = waitingBatch->getMessagesCount();
+    }
+
+    int runningExecutorsCount = getRunningExecutorsCount();
+    double lastCpu = getLastVmCpu();
+
+    return { queueSizes, runningExecutorsCount, lastCpu };
+}
+
+void Scheduler::cpuMonitorLoop()
+{
+    SPDLOG_INFO("Starting VM CPU monitor thread");
+
+    VmCpuData prevData = readVmCpuData();
+
+    while (!stopCpuMonitor) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        if (stopCpuMonitor) {
+            break;
+        }
+
+        VmCpuData currData = readVmCpuData();
+
+        long long totalDiff = currData.totalTime - prevData.totalTime;
+        long long idleDiff = currData.idleTime - prevData.idleTime;
+
+        double currentCpuUsage = 0.0;
+        if (totalDiff > 0) {
+            currentCpuUsage = 100.0 *
+                              static_cast<double>(totalDiff - idleDiff) /
+                              static_cast<double>(totalDiff);
+        }
+
+        prevData = currData;
+
+        faabric::util::FullLock lock(vmCpuHistoryMx);
+        vmCpuHistory.push_back(currentCpuUsage);
+
+        if (vmCpuHistory.size() > 60) {
+            vmCpuHistory.pop_front();
+        }
+    }
+
+    SPDLOG_INFO("VM CPU monitor thread stopped");
+}
+
+double Scheduler::getLastVmCpu()
+{
+    faabric::util::SharedLock lock(vmCpuHistoryMx);
+
+    if (vmCpuHistory.empty()) {
+        return 0.0;
+    }
+
+    return vmCpuHistory.back();
+}
 }

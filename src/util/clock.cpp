@@ -14,6 +14,18 @@ const TimePoint Clock::now()
     return std::chrono::steady_clock::now();
 }
 
+const long Clock::epochSeconds()
+{
+    auto now = std::chrono::system_clock::now();
+    
+    long timestamp_seconds = 
+      std::chrono::duration_cast<std::chrono::seconds>(
+        now.time_since_epoch())
+        .count();
+
+    return timestamp_seconds;
+}
+
 const long Clock::epochMillis()
 {
     long millis = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -168,6 +168,21 @@ class Scheduler
 
     std::map<int, int> getMigrationHistory();
 
+    std::map<time_t, int> getVersionTimestamps();
+
+    std::map<std::string, InstanceMetricsResult> getWorkerMetrics(
+      bool isRuntime = false);
+
+    std::tuple<std::map<std::string, int>, int, double> getStatsSnapshot();
+
+    void notifyExecutorFinished();
+
+    void notifyExecutorStart();
+
+    int getRunningExecutorsCount() const;
+
+    double getLastVmCpu();
+
   private:
     std::string thisHost;
 
@@ -193,6 +208,8 @@ class Scheduler
       std::string,
       std::vector<std::shared_ptr<faabric::executor::Executor>>>
       executors;
+
+    std::atomic<int> runningExecutors{ 0 };
 
     // ---- Threads ----
     faabric::snapshot::SnapshotRegistry& reg;
@@ -329,6 +346,16 @@ class Scheduler
     void updateActiveHosts(
       const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
         scheduledOperatorMap);
+
+    // ==========================================
+    // VM CPU Monitor
+    // ==========================================
+    std::thread cpuMonitorThread;
+    std::atomic<bool> stopCpuMonitor{ false };
+    std::shared_mutex vmCpuHistoryMx;
+    std::deque<double> vmCpuHistory;
+
+    void cpuMonitorLoop();
 };
 
 }

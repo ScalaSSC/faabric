@@ -98,6 +98,17 @@ FunctionCallClient::getRuntimeStats(faabric::RuntimeStatsUpdateRequest req)
     return std::make_unique<faabric::RuntimeStatsResult>(resp);
 }
 
+std::unique_ptr<faabric::WorkerStats>
+FunctionCallClient::getWorkerRuntimeStats()
+{
+    SPDLOG_DEBUG("Getting worker runtime stats from host {}", host);
+    faabric::EmptyRequest req;
+    faabric::WorkerStats resp;
+    syncSend(
+      faabric::scheduler::FunctionCalls::GetWorkerRuntimeStats, &req, &resp);
+    return std::make_unique<faabric::WorkerStats>(resp);
+}
+
 std::unique_ptr<faabric::WorkerStats> FunctionCallClient::getWorkerStats()
 {
     faabric::EmptyRequest req;
@@ -172,7 +183,7 @@ void FunctionCallClient::executeFunctionsBatch(
       "Batch execute call {} with Batch size: {}", host, msgs.size());
     batchMsgsList->set_invokehost(
       faabric::util::getSystemConfig().endpointHost);
-  
+
     for (auto& msg : msgs) {
         batchMsgsList->add_messages()->CopyFrom(*msg);
     }

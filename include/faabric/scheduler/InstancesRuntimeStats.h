@@ -23,6 +23,19 @@ struct InstanceStatsResult
     std::map<std::string, int> chainedCallStats;
 };
 
+struct AverageAndCount
+{
+    int average = 0;
+    int count = 0;
+};
+
+struct InstanceMetricsResult
+{
+    std::map<time_t, AverageAndCount> workerQueueTimeStats;
+    std::map<time_t, AverageAndCount> workerQueueNumStats;
+    std::map<time_t, AverageAndCount> workerExecTimeStats;
+};
+
 class InstanceStats
 {
   public:
@@ -35,9 +48,10 @@ class InstanceStats
     std::map<std::string, std::map<time_t, int>> sourceStats;
     std::map<std::string, std::map<time_t, int>> chainedCallStats;
     // Add more stats as needed.
-    // Worker queuing time.
-    using TimeStatPair = std::pair<int, int>;
-    std::map<time_t, TimeStatPair> workerQueueTimeStats;
+    // Worker queuing time, stats pair <average,count>.
+    std::map<time_t, AverageAndCount> workerQueueTimeStats;
+    std::map<time_t, AverageAndCount> workerQueueNumStats;
+    std::map<time_t, AverageAndCount> workerExecTimeStats;
 };
 
 class InstancesRuntimeStats
@@ -45,7 +59,8 @@ class InstancesRuntimeStats
   private:
     mutable std::shared_mutex statsMx;
 
-    int statsTimeout = 10;
+    int statsTimeout = 1000;                 // Unit: seconds
+    std::map<time_t, int> versionTimestamps; // version -> timestamp
     std::map<std::string, InstanceStats> instanceStatsMap;
 
     InstanceStatsResult computeInstanceStats(InstanceStats& stats,
@@ -90,7 +105,34 @@ class InstancesRuntimeStats
         return result;
     }
 
+    void updateRollingAverage(std::map<time_t, AverageAndCount>& timeMap,
+                              time_t currentTimeT,
+                              int newValue)
+    {
+        // 1. Update the Rolling Average for the current second
+        auto& [currentAvg, currentCount] = timeMap[currentTimeT];
+        long long currentTotal =
+          static_cast<long long>(currentAvg) * currentCount;
+        currentTotal += newValue;
+        currentCount++;
+
+        currentAvg = static_cast<int>(currentTotal / currentCount);
+
+        // 2. Prune old entries
+        time_t cutoffT = currentTimeT - statsTimeout;
+        while (!timeMap.empty() && timeMap.begin()->first < cutoffT) {
+            timeMap.erase(timeMap.begin());
+        }
+    }
+
   public:
+    void versionUpdate(int version)
+    {
+        std::unique_lock lock(statsMx);
+        time_t currentTimeT = faabric::util::getEpochSeconds();
+        versionTimestamps[currentTimeT] = version;
+    }
+
     void instanceAdd(const std::string& instanceName,
                      const std::string& source,
                      int count)
@@ -141,6 +183,12 @@ class InstancesRuntimeStats
         }
     }
 
+    std::map<time_t, int> getVersionTimestamps()
+    {
+        std::shared_lock lock(statsMx);
+        return versionTimestamps;
+    }
+
     // getAllStats iterates over the map only once while holding lock.
     std::map<std::string, InstanceStatsResult> getAllStats()
     {
@@ -148,85 +196,94 @@ class InstancesRuntimeStats
         std::map<std::string, InstanceStatsResult> allStats;
         auto now = std::chrono::steady_clock::now();
         for (auto& [instanceName, stats] : instanceStatsMap) {
-            // Pass 'now' to the compute function.
             allStats[instanceName] = computeInstanceStats(stats, now);
         }
         return allStats;
     }
 
-    // Record a worker queue time event
+    // 1. Record a worker queue time event
     void instanceWorkerQueueTime(const std::string& instanceName, int queueTime)
     {
         std::unique_lock lock(statsMx);
-
         time_t currentTimeT = faabric::util::getEpochSeconds();
-
-        // Get the specific stats map
         auto& stats = instanceStatsMap.try_emplace(instanceName, instanceName)
                         .first->second;
-        auto& timeMap = stats.workerQueueTimeStats;
 
-        // Update the Rolling Average for the current second
-        auto& [currentAvg, currentCount] = timeMap[currentTimeT];
-        long long currentTotal =
-          static_cast<long long>(currentAvg) * currentCount;
-        currentTotal += queueTime;
-        currentCount++;
-
-        currentAvg = static_cast<int>(currentTotal / currentCount);
-
-        // Prune old entries
-        time_t cutoffT = currentTimeT - statsTimeout;
-        while (!timeMap.empty() && timeMap.begin()->first < cutoffT) {
-            timeMap.erase(timeMap.begin());
-        }
+        updateRollingAverage(
+          stats.workerQueueTimeStats, currentTimeT, queueTime);
     }
 
-    std::map<std::string, std::pair<int, int>> getAverageQueuingTimes()
+    // 2. Record a worker queue number event
+    void instanceWorkerQueueNum(const std::string& instanceName, int queueNum)
     {
-        std::shared_lock<std::shared_mutex> lock(statsMx);
+        std::unique_lock lock(statsMx);
+        time_t currentTimeT = faabric::util::getEpochSeconds();
+        auto& stats = instanceStatsMap.try_emplace(instanceName, instanceName)
+                        .first->second;
 
-        std::map<std::string, std::pair<int, int>> latestTimes;
+        updateRollingAverage(stats.workerQueueNumStats, currentTimeT, queueNum);
+    }
+
+    // 3. Record a worker execute time event
+    void instanceWorkerExecTime(const std::string& instanceName, int execTime)
+    {
+        std::unique_lock lock(statsMx);
+        time_t currentTimeT = faabric::util::getEpochSeconds();
+        auto& stats = instanceStatsMap.try_emplace(instanceName, instanceName)
+                        .first->second;
+
+        updateRollingAverage(stats.workerExecTimeStats, currentTimeT, execTime);
+    }
+
+    std::map<std::string, InstanceMetricsResult> getWorkerMetrics(
+      bool isRuntime = false)
+    {
+        // Use shared_lock for read-only thread safety
+        std::shared_lock<std::shared_mutex> lock(statsMx);
+        std::map<std::string, InstanceMetricsResult> metrics;
+
+        if (!isRuntime) {
+            for (const auto& [instanceName, stats] : instanceStatsMap) {
+                metrics[instanceName] =
+                  InstanceMetricsResult{ stats.workerQueueTimeStats,
+                                       stats.workerQueueNumStats,
+                                       stats.workerExecTimeStats };
+            }
+            return metrics;
+        }
+        time_t lastSecondT = faabric::util::getEpochSeconds() - 1;
 
         for (const auto& [instanceName, stats] : instanceStatsMap) {
-            if (!stats.workerQueueTimeStats.empty()) {
-                auto it = stats.workerQueueTimeStats.rbegin();
-                latestTimes[instanceName] = it->second;
+            InstanceMetricsResult lastSecondResult;
+
+            auto qtIt = stats.workerQueueTimeStats.find(lastSecondT);
+            if (qtIt != stats.workerQueueTimeStats.end()) {
+                lastSecondResult.workerQueueTimeStats[lastSecondT] =
+                  qtIt->second;
             }
+
+            auto qnIt = stats.workerQueueNumStats.find(lastSecondT);
+            if (qnIt != stats.workerQueueNumStats.end()) {
+                lastSecondResult.workerQueueNumStats[lastSecondT] =
+                  qnIt->second;
+            }
+
+            auto etIt = stats.workerExecTimeStats.find(lastSecondT);
+            if (etIt != stats.workerExecTimeStats.end()) {
+                lastSecondResult.workerExecTimeStats[lastSecondT] =
+                  etIt->second;
+            }
+
+            metrics[instanceName] = std::move(lastSecondResult);
         }
-        return latestTimes;
+        return metrics;
     }
 
-    void logAverageQueuingTimes()
+    void reset()
     {
-        auto latestStats = getAverageQueuingTimes();
-
-        if (latestStats.empty()) {
-            SPDLOG_DEBUG("No instance queuing stats available.");
-            return;
-        }
-
-        fmt::memory_buffer buf;
-        fmt::format_to(std::back_inserter(buf),
-                       "Current Instance Queuing Stats:");
-
-        bool hasData = false;
-        for (const auto& [instanceName, stats] : latestStats) {
-            const auto& [avgTime, count] = stats;
-
-            if (count > 0) {
-                fmt::format_to(std::back_inserter(buf),
-                               "\n  - {}: {}us (n={})",
-                               instanceName,
-                               avgTime,
-                               count);
-                hasData = true;
-            }
-        }
-
-        if (hasData) {
-            SPDLOG_DEBUG(fmt::to_string(buf));
-        }
+        std::unique_lock lock(statsMx);
+        versionTimestamps.clear();
+        instanceStatsMap.clear();
     }
 };
 } // namespace faabric::scheduler

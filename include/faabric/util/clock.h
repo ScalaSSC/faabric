@@ -15,6 +15,8 @@ class Clock
 
     const TimePoint now();
 
+    const long epochSeconds();
+
     const long epochMillis();
 
     const long long epochMicros();

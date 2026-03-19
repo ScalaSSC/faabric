@@ -331,6 +331,8 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
               task.req->appid());
             // Set up context
             ExecutorContext::set(this, task.req, task.messageIndex);
+            faabric::scheduler::getScheduler().notifyExecutorStart();
+
             // Execute the task
             int32_t returnValue;
             int32_t executeBatchSize = task.req->messages_size();
@@ -384,6 +386,7 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                 availablePoolThreads.insert(threadPoolIdx);
             }
 
+            faabric::scheduler::getScheduler().notifyExecutorFinished();
             // Enqueue the message result
             faabric::scheduler::getScheduler().enqueueSetResults(
               std::move(task.req));

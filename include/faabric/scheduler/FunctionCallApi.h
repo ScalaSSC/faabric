@@ -18,5 +18,6 @@ enum FunctionCalls
     RegisterApplication = 12,
     Custom = 13,
     GetWorkerStats = 14,
+    GetWorkerRuntimeStats = 15,
 };
 }

@@ -73,6 +73,9 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::GetRuntimeStats: {
             return recvGetRuntimeStats(message.udata());
         }
+        case faabric::scheduler::FunctionCalls::GetWorkerRuntimeStats: {
+            return recvGetWorkerRuntimeStats(message.udata());
+        }
         case faabric::scheduler::FunctionCalls::GetWorkerStats: {
             return recvGetWorkerStats(message.udata());
         }
@@ -300,6 +303,66 @@ FunctionCallServer::recvGetRuntimeStats(std::span<const uint8_t> buffer)
     return std::make_unique<faabric::RuntimeStatsResult>(std::move(response));
 }
 
+void serializeWorkerMetrics(
+  const std::map<std::string, faabric::scheduler::InstanceMetricsResult>&
+    cppMetricsMap,
+  google::protobuf::Map<std::string, faabric::InstanceMetricsResultProto>*
+    protoMetricsMap)
+{
+    for (const auto& [instanceName, metrics] : cppMetricsMap) {
+        auto& protoMetrics = (*protoMetricsMap)[instanceName];
+
+        auto* protoQueueTimeMap = protoMetrics.mutable_workerqueuetimestats();
+        for (const auto& [timeKey, avgCount] : metrics.workerQueueTimeStats) {
+            auto& protoAvgCount = (*protoQueueTimeMap)[timeKey];
+            protoAvgCount.set_average(avgCount.average);
+            protoAvgCount.set_count(avgCount.count);
+        }
+
+        auto* protoQueueNumMap = protoMetrics.mutable_workerqueuenumstats();
+        for (const auto& [timeKey, avgCount] : metrics.workerQueueNumStats) {
+            auto& protoAvgCount = (*protoQueueNumMap)[timeKey];
+            protoAvgCount.set_average(avgCount.average);
+            protoAvgCount.set_count(avgCount.count);
+        }
+
+        auto* protoExecTimeMap = protoMetrics.mutable_workerexectimestats();
+        for (const auto& [timeKey, avgCount] : metrics.workerExecTimeStats) {
+            auto& protoAvgCount = (*protoExecTimeMap)[timeKey];
+            protoAvgCount.set_average(avgCount.average);
+            protoAvgCount.set_count(avgCount.count);
+        }
+    }
+}
+
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
+
+    SPDLOG_DEBUG("Getting worker RUNTIME stats for host");
+
+    faabric::WorkerStats out;
+
+    out.set_ip(faabric::util::getSystemConfig().endpointHost);
+    auto workerMetricsMap = scheduler.getWorkerMetrics(true);
+
+    serializeWorkerMetrics(workerMetricsMap, out.mutable_workermetrics());
+
+    auto [waitingQueueSizes, executorsCount, cpuLoadVal] =
+      scheduler.getStatsSnapshot();
+
+    auto* protoQueueNumMap = out.mutable_instancequeuenum();
+    for (const auto& [instanceName, queueSize] : waitingQueueSizes) {
+        (*protoQueueNumMap)[instanceName] = queueSize;
+    }
+
+    out.set_executorsnum(executorsCount);
+    out.set_cpuload(cpuLoadVal);
+
+    return std::make_unique<faabric::WorkerStats>(std::move(out));
+}
+
 std::unique_ptr<google::protobuf::Message>
 FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
 {
@@ -331,6 +394,16 @@ FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
     auto* protoMigrationHistory = out.mutable_migrationhistory();
     for (const auto& [version, duration] : migrationHistory) {
         (*protoMigrationHistory)[version] = duration;
+    }
+
+    // Get worker metrics like total queue time, queue num, exec time, etc. for
+    // each instance. auto workerMetricsMap = scheduler.getWorkerMetrics();
+    // serializeWorkerMetrics(workerMetricsMap, out.mutable_workermetrics());
+
+    auto versiontimestamp = scheduler.getVersionTimestamps();
+    auto* protoVersionHistory = out.mutable_versiontimestamp();
+    for (const auto& [timeKey, version] : versiontimestamp) {
+        (*protoVersionHistory)[timeKey] = version;
     }
 
     return std::make_unique<faabric::WorkerStats>(std::move(out));

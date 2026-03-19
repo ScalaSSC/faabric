@@ -4,6 +4,7 @@
 #include <faabric/batch-scheduler/SchedulingDecision.h>
 #include <faabric/planner/planner.pb.h>
 #include <faabric/proto/faabric.pb.h>
+#include <faabric/scheduler/InstancesRuntimeStats.h>
 #include <faabric/util/queue.h>
 
 #include <cstdint>
@@ -274,7 +275,7 @@ class ApplicationMetrics
         if (tempEndTime != std::numeric_limits<int64_t>::min()) {
             // tempEndTime is in microseconds.
             int64_t secondKey = tempEndTime / 1000000;
-            runtimeCountHistory[secondKey]++;
+            runtimeMetricsHistory[secondKey].count++;
         }
     }
 
@@ -429,43 +430,193 @@ class ApplicationMetrics
         doc.AddMember("p95TotalLatency", p95TotalLatency, alloc);
         doc.AddMember("p99TotalLatency", p99TotalLatency, alloc);
 
-        // MODIFICATION: Add the runtime count history as a JSON array.
+        // MODIFICATION: Add the runtime count history as a JSON array with
+        // version markers.
         rapidjson::Value historyArray(rapidjson::kArrayType);
 
-        // Check if the history map is not empty to avoid errors.
-        if (!runtimeCountHistory.empty()) {
-            // Get an iterator to the first element in the map.
-            auto it = runtimeCountHistory.begin();
+        if (!runtimeMetricsHistory.empty()) {
+            int64_t startSec = runtimeMetricsHistory.begin()->first;
+            int64_t endSec = runtimeMetricsHistory.rbegin()->first;
 
-            // Initialize by adding the first count and tracking its timestamp.
-            int64_t lastTimestamp = it->first;
-            historyArray.PushBack(it->second, alloc);
+            int currentVersion = 0;
+            auto it = versionHistory.upper_bound(startSec);
+            if (it != versionHistory.begin()) {
+                auto prevIt = it;
+                --prevIt;
+                currentVersion = prevIt->second;
+            }
 
-            // Move the iterator to the second element.
-            it++;
+            std::string initialVStr =
+              "version_" + std::to_string(currentVersion);
+            rapidjson::Value initialVal;
+            initialVal.SetString(
+              initialVStr.c_str(), initialVStr.length(), alloc);
+            historyArray.PushBack(initialVal, alloc);
 
-            // Loop through the rest of the map.
-            while (it != runtimeCountHistory.end()) {
-                int64_t currentTimestamp = it->first;
-                int currentCount = it->second;
+            for (int64_t s = startSec; s <= endSec; ++s) {
+                if (versionHistory.contains(s)) {
+                    int newVersion = versionHistory.at(s);
 
-                // Fill in any missing seconds between the last timestamp and
-                // the current one. The loop runs for `gap - 1` seconds.
-                for (int64_t i = 1; i < (currentTimestamp - lastTimestamp);
-                     ++i) {
-                    historyArray.PushBack(0, alloc);
+                    if (newVersion != currentVersion) {
+                        currentVersion = newVersion;
+                        std::string vStr =
+                          "version_" + std::to_string(currentVersion);
+                        rapidjson::Value vVal;
+                        vVal.SetString(vStr.c_str(), vStr.length(), alloc);
+                        historyArray.PushBack(vVal, alloc);
+                    }
                 }
 
-                // Add the actual count for the current timestamp.
-                historyArray.PushBack(currentCount, alloc);
+                int currentCount = 0;
+                int totalQueueSize = 0;
 
-                // Update the last seen timestamp for the next iteration.
-                lastTimestamp = currentTimestamp;
-                it++;
+                if (runtimeMetricsHistory.contains(s)) {
+                    const auto& record = runtimeMetricsHistory.at(s);
+                    currentCount = record.count;
+
+                    for (const auto& [hostIp, qSize] : record.hostQueueSize) {
+                        totalQueueSize += qSize;
+                    }
+                }
+
+                long long totalWaitSum = 0;
+                long totalWaitCount = 0;
+                long long totalExecSum = 0;
+                long totalExecCount = 0;
+
+                int totalExecutors = 0;
+                double totalCpuLoad = 0.0;
+                int hostCountWithCpu = 0;
+
+                for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+                    for (const auto& [instanceName, timeSeries] :
+                         workerNode.instances) {
+                        auto it = timeSeries.history.find(s);
+                        if (it != timeSeries.history.end()) {
+                            const auto& metrics = it->second;
+
+                            totalWaitSum += static_cast<long long>(
+                                              metrics.workerQueueTime.average) *
+                                            metrics.workerQueueTime.count;
+                            totalWaitCount += metrics.workerQueueTime.count;
+
+                            totalExecSum += static_cast<long long>(
+                                              metrics.workerExecTime.average) *
+                                            metrics.workerExecTime.count;
+                            totalExecCount += metrics.workerExecTime.count;
+                        }
+                    }
+                    auto execIt = workerNode.executorsHistory.find(s);
+                    if (execIt != workerNode.executorsHistory.end()) {
+                        totalExecutors += execIt->second;
+                    }
+
+                    auto cpuIt = workerNode.cpuLoadHistory.find(s);
+                    if (cpuIt != workerNode.cpuLoadHistory.end()) {
+                        totalCpuLoad += cpuIt->second;
+                        hostCountWithCpu++;
+                    }
+                }
+
+                int avgWaitTime =
+                  totalWaitCount > 0
+                    ? static_cast<int>(totalWaitSum / totalWaitCount)
+                    : 0;
+                int avgExecTime =
+                  totalExecCount > 0
+                    ? static_cast<int>(totalExecSum / totalExecCount)
+                    : 0;
+
+                double avgCpuLoad = hostCountWithCpu > 0
+                                      ? (totalCpuLoad / hostCountWithCpu)
+                                      : 0.0;
+                char cpuBuffer[32];
+                snprintf(cpuBuffer, sizeof(cpuBuffer), "%.2f", avgCpuLoad);
+
+                std::string entryStr = std::to_string(currentCount) + " / " +
+                                       std::to_string(totalQueueSize) + " / " +
+                                       std::to_string(avgWaitTime) + " / " +
+                                       std::to_string(avgExecTime) + " / " +
+                                       std::to_string(totalExecutors) + " / " +
+                                       std::string(cpuBuffer);
+
+                historyArray.PushBack(
+                  rapidjson::Value(entryStr.c_str(), alloc).Move(), alloc);
             }
         }
 
-        doc.AddMember("runtimeCountHistory", historyArray, alloc);
+        doc.AddMember("runtimeCountHistory: count / queue_size / avg_wait / "
+                      "avg_exec / executors / avg_cpu",
+                      historyArray,
+                      alloc);
+
+        rapidjson::Value versionMetricsObj(rapidjson::kObjectType);
+
+        if (!runtimeMetricsHistory.empty()) {
+            int64_t startSec = runtimeMetricsHistory.begin()->first;
+            int64_t endSec = runtimeMetricsHistory.rbegin()->first;
+
+            int lastKnownVersion = 0;
+            auto it = versionHistory.upper_bound(startSec);
+            if (it != versionHistory.begin()) {
+                auto prevIt = it;
+                --prevIt;
+                lastKnownVersion = prevIt->second;
+            }
+
+            struct VersionStats
+            {
+                long totalThroughput = 0;
+                int durationSeconds = 0;
+                std::vector<int> history;
+            };
+            std::map<int, VersionStats> versionStatsMap;
+
+            for (int64_t s = startSec; s <= endSec; ++s) {
+                if (versionHistory.contains(s)) {
+                    lastKnownVersion = versionHistory.at(s);
+                }
+
+                int currentThroughput = 0;
+                if (runtimeMetricsHistory.contains(s)) {
+                    currentThroughput = runtimeMetricsHistory.at(s).count;
+                }
+
+                versionStatsMap[lastKnownVersion].totalThroughput +=
+                  currentThroughput;
+                versionStatsMap[lastKnownVersion].durationSeconds++;
+                versionStatsMap[lastKnownVersion].history.push_back(
+                  currentThroughput);
+            }
+
+            for (const auto& [vId, stats] : versionStatsMap) {
+                rapidjson::Value vObj(rapidjson::kObjectType);
+
+                vObj.AddMember("totalThroughput",
+                               static_cast<int64_t>(stats.totalThroughput),
+                               alloc);
+                vObj.AddMember("durationSeconds", stats.durationSeconds, alloc);
+
+                double avgThroughput =
+                  stats.durationSeconds > 0
+                    ? static_cast<double>(stats.totalThroughput) /
+                        stats.durationSeconds
+                    : 0.0;
+                vObj.AddMember("averageThroughput", avgThroughput, alloc);
+
+                rapidjson::Value historyArray(rapidjson::kArrayType);
+                for (int count : stats.history) {
+                    historyArray.PushBack(count, alloc);
+                }
+                vObj.AddMember("history", historyArray, alloc);
+
+                std::string vKey = "version_" + std::to_string(vId);
+                versionMetricsObj.AddMember(
+                  rapidjson::Value(vKey.c_str(), alloc).Move(), vObj, alloc);
+            }
+        }
+
+        doc.AddMember("versionMetrics", versionMetricsObj, alloc);
 
         // Optionally, if you want to include per-instance metrics, add them
         // here.
@@ -490,6 +641,103 @@ class ApplicationMetrics
         return doc;
     }
 
+    void setVersion(int version)
+    {
+        faabric::util::FullLock lock(opMx);
+
+        // Record the version change at the current second
+        int64_t secondKey =
+          faabric::util::getGlobalClock().epochMicros() / 1000000;
+        versionHistory[secondKey] = version;
+    }
+
+    // Adds or updates the worker stats fetched from a specific host
+    void recordWorkerMetrics(
+      const std::map<std::string, std::unique_ptr<faabric::WorkerStats>>&
+        results)
+    {
+        faabric::util::FullLock lock(opMx);
+        auto currentTime = faabric::util::getGlobalClock().epochSeconds();
+
+        for (const auto& [ip, statsPtr] : results) {
+            if (!statsPtr) {
+                continue;
+            }
+
+            clusterWorkerMetrics[ip].cpuLoadHistory[currentTime] =
+              statsPtr->cpuload();
+            clusterWorkerMetrics[ip].executorsHistory[currentTime] =
+              statsPtr->executorsnum();
+
+            for (const auto& [instanceName, metricsProto] :
+                 statsPtr->workermetrics()) {
+
+                auto& historyMap =
+                  clusterWorkerMetrics[ip].instances[instanceName].history;
+
+                if (!metricsProto.workerqueuetimestats().empty()) {
+                    auto qt =
+                      metricsProto.workerqueuetimestats().begin()->second;
+                    historyMap[currentTime].workerQueueTime.average =
+                      qt.average();
+                    historyMap[currentTime].workerQueueTime.count = qt.count();
+                }
+
+                if (!metricsProto.workerqueuenumstats().empty()) {
+                    auto qn =
+                      metricsProto.workerqueuenumstats().begin()->second;
+                    historyMap[currentTime].workerQueueNum.average =
+                      qn.average();
+                    historyMap[currentTime].workerQueueNum.count = qn.count();
+                }
+
+                if (!metricsProto.workerexectimestats().empty()) {
+                    auto et =
+                      metricsProto.workerexectimestats().begin()->second;
+                    historyMap[currentTime].workerExecTime.average =
+                      et.average();
+                    historyMap[currentTime].workerExecTime.count = et.count();
+                }
+            }
+
+            int totalQueueSize = 0;
+            for (const auto& [instName, qSize] : statsPtr->instancequeuenum()) {
+                totalQueueSize += qSize;
+            }
+            runtimeMetricsHistory[currentTime].hostQueueSize[ip] =
+              totalQueueSize;
+        }
+
+        // Clean old metrics beyond a certain time window (e.g., 1000 seconds)
+        time_t cutoffTime = currentTime - 1000;
+        for (auto& [ip, workerNode] : clusterWorkerMetrics) {
+            for (auto& [instanceName, timeSeries] : workerNode.instances) {
+                auto& historyMap = timeSeries.history;
+                while (!historyMap.empty() &&
+                       historyMap.begin()->first < cutoffTime) {
+                    historyMap.erase(historyMap.begin());
+                }
+            }
+
+            while (!workerNode.cpuLoadHistory.empty() &&
+                   workerNode.cpuLoadHistory.begin()->first < cutoffTime) {
+                workerNode.cpuLoadHistory.erase(
+                  workerNode.cpuLoadHistory.begin());
+            }
+
+            while (!workerNode.executorsHistory.empty() &&
+                   workerNode.executorsHistory.begin()->first < cutoffTime) {
+                workerNode.executorsHistory.erase(
+                  workerNode.executorsHistory.begin());
+            }
+        }
+
+        while (!runtimeMetricsHistory.empty() &&
+               runtimeMetricsHistory.begin()->first < cutoffTime) {
+            runtimeMetricsHistory.erase(runtimeMetricsHistory.begin());
+        }
+    }
+
     void reset()
     {
         faabric::util::FullLock lock(opMx);
@@ -507,7 +755,8 @@ class ApplicationMetrics
         }
 
         edgeWeightMap.clear();
-        runtimeCountHistory.clear();
+        runtimeMetricsHistory.clear();
+        versionHistory.clear();
     }
 
   private:
@@ -529,10 +778,42 @@ class ApplicationMetrics
     int64_t endTime = std::numeric_limits<int64_t>::min();
     double avgExecutionOperators = 0.0;
     double avgRunningReqs = 0.0;
-    std::map<int64_t, int> runtimeCountHistory;
+    // std::map<int64_t, int> runtimeCountHistory;
+    struct RuntimeMetricsRecord
+    {
+        int count = 0;
+        std::map<std::string, int> hostQueueSize; // <host_ip, total_queue_size>
+    };
+    std::map<int64_t, RuntimeMetricsRecord> runtimeMetricsHistory;
 
     // MAP<source operator : <successor operator, count>>
     std::map<std::string, std::map<std::string, int>> edgeWeightMap;
+
+    // MAP<timestamp_seconds, version_id>
+    std::map<int64_t, int> versionHistory;
+
+    // --------- Metrics Related to Workers ---------
+    struct InstanceRecord
+    {
+        faabric::scheduler::AverageAndCount workerQueueTime;
+        faabric::scheduler::AverageAndCount workerQueueNum;
+        faabric::scheduler::AverageAndCount workerExecTime;
+    };
+
+    struct InstanceTimeSeries
+    {
+        std::map<time_t, InstanceRecord> history;
+    };
+
+    struct WorkerNodeMetrics
+    {
+        std::map<std::string, InstanceTimeSeries> instances;
+        std::map<time_t, double> cpuLoadHistory;
+        std::map<time_t, int> executorsHistory;
+    };
+
+    // MAP<host_ip, WorkerNodeMetrics>
+    std::map<std::string, WorkerNodeMetrics> clusterWorkerMetrics;
 
     std::string getInstanceName(const std::shared_ptr<faabric::Message> msg)
     {

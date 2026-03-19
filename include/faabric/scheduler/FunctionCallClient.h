@@ -54,6 +54,8 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
     std::unique_ptr<faabric::RuntimeStatsResult> getRuntimeStats(
       faabric::RuntimeStatsUpdateRequest req);
 
+    std::unique_ptr<faabric::WorkerStats> getWorkerRuntimeStats();
+
     std::unique_ptr<faabric::WorkerStats> getWorkerStats();
 
     void resetParameter(
