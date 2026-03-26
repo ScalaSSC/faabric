@@ -89,6 +89,8 @@ class Planner
 
     // Main entrypoint to request the execution of batches
 
+    bool enqueueBatchRequest(std::shared_ptr<faabric::BatchExecuteRequest> req);
+
     void scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
                           bool isChained = false);
 
@@ -138,9 +140,13 @@ class Planner
     PlannerState state;
     PlannerConfig config;
 
-    faabric::util::ThreadSafeQueue<
-      std::shared_ptr<faabric::BatchExecuteRequest>>
-      batchExecuteReqQueue;
+    // Batch scheduling queue
+    std::atomic<int> maxWaitingQueueSize{ 100000 };
+    std::atomic<int> maxInflightApps{ 10000 };
+    faabric::util::ThreadSafeQueue<std::shared_ptr<faabric::Message>>
+      waitingMessageQueue;
+    std::thread processWaitingQueueThread;
+    void processWaitingQueueLoop();
 
     // ---- Batch Execution ----
     bool stopThreadTimer = false;

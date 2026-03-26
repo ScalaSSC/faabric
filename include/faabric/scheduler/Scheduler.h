@@ -173,13 +173,13 @@ class Scheduler
     std::map<std::string, InstanceMetricsResult> getWorkerMetrics(
       bool isRuntime = false);
 
-    std::tuple<std::map<std::string, int>, int, double> getStatsSnapshot();
+    std::tuple<std::map<std::string, int>, double, double> getStatsSnapshot();
 
     void notifyExecutorFinished();
 
     void notifyExecutorStart();
 
-    int getRunningExecutorsCount() const;
+    double getAverageExecutors() const;
 
     double getLastVmCpu();
 
@@ -199,7 +199,7 @@ class Scheduler
     std::map<std::string, int> maxReplicasMap;
 
     // Maximum number of concurrent executors in the worker
-    int maxExecutors = 40;
+    int maxExecutors = 10;
 
     int executeBatchsize;
 
@@ -210,6 +210,15 @@ class Scheduler
       executors;
 
     std::atomic<int> runningExecutors{ 0 };
+    std::atomic<int64_t> currentWindowSec{ 0 };
+    std::atomic<long long> currentSecondSum{ 0 };
+    std::atomic<long long> currentSecondCount{ 0 };
+    std::atomic<double> lastSecondAverage{ 0.0 };
+
+    faabric::util::ThreadSafeQueue<std::string> readyDispatchQueue;
+    std::vector<std::thread> dispatchThreads;
+    bool stopDispatcher = false;
+    void dispatchWorkerLoop();
 
     // ---- Threads ----
     faabric::snapshot::SnapshotRegistry& reg;
@@ -287,7 +296,7 @@ class Scheduler
 
     std::thread dispatchChainedMsgsThread;
 
-    bool isUpdateState = false;
+    std::atomic<bool> isUpdateState{ false };
 
     InstancesRuntimeStats runtimeStats;
 

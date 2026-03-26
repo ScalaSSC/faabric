@@ -86,8 +86,9 @@ Planner::Planner()
     dequeueScheduledMsgsThread =
       std::thread(&Planner::dequeueScheduledMsgs, this);
 
-    // Currently, runtime reconfiguration is not triggered.
     updateRuntimeStatsThread = std::thread(&Planner::updateRuntimeStats, this);
+    processWaitingQueueThread =
+      std::thread(&Planner::processWaitingQueueLoop, this);
 }
 
 Planner::~Planner()
@@ -99,6 +100,9 @@ Planner::~Planner()
     }
     if (updateRuntimeStatsThread.joinable()) {
         updateRuntimeStatsThread.join();
+    }
+    if (processWaitingQueueThread.joinable()) {
+        processWaitingQueueThread.join();
     }
 }
 
@@ -454,6 +458,64 @@ int Planner::getNumMigrations()
     return state.numMigrations.load(std::memory_order_acquire);
 }
 
+bool Planner::enqueueBatchRequest(
+  std::shared_ptr<faabric::BatchExecuteRequest> req)
+{
+    if (waitingMessageQueue.size() + req->messages_size() >
+        maxWaitingQueueSize) {
+        SPDLOG_DEBUG("Waiting message queue is full (Current: {}, Incoming: "
+                     "{}). Rejecting request.",
+                     waitingMessageQueue.size(),
+                     req->messages_size());
+        return false;
+    }
+
+    for (int i = 0; i < req->messages_size(); i++) {
+        auto msgPtr = std::make_shared<faabric::Message>(req->messages(i));
+        waitingMessageQueue.enqueue(msgPtr);
+    }
+
+    SPDLOG_DEBUG("Enqueued {} messages. Current waiting queue size: {}",
+                 req->messages_size(),
+                 waitingMessageQueue.size());
+    return true;
+}
+
+void Planner::processWaitingQueueLoop()
+{
+    while (!stopThreadTimer) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
+
+        CONTINUE_IF_OUTPUTTING
+
+        // Checking in-flight apps and schedule if with available slots.
+        int currentInflight = getInFlightAppsSize();
+        int availableSlots = maxInflightApps.load() - currentInflight;
+
+        if (availableSlots > 0 && waitingMessageQueue.size() > 0) {
+
+            int msgsToSchedule = std::min(
+              availableSlots, static_cast<int>(waitingMessageQueue.size()));
+            auto tempBatchReq =
+              std::make_shared<faabric::BatchExecuteRequest>();
+
+            for (int i = 0; i < msgsToSchedule; ++i) {
+                std::shared_ptr<faabric::Message> msg;
+                if (waitingMessageQueue.try_dequeue(msg)) {
+                    *tempBatchReq->add_messages() = *msg;
+                } else {
+                    break;
+                }
+            }
+            if (tempBatchReq->messages_size() > 0) {
+                SPDLOG_DEBUG("Dequeued {} messages. Sending to schedule...",
+                             tempBatchReq->messages_size());
+                scheduleMessages(tempBatchReq, false);
+            }
+        }
+    }
+}
+
 // Schedule Messages should not called when reschedule state, outputting the
 // result.
 void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
@@ -595,7 +657,7 @@ void Planner::dequeueScheduledMsgs()
 int Planner::getInFlightAppsSize()
 {
     faabric::util::SharedLock reqStatusLock(state.reqStatusMx);
-    SPDLOG_DEBUG("Getting in-flight apps size: {}", state.inFlightApps.size());
+    // SPDLOG_DEBUG("Getting in-flight apps size: {}", state.inFlightApps.size());
     return state.inFlightApps.size();
 }
 
@@ -861,6 +923,8 @@ bool Planner::resetParameter(const std::string& key,
             schedHostNum = value;
         } else if (key == "runtime_reconfig_period") {
             runtimeReconfigPeriod = value;
+        } else if (key == "max_waiting_queue_size") {
+            maxWaitingQueueSize = value;
         }
         return true;
     }

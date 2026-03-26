@@ -104,6 +104,12 @@ Scheduler::Scheduler()
 
     dispatchChainedMsgsThread =
       std::thread(&Scheduler::dispatchChainedMsgs, this);
+
+    // Initialize the dispatch worker pool
+    int numDispatchers = 4;
+    for (int i = 0; i < numDispatchers; ++i) {
+        dispatchThreads.emplace_back(&Scheduler::dispatchWorkerLoop, this);
+    }
 }
 
 Scheduler::~Scheduler()
@@ -126,6 +132,16 @@ Scheduler::~Scheduler()
     stopThreadTimer = true;
     if (dispatchChainedMsgsThread.joinable()) {
         dispatchChainedMsgsThread.join();
+    }
+
+    // Safely shutdown dispatch threads
+    stopDispatcher = true;
+    for (size_t i = 0; i < dispatchThreads.size(); ++i) {
+        readyDispatchQueue.enqueue("");
+    }
+    for (auto& t : dispatchThreads) {
+        if (t.joinable())
+            t.join();
     }
 }
 
@@ -310,11 +326,8 @@ void Scheduler::reset()
 void Scheduler::shutdown()
 {
     reset();
-
     reaperThread.stop();
-
     removeHostFromGlobalSet(thisHost);
-
     _isShutdown = true;
 }
 
@@ -333,8 +346,8 @@ int Scheduler::reapStaleExecutors()
     }
 
     std::vector<std::string> keysToRemove;
-
     int nReaped = 0;
+
     for (auto& execPair : executors) {
         std::string key = execPair.first;
         std::vector<std::shared_ptr<faabric::executor::Executor>>& execs =
@@ -460,7 +473,6 @@ std::unique_ptr<faabric::MessageBatch> convertListToBatch(
     }
 
     msgList.clear();
-
     return batch;
 }
 
@@ -516,6 +528,8 @@ void Scheduler::enqueueMessageBatch(
         int waitMsgs = iterator->second->getMessagesCount();
         (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
         runtimeStats.instanceWorkerQueueNum(userFuncPar, waitMsgs);
+
+        // Thread Safe Queue Push
         iterator->second->addMessage(
           std::make_unique<faabric::Message>(std::move(msg)));
     }
@@ -523,51 +537,113 @@ void Scheduler::enqueueMessageBatch(
     // Update the instances runtime stats
     for (const auto& [instancesName, count] : instancesCounter) {
         runtimeStats.instanceAdd(instancesName, invokeHost, count);
+        // Trigger the dispatch worker to process the messages in the queue. We
+        // trigger n+1 threads.
+        int batchesToTrigger = (count / executeBatchsize) + 1;
+        for (int i = 0; i < batchesToTrigger; ++i) {
+            readyDispatchQueue.enqueue(instancesName);
+        }
     }
 
     SPDLOG_DEBUG("Enqueued {} messages completed", nMessages);
 }
 
+void Scheduler::dispatchWorkerLoop()
+{
+    while (!stopDispatcher) {
+        std::string funcToDispatch = readyDispatchQueue.dequeue();
+        if (funcToDispatch.empty() || stopDispatcher)
+            break;
+
+        faabric::util::BatchQueueBase* queuePtr = nullptr;
+
+        if (isUpdateState.load(std::memory_order_acquire)) {
+            readyDispatchQueue.enqueue(funcToDispatch);
+            continue;
+        }
+
+        {
+            faabric::util::SharedLock lock(mx);
+            if (isUpdateState.load(std::memory_order_acquire)) {
+                readyDispatchQueue.enqueue(funcToDispatch);
+                continue;
+            }
+
+            auto it = waitingQueues.find(funcToDispatch);
+            if (it != waitingQueues.end()) {
+                queuePtr = it->second.get();
+            }
+        }
+
+        if (queuePtr && queuePtr->getMessagesCount() > 0) {
+            executeBatchForQueue(funcToDispatch, *queuePtr);
+        }
+    }
+}
+
 void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                                      util::BatchQueueBase& waitingQueue)
 {
-    auto firstMsg = waitingQueue.queueFront();
-    std::string user = firstMsg->user();
-    std::string func = firstMsg->function();
-    std::string funcStr = faabric::util::funcParToString(*firstMsg, false);
-
-    // Check if the executor is available.
-    if (!executorAvailable(funcStr)) {
-        return;
-    }
-    if (isUpdateState) {
-        return;
-    }
-
-    // Generate new BatchExecuteRequest (A request contains multiple requests)
-    auto newReq = faabric::util::batchExecFactory();
-    newReq->set_user(user);
-    newReq->set_function(func);
-
-    // Execute Batch Requests until the queue is empty or no available executor.
     while (waitingQueue.getMessagesCount() != 0) {
-        // The state lock is obtained before the requets are dequeued.
+
+        faabric::Message* firstMsg = nullptr;
+
+        try {
+            firstMsg = waitingQueue.queueFront();
+        } catch (const std::runtime_error& e) {
+            break;
+        }
+
+        if (!firstMsg) {
+            break;
+        }
+
+        std::string user = firstMsg->user();
+        std::string func = firstMsg->function();
+        std::string funcStr = faabric::util::funcParToString(*firstMsg, false);
+
+        if (!executorAvailable(funcStr)) {
+            break;
+        }
+        if (isUpdateState) {
+            break;
+        }
+
+        if (isUpdateState.load(std::memory_order_acquire)) {
+            break;
+        }
+
         auto stateLock =
           std::make_unique<faabric::util::SharedLock>(stateUpdateMx);
-
-        // Double Check
+        if (isUpdateState.load(std::memory_order_acquire)) {
+            break;
+        }
+        // Double check
         if (waitingQueue.getMessagesCount() == 0) {
             stateLock->unlock();
             break;
         }
-        SPDLOG_DEBUG("statelock is acquired for {}", userFuncPar);
-        auto msgVec = waitingQueue.getMessages();
-        // int msgVecSize = msgVec.size();
+
+        std::vector<std::unique_ptr<faabric::Message>> msgVec;
+        try {
+            msgVec = waitingQueue.getMessages();
+        } catch (...) {
+            stateLock->unlock();
+            break;
+        }
+
+        if (msgVec.empty()) {
+            stateLock->unlock();
+            break;
+        }
+
+        auto newReq = faabric::util::batchExecFactory();
+        newReq->set_user(user);
+        newReq->set_function(func);
 
         auto now = faabric::util::getGlobalClock().epochMicros();
+
         for (auto& src : msgVec) {
-            // Before executing, we need to double check if the message is
-            // scheduled to execute here.
             std::string host =
               decentralScheduler.scheduleMessage(activeHosts, *src);
             if (host != thisHost) {
@@ -575,63 +651,59 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                 chainedCallMsgs.push_back(std::move(src));
                 continue;
             }
-            // If the message is scheduled to execute here, we execute it.
+
             auto* message = newReq->add_messages();
             message->Swap(src.get());
 
             auto* metrics = message->mutable_metricrecorder();
             int workerQueueTime = now - (*metrics)[WORKER_ENQUEUE_TIME_KEY];
             message->set_workerqueuewaittime(workerQueueTime);
-
             runtimeStats.instanceWorkerQueueTime(userFuncPar, workerQueueTime);
-
             metrics->erase(WORKER_ENQUEUE_TIME_KEY);
             metrics->erase(WORKER_ENQUEUE_SIZE_KEY);
         }
+
         if (newReq->messages_size() != 0) {
-            // Claim new Executor, we can bound the first msg here, since claim
-            // only needs the user and function of Message.
             faabric::Message& localMsg = newReq->mutable_messages()->at(0);
             auto timeFlag1 = faabric::util::getGlobalClock().epochMicros();
+
             std::shared_ptr<faabric::executor::Executor> e =
               claimExecutor(localMsg);
+
             auto timeFlag2 = faabric::util::getGlobalClock().epochMicros();
             int elapsed = static_cast<int>(timeFlag2 - timeFlag1);
             for (int i = 0; i < newReq->messages_size(); i++) {
                 newReq->mutable_messages()->at(i).set_executorpreparetime(
                   elapsed);
             }
+
             SPDLOG_DEBUG("Claimed executor {} for {} with message size {}",
                          e->id,
                          userFuncPar,
                          newReq->messages_size());
-            // Execute the BatchRequest
+
             auto threadClockId =
               e->executeBatchTasks(newReq, std::move(stateLock));
             if (!runningThreads.contains(threadClockId)) {
                 faabric::util::FullLock cpuLock(cpuRecordMx);
                 runningThreads.emplace(threadClockId);
             }
+        } else {
+            if (stateLock)
+                stateLock->unlock();
         }
-        // Quit if no executor is available. Otherwise, execute the next batch.
-        if (!executorAvailable(funcStr)) {
+
+        if (!executorAvailable(funcStr) || isUpdateState) {
             break;
         }
-        if (isUpdateState) {
-            return;
+    }
+
+    try {
+        if (waitingQueue.getMessagesCount() == 0) {
+            waitingQueue.resetLastTime();
         }
-        // Reset the newReq
-        newReq = faabric::util::batchExecFactory();
-        newReq->set_user(user);
-        newReq->set_function(func);
+    } catch (...) {
     }
-
-    if (waitingQueue.getMessagesCount() == 0) {
-        waitingQueue.resetLastTime();
-    }
-
-    // TODO - DEBUG CODE: TO BE DELETE
-    // runtimeStats.logAverageQueuingTimes();
 }
 
 void Scheduler::enqueueChainedCalls(
@@ -708,34 +780,26 @@ void Scheduler::batchTimerCheck()
         std::this_thread::sleep_for(
           std::chrono::milliseconds(batchCheckPeriod));
 
-        faabric::util::FullLock lock(mx);
-
         if (stopBatchTimer) {
             break;
         }
 
-        // // If we have some unScheduled messages, schedule them.
-        // while (!migratedMsgs.empty()) {
-        //     SPDLOG_DEBUG("Processing unscheduled messages");
-        //     auto msgs = migratedMsgs.dequeue()->messages();
-        //     std::vector<std::unique_ptr<faabric::Message>> msgsVec;
-        //     msgsVec.reserve(msgs.size());
-        //     for (auto& msg : msgs) {
-        //         msgsVec.push_back(std::make_unique<faabric::Message>(msg));
-        //     }
-        //     auto hosts =
-        //       decentralScheduler.scheduleMessagesBatch(hostMap, msgsVec);
-        //     enqueueSchedMsgs(hosts, std::move(msgsVec));
-        // }
+        if (isUpdateState.load(std::memory_order_acquire)) {
+            continue;
+        }
+        faabric::util::SharedLock lock(mx);
+        if (isUpdateState.load(std::memory_order_acquire)) {
+            continue;
+        }
 
-        // Queue for stateless and stateful operators.
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
             if (waitingBatch->getMessagesCount() == 0) {
                 continue;
             }
-            if (waitingBatch->getMessagesCount() >= executeBatchsize ||
-                waitingBatch->getTimeInterval() >= batchInterval) {
-                executeBatchForQueue(userFuncPar, *waitingBatch);
+
+            if (waitingBatch->getTimeInterval() >= batchInterval) {
+                readyDispatchQueue.enqueue(userFuncPar);
+                waitingBatch->resetLastTime();
             }
         }
     }
@@ -763,6 +827,10 @@ void Scheduler::dispatchChainedMsgs()
 
         if (stopThreadTimer) {
             break;
+        }
+
+        if (isUpdateState.load(std::memory_order_acquire)) {
+            continue;
         }
 
         /***
@@ -898,13 +966,12 @@ void Scheduler::dispatchChainedMsgs()
             for (auto& msg : msgsList) {
                 msg->set_plannerdispatchtime(currentTime);
             }
-            msgsCallMap[hostIp] = std::move(msgsList); // Move ownership
+            msgsCallMap[hostIp] = std::move(msgsList);
         }
         scheduledMsgsMap.clear();
         lock.unlock();
 
         for (auto& [hostIp, msgs] : msgsCallMap) {
-            // SPDLOG_DEBUG the hosts and messages
             SPDLOG_DEBUG("Dispatching messages to host {} with message size {}",
                          hostIp,
                          msgs.size());
@@ -932,13 +999,9 @@ void Scheduler::resetParameter(std::string key, int32_t value)
                     plannerCallInterval);
     } else if (key == "batch_size") {
         executeBatchsize = value;
-        // change the batch size of all waiting queues
         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
             waitingBatch->resetBatchSize(executeBatchsize);
         }
-        // for (auto& [userFuncPar, waitingBatch] : partitionedWaitingQueues) {
-        //     waitingBatch->resetBatchSize(executeBatchsize);
-        // }
         SPDLOG_INFO("Reset executeBatchsize parameter to : {}",
                     executeBatchsize);
     } else if (key == "schedule_mode") {
@@ -984,106 +1047,133 @@ std::vector<faabric::Message> Scheduler::getRecordedMessages()
 
 bool Scheduler::executorAvailable(const std::string& funcStr)
 {
-    auto& thisExecutors = executors[funcStr];
-    SPDLOG_TRACE(
-      "Checking if executor is available for {}, current executor size {}",
-      funcStr,
-      thisExecutors.size());
-    // If we can reuse warm executors, we can return true.
-    for (auto& e : thisExecutors) {
-        if (e->availableClaim()) {
-            SPDLOG_TRACE("Available executor {} for {}", e->id, funcStr);
-            return true;
+    int currentExecutorsSize = 0;
+    bool foundAvailable = false;
+
+    {
+        faabric::util::SharedLock lock(mx);
+        auto& thisExecutors = executors[funcStr];
+        currentExecutorsSize = thisExecutors.size();
+
+        for (auto& e : thisExecutors) {
+            if (e->availableClaim()) {
+                foundAvailable = true;
+                break;
+            }
         }
     }
-    // We don't have to check the maxExecutors here, since in updateStatesInfo,
-    // max replicas are limited. Total number of executors won't exceed the
-    // maxExecutors. If current current replicas is less than the max size,
-    // return true.
+
+    if (foundAvailable) {
+        return true;
+    }
 
     int maxReplicas;
     try {
         maxReplicas = util::getOrThrow(maxReplicasMap, funcStr);
     } catch (const std::runtime_error& e) {
-        SPDLOG_WARN("Key {} not found in maxReplicasMap, defaulting to 1",
-                    funcStr);
         maxReplicas = 1;
     }
-    if (thisExecutors.size() < maxReplicas) {
+
+    if (currentExecutorsSize < maxReplicas) {
         return true;
     } else {
-        SPDLOG_DEBUG("No available executor for {}: max replicas for function "
-                     "reached ({} >= {})",
-                     funcStr,
-                     thisExecutors.size(),
-                     maxReplicas);
+        return false;
     }
-
-    return false;
 }
 
 void Scheduler::notifyExecutorStart()
 {
-    runningExecutors++;
+    int current = runningExecutors.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+
+    int64_t window = currentWindowSec.load(std::memory_order_acquire);
+
+    if (now > window) {
+        if (currentWindowSec.compare_exchange_strong(window, now)) {
+            long long oldSum =
+              currentSecondSum.exchange(0, std::memory_order_relaxed);
+            long long oldCount =
+              currentSecondCount.exchange(0, std::memory_order_relaxed);
+
+            if (oldCount > 0) {
+                lastSecondAverage.store(static_cast<double>(oldSum) / oldCount,
+                                        std::memory_order_relaxed);
+            } else {
+                lastSecondAverage.store(current, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    currentSecondSum.fetch_add(current, std::memory_order_relaxed);
+    currentSecondCount.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Scheduler::notifyExecutorFinished()
 {
-    int current = runningExecutors.load();
+    int current = runningExecutors.load(std::memory_order_relaxed);
 
     while (current > 0) {
-        if (runningExecutors.compare_exchange_weak(current, current - 1)) {
+        if (runningExecutors.compare_exchange_weak(
+              current, current - 1, std::memory_order_relaxed)) {
             break;
         }
     }
 }
 
-int Scheduler::getRunningExecutorsCount() const
+double Scheduler::getAverageExecutors() const
 {
-    return runningExecutors.load();
+    int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+    int64_t window = currentWindowSec.load(std::memory_order_relaxed);
+
+    if (now > window) {
+        return runningExecutors.load(std::memory_order_relaxed);
+    }
+    return lastSecondAverage.load(std::memory_order_relaxed);
 }
 
 std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
   faabric::Message& msg)
 {
     std::string funcStr = faabric::util::funcParToString(msg, false);
-
-    std::vector<std::shared_ptr<faabric::executor::Executor>>& thisExecutors =
-      executors[funcStr];
-
     auto factory = faabric::executor::getExecutorFactory();
-
     std::shared_ptr<faabric::executor::Executor> claimed = nullptr;
-    for (auto& e : thisExecutors) {
-        if (e->tryClaim()) {
-            claimed = e;
-            // Reset the just claimed warm executor to guarantee TLS is
-            // refreshed
-            claimed->reset(msg);
-            SPDLOG_DEBUG(
-              "Reusing warm executor {} for {}", claimed->id, funcStr);
-            break;
+
+    {
+        faabric::util::FullLock lock(mx);
+        auto& thisExecutors = executors[funcStr];
+
+        for (auto& e : thisExecutors) {
+            if (e->tryClaim()) {
+                claimed = e;
+                claimed->reset(msg);
+                SPDLOG_DEBUG(
+                  "Reusing warm executor {} for {}", claimed->id, funcStr);
+                break;
+            }
         }
     }
 
-    // We have no warm executors available, so scale up
-    if (claimed == nullptr) {
-        SPDLOG_DEBUG("Scaling {} from {} -> {}",
-                     funcStr,
-                     thisExecutors.size(),
-                     thisExecutors.size() + 1);
+    if (claimed != nullptr) {
+        return claimed;
+    }
 
-        // Spinning up a new executor can be lengthy, allow other things
-        // to run in parallel
-        // schedulerLock.unlock();
-        auto executor = factory->createExecutor(msg);
-        // schedulerLock.lock();
+    SPDLOG_DEBUG("Scaling {} -> creating new executor", funcStr);
+    auto executor = factory->createExecutor(msg);
+
+    {
+        faabric::util::FullLock lock(mx);
+        auto& thisExecutors = executors[funcStr];
+
         thisExecutors.push_back(std::move(executor));
         claimed = thisExecutors.back();
-
-        // Claim it
         claimed->tryClaim();
     }
+
     assert(claimed != nullptr);
     return claimed;
 }
@@ -1093,12 +1183,10 @@ void Scheduler::setThreadResultLocally(uint32_t appId,
                                        int32_t returnValue,
                                        faabric::transport::Message& message)
 {
-    // Keep the message
     faabric::util::FullLock lock(mx);
     threadResultMessages.insert(std::make_pair(msgId, std::move(message)));
 }
 
-// TODO(scheduler-cleanup): move method elsewhere
 std::vector<std::pair<uint32_t, int32_t>> Scheduler::awaitThreadResults(
   std::shared_ptr<faabric::BatchExecuteRequest> req,
   int timeoutMs)
@@ -1233,12 +1321,12 @@ void Scheduler::updateHosts(const std::vector<std::string>& hosts)
         registeredHostsMap.emplace(host, host);
     }
 
-    std::ostringstream oss;
-    oss << "Registered hosts:\n";
-    for (const auto& [key, value] : registeredHostsMap) {
-        oss << key << "=" << value << ";\n";
-    }
-    SPDLOG_INFO("updateHosts: {}", oss.str());
+    // std::ostringstream oss;
+    // oss << "Registered hosts:\n";
+    // for (const auto& [key, value] : registeredHostsMap) {
+    //     oss << key << "=" << value << ";\n";
+    // }
+    // SPDLOG_INFO("updateHosts: {}", oss.str());
 
     hostMap = convertHostMap(registeredHostsMap);
     faabric::state::getGlobalState().updateHosts(hostMap);
@@ -1269,27 +1357,15 @@ void Scheduler::updateActiveHosts(
     }
 
     if (!uniqueIps.empty()) {
-        std::stringstream ss;
-        ss << "Active IPs (" << uniqueIps.size() << "): [";
-        for (auto it = uniqueIps.begin(); it != uniqueIps.end(); ++it) {
-            ss << *it << (std::next(it) != uniqueIps.end() ? ", " : "");
+        activeHosts.clear();
+        for (const auto& ip : uniqueIps) {
+            auto it = hostMap.find(ip);
+            if (it != hostMap.end()) {
+                activeHosts[ip] = it->second;
+            }
         }
-
-        ss << "]";
-        SPDLOG_DEBUG(ss.str());
     } else {
-        SPDLOG_DEBUG("No active IPs found.");
         activeHosts = hostMap;
-    }
-
-    activeHosts.clear();
-    for (const auto& ip : uniqueIps) {
-        auto it = hostMap.find(ip);
-        if (it != hostMap.end()) {
-            activeHosts[ip] = it->second;
-        } else {
-            SPDLOG_WARN("Operator scheduled on unknown host IP: {}", ip);
-        }
     }
 }
 
@@ -1303,28 +1379,18 @@ void Scheduler::updateStatesInfo(
   std::map<std::string, std::set<std::string>>& transDestinationMap,
   std::map<std::string, std::set<std::string>>& transSourceMap)
 {
-    SPDLOG_DEBUG("State Update: Start");
-
     auto startTime = faabric::util::getGlobalClock().epochMillis();
 
-    isUpdateState = true;
-    // Update the states info in decentralized scheduler
-    // To update states, we must ensure that no executors are running (hold
-    // state lock).
-    faabric::util::FullLock lock(mx);
-    SPDLOG_DEBUG("State Update: scheduler lock acquired");
+    isUpdateState.store(true, std::memory_order_release);
     faabric::util::FullLock stateLock(stateUpdateMx);
-    SPDLOG_DEBUG("State Update: state lock acquired");
 
+    faabric::util::FullLock lock(mx);
+    faabric::util::FullLock rflock(reconfigMx);
     // 1. Update the local max replicas map based on the new scheduling
     // decision.
     calculateMaxReplicas(scheduledOperatorMap);
-
     // 2. Update the local scheduler and update the states info in decentralized
     // scheduler
-    faabric::util::FullLock rflock(reconfigMx);
-
-    SPDLOG_DEBUG("State Update: decentralized scheduler states update");
     updateActiveHosts(scheduledOperatorMap);
     decentralScheduler.resetScheduler();
     decentralScheduler.setScheuduledOperatorMap(scheduledOperatorMap);
@@ -1343,7 +1409,6 @@ void Scheduler::updateStatesInfo(
         return;
     }
 
-    // Update the version, state destionation map and state source map.
     currentMigrationVersion = migrationVersion;
     std::set<std::string> migrationDestinations = transDestinationMap[thisHost];
     std::set<std::string> migrationSources = transSourceMap[thisHost];
@@ -1353,10 +1418,7 @@ void Scheduler::updateStatesInfo(
     SPDLOG_DEBUG("State Update: Migration data start");
 
     auto migrationStatesMap = packState(statesInfo);
-
     auto migrationMessagesMap = packMessage();
-
-    // Transfer the state and message to the new host.
 
     transferData(migrationVersion,
                  migrationStatesMap,
@@ -1374,32 +1436,17 @@ void Scheduler::updateStatesInfo(
 
     if (expectedCount > 0) {
         std::unique_lock<std::mutex> lock(migrationMx);
-        bool success = migrationCv.wait_for(
+        migrationCv.wait_for(
           lock,
           std::chrono::seconds(10),
           [this, migrationVersion, expectedCount] {
               return receivedMigrationSources[migrationVersion].size() >=
                      expectedCount;
           });
-        if (!success) {
-            SPDLOG_DEBUG("Migration timed out! Received {}/{} sources",
-                         receivedMigrationSources[migrationVersion].size(),
-                         expectedCount);
-        } else {
-            SPDLOG_DEBUG("Migration completed successfully for version {}",
-                         migrationVersion);
-        }
-    } else {
-        SPDLOG_DEBUG("No migration sources for this host, proceeding.");
     }
-
-    // 5. Head to next step after migration. (sync state and messages)
-    // Create state in state server
-    SPDLOG_DEBUG("State Update: create states based on new states info");
 
     createLocalState(statesInfo);
 
-    // Update the states from migratedStateMap to state
     faabric::util::FullLock migrateStateLock(migratedStateMapMx);
     auto& stateServer = faabric::state::getGlobalState();
     stateServer.loadMigrateState(migratedStateMap);
@@ -1410,19 +1457,14 @@ void Scheduler::updateStatesInfo(
     isUpdateState = false;
 
     while (!migratedMsgs.empty()) {
-        SPDLOG_DEBUG("Processing migrated messages");
         auto msgBatch = migratedMsgs.dequeue();
         enqueueMessageBatch(std::move(msgBatch));
     }
 
-    // Clean up the migration sources
     receivedMigrationSources.erase(migrationVersion);
 
     auto endTime = faabric::util::getGlobalClock().epochMillis();
-    int totalTimeMillis = endTime - startTime;
-    SPDLOG_DEBUG("State Update: completed in {} ms", totalTimeMillis);
-
-    migrationHistory[migrationVersion] = totalTimeMillis;
+    migrationHistory[migrationVersion] = endTime - startTime;
 }
 
 void Scheduler::calculateMaxReplicas(
@@ -1430,7 +1472,6 @@ void Scheduler::calculateMaxReplicas(
     scheduledOperatorMap)
 {
     maxReplicasMap.clear();
-    // reset max replicas based on resource requirements.
     std::map<std::string, int> tempMaxReplicasMap;
     for (const auto& [operatorName, operatorInfo] : scheduledOperatorMap) {
         if (operatorInfo.weightDist.count(thisHost) <= 0) {
@@ -1438,14 +1479,13 @@ void Scheduler::calculateMaxReplicas(
         }
         std::string userFunc = util::splitUserFunc(operatorName).first + "/" +
                                util::splitUserFunc(operatorName).second;
-        // If operator is stateless
+
         if (operatorInfo.node.type == faabric::batch_scheduler::STATELESS) {
             int maxReplica =
               std::round(operatorInfo.weightDist.at(thisHost) * maxExecutors);
             tempMaxReplicasMap[userFunc + "/0"] = maxReplica;
-        }
-        // If operator is stateful
-        else if (operatorInfo.node.type == faabric::batch_scheduler::STATEFUL) {
+        } else if (operatorInfo.node.type ==
+                   faabric::batch_scheduler::STATEFUL) {
             double totalWeight = operatorInfo.weightDist.at(thisHost);
             int totalInstsances = 0;
             for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
@@ -1462,10 +1502,8 @@ void Scheduler::calculateMaxReplicas(
                       maxReplica;
                 }
             }
-        }
-        // If operator is partitioned stateful
-        else if (operatorInfo.node.type ==
-                 faabric::batch_scheduler::PARTITIONED_STATEFUL) {
+        } else if (operatorInfo.node.type ==
+                   faabric::batch_scheduler::PARTITIONED_STATEFUL) {
             for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
                 if (ip == thisHost) {
                     double weight = operatorInfo.weightDist.at(thisHost);
@@ -1476,8 +1514,7 @@ void Scheduler::calculateMaxReplicas(
             }
         }
     }
-    // We then scale, make sure the total replicas are not larger than
-    // maxExecutors.
+
     int totalReplicas = 0;
     for (const auto& [funcStr, maxReplica] : tempMaxReplicasMap) {
         totalReplicas += maxReplica;
@@ -1491,9 +1528,6 @@ void Scheduler::calculateMaxReplicas(
             scaledMaxReplica = 1;
         }
         maxReplicasMap[funcStr] = scaledMaxReplica;
-        SPDLOG_DEBUG("updateStatesInfo: {} max replicas set to {}",
-                     funcStr,
-                     scaledMaxReplica);
     }
 }
 
@@ -1525,10 +1559,8 @@ Scheduler::packState(
     SPDLOG_DEBUG("Packing state for migration");
     // Migrate the state according to new scheduling decision.
     auto& stateServer = faabric::state::getGlobalState();
-
     auto& hashRings = decentralScheduler.getStateHashRing();
     auto migrationStatesMap = stateServer.redirectState(hashRings, statesInfo);
-
     return migrationStatesMap;
 }
 
@@ -1550,6 +1582,7 @@ Scheduler::packMessage()
                          std::make_move_iterator(messages.begin()),
                          std::make_move_iterator(messages.end()));
     }
+
     faabric::util::FullLock lock(scheduledMsgsMapMx);
     for (auto& [_, msgs] : scheduledMsgsMap) {
         for (auto& msg : msgs) {
@@ -1559,9 +1592,6 @@ Scheduler::packMessage()
     scheduledMsgsMap.clear();
     lock.unlock();
 
-    SPDLOG_DEBUG("Total local messages to migrate: {}", localMsgs.size());
-
-    // Schedule the local messages according to the new scheduling decision.
     auto hosts =
       decentralScheduler.scheduleMessagesBatch(activeHosts, localMsgs);
 
@@ -1609,7 +1639,6 @@ void Scheduler::transferData(int migrationVersion,
               "Destination host {} not in migrationRequestMap", destHost));
         }
         auto& requestPtr = migrationRequestMap[destHost];
-
         for (auto& [funcPar, state] : funcData) {
             auto* migrateState = requestPtr->add_migratestates();
             migrateState->set_userfuncpar(funcPar);
@@ -1620,12 +1649,10 @@ void Scheduler::transferData(int migrationVersion,
     for (auto& [destHost, batchPtr] : msgMap) {
         if (!batchPtr)
             continue;
-
         auto& request = migrationRequestMap[destHost];
         request->set_allocated_messagebatch(batchPtr.release());
     }
 
-    // Transfer data to the new host
     for (auto& [destHost, requestPtr] : migrationRequestMap) {
         if (destHost == thisHost) {
             processMigrationData(*requestPtr);
@@ -1681,16 +1708,12 @@ void Scheduler::setLocalPersistentState(
 {
     SPDLOG_DEBUG("Setting local persistent state");
     faabric::state::getGlobalState().writePersistentStateBatch(kvMap);
-    SPDLOG_DEBUG("Local persistent state set successfully");
 }
 
 std::string Scheduler::getLocalPersistentState(std::string key)
 {
     SPDLOG_DEBUG("Getting local persistent state for key: {}", key);
-    std::string value;
-    value = faabric::state::getGlobalState().readPersistentState(key);
-
-    return value;
+    return faabric::state::getGlobalState().readPersistentState(key);
 }
 
 void Scheduler::flushState()
@@ -1713,19 +1736,20 @@ std::map<int, int> Scheduler::getMigrationHistory()
 {
     SPDLOG_DEBUG("Retrieving migration history with {} records",
                  migrationHistory.size());
-    if (migrationHistory.empty()) {
-        SPDLOG_DEBUG("No migration history records found.");
-    } else {
-        std::stringstream ss;
-        ss << "Migration History: {";
-        for (auto it = migrationHistory.begin(); it != migrationHistory.end();
-             ++it) {
-            ss << it->first << ": " << it->second
-               << (std::next(it) != migrationHistory.end() ? ", " : "");
-        }
-        ss << "}";
-        SPDLOG_DEBUG(ss.str());
-    }
+    // if (migrationHistory.empty()) {
+    //     SPDLOG_DEBUG("No migration history records found.");
+    // } else {
+    //     std::stringstream ss;
+    //     ss << "Migration History: {";
+    //     for (auto it = migrationHistory.begin(); it !=
+    //     migrationHistory.end();
+    //          ++it) {
+    //         ss << it->first << ": " << it->second
+    //            << (std::next(it) != migrationHistory.end() ? ", " : "");
+    //     }
+    //     ss << "}";
+    //     SPDLOG_DEBUG(ss.str());
+    // }
 
     return migrationHistory;
 }
@@ -1741,7 +1765,7 @@ std::map<std::string, InstanceMetricsResult> Scheduler::getWorkerMetrics(
     return runtimeStats.getWorkerMetrics(isRuntime);
 }
 
-std::tuple<std::map<std::string, int>, int, double>
+std::tuple<std::map<std::string, int>, double, double>
 Scheduler::getStatsSnapshot()
 {
     std::map<std::string, int> queueSizes;
@@ -1749,7 +1773,7 @@ Scheduler::getStatsSnapshot()
         queueSizes[userFuncPar] = waitingBatch->getMessagesCount();
     }
 
-    int runningExecutorsCount = getRunningExecutorsCount();
+    double runningExecutorsCount = getAverageExecutors();
     double lastCpu = getLastVmCpu();
 
     return { queueSizes, runningExecutorsCount, lastCpu };
@@ -1757,8 +1781,6 @@ Scheduler::getStatsSnapshot()
 
 void Scheduler::cpuMonitorLoop()
 {
-    SPDLOG_INFO("Starting VM CPU monitor thread");
-
     VmCpuData prevData = readVmCpuData();
 
     while (!stopCpuMonitor) {
@@ -1789,18 +1811,14 @@ void Scheduler::cpuMonitorLoop()
             vmCpuHistory.pop_front();
         }
     }
-
-    SPDLOG_INFO("VM CPU monitor thread stopped");
 }
 
 double Scheduler::getLastVmCpu()
 {
     faabric::util::SharedLock lock(vmCpuHistoryMx);
-
     if (vmCpuHistory.empty()) {
         return 0.0;
     }
-
     return vmCpuHistory.back();
 }
 }

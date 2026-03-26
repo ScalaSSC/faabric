@@ -331,6 +331,12 @@ class ThreadSafeQueue
         return m_queue.empty();
     }
 
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.size();
+    }
+
   private:
     std::queue<T> m_queue;
     mutable std::mutex m_mutex;

@@ -20,6 +20,56 @@
 
 namespace faabric::planner {
 
+// The Latency accuracy is dynamic to balance the accuracy and the memory cost.
+// From 0 - 50, the accuracy is 1ms, from 50 - 500ms, the accuracy is 5ms, etc.
+struct LatencyHistogramConfig
+{
+    int limit1 = 50;    // 0 - 50ms
+    int limit2 = 500;   // 50 - 500ms
+    int limit3 = 2000;  // 500 - 2000ms
+    int limit4 = 10000; // 2000 - 10000ms
+
+    int step1 = 1;   // 1ms
+    int step2 = 5;   // 5ms
+    int step3 = 50;  // 50ms
+    int step4 = 500; // 500ms
+
+    int offset1 = 0;
+    int offset2 = limit1 / step1;
+    int offset3 = offset2 + (limit2 - limit1) / step2;
+    int offset4 = offset3 + (limit3 - limit2) / step3;
+    int overflowBin = offset4 + (limit4 - limit3) / step4;
+    int totalBins = overflowBin + 1;
+
+    inline int getBinIdx(int latencyMs) const
+    {
+        if (latencyMs < 0)
+            return 0;
+        if (latencyMs < limit1)
+            return offset1 + latencyMs / step1;
+        if (latencyMs < limit2)
+            return offset2 + (latencyMs - limit1) / step2;
+        if (latencyMs < limit3)
+            return offset3 + (latencyMs - limit2) / step3;
+        if (latencyMs < limit4)
+            return offset4 + (latencyMs - limit3) / step4;
+        return overflowBin;
+    }
+
+    inline int getLatencyMs(int binIdx) const
+    {
+        if (binIdx < offset2)
+            return binIdx * step1;
+        if (binIdx < offset3)
+            return limit1 + (binIdx - offset2) * step2;
+        if (binIdx < offset4)
+            return limit2 + (binIdx - offset3) * step3;
+        if (binIdx < overflowBin)
+            return limit3 + (binIdx - offset4) * step4;
+        return limit4;
+    }
+};
+
 // TODO - Period is not used yet
 class InstanceMetrics
 {
@@ -275,7 +325,13 @@ class ApplicationMetrics
         if (tempEndTime != std::numeric_limits<int64_t>::min()) {
             // tempEndTime is in microseconds.
             int64_t secondKey = tempEndTime / 1000000;
+
+            runtimeMetricsHistory[secondKey].init(histConfig.totalBins);
             runtimeMetricsHistory[secondKey].count++;
+
+            int latencyMs = static_cast<int>(tempTotalLatencyMicro / 1000);
+            int binIdx = histConfig.getBinIdx(latencyMs);
+            runtimeMetricsHistory[secondKey].latencyBins[binIdx]++;
         }
     }
 
@@ -470,12 +526,45 @@ class ApplicationMetrics
                 int currentCount = 0;
                 int totalQueueSize = 0;
 
+                int secMedianLat = 0;
+                int secP95Lat = 0;
+                int secP99Lat = 0;
+
+                int workersNum = 0;
+
                 if (runtimeMetricsHistory.contains(s)) {
                     const auto& record = runtimeMetricsHistory.at(s);
                     currentCount = record.count;
 
+                    workersNum = record.workersNum;
+
                     for (const auto& [hostIp, qSize] : record.hostQueueSize) {
                         totalQueueSize += qSize;
+                    }
+
+                    if (currentCount > 0) {
+                        long target50 = currentCount * 0.50;
+                        long target95 = currentCount * 0.95;
+                        long target99 = currentCount * 0.99;
+
+                        long cumCount = 0;
+                        for (int i = 0; i < histConfig.totalBins; ++i) {
+                            if (record.latencyBins[i] == 0)
+                                continue;
+
+                            cumCount += record.latencyBins[i];
+
+                            int currentLatMs = histConfig.getLatencyMs(i);
+
+                            if (secMedianLat == 0 && cumCount >= target50)
+                                secMedianLat = currentLatMs;
+                            if (secP95Lat == 0 && cumCount >= target95)
+                                secP95Lat = currentLatMs;
+                            if (secP99Lat == 0 && cumCount >= target99) {
+                                secP99Lat = currentLatMs;
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -518,6 +607,11 @@ class ApplicationMetrics
                     }
                 }
 
+                double average_executors =
+                  workersNum > 0 ? static_cast<double>(totalExecutors) /
+                                     static_cast<double>(workersNum)
+                                 : 0.0;
+
                 int avgWaitTime =
                   totalWaitCount > 0
                     ? static_cast<int>(totalWaitSum / totalWaitCount)
@@ -533,12 +627,17 @@ class ApplicationMetrics
                 char cpuBuffer[32];
                 snprintf(cpuBuffer, sizeof(cpuBuffer), "%.2f", avgCpuLoad);
 
-                std::string entryStr = std::to_string(currentCount) + " / " +
-                                       std::to_string(totalQueueSize) + " / " +
-                                       std::to_string(avgWaitTime) + " / " +
-                                       std::to_string(avgExecTime) + " / " +
-                                       std::to_string(totalExecutors) + " / " +
-                                       std::string(cpuBuffer);
+                std::string entryStr =
+                  std::to_string(currentCount) + " / " +
+                  std::to_string(totalQueueSize) + " / " +
+                  std::to_string(avgWaitTime) + " / " +
+                  std::to_string(avgExecTime) + " / " +
+                  std::to_string(totalExecutors) + " / " + 
+                  std::to_string(workersNum) + " / " +
+                  std::to_string(average_executors) + " / " +
+                  std::string(cpuBuffer) + " / " +
+                  std::to_string(secMedianLat) + " / " +
+                  std::to_string(secP95Lat) + " / " + std::to_string(secP99Lat);
 
                 historyArray.PushBack(
                   rapidjson::Value(entryStr.c_str(), alloc).Move(), alloc);
@@ -546,7 +645,9 @@ class ApplicationMetrics
         }
 
         doc.AddMember("runtimeCountHistory: count / queue_size / avg_wait / "
-                      "avg_exec / executors / avg_cpu",
+                      "avg_exec / executors / worker_num / average_executors / "
+                      "avg_cpu / p50latency (ms) / "
+                      "p95latency (ms) / p99latency (ms)",
                       historyArray,
                       alloc);
 
@@ -708,6 +809,9 @@ class ApplicationMetrics
               totalQueueSize;
         }
 
+        int workersNum = results.size();
+        runtimeMetricsHistory[currentTime].workersNum = workersNum;
+
         // Clean old metrics beyond a certain time window (e.g., 1000 seconds)
         time_t cutoffTime = currentTime - 1000;
         for (auto& [ip, workerNode] : clusterWorkerMetrics) {
@@ -779,11 +883,29 @@ class ApplicationMetrics
     double avgExecutionOperators = 0.0;
     double avgRunningReqs = 0.0;
     // std::map<int64_t, int> runtimeCountHistory;
+
+    LatencyHistogramConfig histConfig;
     struct RuntimeMetricsRecord
     {
         int count = 0;
         std::map<std::string, int> hostQueueSize; // <host_ip, total_queue_size>
+
+        // Currently the initialization size is 1000, which means recording
+        // latencies up to 1 second in microsecond granularity.
+        std::vector<int> latencyBins;
+        void init(int totalBins)
+        {
+            if (latencyBins.empty()) {
+                latencyBins.resize(totalBins, 0);
+            }
+        }
+        int workersNum = 0;
+        // int averageLatency = 0;
+        // int p95Latency = 0;
+        // int p99Latency = 0;
+        // bool calculated = false;
     };
+
     std::map<int64_t, RuntimeMetricsRecord> runtimeMetricsHistory;
 
     // MAP<source operator : <successor operator, count>>
@@ -809,7 +931,7 @@ class ApplicationMetrics
     {
         std::map<std::string, InstanceTimeSeries> instances;
         std::map<time_t, double> cpuLoadHistory;
-        std::map<time_t, int> executorsHistory;
+        std::map<time_t, double> executorsHistory;
     };
 
     // MAP<host_ip, WorkerNodeMetrics>

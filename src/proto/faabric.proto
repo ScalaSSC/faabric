@@ -417,6 +417,6 @@ message WorkerStats{
     map<int64, int32> versionTimestamp = 5;
     map<string, InstanceMetricsResultProto> workerMetrics = 6;
     map<string, int32> instanceQueueNum = 7;
-    int32 executorsNum = 8;
+    double executorsNum = 8;
     double cpuLoad = 9;
 }

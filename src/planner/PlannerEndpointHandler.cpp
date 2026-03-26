@@ -199,19 +199,15 @@ void PlannerEndpointHandler::onRequest(
             }
             auto ber = std::make_shared<faabric::BatchExecuteRequest>(rawBer);
 
-            // For Request from the user, we will return false if the waiting
-            // queue is too large.
-            int numInFlight =
-              faabric::planner::getPlanner().getInFlightAppsSize();
-            if (numInFlight >= maxInflightApps) {
+            // For the request from the user, we will return false if the
+            // waiting queue is too large.
+            bool enqueued =
+              faabric::planner::getPlanner().enqueueBatchRequest(ber);
+            if (!enqueued) {
                 response.result(beast::http::status::internal_server_error);
                 response.body() = "No available hosts";
                 return ctx.sendFunction(std::move(response));
             }
-            // Execute the BER
-            // auto decision = getPlanner().callBatch(ber);
-            getPlanner().scheduleMessages(ber, false);
-
             // Prepare the response
             response.result(beast::http::status::ok);
             auto berStatus = faabric::util::batchExecStatusFactory(ber);
@@ -332,11 +328,11 @@ void PlannerEndpointHandler::onRequest(
                 "is_outputting",
                 "num_hosts_scheduled",
                 "runtime_reconfig_period",
+                "max_inflight_reqs",
+                "max_waiting_queue_size",
             };
 
-            if (parameter == "max_inflight_reqs") {
-                maxInflightApps = value;
-            } else if (plannerParams.contains(parameter)) {
+            if (plannerParams.contains(parameter)) {
                 faabric::planner::getPlanner().resetParameter(
                   parameter, value, true);
             } else {
