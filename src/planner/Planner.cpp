@@ -471,7 +471,7 @@ bool Planner::enqueueBatchRequest(
     }
 
     for (int i = 0; i < req->messages_size(); i++) {
-        auto msgPtr = std::make_shared<faabric::Message>(req->messages(i));
+        auto msgPtr = std::make_shared<faabric::Message>(req->messages(i));    
         waitingMessageQueue.enqueue(msgPtr);
     }
 
@@ -657,7 +657,8 @@ void Planner::dequeueScheduledMsgs()
 int Planner::getInFlightAppsSize()
 {
     faabric::util::SharedLock reqStatusLock(state.reqStatusMx);
-    // SPDLOG_DEBUG("Getting in-flight apps size: {}", state.inFlightApps.size());
+    // SPDLOG_DEBUG("Getting in-flight apps size: {}",
+    // state.inFlightApps.size());
     return state.inFlightApps.size();
 }
 
@@ -923,6 +924,8 @@ bool Planner::resetParameter(const std::string& key,
             schedHostNum = value;
         } else if (key == "runtime_reconfig_period") {
             runtimeReconfigPeriod = value;
+        } else if (key == "max_inflight_reqs") {
+            maxInflightApps.store(value);
         } else if (key == "max_waiting_queue_size") {
             maxWaitingQueueSize = value;
         }
@@ -1094,96 +1097,6 @@ std::string Planner::outputResult()
         // Add to migrationHistoryObj under the IP key
         migrationHistoryObj.AddMember(
           rapidjson::Value(ip.c_str(), alloc).Move(), migrationArr, alloc);
-
-        // std::map<int64_t, int> currentVersiontimestamp;
-        // for (const auto& [t, v] : stats->versiontimestamp()) {
-        //     currentVersiontimestamp[t] = v;
-        // }
-
-        // rapidjson::Value hostWorkerMetricsObj(rapidjson::kObjectType);
-
-        // for (const auto& [instanceName, metricsProto] :
-        //      stats->workermetrics()) {
-        //     rapidjson::Value instanceObj(rapidjson::kObjectType);
-
-        //     std::set<int64_t> allTimestamps;
-
-        //     for (const auto& [t, _] : metricsProto.workerqueuetimestats())
-        //         allTimestamps.insert(t);
-        //     for (const auto& [t, _] : metricsProto.workerqueuenumstats())
-        //         allTimestamps.insert(t);
-        //     for (const auto& [t, _] : metricsProto.workerexectimestats())
-        //         allTimestamps.insert(t);
-
-        //     std::map<int, rapidjson::Value> versionBuckets;
-
-        //     for (int64_t t : allTimestamps) {
-        //         rapidjson::Value timeObj(rapidjson::kObjectType);
-
-        //         auto qtIt = metricsProto.workerqueuetimestats().find(t);
-        //         timeObj.AddMember(
-        //           "workerQueueTime",
-        //           (qtIt != metricsProto.workerqueuetimestats().end())
-        //             ? qtIt->second.average()
-        //             : 0,
-        //           alloc);
-
-        //         auto qnIt = metricsProto.workerqueuenumstats().find(t);
-        //         timeObj.AddMember(
-        //           "workerQueueNum",
-        //           (qnIt != metricsProto.workerqueuenumstats().end())
-        //             ? qnIt->second.average()
-        //             : 0,
-        //           alloc);
-
-        //         auto etIt = metricsProto.workerexectimestats().find(t);
-        //         timeObj.AddMember(
-        //           "workerExecTime",
-        //           (etIt != metricsProto.workerexectimestats().end())
-        //             ? etIt->second.average()
-        //             : 0,
-        //           alloc);
-
-        //         int activeVersion = 0;
-        //         auto it = currentVersiontimestamp.upper_bound(t);
-        //         if (it != currentVersiontimestamp.begin()) {
-        //             auto prevIt = it;
-        //             --prevIt;
-        //             activeVersion = prevIt->second;
-        //         }
-
-        //         if (versionBuckets.find(activeVersion) ==
-        //             versionBuckets.end()) {
-        //             versionBuckets[activeVersion] =
-        //               rapidjson::Value(rapidjson::kObjectType);
-        //         }
-
-        //         std::string timeStr = std::to_string(t);
-        //         versionBuckets[activeVersion].AddMember(
-        //           rapidjson::Value(timeStr.c_str(), alloc).Move(),
-        //           timeObj,
-        //           alloc);
-        //     }
-
-        //     for (auto& [versionNum, bucketObj] : versionBuckets) {
-        //         std::string versionStr =
-        //           "version_" + std::to_string(versionNum);
-        //         instanceObj.AddMember(
-        //           rapidjson::Value(versionStr.c_str(), alloc).Move(),
-        //           bucketObj.Move(),
-        //           alloc);
-        //     }
-
-        //     hostWorkerMetricsObj.AddMember(
-        //       rapidjson::Value(instanceName.c_str(), alloc).Move(),
-        //       instanceObj,
-        //       alloc);
-        // }
-
-        // allWorkerMetricsObj.AddMember(
-        //   rapidjson::Value(ip.c_str(), alloc).Move(),
-        //   hostWorkerMetricsObj,
-        //   alloc);
     }
 
     for (const auto& [version, duration] : migrationDurations) {

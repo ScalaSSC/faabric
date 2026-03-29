@@ -366,6 +366,8 @@ class BatchQueueBase
 
     // Get the time interval.
     virtual int getTimeInterval() = 0;
+
+    virtual std::string getUserFuncPar() = 0;
 };
 
 /*

@@ -329,9 +329,9 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
               id,
               threadPoolIdx,
               task.req->appid());
+            faabric::scheduler::getScheduler().notifyExecutorStart();
             // Set up context
             ExecutorContext::set(this, task.req, task.messageIndex);
-            faabric::scheduler::getScheduler().notifyExecutorStart();
 
             // Execute the task
             int32_t returnValue;
@@ -386,7 +386,6 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                 availablePoolThreads.insert(threadPoolIdx);
             }
 
-            faabric::scheduler::getScheduler().notifyExecutorFinished();
             // Enqueue the message result
             faabric::scheduler::getScheduler().enqueueSetResults(
               std::move(task.req));
@@ -396,6 +395,7 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                   "statelock unlocked by thread {}:{}", id, threadPoolIdx);
                 stateLock->unlock();
             }
+            faabric::scheduler::getScheduler().notifyExecutorFinished();
 
             continue;
         }

@@ -340,7 +340,7 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
 {
     PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
 
-    SPDLOG_DEBUG("Getting worker RUNTIME stats for host");
+    // SPDLOG_DEBUG("Getting worker RUNTIME stats for host");
 
     faabric::WorkerStats out;
 

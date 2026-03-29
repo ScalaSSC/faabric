@@ -246,6 +246,7 @@ class Scheduler
     faabric::transport::PointToPointBroker& broker;
 
     // A queue stores the uninvoked requests: MAP<UserFuncPar, Queue>
+    std::shared_mutex waitingQueuesMx;
     std::map<std::string, std::unique_ptr<faabric::util::BatchQueue>>
       waitingQueues;
 

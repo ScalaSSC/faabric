@@ -97,7 +97,7 @@ Scheduler::Scheduler()
     executeBatchsize = conf.batchSize;
     // Start the reaper thread
     reaperThread.start(conf.reaperIntervalSeconds);
-    batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
+    // batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
     setResultThread = std::thread(&Scheduler::setMessageResults, this);
     stopCpuMonitor = false;
     cpuMonitorThread = std::thread(&Scheduler::cpuMonitorLoop, this);
@@ -119,9 +119,9 @@ Scheduler::~Scheduler()
     }
     // Stop the batch timer thread
     stopBatchTimer = true;
-    if (batchTimerThread.joinable()) {
-        batchTimerThread.join();
-    }
+    // if (batchTimerThread.joinable()) {
+    //     batchTimerThread.join();
+    // }
     if (setResultThread.joinable()) {
         setResultThread.join();
     }
@@ -136,9 +136,9 @@ Scheduler::~Scheduler()
 
     // Safely shutdown dispatch threads
     stopDispatcher = true;
-    for (size_t i = 0; i < dispatchThreads.size(); ++i) {
-        readyDispatchQueue.enqueue("");
-    }
+    // for (size_t i = 0; i < dispatchThreads.size(); ++i) {
+    //     readyDispatchQueue.enqueue("");
+    // }
     for (auto& t : dispatchThreads) {
         if (t.joinable())
             t.join();
@@ -230,9 +230,9 @@ void Scheduler::reset()
     reaperThread.stop();
 
     stopBatchTimer = true;
-    if (batchTimerThread.joinable()) {
-        batchTimerThread.join();
-    }
+    // if (batchTimerThread.joinable()) {
+    //     batchTimerThread.join();
+    // }
     if (setResultThread.joinable()) {
         setResultThread.join();
     }
@@ -306,7 +306,7 @@ void Scheduler::reset()
     activeHosts = hostMap;
 
     stopBatchTimer = false;
-    batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
+    // batchTimerThread = std::thread(&Scheduler::batchTimerCheck, this);
     setResultThread = std::thread(&Scheduler::setMessageResults, this);
 
     stopThreadTimer = false;
@@ -521,28 +521,35 @@ void Scheduler::enqueueMessageBatch(
         msg.set_dispatchreceivetime(current);
         msg.set_executedhost(endPoint);
 
-        auto [iterator, inserted] =
-          waitingQueues.emplace(userFuncPar,
-                                std::make_unique<faabric::util::BatchQueue>(
-                                  userFuncPar, executeBatchsize));
-        int waitMsgs = iterator->second->getMessagesCount();
+        faabric::util::BatchQueueBase* targetQueue = nullptr;
+
+        {
+            faabric::util::SharedLock readLock(waitingQueuesMx);
+            auto it = waitingQueues.find(userFuncPar);
+            if (it != waitingQueues.end()) {
+                targetQueue = it->second.get();
+            }
+        }
+        if (targetQueue == nullptr) {
+            faabric::util::FullLock writeLock(waitingQueuesMx);
+            auto [iterator, inserted] =
+              waitingQueues.emplace(userFuncPar,
+                                    std::make_unique<faabric::util::BatchQueue>(
+                                      userFuncPar, executeBatchsize));
+            targetQueue = iterator->second.get();
+        }
+
+        int waitMsgs = targetQueue->getMessagesCount();
         (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
         runtimeStats.instanceWorkerQueueNum(userFuncPar, waitMsgs);
 
         // Thread Safe Queue Push
-        iterator->second->addMessage(
-          std::make_unique<faabric::Message>(std::move(msg)));
+        targetQueue->addMessage(std::move(msgPtr));
     }
 
     // Update the instances runtime stats
     for (const auto& [instancesName, count] : instancesCounter) {
         runtimeStats.instanceAdd(instancesName, invokeHost, count);
-        // Trigger the dispatch worker to process the messages in the queue. We
-        // trigger n+1 threads.
-        int batchesToTrigger = (count / executeBatchsize) + 1;
-        for (int i = 0; i < batchesToTrigger; ++i) {
-            readyDispatchQueue.enqueue(instancesName);
-        }
     }
 
     SPDLOG_DEBUG("Enqueued {} messages completed", nMessages);
@@ -551,32 +558,45 @@ void Scheduler::enqueueMessageBatch(
 void Scheduler::dispatchWorkerLoop()
 {
     while (!stopDispatcher) {
-        std::string funcToDispatch = readyDispatchQueue.dequeue();
-        if (funcToDispatch.empty() || stopDispatcher)
+        std::this_thread::sleep_for(
+          std::chrono::milliseconds(batchCheckPeriod));
+
+        if (stopDispatcher)
             break;
 
-        faabric::util::BatchQueueBase* queuePtr = nullptr;
-
         if (isUpdateState.load(std::memory_order_acquire)) {
-            readyDispatchQueue.enqueue(funcToDispatch);
             continue;
         }
 
+        std::vector<std::pair<std::string, faabric::util::BatchQueueBase*>>
+          readyQueues;
+
         {
-            faabric::util::SharedLock lock(mx);
+            faabric::util::SharedLock readlock(waitingQueuesMx);
+
             if (isUpdateState.load(std::memory_order_acquire)) {
-                readyDispatchQueue.enqueue(funcToDispatch);
                 continue;
             }
 
-            auto it = waitingQueues.find(funcToDispatch);
-            if (it != waitingQueues.end()) {
-                queuePtr = it->second.get();
+            for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
+                if (waitingBatch->getMessagesCount() == 0) {
+                    continue;
+                }
+
+                if (waitingBatch->getMessagesCount() >= executeBatchsize ||
+                    waitingBatch->getTimeInterval() >= batchInterval) {
+
+                    readyQueues.push_back({ userFuncPar, waitingBatch.get() });
+                    waitingBatch->resetLastTime();
+                }
             }
         }
 
-        if (queuePtr && queuePtr->getMessagesCount() > 0) {
-            executeBatchForQueue(funcToDispatch, *queuePtr);
+        for (auto& [funcStr, qPtr] : readyQueues) {
+            if (isUpdateState.load(std::memory_order_acquire)) {
+                break;
+            }
+            executeBatchForQueue(funcStr, *qPtr);
         }
     }
 }
@@ -584,28 +604,21 @@ void Scheduler::dispatchWorkerLoop()
 void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                                      util::BatchQueueBase& waitingQueue)
 {
+    if (isUpdateState.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    auto userFuncParTuple = util::splitUserFuncPar(userFuncPar);
+
+    std::string user = std::get<0>(userFuncParTuple);
+    std::string func = std::get<1>(userFuncParTuple);
+    std::string par = std::get<2>(userFuncParTuple);
+
+    std::string funcStr = user + "/" + func + "/" + par;
+
     while (waitingQueue.getMessagesCount() != 0) {
 
-        faabric::Message* firstMsg = nullptr;
-
-        try {
-            firstMsg = waitingQueue.queueFront();
-        } catch (const std::runtime_error& e) {
-            break;
-        }
-
-        if (!firstMsg) {
-            break;
-        }
-
-        std::string user = firstMsg->user();
-        std::string func = firstMsg->function();
-        std::string funcStr = faabric::util::funcParToString(*firstMsg, false);
-
         if (!executorAvailable(funcStr)) {
-            break;
-        }
-        if (isUpdateState) {
             break;
         }
 
@@ -615,6 +628,7 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
 
         auto stateLock =
           std::make_unique<faabric::util::SharedLock>(stateUpdateMx);
+
         if (isUpdateState.load(std::memory_order_acquire)) {
             break;
         }
@@ -691,10 +705,6 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
         } else {
             if (stateLock)
                 stateLock->unlock();
-        }
-
-        if (!executorAvailable(funcStr) || isUpdateState) {
-            break;
         }
     }
 
@@ -774,36 +784,39 @@ void Scheduler::enqueueSetResults(
     SPDLOG_DEBUG("Enqueueing set results finished");
 }
 
-void Scheduler::batchTimerCheck()
-{
-    while (!stopBatchTimer) {
-        std::this_thread::sleep_for(
-          std::chrono::milliseconds(batchCheckPeriod));
+// void Scheduler::batchTimerCheck()
+// {
+//     while (!stopBatchTimer) {
+//         std::this_thread::sleep_for(
+//           std::chrono::milliseconds(batchCheckPeriod));
 
-        if (stopBatchTimer) {
-            break;
-        }
+//         if (stopBatchTimer) {
+//             break;
+//         }
 
-        if (isUpdateState.load(std::memory_order_acquire)) {
-            continue;
-        }
-        faabric::util::SharedLock lock(mx);
-        if (isUpdateState.load(std::memory_order_acquire)) {
-            continue;
-        }
+//         if (isUpdateState.load(std::memory_order_acquire)) {
+//             continue;
+//         }
+//         faabric::util::SharedLock lock(mx);
+//         if (isUpdateState.load(std::memory_order_acquire)) {
+//             continue;
+//         }
 
-        for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
-            if (waitingBatch->getMessagesCount() == 0) {
-                continue;
-            }
+//         for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
+//             if (waitingBatch->getMessagesCount() == 0) {
+//                 continue;
+//             }
 
-            if (waitingBatch->getTimeInterval() >= batchInterval) {
-                readyDispatchQueue.enqueue(userFuncPar);
-                waitingBatch->resetLastTime();
-            }
-        }
-    }
-}
+//             if (waitingBatch->getMessagesCount() >= executeBatchsize ||
+//                 waitingBatch->getTimeInterval() >= batchInterval) {
+//                 for (int i = 0; i < 2; ++i) {
+//                     readyDispatchQueue.enqueue(userFuncPar);
+//                 }
+//                 waitingBatch->resetLastTime();
+//             }
+//         }
+//     }
+// }
 
 void Scheduler::enqueueSchedMsgs(
   std::vector<std::string> hosts,
@@ -912,7 +925,7 @@ void Scheduler::dispatchChainedMsgs()
             continue;
         }
 
-        faabric::util::FullLock mxlock(mx);
+        // faabric::util::FullLock mxlock(mx);
         // Otherwise, decentralized scheduler is used, we schedule the chained
         std::map<std::string, std::map<std::string, int>> chainedCallsCounter;
         std::vector<std::unique_ptr<faabric::Message>> localChainedCallMsgs;
@@ -1084,7 +1097,6 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
 void Scheduler::notifyExecutorStart()
 {
     int current = runningExecutors.fetch_add(1, std::memory_order_relaxed) + 1;
-
     int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
                     .count();
@@ -1604,7 +1616,7 @@ Scheduler::packMessage()
               std::make_unique<faabric::MessageBatch>();
         }
         auto* newMsg = packedMessageMap[destinationHost]->add_messages();
-        *newMsg = std::move(*msg);
+        newMsg->Swap(msg.get());
     }
 
     return packedMessageMap;
