@@ -402,10 +402,19 @@ message AverageAndCount {
     int32 count = 2;
 }
 
+message ChainedCallSecondProto {
+    // destHost -> count
+    map<string, int32> hostCount = 1;
+}
+
 message InstanceMetricsResultProto {
     map<int64, AverageAndCount> workerQueueTimeStats = 1;
     map<int64, AverageAndCount> workerQueueNumStats = 2;
     map<int64, AverageAndCount> workerExecTimeStats = 3;
+    // timestamp -> throughput count
+    map<int64, int32> throughputStats = 4;
+    // timestamp -> (destHost -> count)
+    map<int64, ChainedCallSecondProto> chainedCallHistory = 5;
 }
 
 message WorkerStats{

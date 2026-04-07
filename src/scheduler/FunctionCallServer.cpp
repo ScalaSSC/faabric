@@ -257,6 +257,7 @@ void logRuntimeStatsUpdateRequest(const faabric::RuntimeStatsUpdateRequest& req)
 std::unique_ptr<google::protobuf::Message>
 FunctionCallServer::recvGetRuntimeStats(std::span<const uint8_t> buffer)
 {
+    // This function is no longer used.
     PARSE_MSG(faabric::RuntimeStatsUpdateRequest, buffer.data(), buffer.size())
 
     // Collect the stats
@@ -332,6 +333,20 @@ void serializeWorkerMetrics(
             protoAvgCount.set_average(avgCount.average);
             protoAvgCount.set_count(avgCount.count);
         }
+
+        auto* protoThroughputMap = protoMetrics.mutable_throughputstats();
+        for (const auto& [timeKey, count] : metrics.throughputStats) {
+            (*protoThroughputMap)[timeKey] = count;
+        }
+
+        auto* protoChainedMap = protoMetrics.mutable_chainedcallhistory();
+        for (const auto& [timeKey, hostCountMap] :
+             metrics.chainedCallHistory) {
+            auto& protoSecond = (*protoChainedMap)[timeKey];
+            for (const auto& [destHost, count] : hostCountMap) {
+                (*protoSecond.mutable_hostcount())[destHost] = count;
+            }
+        }
     }
 }
 
@@ -369,21 +384,21 @@ FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
     PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
 
     SPDLOG_DEBUG("Getting worker stats for host");
-    auto snapshot = scheduler.getCpuRecordHistory();
+    // auto snapshot = scheduler.getCpuRecordHistory();
     auto maxReplicas = scheduler.getMaxReplicasMap();
     auto migrationHistory = scheduler.getMigrationHistory();
 
     WorkerStats out;
     out.set_ip(faabric::util::getSystemConfig().endpointHost);
 
-    while (!snapshot.empty()) {
-        auto [execPct, schedPct] = snapshot.front();
-        snapshot.pop();
+    // while (!snapshot.empty()) {
+    //     auto [execPct, schedPct] = snapshot.front();
+    //     snapshot.pop();
 
-        auto* rec = out.add_history();
-        rec->set_cpuexecutepct(execPct);
-        rec->set_cpuschedulepct(schedPct);
-    }
+    //     auto* rec = out.add_history();
+    //     rec->set_cpuexecutepct(execPct);
+    //     rec->set_cpuschedulepct(schedPct);
+    // }
 
     for (const auto& [instanceName, count] : maxReplicas) {
         auto* rec = out.add_instancereplicas();

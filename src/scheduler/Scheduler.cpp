@@ -91,7 +91,7 @@ Scheduler::Scheduler()
   , conf(faabric::util::getSystemConfig())
   , reg(faabric::snapshot::getSnapshotRegistry())
   , broker(faabric::transport::getPointToPointBroker())
-  , cpuRecordStart(std::chrono::steady_clock::now())
+//   , cpuRecordStart(std::chrono::steady_clock::now())
 //   , instancesLoadState(maxSamples)
 {
     executeBatchsize = conf.batchSize;
@@ -252,15 +252,15 @@ void Scheduler::reset()
 
     runningExecutors.store(0);
 
-    faabric::util::FullLock cpuLock(cpuRecordMx);
-    cpuScheduleTime = 0;
-    cpuRecordStart = std::chrono::steady_clock::now();
-    while (!cpuRecordHistory.empty()) {
-        cpuRecordHistory.pop();
-    }
-    runningThreads.clear();
-    threadClockStartMap.clear();
-    cpuLock.unlock();
+    // faabric::util::FullLock cpuLock(cpuRecordMx);
+    // cpuScheduleTime = 0;
+    // cpuRecordStart = std::chrono::steady_clock::now();
+    // while (!cpuRecordHistory.empty()) {
+    //     cpuRecordHistory.pop();
+    // }
+    // runningThreads.clear();
+    // threadClockStartMap.clear();
+    // cpuLock.unlock();
 
     // Clear the point to point broker
     broker.clear();
@@ -541,7 +541,6 @@ void Scheduler::enqueueMessageBatch(
 
         int waitMsgs = targetQueue->getMessagesCount();
         (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
-        runtimeStats.instanceWorkerQueueNum(userFuncPar, waitMsgs);
 
         // Thread Safe Queue Push
         targetQueue->addMessage(std::move(msgPtr));
@@ -672,9 +671,7 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             auto* metrics = message->mutable_metricrecorder();
             int workerQueueTime = now - (*metrics)[WORKER_ENQUEUE_TIME_KEY];
             message->set_workerqueuewaittime(workerQueueTime);
-            runtimeStats.instanceWorkerQueueTime(userFuncPar, workerQueueTime);
             metrics->erase(WORKER_ENQUEUE_TIME_KEY);
-            metrics->erase(WORKER_ENQUEUE_SIZE_KEY);
         }
 
         if (newReq->messages_size() != 0) {
@@ -696,12 +693,11 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                          userFuncPar,
                          newReq->messages_size());
 
-            auto threadClockId =
-              e->executeBatchTasks(newReq, std::move(stateLock));
-            if (!runningThreads.contains(threadClockId)) {
-                faabric::util::FullLock cpuLock(cpuRecordMx);
-                runningThreads.emplace(threadClockId);
-            }
+            e->executeBatchTasks(newReq, std::move(stateLock));
+            // if (!runningThreads.contains(threadClockId)) {
+            //     faabric::util::FullLock cpuLock(cpuRecordMx);
+            //     runningThreads.emplace(threadClockId);
+            // }
         } else {
             if (stateLock)
                 stateLock->unlock();
@@ -778,7 +774,19 @@ void Scheduler::enqueueSetResults(
         int workerExecuteTime =
           msg.workerexecuteend() - msg.workerexecutestart();
         std::string userFuncPar = faabric::util::getUserFuncPar(msg);
-        runtimeStats.instanceWorkerExecTime(userFuncPar, workerExecuteTime);
+
+        // If the message doesn't have the worker enqueue size record, we set it
+        // to 1 to avoid affecting the update of runtime stats.
+        int waitMsgSize = 1;
+        if (msg.metricrecorder().contains(WORKER_ENQUEUE_SIZE_KEY)) {
+            waitMsgSize = static_cast<int>(
+              msg.metricrecorder().at(WORKER_ENQUEUE_SIZE_KEY));
+        }
+        int queueWaitTime = msg.workerqueuewaittime();
+
+        runtimeStats.updateInstanceExecutionMetrics(
+          userFuncPar, queueWaitTime, waitMsgSize, workerExecuteTime);
+
         setResultMsgs.emplace_back(std::make_unique<faabric::Message>(msg));
     }
     SPDLOG_DEBUG("Enqueueing set results finished");
@@ -849,54 +857,55 @@ void Scheduler::dispatchChainedMsgs()
         /***
          * CPU usage recording
          ***/
-        faabric::util::FullLock cpuLock(cpuRecordMx);
-        auto nowWall = std::chrono::steady_clock::now();
-        if (nowWall - cpuRecordStart >= cpuRecordWindow) {
-            const auto wallNs =
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                nowWall - cpuRecordStart)
-                .count();
-            long long totalDeltaNs = 0;
+        // faabric::util::FullLock cpuLock(cpuRecordMx);
+        // auto nowWall = std::chrono::steady_clock::now();
+        // if (nowWall - cpuRecordStart >= cpuRecordWindow) {
+        //     const auto wallNs =
+        //       std::chrono::duration_cast<std::chrono::nanoseconds>(
+        //         nowWall - cpuRecordStart)
+        //         .count();
+        //     long long totalDeltaNs = 0;
 
-            for (const auto& [clk, startNs] : threadClockStartMap) {
-                const int64_t endNs = faabric::util::getCpuTimeNano(clk);
-                if (endNs >= 0 && startNs >= 0 && endNs >= startNs) {
-                    const int64_t deltaNs = endNs - startNs;
-                    totalDeltaNs += deltaNs;
-                }
-            }
+        //     for (const auto& [clk, startNs] : threadClockStartMap) {
+        //         const int64_t endNs = faabric::util::getCpuTimeNano(clk);
+        //         if (endNs >= 0 && startNs >= 0 && endNs >= startNs) {
+        //             const int64_t deltaNs = endNs - startNs;
+        //             totalDeltaNs += deltaNs;
+        //         }
+        //     }
 
-            if (wallNs > 0 && totalDeltaNs > 0) {
-                const double cpuExecutePct =
-                  100.0 * (double)totalDeltaNs / (double)wallNs;
-                const int64_t cpuScheduleNs =
-                  cpuScheduleTime.exchange(0, std::memory_order_acq_rel);
-                const double cpuSchedulePct =
-                  100.0 * (double)cpuScheduleNs / (double)wallNs;
+        //     if (wallNs > 0 && totalDeltaNs > 0) {
+        //         const double cpuExecutePct =
+        //           100.0 * (double)totalDeltaNs / (double)wallNs;
+        //         const int64_t cpuScheduleNs =
+        //           cpuScheduleTime.exchange(0, std::memory_order_acq_rel);
+        //         const double cpuSchedulePct =
+        //           100.0 * (double)cpuScheduleNs / (double)wallNs;
 
-                SPDLOG_DEBUG(
-                  "CPU execute percentage: {:.2f}%, CPU schedule percentage: "
-                  "{:.2f}%",
-                  cpuExecutePct,
-                  cpuSchedulePct);
+        //         SPDLOG_DEBUG(
+        //           "CPU execute percentage: {:.2f}%, CPU schedule percentage:
+        //           "
+        //           "{:.2f}%",
+        //           cpuExecutePct,
+        //           cpuSchedulePct);
 
-                cpuRecordHistory.emplace(
-                  std::make_tuple(cpuExecutePct, cpuSchedulePct));
-                while (cpuRecordHistory.size() > historyCap) {
-                    cpuRecordHistory.pop();
-                }
-            }
-            threadClockStartMap.clear();
+        //         cpuRecordHistory.emplace(
+        //           std::make_tuple(cpuExecutePct, cpuSchedulePct));
+        //         while (cpuRecordHistory.size() > historyCap) {
+        //             cpuRecordHistory.pop();
+        //         }
+        //     }
+        //     threadClockStartMap.clear();
 
-            for (const clockid_t clk : runningThreads) {
-                const int64_t nowNs = faabric::util::getCpuTimeNano(clk);
-                if (nowNs >= 0) {
-                    threadClockStartMap.emplace(clk, nowNs);
-                }
-            }
-            cpuRecordStart = nowWall;
-        }
-        cpuLock.unlock();
+        //     for (const clockid_t clk : runningThreads) {
+        //         const int64_t nowNs = faabric::util::getCpuTimeNano(clk);
+        //         if (nowNs >= 0) {
+        //             threadClockStartMap.emplace(clk, nowNs);
+        //         }
+        //     }
+        //     cpuRecordStart = nowWall;
+        // }
+        // cpuLock.unlock();
         /***
          * End of CPU usage recording
          ***/
@@ -927,6 +936,7 @@ void Scheduler::dispatchChainedMsgs()
 
         // faabric::util::FullLock mxlock(mx);
         // Otherwise, decentralized scheduler is used, we schedule the chained
+        // MAP<UserFuncPar, <Host, Count>>
         std::map<std::string, std::map<std::string, int>> chainedCallsCounter;
         std::vector<std::unique_ptr<faabric::Message>> localChainedCallMsgs;
         {
@@ -938,14 +948,14 @@ void Scheduler::dispatchChainedMsgs()
         }
         if (!localChainedCallMsgs.empty()) {
             // Schedule the chained calls
-            auto start = faabric::util::getCpuTimeNano();
+            // auto start = faabric::util::getCpuTimeNano();
             auto hosts = decentralScheduler.scheduleMessagesBatch(
               activeHosts, localChainedCallMsgs);
-            auto end = faabric::util::getCpuTimeNano();
-            if (start > 0 && end >= start) {
-                cpuScheduleTime.fetch_add(end - start,
-                                          std::memory_order_relaxed);
-            }
+            // auto end = faabric::util::getCpuTimeNano();
+            // if (start > 0 && end >= start) {
+            //     cpuScheduleTime.fetch_add(end - start,
+            //                               std::memory_order_relaxed);
+            // }
 
             // Statistics the chained calls
             for (int i = 0; i < localChainedCallMsgs.size(); i++) {
@@ -1734,10 +1744,10 @@ void Scheduler::flushState()
     faabric::state::getGlobalState().flushState();
 }
 
-std::queue<std::tuple<double, double>> Scheduler::getCpuRecordHistory()
-{
-    return cpuRecordHistory;
-}
+// std::queue<std::tuple<double, double>> Scheduler::getCpuRecordHistory()
+// {
+//     return cpuRecordHistory;
+// }
 
 std::map<std::string, int> Scheduler::getMaxReplicasMap()
 {

@@ -29,11 +29,22 @@ struct AverageAndCount
     int count = 0;
 };
 
+struct InstanceSecondStats
+{
+    AverageAndCount queueTime;
+    AverageAndCount queueNum;
+    AverageAndCount execTime;
+    int throughput = 0;
+};
+
 struct InstanceMetricsResult
 {
     std::map<time_t, AverageAndCount> workerQueueTimeStats;
     std::map<time_t, AverageAndCount> workerQueueNumStats;
     std::map<time_t, AverageAndCount> workerExecTimeStats;
+    std::map<time_t, int> throughputStats;
+    // Global chained call history: timestamp -> (destHost -> count)
+    std::map<time_t, std::map<std::string, int>> chainedCallHistory;
 };
 
 class InstanceStats
@@ -49,9 +60,7 @@ class InstanceStats
     std::map<std::string, std::map<time_t, int>> chainedCallStats;
     // Add more stats as needed.
     // Worker queuing time, stats pair <average,count>.
-    std::map<time_t, AverageAndCount> workerQueueTimeStats;
-    std::map<time_t, AverageAndCount> workerQueueNumStats;
-    std::map<time_t, AverageAndCount> workerExecTimeStats;
+    std::map<time_t, InstanceSecondStats> metrics;
 };
 
 class InstancesRuntimeStats
@@ -62,6 +71,10 @@ class InstancesRuntimeStats
     int statsTimeout = 1000;                 // Unit: seconds
     std::map<time_t, int> versionTimestamps; // version -> timestamp
     std::map<std::string, InstanceStats> instanceStatsMap;
+
+    // The statistics of chained request calls.
+    // MAP<timestamp, MAP<destination worker IP, count>>
+    std::map<time_t, std::map<std::string, int>> chainedCallHistory;
 
     InstanceStatsResult computeInstanceStats(InstanceStats& stats,
                                              const TimePoint now)
@@ -103,26 +116,6 @@ class InstancesRuntimeStats
         }
 
         return result;
-    }
-
-    void updateRollingAverage(std::map<time_t, AverageAndCount>& timeMap,
-                              time_t currentTimeT,
-                              int newValue)
-    {
-        // 1. Update the Rolling Average for the current second
-        auto& [currentAvg, currentCount] = timeMap[currentTimeT];
-        long long currentTotal =
-          static_cast<long long>(currentAvg) * currentCount;
-        currentTotal += newValue;
-        currentCount++;
-
-        currentAvg = static_cast<int>(currentTotal / currentCount);
-
-        // 2. Prune old entries
-        time_t cutoffT = currentTimeT - statsTimeout;
-        while (!timeMap.empty() && timeMap.begin()->first < cutoffT) {
-            timeMap.erase(timeMap.begin());
-        }
     }
 
   public:
@@ -181,6 +174,15 @@ class InstancesRuntimeStats
         while (!eventMap.empty() && eventMap.begin()->first < cutoffT) {
             eventMap.erase(eventMap.begin());
         }
+
+        // Also update global chained call history.
+        if (!dest.empty()) {
+            chainedCallHistory[currentTimeT][dest] += count;
+            while (!chainedCallHistory.empty() &&
+                   chainedCallHistory.begin()->first < cutoffT) {
+                chainedCallHistory.erase(chainedCallHistory.begin());
+            }
+        }
     }
 
     std::map<time_t, int> getVersionTimestamps()
@@ -201,38 +203,106 @@ class InstancesRuntimeStats
         return allStats;
     }
 
-    // 1. Record a worker queue time event
-    void instanceWorkerQueueTime(const std::string& instanceName, int queueTime)
+    void updateInstanceExecutionMetrics(const std::string& instanceName,
+                                        int qTime,
+                                        int qNum,
+                                        int eTime,
+                                        int processedCount = 1)
     {
-        std::unique_lock lock(statsMx);
-        time_t currentTimeT = faabric::util::getEpochSeconds();
+        std::unique_lock<std::shared_mutex> lock(statsMx);
+        time_t now = faabric::util::getEpochSeconds();
+
         auto& stats = instanceStatsMap.try_emplace(instanceName, instanceName)
                         .first->second;
 
-        updateRollingAverage(
-          stats.workerQueueTimeStats, currentTimeT, queueTime);
+        auto& secondData = stats.metrics[now];
+
+        auto updateRolling = [](AverageAndCount& target, int newValue) {
+            long long total =
+              static_cast<long long>(target.average) * target.count;
+            total += newValue;
+            target.count++;
+            target.average = static_cast<int>(total / target.count);
+        };
+
+        updateRolling(secondData.queueTime, qTime);
+        updateRolling(secondData.queueNum, qNum);
+        updateRolling(secondData.execTime, eTime);
+
+        secondData.throughput += processedCount;
+
+        time_t cutoff = now - statsTimeout;
+        while (!stats.metrics.empty() &&
+               stats.metrics.begin()->first < cutoff) {
+            stats.metrics.erase(stats.metrics.begin());
+        }
     }
 
-    // 2. Record a worker queue number event
-    void instanceWorkerQueueNum(const std::string& instanceName, int queueNum)
+    void recordChainedCall(const std::map<std::string, int>& hostCountMap)
     {
-        std::unique_lock lock(statsMx);
-        time_t currentTimeT = faabric::util::getEpochSeconds();
-        auto& stats = instanceStatsMap.try_emplace(instanceName, instanceName)
-                        .first->second;
+        if (hostCountMap.empty()) {
+            return;
+        }
 
-        updateRollingAverage(stats.workerQueueNumStats, currentTimeT, queueNum);
+        std::unique_lock<std::shared_mutex> lock(statsMx);
+        time_t currentTimeT = faabric::util::getEpochSeconds();
+
+        auto& currentSecondMap = chainedCallHistory[currentTimeT];
+        for (const auto& [destHost, count] : hostCountMap) {
+            if (destHost.empty()) {
+                SPDLOG_WARN("Invalid destHost in chained call stats: '{}'",
+                            destHost);
+                continue;
+            }
+            currentSecondMap[destHost] += count;
+        }
+
+        time_t cutoffT = currentTimeT - statsTimeout;
+        while (!chainedCallHistory.empty() &&
+               chainedCallHistory.begin()->first < cutoffT) {
+            chainedCallHistory.erase(chainedCallHistory.begin());
+        }
     }
 
-    // 3. Record a worker execute time event
-    void instanceWorkerExecTime(const std::string& instanceName, int execTime)
+    std::map<std::string, int> getGlobalChainedTraffic(int secondsLookback = 1)
     {
-        std::unique_lock lock(statsMx);
-        time_t currentTimeT = faabric::util::getEpochSeconds();
-        auto& stats = instanceStatsMap.try_emplace(instanceName, instanceName)
-                        .first->second;
+        std::shared_lock<std::shared_mutex> lock(statsMx);
+        std::map<std::string, int> aggregatedStats;
 
-        updateRollingAverage(stats.workerExecTimeStats, currentTimeT, execTime);
+        time_t nowT = faabric::util::getEpochSeconds();
+        time_t endT = nowT - 1;
+        time_t startT = nowT - secondsLookback;
+
+        if (startT > endT) {
+            return aggregatedStats;
+        }
+
+        for (auto it = chainedCallHistory.lower_bound(startT);
+             it != chainedCallHistory.end();
+             ++it) {
+            if (it->first >= nowT) {
+                break;
+            }
+            for (const auto& [host, count] : it->second) {
+                aggregatedStats[host] += count;
+            }
+        }
+
+        return aggregatedStats;
+    }
+
+    std::map<std::string, InstanceSecondStats> getLastSecondStats()
+    {
+        std::shared_lock<std::shared_mutex> lock(statsMx);
+        std::map<std::string, InstanceSecondStats> result;
+        time_t lastSecondT = faabric::util::getEpochSeconds() - 1;
+        for (const auto& [instanceName, stats] : instanceStatsMap) {
+            auto it = stats.metrics.find(lastSecondT);
+            if (it != stats.metrics.end()) {
+                result[instanceName] = it->second;
+            }
+        }
+        return result;
     }
 
     std::map<std::string, InstanceMetricsResult> getWorkerMetrics(
@@ -244,36 +314,50 @@ class InstancesRuntimeStats
 
         if (!isRuntime) {
             for (const auto& [instanceName, stats] : instanceStatsMap) {
-                metrics[instanceName] =
-                  InstanceMetricsResult{ stats.workerQueueTimeStats,
-                                       stats.workerQueueNumStats,
-                                       stats.workerExecTimeStats };
+                InstanceMetricsResult currentMetrics;
+                for (const auto& [timestamp, secondStats] : stats.metrics) {
+                    currentMetrics.workerQueueTimeStats[timestamp] =
+                      secondStats.queueTime;
+                    currentMetrics.workerQueueNumStats[timestamp] =
+                      secondStats.queueNum;
+                    currentMetrics.workerExecTimeStats[timestamp] =
+                      secondStats.execTime;
+                    currentMetrics.throughputStats[timestamp] =
+                      secondStats.throughput;
+                }
+                currentMetrics.chainedCallHistory = chainedCallHistory;
+                metrics[instanceName] = std::move(currentMetrics);
             }
             return metrics;
         }
         time_t lastSecondT = faabric::util::getEpochSeconds() - 1;
 
+        // Extract the last second's global chained call history once.
+        std::map<time_t, std::map<std::string, int>> lastSecChainedHistory;
+        auto chainIt = chainedCallHistory.find(lastSecondT);
+        if (chainIt != chainedCallHistory.end()) {
+            lastSecChainedHistory[lastSecondT] = chainIt->second;
+        }
+
         for (const auto& [instanceName, stats] : instanceStatsMap) {
             InstanceMetricsResult lastSecondResult;
 
-            auto qtIt = stats.workerQueueTimeStats.find(lastSecondT);
-            if (qtIt != stats.workerQueueTimeStats.end()) {
+            auto it = stats.metrics.find(lastSecondT);
+            if (it != stats.metrics.end()) {
+                // Found stats for the last second, extract them
+                const auto& secondData = it->second;
+
                 lastSecondResult.workerQueueTimeStats[lastSecondT] =
-                  qtIt->second;
-            }
-
-            auto qnIt = stats.workerQueueNumStats.find(lastSecondT);
-            if (qnIt != stats.workerQueueNumStats.end()) {
+                  secondData.queueTime;
                 lastSecondResult.workerQueueNumStats[lastSecondT] =
-                  qnIt->second;
-            }
-
-            auto etIt = stats.workerExecTimeStats.find(lastSecondT);
-            if (etIt != stats.workerExecTimeStats.end()) {
+                  secondData.queueNum;
                 lastSecondResult.workerExecTimeStats[lastSecondT] =
-                  etIt->second;
+                  secondData.execTime;
+                lastSecondResult.throughputStats[lastSecondT] =
+                  secondData.throughput;
             }
 
+            lastSecondResult.chainedCallHistory = lastSecChainedHistory;
             metrics[instanceName] = std::move(lastSecondResult);
         }
         return metrics;

@@ -162,7 +162,7 @@ class Scheduler
     void setLocalPersistentState(
       const std::map<std::string, std::string>& kvMap);
 
-    std::queue<std::tuple<double, double>> getCpuRecordHistory();
+    // std::queue<std::tuple<double, double>> getCpuRecordHistory();
 
     std::map<std::string, int> getMaxReplicasMap();
 
@@ -309,15 +309,16 @@ class Scheduler
     bool parallelDispatch = true;
     std::shared_mutex reconfigMx;
 
-    std::shared_mutex cpuRecordMx;
-    std::atomic<std::int64_t> cpuScheduleTime{ 0 };
-    std::chrono::steady_clock::time_point cpuRecordStart{};
-    std::chrono::seconds cpuRecordWindow{ 10 };
-    size_t historyCap = 60;
-    std::queue<std::tuple<double, double>> cpuRecordHistory;
+    // All related to cpu record for each executor.
+    // std::shared_mutex cpuRecordMx;
+    // std::atomic<std::int64_t> cpuScheduleTime{ 0 };
+    // std::chrono::steady_clock::time_point cpuRecordStart{};
+    // std::chrono::seconds cpuRecordWindow{ 10 };
+    // size_t historyCap = 60;
+    // std::queue<std::tuple<double, double>> cpuRecordHistory;
     // std::map<std::string, clockid_t> runningThreads;
-    std::set<clockid_t> runningThreads;
-    std::map<clockid_t, int64_t> threadClockStartMap;
+    // std::set<clockid_t> runningThreads;
+    // std::map<clockid_t, int64_t> threadClockStartMap;
 
     std::mutex migrationMx;
     int currentMigrationVersion = 0;

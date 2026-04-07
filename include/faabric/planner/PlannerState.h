@@ -739,6 +739,63 @@ class ApplicationMetrics
               alloc);
         }
         doc.AddMember("instances", instancesObj, alloc);
+
+        // Per-worker time series: throughput / num_dest_workers /
+        // total_chained_count
+        rapidjson::Value workerMetricDetailsObj(rapidjson::kObjectType);
+
+        if (!runtimeMetricsHistory.empty()) {
+            int64_t startSec = runtimeMetricsHistory.begin()->first;
+            int64_t endSec = runtimeMetricsHistory.rbegin()->first;
+
+            for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+                rapidjson::Value workerArr(rapidjson::kArrayType);
+
+                for (int64_t s = startSec; s <= endSec; ++s) {
+                    int totalThroughput = 0;
+                    std::map<std::string, int> aggregatedChained;
+
+                    for (const auto& [instanceName, timeSeries] :
+                         workerNode.instances) {
+                        auto it = timeSeries.history.find(s);
+                        if (it != timeSeries.history.end()) {
+                            const auto& rec = it->second;
+                            totalThroughput += rec.throughput;
+                            for (const auto& [dest, cnt] :
+                                 rec.chainedCallHistory) {
+                                aggregatedChained[dest] += cnt;
+                            }
+                        }
+                    }
+
+                    int numDestWorkers =
+                      static_cast<int>(aggregatedChained.size());
+                    int totalChainedCount = 0;
+                    for (const auto& [dest, cnt] : aggregatedChained) {
+                        totalChainedCount += cnt;
+                    }
+
+                    std::string entry = std::to_string(totalThroughput) +
+                                        " / " +
+                                        std::to_string(numDestWorkers) + " / " +
+                                        std::to_string(totalChainedCount);
+                    workerArr.PushBack(
+                      rapidjson::Value(entry.c_str(), alloc).Move(), alloc);
+                }
+
+                workerMetricDetailsObj.AddMember(
+                  rapidjson::Value(ip.c_str(), alloc).Move(),
+                  workerArr,
+                  alloc);
+            }
+        }
+
+        doc.AddMember(
+          "workerMetricDetails: throughput / num_dest_workers / "
+          "total_chained_count",
+          workerMetricDetailsObj,
+          alloc);
+
         return doc;
     }
 
@@ -798,6 +855,21 @@ class ApplicationMetrics
                     historyMap[currentTime].workerExecTime.average =
                       et.average();
                     historyMap[currentTime].workerExecTime.count = et.count();
+                }
+
+                if (!metricsProto.throughputstats().empty()) {
+                    historyMap[currentTime].throughput =
+                      metricsProto.throughputstats().begin()->second;
+                }
+
+                if (!metricsProto.chainedcallhistory().empty()) {
+                    const auto& chainedSecond =
+                      metricsProto.chainedcallhistory().begin()->second;
+                    for (const auto& [destHost, count] :
+                         chainedSecond.hostcount()) {
+                        historyMap[currentTime].chainedCallHistory[destHost] +=
+                          count;
+                    }
                 }
             }
 
@@ -920,6 +992,9 @@ class ApplicationMetrics
         faabric::scheduler::AverageAndCount workerQueueTime;
         faabric::scheduler::AverageAndCount workerQueueNum;
         faabric::scheduler::AverageAndCount workerExecTime;
+        int throughput = 0;
+        // destHost -> count
+        std::map<std::string, int> chainedCallHistory;
     };
 
     struct InstanceTimeSeries

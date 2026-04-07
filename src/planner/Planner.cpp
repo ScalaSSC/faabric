@@ -1054,19 +1054,19 @@ std::string Planner::outputResult()
         auto stats =
           faabric::scheduler::getFunctionCallClient(ip)->getWorkerStats();
 
-        SPDLOG_DEBUG("Planner parse cpu stats from host {}", ip);
-        // ===== history =====
-        rapidjson::Value historyArr(rapidjson::kArrayType);
-        for (const auto& rec : stats->history()) {
-            rapidjson::Value recObj(rapidjson::kObjectType);
-            recObj.AddMember("cpuExecutePct", rec.cpuexecutepct(), alloc);
-            recObj.AddMember("cpuSchedulePct", rec.cpuschedulepct(), alloc);
-            historyArr.PushBack(recObj, alloc);
-        }
+        // SPDLOG_DEBUG("Planner parse cpu stats from host {}", ip);
+        // // ===== history =====
+        // rapidjson::Value historyArr(rapidjson::kArrayType);
+        // for (const auto& rec : stats->history()) {
+        //     rapidjson::Value recObj(rapidjson::kObjectType);
+        //     recObj.AddMember("cpuExecutePct", rec.cpuexecutepct(), alloc);
+        //     recObj.AddMember("cpuSchedulePct", rec.cpuschedulepct(), alloc);
+        //     historyArr.PushBack(recObj, alloc);
+        // }
 
-        // Add to workerStatsObj under the IP key
-        workerStatsObj.AddMember(
-          rapidjson::Value(ip.c_str(), alloc).Move(), historyArr, alloc);
+        // // Add to workerStatsObj under the IP key
+        // workerStatsObj.AddMember(
+        //   rapidjson::Value(ip.c_str(), alloc).Move(), historyArr, alloc);
 
         SPDLOG_DEBUG("Planner parse replica stats from host {}", ip);
         // ===== instance replicas =====
