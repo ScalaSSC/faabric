@@ -461,22 +461,24 @@ int Planner::getNumMigrations()
 bool Planner::enqueueBatchRequest(
   std::shared_ptr<faabric::BatchExecuteRequest> req)
 {
-    if (waitingMessageQueue.size() + req->messages_size() >
+    int msgCount = req->messages_size();
+    state.applicationMetrics->recordInputRate(msgCount);
+    if (waitingMessageQueue.size() + msgCount >
         maxWaitingQueueSize) {
         SPDLOG_DEBUG("Waiting message queue is full (Current: {}, Incoming: "
                      "{}). Rejecting request.",
                      waitingMessageQueue.size(),
-                     req->messages_size());
+                     msgCount);
         return false;
     }
 
-    for (int i = 0; i < req->messages_size(); i++) {
-        auto msgPtr = std::make_shared<faabric::Message>(req->messages(i));    
+    for (int i = 0; i < msgCount; i++) {
+        auto msgPtr = std::make_shared<faabric::Message>(req->messages(i));
         waitingMessageQueue.enqueue(msgPtr);
     }
 
     SPDLOG_DEBUG("Enqueued {} messages. Current waiting queue size: {}",
-                 req->messages_size(),
+                 msgCount,
                  waitingMessageQueue.size());
     return true;
 }

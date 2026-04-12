@@ -522,7 +522,7 @@ class ApplicationMetrics
                         historyArray.PushBack(vVal, alloc);
                     }
                 }
-
+                int inputRate = 0;
                 int currentCount = 0;
                 int totalQueueSize = 0;
 
@@ -534,6 +534,7 @@ class ApplicationMetrics
 
                 if (runtimeMetricsHistory.contains(s)) {
                     const auto& record = runtimeMetricsHistory.at(s);
+                    inputRate = record.inputRate;
                     currentCount = record.count;
 
                     workersNum = record.workersNum;
@@ -627,25 +628,27 @@ class ApplicationMetrics
                 char cpuBuffer[32];
                 snprintf(cpuBuffer, sizeof(cpuBuffer), "%.2f", avgCpuLoad);
 
-                std::string entryStr =
-                  std::to_string(currentCount) + " / " +
-                  std::to_string(totalQueueSize) + " / " +
-                  std::to_string(avgWaitTime) + " / " +
-                  std::to_string(avgExecTime) + " / " +
-                  std::to_string(totalExecutors) + " / " + 
-                  std::to_string(workersNum) + " / " +
-                  std::to_string(average_executors) + " / " +
-                  std::string(cpuBuffer) + " / " +
-                  std::to_string(secMedianLat) + " / " +
-                  std::to_string(secP95Lat) + " / " + std::to_string(secP99Lat);
+                std::string entryStr = std::to_string(inputRate) + " / " +
+                                       std::to_string(currentCount) + " / " +
+                                       std::to_string(workersNum) + " / " +
+                                       std::to_string(totalQueueSize) + " / " +
+                                       std::to_string(avgWaitTime) + " / " +
+                                       std::to_string(avgExecTime) + " / " +
+                                       std::to_string(totalExecutors) + " / " +
+                                       std::to_string(average_executors) +
+                                       " / " + std::string(cpuBuffer) + " / " +
+                                       std::to_string(secMedianLat) + " / " +
+                                       std::to_string(secP95Lat) + " / " +
+                                       std::to_string(secP99Lat);
 
                 historyArray.PushBack(
                   rapidjson::Value(entryStr.c_str(), alloc).Move(), alloc);
             }
         }
 
-        doc.AddMember("runtimeCountHistory: count / queue_size / avg_wait / "
-                      "avg_exec / executors / worker_num / average_executors / "
+        doc.AddMember("runtimeCountHistory: input_rate/ count / worker_num / "
+                      "queue_size / avg_wait / "
+                      "avg_exec / executors / average_executors / "
                       "avg_cpu / p50latency (ms) / "
                       "p95latency (ms) / p99latency (ms)",
                       historyArray,
@@ -776,25 +779,22 @@ class ApplicationMetrics
                     }
 
                     std::string entry = std::to_string(totalThroughput) +
+                                        " / " + std::to_string(numDestWorkers) +
                                         " / " +
-                                        std::to_string(numDestWorkers) + " / " +
                                         std::to_string(totalChainedCount);
                     workerArr.PushBack(
                       rapidjson::Value(entry.c_str(), alloc).Move(), alloc);
                 }
 
                 workerMetricDetailsObj.AddMember(
-                  rapidjson::Value(ip.c_str(), alloc).Move(),
-                  workerArr,
-                  alloc);
+                  rapidjson::Value(ip.c_str(), alloc).Move(), workerArr, alloc);
             }
         }
 
-        doc.AddMember(
-          "workerMetricDetails: throughput / num_dest_workers / "
-          "total_chained_count",
-          workerMetricDetailsObj,
-          alloc);
+        doc.AddMember("workerMetricDetails: throughput / num_dest_workers / "
+                      "total_chained_count",
+                      workerMetricDetailsObj,
+                      alloc);
 
         return doc;
     }
@@ -807,6 +807,30 @@ class ApplicationMetrics
         int64_t secondKey =
           faabric::util::getGlobalClock().epochMicros() / 1000000;
         versionHistory[secondKey] = version;
+    }
+
+    // Thread-safe: called by multiple threads to accumulate incoming request
+    // count for the current second. Uses a shared lock when the per-second
+    // entry already exists (common case) and falls back to a full lock only
+    // when a new entry must be created.
+    void recordInputRate(int n)
+    {
+        int64_t secondKey = faabric::util::getGlobalClock().epochSeconds();
+
+        {
+            faabric::util::SharedLock sharedLock(opMx);
+            auto it = runtimeMetricsHistory.find(secondKey);
+            if (it != runtimeMetricsHistory.end()) {
+                it->second.inputRate.fetch_add(n, std::memory_order_relaxed);
+                return;
+            }
+        }
+
+        // Entry not found — release shared lock, acquire exclusive lock to
+        // insert, then increment.
+        faabric::util::FullLock fullLock(opMx);
+        runtimeMetricsHistory[secondKey].inputRate.fetch_add(
+          n, std::memory_order_relaxed);
     }
 
     // Adds or updates the worker stats fetched from a specific host
@@ -972,6 +996,7 @@ class ApplicationMetrics
             }
         }
         int workersNum = 0;
+        std::atomic<int> inputRate = 0;
         // int averageLatency = 0;
         // int p95Latency = 0;
         // int p99Latency = 0;
