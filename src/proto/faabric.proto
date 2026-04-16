@@ -415,6 +415,8 @@ message InstanceMetricsResultProto {
     map<int64, int32> throughputStats = 4;
     // timestamp -> (destHost -> count)
     map<int64, ChainedCallSecondProto> chainedCallHistory = 5;
+    // timestamp -> input arrivals count
+    map<int64, int32> inputCountStats = 6;
 }
 
 message WorkerStats{

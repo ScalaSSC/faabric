@@ -15,6 +15,7 @@
 #include <rapidjson/prettywriter.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
+#include <set>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -235,6 +236,114 @@ class InstanceMetrics
 class ApplicationMetrics
 {
   public:
+    // -----------------------------------------------------------------------
+    // CPU-budget model (per worker, at saturation):
+    //
+    //   C = processedNum_i × execTime_i + alpha × chainedCalls_i
+    //                                    + beta  × numDestHosts_i
+    //
+    // Rearranging into RLS form:
+    //   y_i = C - processedNum_i × execTime_i
+    //       = alpha × chainedCalls_i + beta × numDestHosts_i
+    //
+    // where C is a fixed, identical constant across all workers.
+    // alpha and beta are estimated online via Recursive Least Squares (RLS)
+    // with forgetting factor lambda, updated only when the worker is saturated.
+    // -----------------------------------------------------------------------
+    struct CoeffEstimator
+    {
+        // All three unknowns — C, alpha, beta — are estimated jointly from
+        // saturated-worker observations via 3-parameter RLS.  No manual tuning
+        // of C is required.
+        //
+        // RLS state: theta = [C, alpha, beta]
+        //   C     : total CPU budget per second (us), same for all workers
+        //   alpha : chained-call overhead coefficient (us/call)
+        //   beta  : fan-out host overhead coefficient (us/host)
+        double C = 0.0;       // estimated CPU budget (us/s)
+        double alpha = 0.0;   // estimated chained-call cost (us/call)
+        double beta = 0.0;    // estimated fan-out host cost (us/host)
+        double lambda = 0.97; // RLS forgetting factor
+        // 3×3 RLS covariance matrix, row-major (theta has 3 elements)
+        double P[9] = { 1e12, 0, 0, 0, 1e12, 0, 0, 0, 1e12 };
+
+        // Update estimates with one saturated-worker observation.
+        // Regression form:
+        //   y = processedNum × execTime
+        //   x = [1, -chainedCalls, -numDestHosts]
+        //   y ≈ x · [C, alpha, beta]
+        // i.e. processedNum × execTime ≈ C - alpha×chainedCalls -
+        // beta×numDestHosts
+        void update(double processedNum,
+                    double execTime,
+                    double chainedCalls,
+                    double numDestHosts)
+        {
+            if (processedNum <= 0.0 || execTime <= 0.0)
+                return;
+            double y = processedNum * execTime;
+            double x[3] = { 1.0, -chainedCalls, -numDestHosts };
+
+            // Px = P · x  (3-vector)
+            double Px[3] = { 0.0, 0.0, 0.0 };
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    Px[i] += P[i * 3 + j] * x[j];
+
+            // denom = lambda + x' · Px
+            double denom = lambda;
+            for (int i = 0; i < 3; i++)
+                denom += x[i] * Px[i];
+            if (denom < 1e-12)
+                return;
+
+            // K = Px / denom
+            double K[3] = { Px[0] / denom, Px[1] / denom, Px[2] / denom };
+
+            // theta = [C, alpha, beta]; prediction = x · theta
+            double pred = x[0] * C + x[1] * alpha + x[2] * beta;
+            // equivalently: C - alpha×chainedCalls - beta×numDestHosts
+            double err = y - pred;
+
+            C = C + K[0] * err;
+            alpha = std::max(0.0, alpha + K[1] * err);
+            beta = std::max(0.0, beta + K[2] * err);
+
+            // P = (P - K·Px') / lambda  (rank-1 update)
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    P[i * 3 + j] = (P[i * 3 + j] - K[i] * Px[j]) / lambda;
+
+            SPDLOG_DEBUG("CoeffEstimator: C={:.0f}, alpha={:.2f}, beta={:.2f} "
+                         "(y={:.0f}, err={:.0f}, "
+                         "processedNum={:.0f}, execTime={:.1f}us, "
+                         "chained={:.0f}, destHosts={:.0f})",
+                         C,
+                         alpha,
+                         beta,
+                         y,
+                         err,
+                         processedNum,
+                         execTime,
+                         chainedCalls,
+                         numDestHosts);
+        }
+
+        // Maximum sustainable processed-requests given current coefficients.
+        // chainedRatio : chained calls per processed request
+        // numDestHosts : fan-out host count
+        double maxProcessed(double execTime,
+                            double chainedRatio,
+                            double numDestHosts) const
+        {
+            double fanout = beta * numDestHosts;
+            double effCost = execTime + alpha * chainedRatio;
+            if (effCost <= 0.0 || C <= fanout)
+                return 0.0;
+            return (C - fanout) / effCost;
+        }
+    };
+
     ApplicationMetrics(std::string appNameIn, int periodIn)
       : appName(appNameIn)
       , period(periodIn) {};
@@ -373,6 +482,27 @@ class ApplicationMetrics
         faabric::util::FullLock lock(opMx);
         return edgeWeightMap;
     }
+
+    struct RuntimeMetricsRecord
+    {
+        int count = 0;
+        std::map<std::string, int> hostQueueSize; // <host_ip, total_queue_size>
+
+        // Currently the initialization size is 1000, which means recording
+        // latencies up to 1 second in microsecond granularity.
+        std::vector<int> latencyBins;
+        void init(int totalBins)
+        {
+            if (latencyBins.empty()) {
+                latencyBins.resize(totalBins, 0);
+            }
+        }
+        int workersNum = 0;
+        std::atomic<int> inputRate = 0;
+        int waitingQueueSize = 0; // planner waiting queue length snapshot
+        int64_t waitingQueueAgeMicros = 0; // age of oldest waiting message (us)
+        bool plannerQueueSaturated = false;
+    };
 
     rapidjson::Document getMetrics() const
     {
@@ -531,6 +661,7 @@ class ApplicationMetrics
                 int secP99Lat = 0;
 
                 int workersNum = 0;
+                bool plannerSaturated = false;
 
                 if (runtimeMetricsHistory.contains(s)) {
                     const auto& record = runtimeMetricsHistory.at(s);
@@ -538,6 +669,7 @@ class ApplicationMetrics
                     currentCount = record.count;
 
                     workersNum = record.workersNum;
+                    plannerSaturated = record.plannerQueueSaturated;
 
                     for (const auto& [hostIp, qSize] : record.hostQueueSize) {
                         totalQueueSize += qSize;
@@ -639,18 +771,18 @@ class ApplicationMetrics
                                        " / " + std::string(cpuBuffer) + " / " +
                                        std::to_string(secMedianLat) + " / " +
                                        std::to_string(secP95Lat) + " / " +
-                                       std::to_string(secP99Lat);
+                                       std::to_string(secP99Lat) + " / " +
+                                       (plannerSaturated ? "saturated" : "no");
 
                 historyArray.PushBack(
                   rapidjson::Value(entryStr.c_str(), alloc).Move(), alloc);
             }
         }
 
-        doc.AddMember("runtimeCountHistory: input_rate/ count / worker_num / "
-                      "queue_size / avg_wait / "
-                      "avg_exec / executors / average_executors / "
-                      "avg_cpu / p50latency (ms) / "
-                      "p95latency (ms) / p99latency (ms)",
+        doc.AddMember("runtimeCountHistory: input_rate / count / worker_num / "
+                      "queue_size / avg_wait / avg_exec / executors / "
+                      "average_executors / avg_cpu / p50latency (ms) / "
+                      "p95latency (ms) / p99latency (ms) / planner_saturated",
                       historyArray,
                       alloc);
 
@@ -755,18 +887,43 @@ class ApplicationMetrics
                 rapidjson::Value workerArr(rapidjson::kArrayType);
 
                 for (int64_t s = startSec; s <= endSec; ++s) {
+                    int totalInputCount = 0;
                     int totalThroughput = 0;
+                    long long queueNumWeightedSum = 0;
+                    long long queueNumTotalCount = 0;
+                    long long queueTimeWeightedSum = 0;
+                    long long queueTimeTotalCount = 0;
                     std::map<std::string, int> aggregatedChained;
 
+                    bool workerSaturated = false;
                     for (const auto& [instanceName, timeSeries] :
                          workerNode.instances) {
                         auto it = timeSeries.history.find(s);
                         if (it != timeSeries.history.end()) {
                             const auto& rec = it->second;
+                            totalInputCount += rec.inputCount;
                             totalThroughput += rec.throughput;
+                            if (rec.workerQueueNum.count > 0) {
+                                queueNumWeightedSum +=
+                                  static_cast<long long>(
+                                    rec.workerQueueNum.average) *
+                                  rec.workerQueueNum.count;
+                                queueNumTotalCount += rec.workerQueueNum.count;
+                            }
+                            if (rec.workerQueueTime.count > 0) {
+                                queueTimeWeightedSum +=
+                                  static_cast<long long>(
+                                    rec.workerQueueTime.average) *
+                                  rec.workerQueueTime.count;
+                                queueTimeTotalCount +=
+                                  rec.workerQueueTime.count;
+                            }
                             for (const auto& [dest, cnt] :
                                  rec.chainedCallHistory) {
                                 aggregatedChained[dest] += cnt;
+                            }
+                            if (rec.isSaturated) {
+                                workerSaturated = true;
                             }
                         }
                     }
@@ -777,11 +934,29 @@ class ApplicationMetrics
                     for (const auto& [dest, cnt] : aggregatedChained) {
                         totalChainedCount += cnt;
                     }
+                    double avgQueueNum =
+                      queueNumTotalCount > 0
+                        ? static_cast<double>(queueNumWeightedSum) /
+                            queueNumTotalCount
+                        : 0.0;
+                    double avgQueueTime =
+                      queueTimeTotalCount > 0
+                        ? static_cast<double>(queueTimeWeightedSum) /
+                            queueTimeTotalCount
+                        : 0.0;
 
-                    std::string entry = std::to_string(totalThroughput) +
-                                        " / " + std::to_string(numDestWorkers) +
-                                        " / " +
-                                        std::to_string(totalChainedCount);
+                    char queueNumBuf[16], queueTimeBuf[16];
+                    snprintf(
+                      queueNumBuf, sizeof(queueNumBuf), "%.1f", avgQueueNum);
+                    snprintf(
+                      queueTimeBuf, sizeof(queueTimeBuf), "%.1f", avgQueueTime);
+                    std::string entry =
+                      std::to_string(totalInputCount) + " / " +
+                      std::to_string(totalThroughput) + " / " + queueNumBuf +
+                      " / " + queueTimeBuf + " / " +
+                      std::to_string(numDestWorkers) + " / " +
+                      std::to_string(totalChainedCount) + " / " +
+                      (workerSaturated ? "saturated" : "no");
                     workerArr.PushBack(
                       rapidjson::Value(entry.c_str(), alloc).Move(), alloc);
                 }
@@ -791,10 +966,11 @@ class ApplicationMetrics
             }
         }
 
-        doc.AddMember("workerMetricDetails: throughput / num_dest_workers / "
-                      "total_chained_count",
-                      workerMetricDetailsObj,
-                      alloc);
+        doc.AddMember(
+          "workerMetricDetails: input / throughput / "
+          "queueNum / queueTime / num_dest_workers / total_chained_count",
+          workerMetricDetailsObj,
+          alloc);
 
         return doc;
     }
@@ -833,7 +1009,66 @@ class ApplicationMetrics
           n, std::memory_order_relaxed);
     }
 
+    // Per-second snapshot for one instance on one worker.
+    struct InstanceRecord
+    {
+        faabric::scheduler::AverageAndCount workerQueueTime;
+        faabric::scheduler::AverageAndCount workerQueueNum;
+        faabric::scheduler::AverageAndCount workerExecTime;
+        int inputCount = 0;
+        int throughput = 0;
+        bool isSaturated = false;
+        std::map<std::string, int> chainedCallHistory;
+    };
+    struct InstanceTimeSeries
+    {
+        std::map<time_t, InstanceRecord> history;
+    };
+    struct WorkerNodeMetrics
+    {
+        std::map<std::string, InstanceTimeSeries> instances;
+        std::map<time_t, double> cpuLoadHistory;
+        std::map<time_t, double> executorsHistory;
+    };
+
     // Adds or updates the worker stats fetched from a specific host
+    // Deserialise one InstanceMetricsResultProto into an InstanceRecord.
+    // The proto carries only the latest second's data (isRuntime=true path),
+    // so we read the first (and only) entry of each map.
+    static void deserialiseInstanceMetrics(
+      const faabric::InstanceMetricsResultProto& proto,
+      InstanceRecord& rec)
+    {
+        if (!proto.workerqueuetimestats().empty()) {
+            const auto& qt = proto.workerqueuetimestats().begin()->second;
+            rec.workerQueueTime.average = qt.average();
+            rec.workerQueueTime.count = qt.count();
+        }
+        if (!proto.workerqueuenumstats().empty()) {
+            const auto& qn = proto.workerqueuenumstats().begin()->second;
+            rec.workerQueueNum.average = qn.average();
+            rec.workerQueueNum.count = qn.count();
+        }
+        if (!proto.workerexectimestats().empty()) {
+            const auto& et = proto.workerexectimestats().begin()->second;
+            rec.workerExecTime.average = et.average();
+            rec.workerExecTime.count = et.count();
+        }
+        if (!proto.inputcountstats().empty()) {
+            rec.inputCount = proto.inputcountstats().begin()->second;
+        }
+        if (!proto.throughputstats().empty()) {
+            rec.throughput = proto.throughputstats().begin()->second;
+        }
+        if (!proto.chainedcallhistory().empty()) {
+            const auto& chainedSecond =
+              proto.chainedcallhistory().begin()->second;
+            for (const auto& [destHost, count] : chainedSecond.hostcount()) {
+                rec.chainedCallHistory[destHost] += count;
+            }
+        }
+    }
+
     void recordWorkerMetrics(
       const std::map<std::string, std::unique_ptr<faabric::WorkerStats>>&
         results)
@@ -853,47 +1088,44 @@ class ApplicationMetrics
 
             for (const auto& [instanceName, metricsProto] :
                  statsPtr->workermetrics()) {
+                auto& rec = clusterWorkerMetrics[ip]
+                              .instances[instanceName]
+                              .history[currentTime];
+                deserialiseInstanceMetrics(metricsProto, rec);
 
-                auto& historyMap =
-                  clusterWorkerMetrics[ip].instances[instanceName].history;
+                // Compute saturation flag immediately after deserialization.
+                rec.isSaturated =
+                  (rec.workerQueueNum.average > workerQueueNumThreshold) &&
+                  (rec.workerQueueTime.average > workerQueueTimeThresholdUs);
 
-                if (!metricsProto.workerqueuetimestats().empty()) {
-                    auto qt =
-                      metricsProto.workerqueuetimestats().begin()->second;
-                    historyMap[currentTime].workerQueueTime.average =
-                      qt.average();
-                    historyMap[currentTime].workerQueueTime.count = qt.count();
-                }
-
-                if (!metricsProto.workerqueuenumstats().empty()) {
-                    auto qn =
-                      metricsProto.workerqueuenumstats().begin()->second;
-                    historyMap[currentTime].workerQueueNum.average =
-                      qn.average();
-                    historyMap[currentTime].workerQueueNum.count = qn.count();
-                }
-
-                if (!metricsProto.workerexectimestats().empty()) {
-                    auto et =
-                      metricsProto.workerexectimestats().begin()->second;
-                    historyMap[currentTime].workerExecTime.average =
-                      et.average();
-                    historyMap[currentTime].workerExecTime.count = et.count();
-                }
-
-                if (!metricsProto.throughputstats().empty()) {
-                    historyMap[currentTime].throughput =
-                      metricsProto.throughputstats().begin()->second;
-                }
-
-                if (!metricsProto.chainedcallhistory().empty()) {
-                    const auto& chainedSecond =
-                      metricsProto.chainedcallhistory().begin()->second;
-                    for (const auto& [destHost, count] :
-                         chainedSecond.hostcount()) {
-                        historyMap[currentTime].chainedCallHistory[destHost] +=
-                          count;
+                // Update RLS coefficients only when this instance is saturated.
+                if (rec.isSaturated) {
+                    double chainedCalls = 0.0;
+                    std::set<std::string> destHostSet;
+                    for (const auto& [dest, cnt] : rec.chainedCallHistory) {
+                        chainedCalls += cnt;
+                        if (!dest.empty()) {
+                            destHostSet.insert(dest);
+                        }
                     }
+                    double numDestHosts =
+                      static_cast<double>(destHostSet.size());
+                    coeffEstimator.update(static_cast<double>(rec.throughput),
+                                          rec.workerExecTime.average,
+                                          chainedCalls,
+                                          numDestHosts);
+                    SPDLOG_DEBUG(
+                      "CoeffEstimator updated for {}/{}: alpha={:.4f}, "
+                      "beta={:.4f} (throughput={}, execTime={:.1f}us, "
+                      "chained={:.1f}, destHosts={:.0f})",
+                      ip,
+                      instanceName,
+                      coeffEstimator.alpha,
+                      coeffEstimator.beta,
+                      rec.throughput,
+                      static_cast<double>(rec.workerExecTime.average),
+                      chainedCalls,
+                      numDestHosts);
                 }
             }
 
@@ -903,6 +1135,14 @@ class ApplicationMetrics
             }
             runtimeMetricsHistory[currentTime].hostQueueSize[ip] =
               totalQueueSize;
+
+            if (isWorkerSaturatedUnlocked(ip)) {
+                SPDLOG_DEBUG("Worker {} is saturated (queueNum > {}, "
+                             "queueTime > {} us)",
+                             ip,
+                             workerQueueNumThreshold,
+                             workerQueueTimeThresholdUs);
+            }
         }
 
         int workersNum = results.size();
@@ -936,6 +1176,162 @@ class ApplicationMetrics
                runtimeMetricsHistory.begin()->first < cutoffTime) {
             runtimeMetricsHistory.erase(runtimeMetricsHistory.begin());
         }
+    }
+
+    // Per-worker capability snapshot.
+    // isSaturated requires both signals to be true simultaneously:
+    //   1. avgQueueNum > queueThreshold  (queue consistently backed up)
+    //   2. totalThroughput < totalInputCount  (processing less than arriving)
+    struct WorkerCapability
+    {
+        int totalInputCount = 0;   // requests arrived in window
+        double throughput = 0.0;   // requests processed in window
+        double chainedRatio = 0.0; // chained calls per processed request
+        int distinctChainedDests = 0;
+        double avgQueueNum = 0.0; // avg queue length across instances
+        bool isSaturated = false;
+    };
+
+    // Saturation = queue is consistently backed up AND worker is falling
+    // behind. queueThreshold: minimum sustained avgQueueNum to count as "backed
+    // up".
+    std::map<std::string, WorkerCapability> computeWorkerCapabilities(
+      int windowSec,
+      double queueThreshold = 1.0) const
+    {
+        faabric::util::SharedLock lock(opMx);
+
+        std::map<std::string, WorkerCapability> result;
+        time_t nowSec = faabric::util::getGlobalClock().epochSeconds();
+        time_t startSec = nowSec - windowSec;
+
+        for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+            WorkerCapability cap;
+
+            // --- Per-instance aggregation ---
+            int totalChainedCalls = 0;
+            std::set<std::string> chainedDests;
+            double queueNumSum = 0.0;
+            int queueNumCount = 0;
+
+            for (const auto& [instanceName, timeSeries] :
+                 workerNode.instances) {
+                for (const auto& [ts, rec] : timeSeries.history) {
+                    if (ts < startSec)
+                        continue;
+
+                    cap.totalInputCount += rec.inputCount;
+                    cap.throughput += rec.throughput;
+
+                    for (const auto& [dest, count] : rec.chainedCallHistory) {
+                        totalChainedCalls += count;
+                        if (!dest.empty()) {
+                            chainedDests.insert(dest);
+                        }
+                    }
+
+                    if (rec.workerQueueNum.count > 0) {
+                        queueNumSum += rec.workerQueueNum.average;
+                        queueNumCount++;
+                    }
+                }
+            }
+
+            cap.chainedRatio =
+              cap.throughput > 0
+                ? static_cast<double>(totalChainedCalls) / cap.throughput
+                : 0.0;
+            cap.distinctChainedDests = static_cast<int>(chainedDests.size());
+            cap.avgQueueNum =
+              queueNumCount > 0 ? queueNumSum / queueNumCount : 0.0;
+
+            // Both conditions must hold: sustained queue backlog AND
+            // throughput not keeping up with arrivals.
+            cap.isSaturated = (cap.avgQueueNum > queueThreshold) &&
+                              (cap.throughput < cap.totalInputCount);
+
+            result[ip] = cap;
+        }
+        return result;
+    }
+
+    struct ScalingSignals
+    {
+        double avgInputRate = 0.0; // req/s, averaged over windowSec seconds
+        double avgQueueSize = 0.0; // worker-side queue length, averaged
+        int plannerWaitingQueueSize = 0; // current planner waiting queue length
+        int64_t plannerWaitingQueueAgeMicros =
+          0; // age of oldest waiting msg (us)
+        bool plannerQueueSaturated =
+          false; // size > threshold AND age > threshold
+    };
+
+    ScalingSignals getScalingSignals(int windowSec) const
+    {
+        faabric::util::SharedLock lock(opMx);
+        int64_t nowSec = faabric::util::getGlobalClock().epochSeconds();
+        int totalInput = 0, totalQueue = 0, validSecs = 0;
+
+        for (int64_t s = nowSec - windowSec; s < nowSec; s++) {
+            auto it = runtimeMetricsHistory.find(s);
+            if (it == runtimeMetricsHistory.end()) {
+                continue;
+            }
+            totalInput += it->second.inputRate.load(std::memory_order_relaxed);
+            for (const auto& [ip, q] : it->second.hostQueueSize) {
+                totalQueue += q;
+            }
+            validSecs++;
+        }
+
+        ScalingSignals sig;
+        if (validSecs > 0) {
+            sig.avgInputRate = (double)totalInput / validSecs;
+            sig.avgQueueSize = (double)totalQueue / validSecs;
+        }
+
+        // Latest planner waiting queue snapshot — saturation pre-computed in
+        // recordQueueSnapshot, just copy the stored result here.
+        if (!runtimeMetricsHistory.empty()) {
+            const auto& latest = runtimeMetricsHistory.rbegin()->second;
+            sig.plannerWaitingQueueSize = latest.waitingQueueSize;
+            sig.plannerWaitingQueueAgeMicros = latest.waitingQueueAgeMicros;
+            sig.plannerQueueSaturated = latest.plannerQueueSaturated;
+        }
+        return sig;
+    }
+
+    // Called from updateRuntimeStats to snapshot the planner's waiting queue.
+    // Saturation is computed here so getScalingSignals just reads the result.
+    void recordQueueSnapshot(int queueSize, int64_t queueAgeMicros)
+    {
+        faabric::util::FullLock lock(opMx);
+        int64_t currentTime = faabric::util::getGlobalClock().epochSeconds();
+        auto& rec = runtimeMetricsHistory[currentTime];
+        rec.waitingQueueSize = queueSize;
+        rec.waitingQueueAgeMicros = queueAgeMicros;
+        rec.plannerQueueSaturated =
+          (queueSize > plannerWaitingQueueSizeThreshold) &&
+          (queueAgeMicros > plannerWaitingQueueAgeThresholdUs);
+    }
+
+    // Dynamically update saturation thresholds (called from resetParameter).
+    bool setThreshold(const std::string& key, int64_t value)
+    {
+        faabric::util::FullLock lock(opMx);
+        if (key == "worker_queue_num_threshold") {
+            workerQueueNumThreshold = static_cast<int>(value);
+        } else if (key == "worker_queue_time_threshold") {
+            workerQueueTimeThresholdUs = value;
+        } else if (key == "planner_queue_size_threshold") {
+            plannerWaitingQueueSizeThreshold = static_cast<int>(value);
+        } else if (key == "planner_queue_age_threshold") {
+            plannerWaitingQueueAgeThresholdUs = value;
+        } else {
+            return false;
+        }
+        SPDLOG_INFO("ApplicationMetrics: set {} = {}", key, value);
+        return true;
     }
 
     void reset()
@@ -980,28 +1376,48 @@ class ApplicationMetrics
     double avgRunningReqs = 0.0;
     // std::map<int64_t, int> runtimeCountHistory;
 
-    LatencyHistogramConfig histConfig;
-    struct RuntimeMetricsRecord
-    {
-        int count = 0;
-        std::map<std::string, int> hostQueueSize; // <host_ip, total_queue_size>
+    // Online RLS coefficient estimator (alpha, beta in CPU-budget model).
+    CoeffEstimator coeffEstimator;
 
-        // Currently the initialization size is 1000, which means recording
-        // latencies up to 1 second in microsecond granularity.
-        std::vector<int> latencyBins;
-        void init(int totalBins)
-        {
-            if (latencyBins.empty()) {
-                latencyBins.resize(totalBins, 0);
+    // thresholds for worker-side saturation detection
+    int workerQueueNumThreshold = 500;
+    int64_t workerQueueTimeThresholdUs = 100000; // microseconds
+
+    // thresholds for planner-level waiting queue saturation
+    int plannerWaitingQueueSizeThreshold = 5000;
+    int64_t plannerWaitingQueueAgeThresholdUs = 500000; // 1 second in us
+
+    // Internal helper — caller must already hold opMx (shared or exclusive).
+    // Returns true if any instance at the latest recorded second is saturated.
+    bool isWorkerSaturatedUnlocked(const std::string& ip) const
+    {
+        auto workerIt = clusterWorkerMetrics.find(ip);
+        if (workerIt == clusterWorkerMetrics.end()) {
+            return false;
+        }
+        const auto& workerNode = workerIt->second;
+
+        time_t latestTs = 0;
+        for (const auto& [instanceName, timeSeries] : workerNode.instances) {
+            if (!timeSeries.history.empty()) {
+                latestTs =
+                  std::max(latestTs, timeSeries.history.rbegin()->first);
             }
         }
-        int workersNum = 0;
-        std::atomic<int> inputRate = 0;
-        // int averageLatency = 0;
-        // int p95Latency = 0;
-        // int p99Latency = 0;
-        // bool calculated = false;
-    };
+        if (latestTs == 0) {
+            return false;
+        }
+
+        for (const auto& [instanceName, timeSeries] : workerNode.instances) {
+            auto it = timeSeries.history.find(latestTs);
+            if (it != timeSeries.history.end() && it->second.isSaturated) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    LatencyHistogramConfig histConfig;
 
     std::map<int64_t, RuntimeMetricsRecord> runtimeMetricsHistory;
 
@@ -1012,28 +1428,6 @@ class ApplicationMetrics
     std::map<int64_t, int> versionHistory;
 
     // --------- Metrics Related to Workers ---------
-    struct InstanceRecord
-    {
-        faabric::scheduler::AverageAndCount workerQueueTime;
-        faabric::scheduler::AverageAndCount workerQueueNum;
-        faabric::scheduler::AverageAndCount workerExecTime;
-        int throughput = 0;
-        // destHost -> count
-        std::map<std::string, int> chainedCallHistory;
-    };
-
-    struct InstanceTimeSeries
-    {
-        std::map<time_t, InstanceRecord> history;
-    };
-
-    struct WorkerNodeMetrics
-    {
-        std::map<std::string, InstanceTimeSeries> instances;
-        std::map<time_t, double> cpuLoadHistory;
-        std::map<time_t, double> executorsHistory;
-    };
-
     // MAP<host_ip, WorkerNodeMetrics>
     std::map<std::string, WorkerNodeMetrics> clusterWorkerMetrics;
 

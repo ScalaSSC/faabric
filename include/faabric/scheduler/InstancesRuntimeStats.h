@@ -34,7 +34,8 @@ struct InstanceSecondStats
     AverageAndCount queueTime;
     AverageAndCount queueNum;
     AverageAndCount execTime;
-    int throughput = 0;
+    int throughput  = 0;
+    int inputCount  = 0; // requests arriving at this instance per second
 };
 
 struct InstanceMetricsResult
@@ -43,6 +44,7 @@ struct InstanceMetricsResult
     std::map<time_t, AverageAndCount> workerQueueNumStats;
     std::map<time_t, AverageAndCount> workerExecTimeStats;
     std::map<time_t, int> throughputStats;
+    std::map<time_t, int> inputCountStats; // arrivals per second
     // Global chained call history: timestamp -> (destHost -> count)
     std::map<time_t, std::map<std::string, int>> chainedCallHistory;
 };
@@ -151,6 +153,9 @@ class InstancesRuntimeStats
         while (!eventMap.empty() && eventMap.begin()->first < cutoffT) {
             eventMap.erase(eventMap.begin());
         }
+
+        // Track total arrivals per second for throughput/input ratio.
+        stats.metrics[currentTimeT].inputCount += count;
     }
 
     // Record a chained call event.
@@ -324,6 +329,8 @@ class InstancesRuntimeStats
                       secondStats.execTime;
                     currentMetrics.throughputStats[timestamp] =
                       secondStats.throughput;
+                    currentMetrics.inputCountStats[timestamp] =
+                      secondStats.inputCount;
                 }
                 currentMetrics.chainedCallHistory = chainedCallHistory;
                 metrics[instanceName] = std::move(currentMetrics);
@@ -344,7 +351,6 @@ class InstancesRuntimeStats
 
             auto it = stats.metrics.find(lastSecondT);
             if (it != stats.metrics.end()) {
-                // Found stats for the last second, extract them
                 const auto& secondData = it->second;
 
                 lastSecondResult.workerQueueTimeStats[lastSecondT] =
@@ -355,6 +361,8 @@ class InstancesRuntimeStats
                   secondData.execTime;
                 lastSecondResult.throughputStats[lastSecondT] =
                   secondData.throughput;
+                lastSecondResult.inputCountStats[lastSecondT] =
+                  secondData.inputCount;
             }
 
             lastSecondResult.chainedCallHistory = lastSecChainedHistory;

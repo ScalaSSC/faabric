@@ -204,6 +204,15 @@ class Planner
 
     int runtimeReconfigPeriod = 5000; // ms
 
+    // Auto-scaling: evaluate host count every scalingDecisionPeriodMs
+    int  scalingDecisionPeriodMs = 10000; // ms
+    long lastScalingDecisionMs   = 0;
+
+    int computeTargetHostNum(
+      const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
+      int currentHostNum,
+      int maxHostNum);
+
     void dequeueScheduledMsgs();
 
     bool isOutputting = false;

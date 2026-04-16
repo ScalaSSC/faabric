@@ -330,6 +330,10 @@ void PlannerEndpointHandler::onRequest(
                 "runtime_reconfig_period",
                 "max_inflight_reqs",
                 "max_waiting_queue_size",
+                "worker_queue_num_threshold",
+                "worker_queue_time_threshold",
+                "planner_queue_size_threshold",
+                "planner_queue_age_threshold",
             };
 
             if (plannerParams.contains(parameter)) {

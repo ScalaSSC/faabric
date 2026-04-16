@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <queue>
 #include <readerwriterqueue/readerwritercircularbuffer.h>
 #include <vector>
@@ -335,6 +336,15 @@ class ThreadSafeQueue
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_queue.size();
+    }
+
+    // Returns a copy of the front element without removing it.
+    // Returns std::nullopt if the queue is empty.
+    std::optional<T> peek_front() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_queue.empty()) return std::nullopt;
+        return m_queue.front();
     }
 
   private:

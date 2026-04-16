@@ -31,6 +31,8 @@
 
 namespace faabric::planner {
 
+const std::string PLANNER_ENQUEUE_TIME_KEY = "planner_queue_time_key";
+
 #define CONTINUE_IF_OUTPUTTING                                                 \
     if (isOutputting) {                                                        \
         continue;                                                              \
@@ -463,8 +465,7 @@ bool Planner::enqueueBatchRequest(
 {
     int msgCount = req->messages_size();
     state.applicationMetrics->recordInputRate(msgCount);
-    if (waitingMessageQueue.size() + msgCount >
-        maxWaitingQueueSize) {
+    if (waitingMessageQueue.size() + msgCount > maxWaitingQueueSize) {
         SPDLOG_DEBUG("Waiting message queue is full (Current: {}, Incoming: "
                      "{}). Rejecting request.",
                      waitingMessageQueue.size(),
@@ -472,8 +473,11 @@ bool Planner::enqueueBatchRequest(
         return false;
     }
 
+    int64_t enqueueTimeMicros = faabric::util::getGlobalClock().epochMicros();
     for (int i = 0; i < msgCount; i++) {
         auto msgPtr = std::make_shared<faabric::Message>(req->messages(i));
+        (*msgPtr->mutable_metricrecorder())[PLANNER_ENQUEUE_TIME_KEY] =
+          enqueueTimeMicros;
         waitingMessageQueue.enqueue(msgPtr);
     }
 
@@ -930,6 +934,9 @@ bool Planner::resetParameter(const std::string& key,
             maxInflightApps.store(value);
         } else if (key == "max_waiting_queue_size") {
             maxWaitingQueueSize = value;
+        } else if (state.applicationMetrics &&
+                   state.applicationMetrics->setThreshold(key, value)) {
+            // threshold keys handled inside ApplicationMetrics
         }
         return true;
     }
@@ -1223,6 +1230,12 @@ void Planner::updateRuntimeStats()
         }
         SPDLOG_DEBUG("Planner will fetch stats from {} hosts",
                      targetIps.size());
+
+        // Scope reconfigMx to fetch + process only.
+        // Must NOT hold reconfigMx when acquiring plannerMx (scaling decision),
+        // because flushExecutors/flushSchedulingState acquire plannerMx →
+        // reconfigMx in that order — the opposite would deadlock.
+
         faabric::util::FullLock rflock(reconfigMx);
         std::vector<std::future<void>> futures;
 
@@ -1239,10 +1252,10 @@ void Planner::updateRuntimeStats()
                           std::lock_guard<std::mutex> lock(resultsMutex);
                           results[ip] = std::move(stats);
                       } catch (const std::exception& e) {
-                          SPDLOG_ERROR(
-                            "Failed to fetch runtime stats from host {}: {}",
-                            ip,
-                            e.what());
+                          SPDLOG_ERROR("Failed to fetch runtime stats from "
+                                       "host {}: {}",
+                                       ip,
+                                       e.what());
                       } catch (...) {
                           SPDLOG_ERROR("Unknown exception fetching runtime "
                                        "stats from host {}",
@@ -1272,8 +1285,80 @@ void Planner::updateRuntimeStats()
             state.applicationMetrics->recordWorkerMetrics(results);
         }
         results.clear();
+        rflock.unlock();
+
+        // Capture planner-level waiting queue snapshot.
+        if (state.applicationMetrics) {
+            int qSize = (int)waitingMessageQueue.size();
+            int64_t qAgeMicros = 0;
+            auto frontMsg = waitingMessageQueue.peek_front();
+            if (frontMsg) {
+                const auto& metrics = (*frontMsg)->metricrecorder();
+                auto it = metrics.find(PLANNER_ENQUEUE_TIME_KEY);
+                if (it != metrics.end() && it->second > 0) {
+                    int64_t nowMicros =
+                      faabric::util::getGlobalClock().epochMicros();
+                    qAgeMicros = nowMicros - it->second;
+                    if (qAgeMicros < 0)
+                        qAgeMicros = 0;
+                }
+            }
+            state.applicationMetrics->recordQueueSnapshot(qSize, qAgeMicros);
+        }
+
         SPDLOG_DEBUG("Planner finished updating runtime stats");
+
+        // Every scalingDecisionPeriodMs (default 10 s) evaluate whether the
+        // number of active hosts should change.
+        long nowMs = faabric::util::getGlobalClock().epochMillis();
+        if (nowMs - lastScalingDecisionMs < scalingDecisionPeriodMs) {
+            continue;
+        }
+        lastScalingDecisionMs = nowMs;
+
+        if (!state.applicationMetrics) {
+            continue;
+        }
+        auto signals = state.applicationMetrics->getScalingSignals(
+          scalingDecisionPeriodMs / 1000);
+
+        faabric::util::SharedLock plock(plannerMx);
+        int maxHostNum = (int)state.hostMap.size();
+        plock.unlock();
+
+        int targetN = computeTargetHostNum(signals, schedHostNum, maxHostNum);
+
+        SPDLOG_DEBUG("Scaling signals: inputRate={:.1f} req/s, "
+                     "workerQueueSize={:.1f}, "
+                     "plannerWaitingQueue={} msgs / {:.1f} ms, saturated={}",
+                     signals.avgInputRate,
+                     signals.avgQueueSize,
+                     signals.plannerWaitingQueueSize,
+                     signals.plannerWaitingQueueAgeMicros / 1000.0,
+                     signals.plannerQueueSaturated);
+
+        if (targetN > 0 && targetN != schedHostNum) {
+            SPDLOG_INFO("Auto-scaling: {} -> {} hosts (inputRate={:.1f} req/s, "
+                        "plannerQueue={} msgs/{:.1f} ms, saturated={})",
+                        schedHostNum,
+                        targetN,
+                        signals.avgInputRate,
+                        signals.plannerWaitingQueueSize,
+                        signals.plannerWaitingQueueAgeMicros / 1000.0,
+                        signals.plannerQueueSaturated);
+            rescheduleApp(1, targetN);
+        }
     }
+}
+
+int Planner::computeTargetHostNum(
+  const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
+  int currentHostNum,
+  int maxHostNum)
+{
+    // TODO: replace with real policy.
+    // Placeholder: keep the current host count unchanged.
+    return currentHostNum;
 }
 
 Planner& getPlanner()

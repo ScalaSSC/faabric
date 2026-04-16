@@ -347,6 +347,11 @@ void serializeWorkerMetrics(
                 (*protoSecond.mutable_hostcount())[destHost] = count;
             }
         }
+
+        auto* protoInputCountMap = protoMetrics.mutable_inputcountstats();
+        for (const auto& [timeKey, count] : metrics.inputCountStats) {
+            (*protoInputCountMap)[timeKey] = count;
+        }
     }
 }
 
