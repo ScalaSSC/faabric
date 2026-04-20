@@ -17,6 +17,7 @@
 #include <faabric/util/message.h>
 #include <faabric/util/string_tools.h>
 
+#include <cmath>
 #include <fstream>
 #include <future>
 #include <map>
@@ -926,6 +927,9 @@ bool Planner::resetParameter(const std::string& key,
         SPDLOG_INFO("Planner reset parameter {} to {}", key, value);
         if (key == "is_outputting") {
             isOutputting = value == 1;
+        } else if (key == "is_warmup") {
+            isWarmup.store(value == 1);
+            SPDLOG_INFO("Planner warmup mode: {}", isWarmup.load() ? "ON" : "OFF");
         } else if (key == "num_hosts_scheduled") {
             schedHostNum = value;
         } else if (key == "runtime_reconfig_period") {
@@ -983,14 +987,16 @@ bool Planner::resetParameter(const std::string& key,
 void Planner::rescheduleApp(int rescheduleMode, int hostNum)
 {
     SPDLOG_INFO("Planner reschedules application");
+    lastRescheduleMs = faabric::util::getGlobalClock().epochMillis();
     // rescheduleMode == 0 means reschedule immediately and clean the state.
     // rescheduleMode == 1 means wait until all running messages are finished.
 
     faabric::util::FullLock lock(plannerMx);
 
-    if (hostNum > 0 && hostNum < state.hostMap.size()) {
+    if (hostNum > 0 && hostNum <= (int)state.hostMap.size()) {
         state.activeHosts = faabric::util::getFirstNElements(
           convertToHostMap(state.hostMap), hostNum);
+        schedHostNum = hostNum;
     }
 
     // If reschedule mode is 1, we want to wait until no inflight requests and
@@ -1062,20 +1068,6 @@ std::string Planner::outputResult()
         SPDLOG_DEBUG("Planner fetch stats from host {}", ip);
         auto stats =
           faabric::scheduler::getFunctionCallClient(ip)->getWorkerStats();
-
-        // SPDLOG_DEBUG("Planner parse cpu stats from host {}", ip);
-        // // ===== history =====
-        // rapidjson::Value historyArr(rapidjson::kArrayType);
-        // for (const auto& rec : stats->history()) {
-        //     rapidjson::Value recObj(rapidjson::kObjectType);
-        //     recObj.AddMember("cpuExecutePct", rec.cpuexecutepct(), alloc);
-        //     recObj.AddMember("cpuSchedulePct", rec.cpuschedulepct(), alloc);
-        //     historyArr.PushBack(recObj, alloc);
-        // }
-
-        // // Add to workerStatsObj under the IP key
-        // workerStatsObj.AddMember(
-        //   rapidjson::Value(ip.c_str(), alloc).Move(), historyArr, alloc);
 
         SPDLOG_DEBUG("Planner parse replica stats from host {}", ip);
         // ===== instance replicas =====
@@ -1316,11 +1308,30 @@ void Planner::updateRuntimeStats()
         }
         lastScalingDecisionMs = nowMs;
 
-        if (!state.applicationMetrics) {
+        if (!state.applicationMetrics || isWarmup.load()) {
             continue;
         }
         auto signals = state.applicationMetrics->getScalingSignals(
           scalingDecisionPeriodMs / 1000);
+
+        // Compute chainedMultiplier from Application DAG:
+        // totalLoad = inputRate × (totalOperatorCount / inputOperatorCount)
+        if (stateAwareScheduler) {
+            const auto& inputNodeNames =
+              stateAwareScheduler->getInputNodeNames();
+            if (!inputNodeNames.empty()) {
+                auto workloads = state.applicationMetrics->getOptWorkloads();
+                long inputCount = 0, totalCount = 0;
+                for (const auto& [name, count] : workloads)
+                    totalCount += count;
+                for (const auto& inputName : inputNodeNames)
+                    if (workloads.count(inputName))
+                        inputCount += workloads.at(inputName);
+                if (inputCount > 0)
+                    signals.chainedMultiplier =
+                      static_cast<double>(totalCount - inputCount) / inputCount;
+            }
+        }
 
         faabric::util::SharedLock plock(plannerMx);
         int maxHostNum = (int)state.hostMap.size();
@@ -1338,6 +1349,12 @@ void Planner::updateRuntimeStats()
                      signals.plannerQueueSaturated);
 
         if (targetN > 0 && targetN != schedHostNum) {
+            if (nowMs - lastRescheduleMs < rescheduleIntervalMs) {
+                SPDLOG_DEBUG(
+                  "Auto-scaling suppressed: cooldown {:.1f}s remaining",
+                  (rescheduleIntervalMs - (nowMs - lastRescheduleMs)) / 1000.0);
+                continue;
+            }
             SPDLOG_INFO("Auto-scaling: {} -> {} hosts (inputRate={:.1f} req/s, "
                         "plannerQueue={} msgs/{:.1f} ms, saturated={})",
                         schedHostNum,
@@ -1346,7 +1363,7 @@ void Planner::updateRuntimeStats()
                         signals.plannerWaitingQueueSize,
                         signals.plannerWaitingQueueAgeMicros / 1000.0,
                         signals.plannerQueueSaturated);
-            rescheduleApp(1, targetN);
+            rescheduleApp(0, targetN);
         }
     }
 }
@@ -1356,9 +1373,56 @@ int Planner::computeTargetHostNum(
   int currentHostNum,
   int maxHostNum)
 {
-    // TODO: replace with real policy.
-    // Placeholder: keep the current host count unchanged.
-    return currentHostNum;
+    // Require a valid C estimate before making any scaling decision.
+    if (signals.coeffC <= 0.0 || signals.avgExecTime <= 0.0)
+        return currentHostNum;
+    // Equation for capacity per worker (processedNum):
+    // C= processedNum × execTime + a × chainedCalls + b × numDestHosts
+    // C - b × numDestHosts = processedNum × (execTime + a × chainedRatio)
+    // capPerWorker = (C - b × numDestHosts) / (execTime + a × chainedRatio)
+    double numDestHosts = signals.avgNumDestHosts;
+    // betaOverhead = beta × numDestHosts
+    double betaOverhead = std::max(0.0, signals.beta) * numDestHosts;
+    // numerator = C - beta × numDestHosts
+    double numerator = signals.coeffC - betaOverhead;
+    // denominator = execTime + alpha × chainedRatio
+    double denominator = signals.avgExecTime +
+                         std::max(0.0, signals.alpha) * signals.avgChainedRatio;
+
+    if (numerator <= 0.0 || denominator <= 0.0)
+        return currentHostNum;
+
+    double capPerWorker = numerator / denominator;
+    if (capPerWorker <= 0.0)
+        return currentHostNum;
+
+    // totalLoad = inputRate + inputRate × chainedMultiplier
+    // where chainedMultiplier = chainedOperatorCount / inputOperatorCount
+    // (e.g., 1.0 for a two-operator pipeline: A→B, each input creates one
+    // chain)
+    double totalLoad =
+      signals.avgInputRate * signals.chainedMultiplier + signals.avgInputRate;
+    int targetN = static_cast<int>(std::ceil(totalLoad / capPerWorker));
+    targetN = std::max(1, std::min(targetN, maxHostNum));
+
+    SPDLOG_DEBUG("computeTargetHostNum: C={:.0f}us/s, alpha={:.3f}, "
+                 "beta={:.3f}, execTime={:.1f}us, chainedRatio={:.3f}, "
+                 "numDestHosts={:.1f}, capPerWorker={:.1f}, "
+                 "inputRate={:.1f}, chainedMultiplier={:.2f}, "
+                 "totalLoad={:.1f} -> targetN={}",
+                 signals.coeffC,
+                 signals.alpha,
+                 signals.beta,
+                 signals.avgExecTime,
+                 signals.avgChainedRatio,
+                 numDestHosts,
+                 capPerWorker,
+                 signals.avgInputRate,
+                 signals.chainedMultiplier,
+                 totalLoad,
+                 targetN);
+
+    return targetN;
 }
 
 Planner& getPlanner()

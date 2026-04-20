@@ -326,6 +326,7 @@ void PlannerEndpointHandler::onRequest(
                         value);
             static const std::unordered_set<std::string> plannerParams = {
                 "is_outputting",
+                "is_warmup",
                 "num_hosts_scheduled",
                 "runtime_reconfig_period",
                 "max_inflight_reqs",

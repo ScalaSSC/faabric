@@ -80,6 +80,12 @@ class StateAwareScheduler : public BatchScheduler
 
     bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
 
+    const std::vector<std::string>& getInputNodeNames() const
+    {
+        static const std::vector<std::string> empty;
+        return application ? application->getInputNodes() : empty;
+    }
+
     void initApp(const HostMap& hostMap);
 
     // std::string scheduleStatelessMessageRBHost(std::string& userFunc,

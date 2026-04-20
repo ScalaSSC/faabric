@@ -208,6 +208,10 @@ class Planner
     int  scalingDecisionPeriodMs = 10000; // ms
     long lastScalingDecisionMs   = 0;
 
+    // Minimum interval between two consecutive reschedule operations (ms)
+    long rescheduleIntervalMs  = 20000;
+    long lastRescheduleMs      = 0;
+
     int computeTargetHostNum(
       const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
       int currentHostNum,
@@ -216,6 +220,7 @@ class Planner
     void dequeueScheduledMsgs();
 
     bool isOutputting = false;
+    std::atomic<bool> isWarmup = false;
 
     void doDistributeStatesInfo(
       int curVersion,
