@@ -106,9 +106,7 @@ class Planner
 
     void distributeApp(faabric::planner::RegisterApplicationRequest& rawReq);
 
-    bool resetParameter(const std::string& key,
-                        const int32_t value,
-                        bool plannerParameter = false);
+    bool resetParameter(const faabric::planner::ResetStreamParameterRequest& req);
 
     void rescheduleApp(int rescheduleMode, int hostNum = 0);
 
@@ -221,6 +219,7 @@ class Planner
 
     bool isOutputting = false;
     std::atomic<bool> isWarmup = false;
+    std::atomic<bool> autoScalingEnabled = false;
 
     void doDistributeStatesInfo(
       int curVersion,
@@ -233,6 +232,9 @@ class Planner
     void doRescheduleMessages();
 
     void updateRuntimeStats();
+
+    std::map<std::string, std::unique_ptr<faabric::WorkerStats>>
+    fetchWorkerStatsAsync(const std::vector<std::string>& targetIps);
 };
 
 Planner& getPlanner();

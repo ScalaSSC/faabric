@@ -20,7 +20,8 @@ namespace faabric::planner {
 // are normalized before fitting:
 //
 //   y_norm = processedNum × execTime / Y_NORM              (~600)
-//   x      = [1, -chainedCalls/CHAIN_NORM, -numDestHosts/HOST_NORM]  (~[1,-1,-1])
+//   x      = [1, -chainedCalls/CHAIN_NORM, -numDestHosts/HOST_NORM]
+//   (~[1,-1,-1])
 //
 // Stored theta = [C_n, alphaS, betaS] are the normalized coefficients:
 //   C     = C_n * Y_NORM
@@ -62,10 +63,16 @@ struct CoeffEstimator
         if (processedNum <= 0.0 || execTime <= 0.0)
             return;
 
+        // When numDestHosts ≤ 1 the fan-out feature is a constant, making it
+        // collinear with the bias term and causing betaS / C_n to diverge.
+        // Treat it as 0 so betaS is only estimated under genuine multi-host
+        // traffic (> 1 distinct destination hosts).
+        double effectiveDestHosts = numDestHosts > 1.0 ? numDestHosts : 0.0;
+
         double y = (processedNum * execTime) / Y_NORM;
         double x[3] = { 1.0,
-                         -(chainedCalls / CHAIN_NORM),
-                         -(numDestHosts / HOST_NORM) };
+                        -(chainedCalls / CHAIN_NORM),
+                        -(effectiveDestHosts / HOST_NORM) };
 
         // Px = P · x  (3-vector)
         double Px[3] = { 0.0, 0.0, 0.0 };
@@ -83,36 +90,53 @@ struct CoeffEstimator
         // K = Px / denom
         double K[3] = { Px[0] / denom, Px[1] / denom, Px[2] / denom };
 
-        // prediction = C_n - alphaS×(chainedCalls/CHAIN_NORM) - betaS×(numDestHosts/HOST_NORM)
+        // prediction = C_n - alphaS×(chainedCalls/CHAIN_NORM) -
+        // betaS×(numDestHosts/HOST_NORM)
         double pred = x[0] * C_n + x[1] * alphaS + x[2] * betaS;
         double err = y - pred;
 
-        // Unconstrained update — clamping inside RLS breaks P↔theta
-        // consistency. Non-negativity enforced only in maxProcessed().
-        C_n = C_n + K[0] * err;
-        alphaS = alphaS + K[1] * err;
-        betaS = betaS + K[2] * err;
+        // Non-negativity projection after each RLS step. Strictly this
+        // breaks P↔theta consistency, but RLS adapts in subsequent steps
+        // and it prevents physically meaningless negative coefficients.
+        C_n = std::max(0.0, C_n + K[0] * err);
+        alphaS = std::max(0.0, alphaS + K[1] * err);
+        betaS = std::max(0.0, betaS + K[2] * err);
 
         // P = (P - K·Px') / lambda  (rank-1 update)
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < 3; j++)
                 P[i * 3 + j] = (P[i * 3 + j] - K[i] * Px[j]) / lambda;
 
-        SPDLOG_DEBUG(
-          "CoeffEstimator: C={:.0f}us/s, alpha={:.3f}us/call, "
-          "beta={:.3f}us/host "
-          "(y_norm={:.1f}, err={:.2f}, "
-          "processedNum={:.0f}, execTime={:.1f}us, "
-          "chained={:.0f}, destHosts={:.0f})",
-          C(),
-          alpha(),
-          beta(),
-          y,
-          err,
-          processedNum,
-          execTime,
-          chainedCalls,
-          numDestHosts);
+        SPDLOG_DEBUG("CoeffEstimator: C={:.0f}us/s, alpha={:.3f}us/call, "
+                     "beta={:.3f}us/host "
+                     "(y_norm={:.1f}, err={:.2f}, "
+                     "processedNum={:.0f}, execTime={:.1f}us, "
+                     "chained={:.0f}, destHosts={:.0f})",
+                     C(),
+                     alpha(),
+                     beta(),
+                     y,
+                     err,
+                     processedNum,
+                     execTime,
+                     chainedCalls,
+                     effectiveDestHosts);
+    }
+
+    // Set a physical coefficient by name ("coeff_c", "coeff_a", "coeff_b").
+    // Returns false if key is unrecognized.
+    bool set(const std::string& key, double value)
+    {
+        if (key == "coeff_c") {
+            C_n = value / Y_NORM;
+        } else if (key == "coeff_a") {
+            alphaS = value * CHAIN_NORM / Y_NORM;
+        } else if (key == "coeff_b") {
+            betaS = value * HOST_NORM / Y_NORM;
+        } else {
+            return false;
+        }
+        return true;
     }
 
     // Maximum sustainable processed-requests per second.

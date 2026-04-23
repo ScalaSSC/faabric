@@ -189,7 +189,9 @@ class ApplicationMetrics
         int64_t waitingQueueAgeMicros = 0; // age of oldest waiting message (us)
         bool plannerQueueSaturated = false;
         // CoeffEstimator snapshot at this second
-        double coeffC = 0.0;       // physical CPU budget C (us/s)
+        double coeffC = 0.0; // physical CPU budget C (us/s)
+        double alpha = 0.0;  // chained-call overhead coefficient (us/call)
+        double beta = 0.0;   // fan-out host overhead coefficient (us/host)
         double maxProcessed = 0.0; // C / avgExecTime — baseline max req/s
         double avgExecTime =
           0.0; // weighted avg exec time across instances (us)
@@ -356,9 +358,11 @@ class ApplicationMetrics
                 int workersNum = 0;
                 bool plannerSaturated = false;
                 double coeffC = 0.0;
+                double alpha = 0.0;
+                double beta = 0.0;
                 double maxProcessed = 0.0;
 
-                if (runtimeMetricsHistory.contains(s)) {
+                if (runtimeMetricsHistory.count(s)) {
                     const auto& record = runtimeMetricsHistory.at(s);
                     inputRate = record.inputRate;
                     currentCount = record.count;
@@ -366,6 +370,8 @@ class ApplicationMetrics
                     workersNum = record.workersNum;
                     plannerSaturated = record.plannerQueueSaturated;
                     coeffC = record.coeffC;
+                    alpha = record.alpha;
+                    beta = record.beta;
                     maxProcessed = record.maxProcessed;
 
                     for (const auto& [hostIp, qSize] : record.hostQueueSize) {
@@ -437,10 +443,10 @@ class ApplicationMetrics
                     }
                 }
 
-                double average_executors =
-                  workersNum > 0 ? static_cast<double>(totalExecutors) /
-                                     static_cast<double>(workersNum)
-                                 : 0.0;
+                double avgExecutors = workersNum > 0
+                                        ? static_cast<double>(totalExecutors) /
+                                            static_cast<double>(workersNum)
+                                        : 0.0;
 
                 int avgWaitTime =
                   totalWaitCount > 0
@@ -454,9 +460,12 @@ class ApplicationMetrics
                 double avgCpuLoad = hostCountWithCpu > 0
                                       ? (totalCpuLoad / hostCountWithCpu)
                                       : 0.0;
-                char cpuBuffer[32], coeffCBuf[32], maxProcBuf[32];
+                char cpuBuffer[32], coeffCBuf[32], alphaBuf[32], betaBuf[32],
+                  maxProcBuf[32];
                 snprintf(cpuBuffer, sizeof(cpuBuffer), "%.2f", avgCpuLoad);
                 snprintf(coeffCBuf, sizeof(coeffCBuf), "%.0f", coeffC);
+                snprintf(alphaBuf, sizeof(alphaBuf), "%.4f", alpha);
+                snprintf(betaBuf, sizeof(betaBuf), "%.4f", beta);
                 snprintf(maxProcBuf, sizeof(maxProcBuf), "%.1f", maxProcessed);
 
                 std::string entryStr = std::to_string(inputRate) + " / " +
@@ -466,13 +475,15 @@ class ApplicationMetrics
                                        std::to_string(avgWaitTime) + " / " +
                                        std::to_string(avgExecTime) + " / " +
                                        std::to_string(totalExecutors) + " / " +
-                                       std::to_string(average_executors) +
-                                       " / " + std::string(cpuBuffer) + " / " +
+                                       std::to_string(avgExecutors) + " / " +
+                                       std::string(cpuBuffer) + " / " +
                                        std::to_string(secMedianLat) + " / " +
                                        std::to_string(secP95Lat) + " / " +
                                        std::to_string(secP99Lat) + " / " +
                                        (plannerSaturated ? "saturated" : "no") +
                                        " / " + std::string(coeffCBuf) + " / " +
+                                       std::string(alphaBuf) + " / " +
+                                       std::string(betaBuf) + " / " +
                                        std::string(maxProcBuf);
 
                 historyArray.PushBack(
@@ -484,7 +495,7 @@ class ApplicationMetrics
                       "queue_size / avg_wait / avg_exec / executors / "
                       "average_executors / avg_cpu / p50latency (ms) / "
                       "p95latency (ms) / p99latency (ms) / planner_saturated"
-                      " / coeff_C / max_processed",
+                      " / coeff_C / alpha / beta / max_processed",
                       historyArray,
                       alloc);
 
@@ -516,7 +527,7 @@ class ApplicationMetrics
                 }
 
                 int currentThroughput = 0;
-                if (runtimeMetricsHistory.contains(s)) {
+                if (runtimeMetricsHistory.count(s)) {
                     currentThroughput = runtimeMetricsHistory.at(s).count;
                 }
 
@@ -906,6 +917,8 @@ class ApplicationMetrics
 
             auto& snap = runtimeMetricsHistory[currentTime];
             snap.coeffC = coeffEstimator.C();
+            snap.alpha = coeffEstimator.alpha();
+            snap.beta = coeffEstimator.beta();
             snap.maxProcessed =
               coeffEstimator.maxProcessed(avgExecTime, 0.0, 0.0);
             snap.avgExecTime = avgExecTime;
@@ -1049,6 +1062,15 @@ class ApplicationMetrics
             return false;
         }
         SPDLOG_INFO("ApplicationMetrics: set {} = {}", key, value);
+        return true;
+    }
+
+    bool setCoeff(const std::string& key, double value)
+    {
+        faabric::util::FullLock lock(opMx);
+        if (!coeffEstimator.set(key, value))
+            return false;
+        SPDLOG_INFO("ApplicationMetrics: set coeff {} = {:.4f}", key, value);
         return true;
     }
 

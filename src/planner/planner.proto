@@ -240,6 +240,10 @@ message MaxReplicasRequest{
 message ResetStreamParameterRequest{
     string parameter = 1;
     int32 value = 2;
+    double value_double = 3;
+    string value_string = 4;
+    bool value_bool = 5;
+    int64 value_int64 = 6;
 }
 
 message RegisterFunctionStateRequest{

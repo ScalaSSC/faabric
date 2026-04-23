@@ -916,20 +916,45 @@ void Planner::doRescheduleMessages()
     doEnqueueSchedMessages(newHosts, std::move(messages));
 }
 
-bool Planner::resetParameter(const std::string& key,
-                             const int32_t value,
-                             bool plannerParameter)
+bool Planner::resetParameter(
+  const faabric::planner::ResetStreamParameterRequest& req)
 {
+    const std::string& key = req.parameter();
+    const int32_t value = req.value();
+
+    static const std::unordered_set<std::string> plannerParams = {
+        "is_outputting",
+        "is_warmup",
+        "auto_scaling_enabled",
+        "num_hosts_scheduled",
+        "runtime_reconfig_period",
+        "max_inflight_reqs",
+        "max_waiting_queue_size",
+        "worker_queue_num_threshold",
+        "worker_queue_time_threshold",
+        "planner_queue_size_threshold",
+        "planner_queue_age_threshold",
+        "coeff_c",
+        "coeff_a",
+        "coeff_b",
+    };
+
     faabric::util::FullLock lock(plannerMx);
 
-    // Reset the parameter of planner
-    if (plannerParameter) {
+    if (plannerParams.contains(key)) {
         SPDLOG_INFO("Planner reset parameter {} to {}", key, value);
         if (key == "is_outputting") {
             isOutputting = value == 1;
+            SPDLOG_INFO("Planner outputting mode: {}",
+                        isOutputting ? "ON" : "OFF");
         } else if (key == "is_warmup") {
             isWarmup.store(value == 1);
-            SPDLOG_INFO("Planner warmup mode: {}", isWarmup.load() ? "ON" : "OFF");
+            SPDLOG_INFO("Planner warmup mode: {}",
+                        isWarmup.load() ? "ON" : "OFF");
+        } else if (key == "auto_scaling_enabled") {
+            autoScalingEnabled.store(value == 1);
+            SPDLOG_INFO("Planner auto-scaling: {}",
+                        autoScalingEnabled.load() ? "ON" : "OFF");
         } else if (key == "num_hosts_scheduled") {
             schedHostNum = value;
         } else if (key == "runtime_reconfig_period") {
@@ -938,6 +963,10 @@ bool Planner::resetParameter(const std::string& key,
             maxInflightApps.store(value);
         } else if (key == "max_waiting_queue_size") {
             maxWaitingQueueSize = value;
+        } else if (key == "coeff_c" || key == "coeff_a" || key == "coeff_b") {
+            if (state.applicationMetrics) {
+                state.applicationMetrics->setCoeff(key, req.value_double());
+            }
         } else if (state.applicationMetrics &&
                    state.applicationMetrics->setThreshold(key, value)) {
             // threshold keys handled inside ApplicationMetrics
@@ -965,19 +994,15 @@ bool Planner::resetParameter(const std::string& key,
         stateAwareScheduler->setAlpha(newAlpha);
     }
 
-    // Reset the parameter of the worker hosts
+    // Forward to worker hosts
+    auto reqPtr =
+      std::make_shared<faabric::planner::ResetStreamParameterRequest>(req);
     auto availableHosts = getAvailableHosts(true);
-    faabric::planner::ResetStreamParameterRequest req;
-    req.set_parameter(key);
-    req.set_value(value);
-
     for (const auto& host : availableHosts) {
         SPDLOG_INFO(
           "Planner reset {} parameter {} to {}", host->ip(), key, value);
         faabric::scheduler::getFunctionCallClient(host->ip())
-          ->resetParameter(
-            std::make_shared<faabric::planner::ResetStreamParameterRequest>(
-              req));
+          ->resetParameter(reqPtr);
     }
 
     SPDLOG_DEBUG("Planner reschedules messages done");
@@ -1189,12 +1214,57 @@ std::string Planner::outputResult()
 //     }
 // }
 
-// This is a function updating runtime statistics periodically.
-void Planner::updateRuntimeStats()
+std::map<std::string, std::unique_ptr<faabric::WorkerStats>>
+Planner::fetchWorkerStatsAsync(const std::vector<std::string>& targetIps)
 {
     std::map<std::string, std::unique_ptr<faabric::WorkerStats>> results;
     std::mutex resultsMutex;
+    std::vector<std::future<void>> futures;
+    for (const auto& ip : targetIps) {
+        try {
+            futures.emplace_back(
+              std::async(std::launch::async, [&results, &resultsMutex, ip]() {
+                  try {
+                      SPDLOG_DEBUG("Fetching runtime stats from host {}", ip);
+                      auto stats = faabric::scheduler::getFunctionCallClient(ip)
+                                     ->getWorkerRuntimeStats();
+                      std::lock_guard<std::mutex> lock(resultsMutex);
+                      results[ip] = std::move(stats);
+                  } catch (const std::exception& e) {
+                      SPDLOG_ERROR(
+                        "Failed to fetch runtime stats from host {}: {}",
+                        ip,
+                        e.what());
+                  } catch (...) {
+                      SPDLOG_ERROR(
+                        "Unknown exception fetching runtime stats from host {}",
+                        ip);
+                  }
+              }));
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR(
+              "Failed to spawn async thread for {}: {}", ip, e.what());
+        }
+    }
+    SPDLOG_DEBUG("All async tasks for fetching stats have been launched");
+    for (auto& fut : futures) {
+        try {
+            if (fut.valid()) {
+                fut.get();
+            }
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR("Async task threw an exception during get(): {}",
+                         e.what());
+        } catch (...) {
+            SPDLOG_ERROR("Unknown exception during async task get()");
+        }
+    }
+    return results;
+}
 
+// This is a function updating runtime statistics periodically.
+void Planner::updateRuntimeStats()
+{
     while (!stopThreadTimer) {
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeReconfigPeriod));
@@ -1203,16 +1273,16 @@ void Planner::updateRuntimeStats()
             break;
         }
 
-        SPDLOG_DEBUG("Planner starts fetching runtime stats from workers");
+        SPDLOG_TRACE("Planner starts fetching runtime stats from workers");
+        // If no hosts or registered applications, skip fetching stats.
         std::vector<std::string> targetIps;
+        int maxHostNum = 0;
         {
-            // If no hosts or registered applications, skip fetching stats to
-            // save resources.
             faabric::util::SharedLock lock(plannerMx);
             if (state.hostMap.empty()) {
                 continue;
             }
-
+            maxHostNum = (int)state.hostMap.size();
             for (const auto& [ip, hostInfo] : state.activeHosts) {
                 targetIps.push_back(ip);
             }
@@ -1220,8 +1290,6 @@ void Planner::updateRuntimeStats()
         if (targetIps.empty()) {
             continue;
         }
-        SPDLOG_DEBUG("Planner will fetch stats from {} hosts",
-                     targetIps.size());
 
         // Scope reconfigMx to fetch + process only.
         // Must NOT hold reconfigMx when acquiring plannerMx (scaling decision),
@@ -1229,54 +1297,11 @@ void Planner::updateRuntimeStats()
         // reconfigMx in that order — the opposite would deadlock.
 
         faabric::util::FullLock rflock(reconfigMx);
-        std::vector<std::future<void>> futures;
-
-        for (const auto& ip : targetIps) {
-            try {
-                futures.emplace_back(std::async(
-                  std::launch::async, [&results, &resultsMutex, ip]() {
-                      try {
-                          SPDLOG_DEBUG("Fetching runtime stats from host {}",
-                                       ip);
-                          auto stats =
-                            faabric::scheduler::getFunctionCallClient(ip)
-                              ->getWorkerRuntimeStats();
-                          std::lock_guard<std::mutex> lock(resultsMutex);
-                          results[ip] = std::move(stats);
-                      } catch (const std::exception& e) {
-                          SPDLOG_ERROR("Failed to fetch runtime stats from "
-                                       "host {}: {}",
-                                       ip,
-                                       e.what());
-                      } catch (...) {
-                          SPDLOG_ERROR("Unknown exception fetching runtime "
-                                       "stats from host {}",
-                                       ip);
-                      }
-                  }));
-            } catch (const std::exception& e) {
-                SPDLOG_ERROR(
-                  "Failed to spawn async thread for {}: {}", ip, e.what());
-            }
-        }
-        SPDLOG_DEBUG("All async tasks for fetching stats have been launched");
-        for (auto& fut : futures) {
-            try {
-                if (fut.valid()) {
-                    fut.get();
-                }
-            } catch (const std::exception& e) {
-                SPDLOG_ERROR("Async task threw an exception during get(): {}",
-                             e.what());
-            } catch (...) {
-                SPDLOG_ERROR("Unknown exception during async task get()");
-            }
-        }
+        auto results = fetchWorkerStatsAsync(targetIps);
 
         if (state.applicationMetrics) {
             state.applicationMetrics->recordWorkerMetrics(results);
         }
-        results.clear();
         rflock.unlock();
 
         // Capture planner-level waiting queue snapshot.
@@ -1308,7 +1333,8 @@ void Planner::updateRuntimeStats()
         }
         lastScalingDecisionMs = nowMs;
 
-        if (!state.applicationMetrics || isWarmup.load()) {
+        if (!state.applicationMetrics || isWarmup.load() ||
+            !autoScalingEnabled.load()) {
             continue;
         }
         auto signals = state.applicationMetrics->getScalingSignals(
@@ -1332,10 +1358,6 @@ void Planner::updateRuntimeStats()
                       static_cast<double>(totalCount - inputCount) / inputCount;
             }
         }
-
-        faabric::util::SharedLock plock(plannerMx);
-        int maxHostNum = (int)state.hostMap.size();
-        plock.unlock();
 
         int targetN = computeTargetHostNum(signals, schedHostNum, maxHostNum);
 

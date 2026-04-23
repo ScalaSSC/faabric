@@ -615,7 +615,14 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
 
     std::string funcStr = user + "/" + func + "/" + par;
 
+    auto loopDeadlineMs = faabric::util::getGlobalClock().epochMillis() +
+                          batchCheckPeriod;
+
     while (waitingQueue.getMessagesCount() != 0) {
+
+        if (faabric::util::getGlobalClock().epochMillis() >= loopDeadlineMs) {
+            break;
+        }
 
         if (!executorAvailable(funcStr)) {
             break;

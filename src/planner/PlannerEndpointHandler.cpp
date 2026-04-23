@@ -319,30 +319,9 @@ void PlannerEndpointHandler::onRequest(
                 response.body() = std::string("Bad JSON in body's payload");
                 return ctx.sendFunction(std::move(response));
             }
-            std::string parameter = rawReq.parameter();
-            int32_t value = rawReq.value();
-            SPDLOG_INFO("Planner Handler Resetting parameter {} to value {}",
-                        parameter,
-                        value);
-            static const std::unordered_set<std::string> plannerParams = {
-                "is_outputting",
-                "is_warmup",
-                "num_hosts_scheduled",
-                "runtime_reconfig_period",
-                "max_inflight_reqs",
-                "max_waiting_queue_size",
-                "worker_queue_num_threshold",
-                "worker_queue_time_threshold",
-                "planner_queue_size_threshold",
-                "planner_queue_age_threshold",
-            };
-
-            if (plannerParams.contains(parameter)) {
-                faabric::planner::getPlanner().resetParameter(
-                  parameter, value, true);
-            } else {
-                faabric::planner::getPlanner().resetParameter(parameter, value);
-            }
+            SPDLOG_INFO("Planner Handler Resetting parameter {}",
+                        rawReq.parameter());
+            faabric::planner::getPlanner().resetParameter(rawReq);
 
             return ctx.sendFunction(std::move(response));
         }
