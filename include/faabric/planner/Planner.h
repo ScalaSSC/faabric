@@ -106,7 +106,8 @@ class Planner
 
     void distributeApp(faabric::planner::RegisterApplicationRequest& rawReq);
 
-    bool resetParameter(const faabric::planner::ResetStreamParameterRequest& req);
+    bool resetParameter(
+      const faabric::planner::ResetStreamParameterRequest& req);
 
     void rescheduleApp(int rescheduleMode, int hostNum = 0);
 
@@ -203,16 +204,30 @@ class Planner
     int runtimeReconfigPeriod = 5000; // ms
 
     // Auto-scaling: evaluate host count every scalingDecisionPeriodMs
-    int  scalingDecisionPeriodMs = 10000; // ms
-    long lastScalingDecisionMs   = 0;
+    int scalingDecisionPeriodMs = 10000; // ms
 
     // Minimum interval between two consecutive reschedule operations (ms)
-    long rescheduleIntervalMs  = 20000;
-    long lastRescheduleMs      = 0;
+    // Periodic reschedule interval
+    long periodicRescheduleIntervalMs = 10000; // ms
+    long lastPeriodicRescheduleMs = 0;
+
+    // Input-rate change detection
+    double stableInputRate = 0.0;       // baseline rate at last reschedule
+    double pendingInputRate = 0.0;      // rate when change was first detected
+    long inputRateChangeDetectedMs = 0; // 0 = no change pending
+    int inputRateStabilityWindowMs = 5000; // ms to wait for stability
+    double inputRateDeviationRatio = 0.2;  // tolerance: 0.2 = 20%
+    double pendingDevToleranceRatio = 0.2; // tolerance for pending input rate deviation
 
     int computeTargetHostNum(
       const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
       int currentHostNum,
+      int maxHostNum);
+
+    // Evaluate whether a reschedule should be triggered this cycle.
+    // Returns true if a reschedule was fired.
+    bool evaluateReschedule(
+      const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
       int maxHostNum);
 
     void dequeueScheduledMsgs();

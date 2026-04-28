@@ -302,7 +302,8 @@ bool Planner::registerHost(const Host& hostIn, bool overwrite)
 const std::pair<bool, HostPtrMap&> Planner::getRegisteredHost(
   std::string hostIp)
 {
-    faabric::util::SharedLock lock(plannerMx);
+    // FullLock: hostsync is a write, SharedLock would be a data race.
+    faabric::util::FullLock lock(plannerMx);
 
     auto it = state.hostMap.find(hostIp);
     if (it == state.hostMap.end()) {
@@ -937,6 +938,9 @@ bool Planner::resetParameter(
         "coeff_c",
         "coeff_a",
         "coeff_b",
+        "periodic_reschedule_interval",
+        "input_rate_stability_window",
+        "input_rate_deviation",
     };
 
     faabric::util::FullLock lock(plannerMx);
@@ -967,6 +971,12 @@ bool Planner::resetParameter(
             if (state.applicationMetrics) {
                 state.applicationMetrics->setCoeff(key, req.value_double());
             }
+        } else if (key == "periodic_reschedule_interval") {
+            periodicRescheduleIntervalMs = value;
+        } else if (key == "input_rate_stability_window") {
+            inputRateStabilityWindowMs = value;
+        } else if (key == "input_rate_deviation") {
+            inputRateDeviationRatio = req.value_double();
         } else if (state.applicationMetrics &&
                    state.applicationMetrics->setThreshold(key, value)) {
             // threshold keys handled inside ApplicationMetrics
@@ -1012,8 +1022,8 @@ bool Planner::resetParameter(
 void Planner::rescheduleApp(int rescheduleMode, int hostNum)
 {
     SPDLOG_INFO("Planner reschedules application");
-    lastRescheduleMs = faabric::util::getGlobalClock().epochMillis();
-    // rescheduleMode == 0 means reschedule immediately and clean the state.
+    lastPeriodicRescheduleMs = faabric::util::getGlobalClock().epochMillis();
+    // rescheduleMode == 0 means reschedule immediately.
     // rescheduleMode == 1 means wait until all running messages are finished.
 
     faabric::util::FullLock lock(plannerMx);
@@ -1325,18 +1335,11 @@ void Planner::updateRuntimeStats()
 
         SPDLOG_DEBUG("Planner finished updating runtime stats");
 
-        // Every scalingDecisionPeriodMs (default 10 s) evaluate whether the
-        // number of active hosts should change.
-        long nowMs = faabric::util::getGlobalClock().epochMillis();
-        if (nowMs - lastScalingDecisionMs < scalingDecisionPeriodMs) {
-            continue;
-        }
-        lastScalingDecisionMs = nowMs;
-
         if (!state.applicationMetrics || isWarmup.load() ||
             !autoScalingEnabled.load()) {
             continue;
         }
+
         auto signals = state.applicationMetrics->getScalingSignals(
           scalingDecisionPeriodMs / 1000);
 
@@ -1359,34 +1362,7 @@ void Planner::updateRuntimeStats()
             }
         }
 
-        int targetN = computeTargetHostNum(signals, schedHostNum, maxHostNum);
-
-        SPDLOG_DEBUG("Scaling signals: inputRate={:.1f} req/s, "
-                     "workerQueueSize={:.1f}, "
-                     "plannerWaitingQueue={} msgs / {:.1f} ms, saturated={}",
-                     signals.avgInputRate,
-                     signals.avgQueueSize,
-                     signals.plannerWaitingQueueSize,
-                     signals.plannerWaitingQueueAgeMicros / 1000.0,
-                     signals.plannerQueueSaturated);
-
-        if (targetN > 0 && targetN != schedHostNum) {
-            if (nowMs - lastRescheduleMs < rescheduleIntervalMs) {
-                SPDLOG_DEBUG(
-                  "Auto-scaling suppressed: cooldown {:.1f}s remaining",
-                  (rescheduleIntervalMs - (nowMs - lastRescheduleMs)) / 1000.0);
-                continue;
-            }
-            SPDLOG_INFO("Auto-scaling: {} -> {} hosts (inputRate={:.1f} req/s, "
-                        "plannerQueue={} msgs/{:.1f} ms, saturated={})",
-                        schedHostNum,
-                        targetN,
-                        signals.avgInputRate,
-                        signals.plannerWaitingQueueSize,
-                        signals.plannerWaitingQueueAgeMicros / 1000.0,
-                        signals.plannerQueueSaturated);
-            rescheduleApp(0, targetN);
-        }
+        evaluateReschedule(signals, maxHostNum);
     }
 }
 
@@ -1445,6 +1421,78 @@ int Planner::computeTargetHostNum(
                  targetN);
 
     return targetN;
+}
+
+bool Planner::evaluateReschedule(
+  const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
+  int maxHostNum)
+{
+    /***
+     Detect whether reschedule should be triggered.
+     The conditions to trigger reschedule (Logical OR):
+     1. Last reschedule exceeds the periodic reschedule interval.
+     2. The input rate stably changes for some seconds.
+     Only compute targetN and perform reschedule if a condition is met.
+     ***/
+    long nowMs = faabric::util::getGlobalClock().epochMillis();
+    double currentRate = signals.avgInputRate;
+
+    // If stableInputRate is not set, initialize it with the current rate.
+    if (stableInputRate <= 0.0 && currentRate > 0.0)
+        stableInputRate = currentRate;
+
+    bool inputRateTriggered = false;
+    if (stableInputRate > 0.0 && currentRate > 0.0) {
+        double relChange =
+          std::abs(currentRate - stableInputRate) / stableInputRate;
+
+        if (relChange <= inputRateDeviationRatio) {
+            // Rate returned to baseline — cancel any pending detection.
+            inputRateChangeDetectedMs = 0;
+        } else if (inputRateChangeDetectedMs == 0) {
+            // First deviation observed — start the stability window.
+            inputRateChangeDetectedMs = nowMs;
+            pendingInputRate = currentRate;
+            SPDLOG_DEBUG(
+              "Input rate change detected: {:.1f} -> {:.1f} ({:.1f}%)",
+              stableInputRate,
+              currentRate,
+              relChange * 100.0);
+        } else {
+            // Already tracking — check whether the new rate has stabilized.
+            double pendingDev =
+              pendingInputRate > 0.0
+                ? std::abs(currentRate - pendingInputRate) / pendingInputRate
+                : 1.0;
+            bool stableEnough = pendingDev <= pendingDevToleranceRatio;
+            bool windowElapsed =
+              nowMs - inputRateChangeDetectedMs >= inputRateStabilityWindowMs;
+            if (!stableEnough) {
+                // Rate still drifting — restart the stability window.
+                inputRateChangeDetectedMs = nowMs;
+                pendingInputRate = currentRate;
+            } else if (windowElapsed) {
+                inputRateTriggered = true;
+            }
+        }
+    }
+
+    bool periodicTriggered =
+      (nowMs - lastPeriodicRescheduleMs >= periodicRescheduleIntervalMs);
+
+    if (!inputRateTriggered && !periodicTriggered)
+        return false;
+
+    int targetN = computeTargetHostNum(signals, schedHostNum, maxHostNum);
+    lastPeriodicRescheduleMs = nowMs;
+
+    if (targetN <= 0 || targetN == schedHostNum)
+        return false;
+
+    stableInputRate = currentRate;
+    inputRateChangeDetectedMs = 0;
+    rescheduleApp(0, targetN);
+    return true;
 }
 
 Planner& getPlanner()

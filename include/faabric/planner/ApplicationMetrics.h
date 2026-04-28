@@ -499,74 +499,6 @@ class ApplicationMetrics
                       historyArray,
                       alloc);
 
-        rapidjson::Value versionMetricsObj(rapidjson::kObjectType);
-
-        if (!runtimeMetricsHistory.empty()) {
-            int64_t startSec = runtimeMetricsHistory.begin()->first;
-            int64_t endSec = runtimeMetricsHistory.rbegin()->first;
-
-            int lastKnownVersion = 0;
-            auto it = versionHistory.upper_bound(startSec);
-            if (it != versionHistory.begin()) {
-                auto prevIt = it;
-                --prevIt;
-                lastKnownVersion = prevIt->second;
-            }
-
-            struct VersionStats
-            {
-                long totalThroughput = 0;
-                int durationSeconds = 0;
-                std::vector<int> history;
-            };
-            std::map<int, VersionStats> versionStatsMap;
-
-            for (int64_t s = startSec; s <= endSec; ++s) {
-                if (versionHistory.count(s)) {
-                    lastKnownVersion = versionHistory.at(s);
-                }
-
-                int currentThroughput = 0;
-                if (runtimeMetricsHistory.count(s)) {
-                    currentThroughput = runtimeMetricsHistory.at(s).count;
-                }
-
-                versionStatsMap[lastKnownVersion].totalThroughput +=
-                  currentThroughput;
-                versionStatsMap[lastKnownVersion].durationSeconds++;
-                versionStatsMap[lastKnownVersion].history.push_back(
-                  currentThroughput);
-            }
-
-            for (const auto& [vId, stats] : versionStatsMap) {
-                rapidjson::Value vObj(rapidjson::kObjectType);
-
-                vObj.AddMember("totalThroughput",
-                               static_cast<int64_t>(stats.totalThroughput),
-                               alloc);
-                vObj.AddMember("durationSeconds", stats.durationSeconds, alloc);
-
-                double avgThroughput =
-                  stats.durationSeconds > 0
-                    ? static_cast<double>(stats.totalThroughput) /
-                        stats.durationSeconds
-                    : 0.0;
-                vObj.AddMember("averageThroughput", avgThroughput, alloc);
-
-                rapidjson::Value historyArray(rapidjson::kArrayType);
-                for (int count : stats.history) {
-                    historyArray.PushBack(count, alloc);
-                }
-                vObj.AddMember("history", historyArray, alloc);
-
-                std::string vKey = "version_" + std::to_string(vId);
-                versionMetricsObj.AddMember(
-                  rapidjson::Value(vKey.c_str(), alloc).Move(), vObj, alloc);
-            }
-        }
-
-        doc.AddMember("versionMetrics", versionMetricsObj, alloc);
-
         // Optionally, if you want to include per-instance metrics, add them
         // here.
         rapidjson::Value instancesObj(rapidjson::kObjectType);
@@ -608,7 +540,6 @@ class ApplicationMetrics
                     long long queueTimeTotalCount = 0;
                     std::map<std::string, int> aggregatedChained;
 
-                    bool workerSaturated = false;
                     for (const auto& [instanceName, timeSeries] :
                          workerNode.instances) {
                         auto it = timeSeries.history.find(s);
@@ -635,11 +566,12 @@ class ApplicationMetrics
                                  rec.chainedCallHistory) {
                                 aggregatedChained[dest] += cnt;
                             }
-                            if (rec.isSaturated) {
-                                workerSaturated = true;
-                            }
                         }
                     }
+                    auto satIt = workerNode.saturatedHistory.find(s);
+                    bool workerSaturated =
+                      satIt != workerNode.saturatedHistory.end() &&
+                      satIt->second;
 
                     int numDestWorkers =
                       static_cast<int>(aggregatedChained.size());
@@ -680,7 +612,7 @@ class ApplicationMetrics
         }
 
         doc.AddMember(
-          "workerMetricDetails: input / throughput / "
+          "workerMetricDetails: input / processed / "
           "queueNum / queueTime / num_dest_workers / total_chained_count",
           workerMetricDetailsObj,
           alloc);
@@ -730,7 +662,6 @@ class ApplicationMetrics
         faabric::scheduler::AverageAndCount workerExecTime;
         int inputCount = 0;
         int throughput = 0;
-        bool isSaturated = false;
         std::map<std::string, int> chainedCallHistory;
     };
     struct InstanceTimeSeries
@@ -742,6 +673,7 @@ class ApplicationMetrics
         std::map<std::string, InstanceTimeSeries> instances;
         std::map<time_t, double> cpuLoadHistory;
         std::map<time_t, double> executorsHistory;
+        std::map<time_t, bool> saturatedHistory;
     };
 
     // Adds or updates the worker stats fetched from a specific host.
@@ -789,6 +721,7 @@ class ApplicationMetrics
         faabric::util::FullLock lock(opMx);
         auto currentTime = faabric::util::getGlobalClock().epochSeconds();
 
+        // Iterate hosts, update the per-worker records and coeff estimator.
         for (const auto& [ip, statsPtr] : results) {
             if (!statsPtr) {
                 continue;
@@ -799,6 +732,17 @@ class ApplicationMetrics
             clusterWorkerMetrics[ip].executorsHistory[currentTime] =
               statsPtr->executorsnum();
 
+            // Aggregate across all instances on this host before RLS update.
+            double hostThroughput = 0.0;
+            long long hostExecTimeSum = 0;
+            long long hostExecTimeCount = 0;
+            double hostChainedCalls = 0.0;
+            std::set<std::string> hostDestHostSet;
+            long long hostQueueNumSum = 0;
+            long long hostQueueNumCount = 0;
+            long long hostQueueTimeSum = 0;
+            long long hostQueueTimeCount = 0;
+
             for (const auto& [instanceName, metricsProto] :
                  statsPtr->workermetrics()) {
                 auto& rec = clusterWorkerMetrics[ip]
@@ -806,40 +750,70 @@ class ApplicationMetrics
                               .history[currentTime];
                 deserialiseInstanceMetrics(metricsProto, rec);
 
-                // Compute saturation flag immediately after deserialization.
-                rec.isSaturated =
-                  (rec.workerQueueNum.average > workerQueueNumThreshold) &&
-                  (rec.workerQueueTime.average > workerQueueTimeThresholdUs);
-
-                // Update RLS coefficients only when this instance is saturated.
-                if (rec.isSaturated) {
-                    double chainedCalls = 0.0;
-                    std::set<std::string> destHostSet;
-                    for (const auto& [dest, cnt] : rec.chainedCallHistory) {
-                        chainedCalls += cnt;
-                        if (!dest.empty()) {
-                            destHostSet.insert(dest);
-                        }
-                    }
-                    double numDestHosts =
-                      static_cast<double>(destHostSet.size());
-                    coeffEstimator.update(static_cast<double>(rec.throughput),
-                                          rec.workerExecTime.average,
-                                          chainedCalls,
-                                          numDestHosts);
-                    SPDLOG_DEBUG(
-                      "CoeffEstimator updated for {}/{}: alpha={:.4f}, "
-                      "beta={:.4f} (throughput={}, execTime={:.1f}us, "
-                      "chained={:.1f}, destHosts={:.0f})",
-                      ip,
-                      instanceName,
-                      coeffEstimator.alpha(),
-                      coeffEstimator.beta(),
-                      rec.throughput,
-                      static_cast<double>(rec.workerExecTime.average),
-                      chainedCalls,
-                      numDestHosts);
+                hostThroughput += rec.throughput;
+                if (rec.workerExecTime.count > 0) {
+                    hostExecTimeSum +=
+                      static_cast<long long>(rec.workerExecTime.average) *
+                      rec.workerExecTime.count;
+                    hostExecTimeCount += rec.workerExecTime.count;
                 }
+                if (rec.workerQueueNum.count > 0) {
+                    hostQueueNumSum +=
+                      static_cast<long long>(rec.workerQueueNum.average) *
+                      rec.workerQueueNum.count;
+                    hostQueueNumCount += rec.workerQueueNum.count;
+                }
+                if (rec.workerQueueTime.count > 0) {
+                    hostQueueTimeSum +=
+                      static_cast<long long>(rec.workerQueueTime.average) *
+                      rec.workerQueueTime.count;
+                    hostQueueTimeCount += rec.workerQueueTime.count;
+                }
+                for (const auto& [dest, cnt] : rec.chainedCallHistory) {
+                    hostChainedCalls += cnt;
+                    if (!dest.empty()) {
+                        hostDestHostSet.insert(dest);
+                    }
+                }
+            }
+
+            // Host is saturated when the host-wide weighted average queue depth
+            // and wait time both exceed their thresholds.
+            double hostAvgQueueNum =
+              hostQueueNumCount > 0
+                ? static_cast<double>(hostQueueNumSum) / hostQueueNumCount
+                : 0.0;
+            double hostAvgQueueTime =
+              hostQueueTimeCount > 0
+                ? static_cast<double>(hostQueueTimeSum) / hostQueueTimeCount
+                : 0.0;
+            bool hostSaturated =
+              (hostAvgQueueNum > workerQueueNumThreshold) &&
+              (hostAvgQueueTime > workerQueueTimeThresholdUs);
+
+            clusterWorkerMetrics[ip].saturatedHistory[currentTime] =
+              hostSaturated;
+
+            // One RLS update per host per second, only when saturated.
+            if (hostSaturated && hostThroughput > 0.0 &&
+                hostExecTimeCount > 0) {
+                double avgExecTime =
+                  static_cast<double>(hostExecTimeSum) / hostExecTimeCount;
+                double numDestHosts =
+                  static_cast<double>(hostDestHostSet.size());
+                coeffEstimator.update(
+                  hostThroughput, avgExecTime, hostChainedCalls, numDestHosts);
+                SPDLOG_DEBUG(
+                  "CoeffEstimator updated for host {}: alpha={:.4f}, "
+                  "beta={:.4f} (throughput={:.0f}, execTime={:.1f}us, "
+                  "chained={:.0f}, destHosts={:.0f})",
+                  ip,
+                  coeffEstimator.alpha(),
+                  coeffEstimator.beta(),
+                  hostThroughput,
+                  avgExecTime,
+                  hostChainedCalls,
+                  numDestHosts);
             }
 
             int totalQueueSize = 0;
@@ -848,14 +822,6 @@ class ApplicationMetrics
             }
             runtimeMetricsHistory[currentTime].hostQueueSize[ip] =
               totalQueueSize;
-
-            if (isWorkerSaturatedUnlocked(ip)) {
-                SPDLOG_DEBUG("Worker {} is saturated (queueNum > {}, "
-                             "queueTime > {} us)",
-                             ip,
-                             workerQueueNumThreshold,
-                             workerQueueTimeThresholdUs);
-            }
         }
 
         int workersNum = results.size();
@@ -948,6 +914,12 @@ class ApplicationMetrics
                 workerNode.executorsHistory.erase(
                   workerNode.executorsHistory.begin());
             }
+
+            while (!workerNode.saturatedHistory.empty() &&
+                   workerNode.saturatedHistory.begin()->first < cutoffTime) {
+                workerNode.saturatedHistory.erase(
+                  workerNode.saturatedHistory.begin());
+            }
         }
 
         while (!runtimeMetricsHistory.empty() &&
@@ -955,17 +927,6 @@ class ApplicationMetrics
             runtimeMetricsHistory.erase(runtimeMetricsHistory.begin());
         }
     }
-
-    // Per-worker capability snapshot.
-    struct WorkerCapability
-    {
-        int totalInputCount = 0;
-        double throughput = 0.0;
-        double chainedRatio = 0.0;
-        int distinctChainedDests = 0;
-        double avgQueueNum = 0.0;
-        bool isSaturated = false;
-    };
 
     struct ScalingSignals
     {
@@ -1126,36 +1087,6 @@ class ApplicationMetrics
     // thresholds for planner-level waiting queue saturation
     int plannerWaitingQueueSizeThreshold = 5000;
     int64_t plannerWaitingQueueAgeThresholdUs = 500000;
-
-    // Internal helper — caller must already hold opMx (shared or exclusive).
-    // Returns true if any instance at the latest recorded second is saturated.
-    bool isWorkerSaturatedUnlocked(const std::string& ip) const
-    {
-        auto workerIt = clusterWorkerMetrics.find(ip);
-        if (workerIt == clusterWorkerMetrics.end()) {
-            return false;
-        }
-        const auto& workerNode = workerIt->second;
-
-        time_t latestTs = 0;
-        for (const auto& [instanceName, timeSeries] : workerNode.instances) {
-            if (!timeSeries.history.empty()) {
-                latestTs =
-                  std::max(latestTs, timeSeries.history.rbegin()->first);
-            }
-        }
-        if (latestTs == 0) {
-            return false;
-        }
-
-        for (const auto& [instanceName, timeSeries] : workerNode.instances) {
-            auto it = timeSeries.history.find(latestTs);
-            if (it != timeSeries.history.end() && it->second.isSaturated) {
-                return true;
-            }
-        }
-        return false;
-    }
 
     LatencyHistogramConfig histConfig;
 

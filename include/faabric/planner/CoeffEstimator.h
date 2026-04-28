@@ -14,41 +14,88 @@ namespace faabric::planner {
 // C is the total CPU budget per second (us/s), shared across all workers.
 // alpha and beta capture per-call chaining and per-host fan-out overhead.
 //
-// maxProcessed = (C - alpha×chainedCalls - beta×numDestHosts) / execTime
+// Normalized form (multiplicative convention):
 //
-// To make the 3-parameter RLS well-conditioned, all regression variables
-// are normalized before fitting:
+//   C_n × Y_NORM = processedNum × execTime
+//                + alphaS × chainedCalls × CHAIN_NORM
+//                + betaS  × numDestHosts × HOST_NORM
 //
-//   y_norm = processedNum × execTime / Y_NORM              (~600)
-//   x      = [1, -chainedCalls/CHAIN_NORM, -numDestHosts/HOST_NORM]
-//   (~[1,-1,-1])
+// Mapping between physical and normalized coefficients (multiply):
 //
-// Stored theta = [C_n, alphaS, betaS] are the normalized coefficients:
-//   C     = C_n * Y_NORM
-//   alpha = alphaS * Y_NORM / CHAIN_NORM
-//   beta  = betaS  * Y_NORM / HOST_NORM
+//   C     = C_n    × Y_NORM
+//   alpha = alphaS × CHAIN_NORM
+//   beta  = betaS  × HOST_NORM
 //
-// Based on observed values: processedNum~2000, execTime~300us,
-//   chainedCalls~3000, numDestHosts~0-10.
+// In RLS form (divide both sides by Y_NORM so y stays bounded):
+//
+//   y = processedNum × execTime / Y_NORM
+//   x = [ 1,
+//         -chainedCalls × CHAIN_NORM / Y_NORM,
+//         -numDestHosts × HOST_NORM / Y_NORM ]
+//   theta = [C_n, alphaS, betaS]
+//
+// Convention: NORM constants are set to the typical PHYSICAL value of each
+// quantity, so the corresponding normalized coefficient is initialised at
+// 1.0 ("ratio to typical"):
+//
+//   Y_NORM     = typical (processedNum × execTime) = 1000 × 400 = 400000
+//   CHAIN_NORM = typical alpha = 40   us/call
+//   HOST_NORM  = typical beta  = 8000 us/host
+//
+// Observed ranges: processedNum~1000, execTime 300-500us,
+//   chainedCalls~400, numDestHosts 1-10 (avg 5).
+//
+// Prior-informed initial values (execTime ≈ 400us midpoint):
+//   C     ≈ 450000 us/s     → C_n    = 450000 / Y_NORM     = 1.125
+//   alpha ≈ 40 us/call      → alphaS = alpha / CHAIN_NORM  = 1.0
+//   beta  ≈ 8000 us/host    → betaS  = beta  / HOST_NORM   = 1.0
+//
+// Where the prior comes from:
+//   - alpha = 0.1 × execTime    (10% chaining overhead rule)
+//   - beta  = 20  × execTime    (1→2 host: processedNum drops by 20
+//                                 ⇒ beta  = 20 × execTime)
+//   - C     = (1000 + 40×chain/processed + beta×host) × execTime
 // -----------------------------------------------------------------------
 struct CoeffEstimator
 {
-    static constexpr double Y_NORM = 1000.0;     // us → ms scale for y
-    static constexpr double CHAIN_NORM = 3000.0; // typical chainedCalls/s
-    static constexpr double HOST_NORM = 5.0;     // typical numDestHosts
+    static constexpr double Y_NORM = 400000.0;   // typical processedNum × execTime
+    static constexpr double CHAIN_NORM = 40.0;   // typical alpha (us/call)
+    static constexpr double HOST_NORM = 8000.0;  // typical beta  (us/host)
+
+    // Hard bounds on each normalized coefficient (as ratios to prior).
+    // Guards against single-observation overshoots and stuck-at-zero
+    // behavior. C is bounded tighter because CPU capacity is structural;
+    // alpha/beta are workload-dependent and allowed wider drift.
+    static constexpr double C_N_MIN    = 0.5,  C_N_MAX    = 3.0;  // C  : 200K-1350K us/s
+    static constexpr double ALPHAS_MIN = 0.25, ALPHAS_MAX = 4.0;  // α  : 10-160 us/call
+    static constexpr double BETAS_MIN  = 0.25, BETAS_MAX  = 4.0;  // β  : 2000-32000 us/host
 
     // Normalized RLS state: theta = [C_n, alphaS, betaS]
-    double C_n = 0.0;
-    double alphaS = 0.0;
-    double betaS = 0.0;
-    double lambda = 0.97; // RLS forgetting factor
-    // 3×3 RLS covariance matrix, row-major
-    double P[9] = { 1e6, 0, 0, 0, 1e6, 0, 0, 0, 1e6 };
+    // Each coefficient = 1.0 means "exactly at the typical/prior value".
+    // Initialised with prior estimates to avoid the long cold-start climb
+    // from zero and the wild first-update overshoot from an uninformed
+    // prior.
+    double C_n = 1.125;    // C     ≈ 450000 us/s   (C_n     = C / Y_NORM)
+    double alphaS = 1.0;   // alpha ≈ 40 us/call    (alphaS  = alpha / CHAIN_NORM)
+    double betaS = 1.0;    // beta  ≈ 8000 us/host  (betaS   = beta  / HOST_NORM)
+    double lambda = 0.97;  // RLS forgetting factor
+    // 3×3 RLS covariance matrix, row-major. With theta now O(1), absolute
+    // P values are also O(1). Asymmetric diagonal reflects our confidence:
+    //   - C_n   moderately certain (execTime range 300-500 → ±25%)
+    //   - alphaS strong prior (10% rule) AND x[1]=-0.04 signal is weak,
+    //     so we keep P[1,1] tiny — αS is effectively held at the prior.
+    //   - betaS  strong prior (1→2 host measurement); x[2]=-0.1 has decent
+    //     signal so P[2,2] can be slightly larger.
+    double P[9] = {
+        0.1,  0,    0,
+        0,    0.01, 0,
+        0,    0,    0.05,
+    };
 
-    // Physical coefficients (derived from normalized state)
+    // Physical coefficients (derived from normalized state via multiplication)
     double C() const { return C_n * Y_NORM; }
-    double alpha() const { return alphaS * Y_NORM / CHAIN_NORM; }
-    double beta() const { return betaS * Y_NORM / HOST_NORM; }
+    double alpha() const { return alphaS * CHAIN_NORM; }
+    double beta() const { return betaS * HOST_NORM; }
 
     // Update estimates with one saturated-worker observation.
     // processedNum : requests processed in this second
@@ -71,8 +118,8 @@ struct CoeffEstimator
 
         double y = (processedNum * execTime) / Y_NORM;
         double x[3] = { 1.0,
-                        -(chainedCalls / CHAIN_NORM),
-                        -(effectiveDestHosts / HOST_NORM) };
+                        -(chainedCalls * CHAIN_NORM / Y_NORM),
+                        -(effectiveDestHosts * HOST_NORM / Y_NORM) };
 
         // Px = P · x  (3-vector)
         double Px[3] = { 0.0, 0.0, 0.0 };
@@ -90,17 +137,19 @@ struct CoeffEstimator
         // K = Px / denom
         double K[3] = { Px[0] / denom, Px[1] / denom, Px[2] / denom };
 
-        // prediction = C_n - alphaS×(chainedCalls/CHAIN_NORM) -
-        // betaS×(numDestHosts/HOST_NORM)
+        // prediction = C_n - alphaS×(chain×CHAIN_NORM/Y_NORM)
+        //                  - betaS ×(host ×HOST_NORM /Y_NORM)
         double pred = x[0] * C_n + x[1] * alphaS + x[2] * betaS;
         double err = y - pred;
 
-        // Non-negativity projection after each RLS step. Strictly this
-        // breaks P↔theta consistency, but RLS adapts in subsequent steps
-        // and it prevents physically meaningless negative coefficients.
-        C_n = std::max(0.0, C_n + K[0] * err);
-        alphaS = std::max(0.0, alphaS + K[1] * err);
-        betaS = std::max(0.0, betaS + K[2] * err);
+        // Hard-clamp projection after each RLS step. Strictly this breaks
+        // P↔theta consistency, but RLS adapts in subsequent steps and the
+        // bounds prevent (a) negative/runaway estimates from a noisy single
+        // observation and (b) stuck-at-zero behavior when the unconstrained
+        // RLS would drive a coefficient below its physical minimum.
+        C_n    = std::clamp(C_n    + K[0] * err, C_N_MIN,    C_N_MAX);
+        alphaS = std::clamp(alphaS + K[1] * err, ALPHAS_MIN, ALPHAS_MAX);
+        betaS  = std::clamp(betaS  + K[2] * err, BETAS_MIN,  BETAS_MAX);
 
         // P = (P - K·Px') / lambda  (rank-1 update)
         for (int i = 0; i < 3; i++)
@@ -109,7 +158,7 @@ struct CoeffEstimator
 
         SPDLOG_DEBUG("CoeffEstimator: C={:.0f}us/s, alpha={:.3f}us/call, "
                      "beta={:.3f}us/host "
-                     "(y_norm={:.1f}, err={:.2f}, "
+                     "(y_norm={:.3f}, err={:.3f}, "
                      "processedNum={:.0f}, execTime={:.1f}us, "
                      "chained={:.0f}, destHosts={:.0f})",
                      C(),
@@ -128,11 +177,11 @@ struct CoeffEstimator
     bool set(const std::string& key, double value)
     {
         if (key == "coeff_c") {
-            C_n = value / Y_NORM;
+            C_n = std::clamp(value / Y_NORM, C_N_MIN, C_N_MAX);
         } else if (key == "coeff_a") {
-            alphaS = value * CHAIN_NORM / Y_NORM;
+            alphaS = std::clamp(value / CHAIN_NORM, ALPHAS_MIN, ALPHAS_MAX);
         } else if (key == "coeff_b") {
-            betaS = value * HOST_NORM / Y_NORM;
+            betaS = std::clamp(value / HOST_NORM, BETAS_MIN, BETAS_MAX);
         } else {
             return false;
         }
@@ -149,8 +198,9 @@ struct CoeffEstimator
     {
         if (execTime <= 0.0 || C_n <= 0.0)
             return 0.0;
-        double overhead = std::max(0.0, alphaS) * (chainedCalls / CHAIN_NORM) +
-                          std::max(0.0, betaS) * (numDestHosts / HOST_NORM);
+        // alphaS and betaS are bounded ≥ MIN > 0 by construction.
+        double overhead = alphaS * (chainedCalls * CHAIN_NORM / Y_NORM) +
+                          betaS * (numDestHosts * HOST_NORM / Y_NORM);
         double budget = C_n - overhead;
         if (budget <= 0.0)
             return 0.0;
