@@ -158,9 +158,11 @@ class State
 
     void updateHosts(faabric::batch_scheduler::HostMap hostMap);
 
+    void setScheduleMode(int mode) { scheduleMode = mode; }
+
   private:
     const std::string thisIP;
-
+    int scheduleMode = 0;
     faabric::batch_scheduler::HostMap hosts;
 
     std::unordered_map<std::string, std::shared_ptr<StateKeyValue>> kvMap;

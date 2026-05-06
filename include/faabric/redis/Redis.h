@@ -4,6 +4,7 @@
 #include <faabric/util/exception.h>
 
 #include <hiredis/hiredis.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -120,6 +121,11 @@ class Redis
                           size_t size);
 
     void flushPipeline(long pipelineLength);
+
+    void mset(const std::map<std::string, std::vector<uint8_t>>& kvs);
+
+    std::map<std::string, std::vector<uint8_t>> mget(
+      const std::vector<std::string>& keys);
 
     void getRange(const std::string& key,
                   uint8_t* buffer,

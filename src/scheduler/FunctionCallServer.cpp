@@ -233,10 +233,12 @@ FunctionCallServer::recvGetRuntimeStats(std::span<const uint8_t> buffer)
     PARSE_MSG(faabric::RuntimeStatsUpdateRequest, buffer.data(), buffer.size())
 
     // Collect the stats
-    auto stats = faabric::scheduler::getScheduler().getRuntimeStats();
+    auto& scheduler = faabric::scheduler::getScheduler();
+    auto stats = scheduler.getRuntimeStats();
 
     faabric::RuntimeStatsResult response;
     response.set_host(faabric::util::getSystemConfig().endpointHost);
+    response.set_totalwaitingqueuesize(scheduler.getTotalWaitingQueueSize());
 
     for (const auto& [instanceName, instanceStats] : stats) {
         faabric::InstanceStatsPayload* payload = response.add_instancesstats();

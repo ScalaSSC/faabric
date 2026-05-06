@@ -760,6 +760,32 @@ void Scheduler::dispatchChainedMsgs()
             continue;
         }
 
+        // scheduleMode 8: offload chained msgs that exceed maxWaitingMessages
+        // to the planner; remaining msgs fall through to decentralized scheduling
+        if (scheduleMode == 8) {
+            faabric::util::FullLock chainedCallLock(chainedCallMsgsMx);
+            if (static_cast<int>(chainedCallMsgs.size()) > maxWaitingMessages) {
+                auto& plannerCli = faabric::planner::getPlannerClient();
+                auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
+                auto currentTime =
+                  faabric::util::getGlobalClock().epochMicros();
+                for (int i = maxWaitingMessages;
+                     i < static_cast<int>(chainedCallMsgs.size());
+                     i++) {
+                    chainedCallMsgs[i]->set_plannerdispatchtime(currentTime);
+                    auto* message = req->add_messages();
+                    *message = std::move(*chainedCallMsgs[i]);
+                }
+                chainedCallMsgs.resize(maxWaitingMessages);
+                SPDLOG_DEBUG(
+                  "scheduleMode 8: {} overflow msgs sent to planner",
+                  req->messages_size());
+                plannerCli.enqueueFunctions(req);
+            }
+            // Lock released here; remaining msgs processed by decentralized
+            // scheduler below
+        }
+
         // Otherwise, decentralized scheduler is used
 
         // Schedule the chained calls
@@ -904,6 +930,7 @@ void Scheduler::resetParameter(std::string key, int32_t value)
     } else if (key == "schedule_mode") {
         decentralScheduler.setScheduleMode(value);
         scheduleMode = value;
+        faabric::state::getGlobalState().setScheduleMode(value);
         SPDLOG_INFO("Reset schedule_mode parameter to : {}", value);
     } else if (key == "dispatch_period") {
         dispatchPeriod = value;
@@ -924,6 +951,10 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
         decentralScheduler.setAlpha(newAlpha);
+    } else if (key == "max_waiting_messages") {
+        maxWaitingMessages = value;
+        SPDLOG_INFO("Reset maxWaitingMessages parameter to : {}",
+                    maxWaitingMessages);
     } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
@@ -1267,6 +1298,23 @@ void Scheduler::updateStatesInfo(
                      scaledMaxReplica);
     }
 
+    if (scheduleMode == 8) {
+        int totalOperators = static_cast<int>(scheuduledOperatorMap.size());
+        int maxReplica =
+          std::max(1, maxExecutors / std::max(1, totalOperators));
+        for (const auto& [operatorName, operatorInfo] : scheuduledOperatorMap) {
+            std::string userFunc = util::splitUserFunc(operatorName).first +
+                                   "/" +
+                                   util::splitUserFunc(operatorName).second;
+            maxReplicasMap[userFunc + "/0"] = maxReplica;
+        }
+        faabric::util::FullLock rflock(reconfigMx);
+        decentralScheduler.resetScheduler();
+        decentralScheduler.setScheuduledOperatorMap(scheuduledOperatorMap);
+        isUpdateState = false;
+        return;
+    }
+
     faabric::util::FullLock rflock(reconfigMx);
     decentralScheduler.resetScheduler();
 
@@ -1278,30 +1326,6 @@ void Scheduler::updateStatesInfo(
     // We migrate the old state and create the new state according to the
     // planner's new scheduling decision.
     auto& stateServer = faabric::state::getGlobalState();
-
-    // stateServer.backupAll();
-    // auto& hashRings = decentralScheduler.getStateHashRing();
-    // auto migrationStatesMap =
-    //   stateServer.schedulePreStates(hashRings, statesInfo);
-
-    // Migrate the states.
-    // SPDLOG_INFO("updateStatesInfo: transferring states to other hosts");
-    // std::vector<std::thread> threads;
-    // for (const auto& [ip, migrStates] : migrationStatesMap) {
-    //     auto req = std::make_shared<faabric::StateMigrationRequest>();
-    //     for (const auto& [userFuncPar, serializedState] : migrStates) {
-    //         auto* migrateState = req->add_migratestates();
-    //         migrateState->set_userfuncpar(userFuncPar);
-    //         migrateState->set_serializedstate(serializedState);
-    //     }
-    //     threads.emplace_back(
-    //       [ip, req]() { getFunctionCallClient(ip)->migrateStates(req); });
-    // }
-    // for (auto& t : threads) {
-    //     if (t.joinable()) {
-    //         t.join();
-    //     }
-    // }
 
     SPDLOG_INFO(
       "updateStatesInfo: states update complete, reallocate states now");
@@ -1390,6 +1414,16 @@ void Scheduler::updateStatesInfo(
 std::map<std::string, InstanceStatsResult> Scheduler::getRuntimeStats()
 {
     return runtimeStats.getAllStats();
+}
+
+int Scheduler::getTotalWaitingQueueSize()
+{
+    faabric::util::SharedLock lock(mx);
+    int total = 0;
+    for (const auto& [key, queue] : waitingQueues) {
+        total += queue->getMessagesCount();
+    }
+    return total;
 }
 
 void Scheduler::updateStatelessDist(

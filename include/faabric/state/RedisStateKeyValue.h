@@ -6,6 +6,11 @@
 #include <faabric/util/clock.h>
 #include <faabric/util/locks.h>
 
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
 namespace faabric::state {
 class RedisStateKeyValue final : public StateKeyValue
 {
@@ -23,6 +28,28 @@ class RedisStateKeyValue final : public StateKeyValue
                                  const std::string& keyIn);
 
     static void clearAll(bool global);
+
+    static std::map<std::string, std::vector<uint8_t>> readKeysFromRemote(
+      const std::string& user,
+      const std::string& func,
+      int parallelismId,
+      const std::set<std::string>& keys);
+
+    static void setKeysToRemote(const std::string& user,
+                                const std::string& func,
+                                int parallelismId,
+                                std::vector<uint8_t>& data);
+
+    static std::vector<uint8_t> readFuncStateFromRemote(
+      const std::string& user,
+      const std::string& func,
+      int parallelismId);
+
+    static void setFuncStateToRemote(const std::string& user,
+                                     const std::string& func,
+                                     int parallelismId,
+                                     const uint8_t* buffer,
+                                     size_t bufferLen);
 
   private:
     const std::string joinedKey;

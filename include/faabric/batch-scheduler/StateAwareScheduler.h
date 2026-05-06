@@ -87,6 +87,8 @@ class StateAwareScheduler : public BatchScheduler
     //                                        const std::unique_ptr<Message>&
     //                                        msg);
 
+    std::string scheduleMessageRoundRobin(const HostMap& hostMap);
+
     std::string scheduleStatelessMessageApportion(
       std::string& userFunc,
       const HostMap& hostMap,
@@ -144,6 +146,8 @@ class StateAwareScheduler : public BatchScheduler
 
     void rescheduleAppBinpack(const HostMap& hostMap);
 
+    void rescheduleAppPhe(const HostMap& hostMap);
+
     void rescheduleAppFaaSFlow(const HostMap& hostMap);
 
     const std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>&
@@ -187,7 +191,17 @@ class StateAwareScheduler : public BatchScheduler
 
     void setAlpha(double value);
 
+    void updateWorkerQueueSizes(const std::map<std::string, int>& sizes);
+
+    std::map<std::string, int> getWorkerQueueSizes() const;
+
+    std::vector<std::string> scheduleMessagesAvailableBatch(
+      const HostMap& hostMap,
+      const std::vector<std::unique_ptr<faabric::Message>>& msgs);
+
   protected:
+    std::map<std::string, int> workerQueueSizes;
+    mutable std::shared_mutex workerQueueSizesMx;
     // scheduler lock
     std::shared_mutex scheduleMx;
 

@@ -399,6 +399,15 @@ std::string StateAwareScheduler::scheduleStatelessMessageApportion(
     return host;
 }
 
+std::string StateAwareScheduler::scheduleMessageRoundRobin(
+  const HostMap& hostMap)
+{
+    std::string host = "unknown";
+    auto localCounter = getNextCounter("roundRobin");
+    host = faabric::util::getNthKey(hostMap, localCounter % hostMap.size());
+    return host;
+}
+
 std::string StateAwareScheduler::scheduleStatelessMessageRoundRobin(
   std::string& userFunc,
   const HostMap& hostMap,
@@ -497,6 +506,19 @@ std::string StateAwareScheduler::scheduleMessage(
     }
     std::string userFunc = msg->user() + "_" + msg->function();
     std::string host = "unknown";
+
+    // When schedule mode is 8, we schedule it locally.
+    if (scheduleMode == 8) {
+        if (isplanner) {
+            host = scheduleMessageRoundRobin(hostMap);
+            msg->set_isscheduledlocally(false);
+            return host;
+        }
+        host = localHost;
+        msg->set_isscheduledlocally(true);
+        return host;
+    }
+
     // Stateful or partitioned stateful function
     if (functionParallelism.contains(userFunc)) {
         // TODO - get parallelism is not thread safe now
@@ -1016,6 +1038,11 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
 
     if (scheduleMode == 3 || scheduleMode == 7) {
         rescheduleAppFaaSFlow(hostMap);
+        return;
+    }
+
+    if (scheduleMode == 8) {
+        rescheduleAppPhe(hostMap);
         return;
     }
 
@@ -1662,6 +1689,48 @@ void StateAwareScheduler::rescheduleAppBinpack(const HostMap& hostMap)
     printScheduleInfomation();
 }
 
+void StateAwareScheduler::rescheduleAppPhe(const HostMap& hostMap)
+{
+    SPDLOG_INFO("Rescheduling the application in Stream-based Mode");
+
+    // MAP <USER_FUNC_PARALLELISM, MAP<IP, proportion>>
+    std::map<std::string, std::map<std::string, double>> newStatelessReqWeight;
+    // MAP <USER_FUNC, MAP<PARALLELISM_IDX, proportion>>
+    std::map<std::string, std::map<int, double>> newParStateReqWeight;
+
+    // For stream-based scheduling, states are stored on remote storage and no
+    // spcified parallelism
+    stateHost.clear();
+    functionParallelism.clear();
+
+    // Build the scheduledOperatorsMap
+    scheduledOperatorsMap.clear();
+    for (const auto& [nodeName, node] : application->getNodes()) {
+        scheduledOperatorsMap.emplace(
+          nodeName,
+          ScheduledOperator(*node,
+                            0,
+                            false,
+                            "None",
+                            1,
+                            {},
+                            {},
+                            LocalStatelessOperatorType::UNKNOWN));
+    }
+
+    // Initialize the State Information for stateful and partitioned stateful
+    // operators.
+    stateHashRing.clear();
+
+    redis::Redis& redis = redis::Redis::getState();
+    redis.flushAll();
+    for (const auto& [stateName, ip] : stateHost) {
+        registerStateToRedis(stateName, ip);
+    }
+
+    printScheduleInfomation();
+}
+
 void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
 {
     SPDLOG_INFO("Rescheduling the application in FaaSFlow Mode");
@@ -1918,6 +1987,64 @@ void StateAwareScheduler::runtimeDistTune(
 void StateAwareScheduler::setScheduleMode(int mode)
 {
     scheduleMode = mode;
+}
+
+void StateAwareScheduler::updateWorkerQueueSizes(
+  const std::map<std::string, int>& sizes)
+{
+    std::unique_lock lock(workerQueueSizesMx);
+    workerQueueSizes = sizes;
+}
+
+std::map<std::string, int> StateAwareScheduler::getWorkerQueueSizes() const
+{
+    std::shared_lock lock(workerQueueSizesMx);
+    return workerQueueSizes;
+}
+
+std::vector<std::string> StateAwareScheduler::scheduleMessagesAvailableBatch(
+  const HostMap& hostMap,
+  const std::vector<std::unique_ptr<faabric::Message>>& msgs)
+{
+    if (hostMap.empty()) {
+        SPDLOG_ERROR("Host map is empty, cannot schedule messages");
+        throw std::runtime_error("Host map is empty");
+    }
+
+    // Build a mutable copy of queue sizes, seeded from the last observed values.
+    // Hosts absent from workerQueueSizes start at 0.
+    std::map<std::string, int> pendingCount;
+    {
+        std::shared_lock lock(workerQueueSizesMx);
+        for (const auto& [host, _] : hostMap) {
+            auto it = workerQueueSizes.find(host);
+            pendingCount[host] =
+              (it != workerQueueSizes.end()) ? it->second : 0;
+        }
+    }
+
+    std::vector<std::string> hosts;
+    hosts.reserve(msgs.size());
+
+    for (size_t i = 0; i < msgs.size(); i++) {
+        // Pick the host with the minimum pending count.
+        auto minIt = std::min_element(
+          pendingCount.begin(),
+          pendingCount.end(),
+          [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        const std::string& chosen = minIt->first;
+        hosts.push_back(chosen);
+        msgs[i]->set_isscheduledlocally(false);
+        minIt->second++;
+    }
+
+    SPDLOG_DEBUG(
+      "scheduleMessagesAvailableBatch: assigned {} msgs across {} hosts",
+      msgs.size(),
+      hostMap.size());
+
+    return hosts;
 }
 
 void StateAwareScheduler::setRuntimeReconfig(bool value)

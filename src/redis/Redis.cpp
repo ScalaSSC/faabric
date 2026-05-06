@@ -332,6 +332,69 @@ void Redis::flushPipeline(long pipelineLength)
     }
 }
 
+std::map<std::string, std::vector<uint8_t>> Redis::mget(
+  const std::vector<std::string>& keys)
+{
+    if (keys.empty()) {
+        return {};
+    }
+
+    std::vector<const char*> argv;
+    std::vector<size_t> argvlen;
+    argv.push_back("MGET");
+    argvlen.push_back(4);
+    for (const auto& key : keys) {
+        argv.push_back(key.c_str());
+        argvlen.push_back(key.size());
+    }
+
+    auto reply = wrapReply((redisReply*)redisCommandArgv(
+      context, argv.size(), argv.data(), argvlen.data()));
+
+    if (!reply || reply->type != REDIS_REPLY_ARRAY) {
+        throw std::runtime_error("MGET failed");
+    }
+
+    std::map<std::string, std::vector<uint8_t>> result;
+    for (size_t i = 0; i < keys.size(); i++) {
+        const redisReply* elem = reply->element[i];
+        if (elem->type != REDIS_REPLY_NIL) {
+            result[keys[i]] =
+              std::vector<uint8_t>(elem->str, elem->str + elem->len);
+        }
+    }
+    return result;
+}
+
+void Redis::mset(const std::map<std::string, std::vector<uint8_t>>& kvs)
+{
+    if (kvs.empty()) {
+        return;
+    }
+
+    // argv layout: ["MSET", key1, val1, key2, val2, ...]
+    std::vector<const char*> argv;
+    std::vector<size_t> argvlen;
+    argv.reserve(1 + kvs.size() * 2);
+    argvlen.reserve(1 + kvs.size() * 2);
+
+    argv.push_back("MSET");
+    argvlen.push_back(4);
+    for (const auto& [key, value] : kvs) {
+        argv.push_back(key.c_str());
+        argvlen.push_back(key.size());
+        argv.push_back(reinterpret_cast<const char*>(value.data()));
+        argvlen.push_back(value.size());
+    }
+
+    auto reply = wrapReply((redisReply*)redisCommandArgv(
+      context, argv.size(), argv.data(), argvlen.data()));
+
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        throw std::runtime_error("MSET failed");
+    }
+}
+
 void Redis::sadd(const std::string& key, const std::string& value)
 {
     auto reply =

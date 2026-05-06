@@ -149,6 +149,8 @@ class Scheduler
 
     std::map<std::string, InstanceStatsResult> getRuntimeStats();
 
+    int getTotalWaitingQueueSize();
+
     void updateStatelessDist(
       const std::map<std::string, std::map<std::string, int>>&
         sourceCountStats);
@@ -175,6 +177,7 @@ class Scheduler
 
     // Maximum number of replicas per function
     // int maxReplicas = 8;
+    int maxWaitingMessages = 10000;
 
     std::map<std::string, int> maxReplicasMap;
 

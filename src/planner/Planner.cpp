@@ -503,8 +503,14 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
           std::make_unique<faabric::Message>(*req->mutable_messages(i));
         messages.push_back(std::move(message));
     }
-    auto hosts = stateAwareScheduler->scheduleMessagesBatch(
-      state.batchSchedHostMap, messages);
+    std::vector<std::string> hosts;
+    if (scheduleMode == 8 && isChained) {
+        hosts = stateAwareScheduler->scheduleMessagesAvailableBatch(
+          state.batchSchedHostMap, messages);
+    } else {
+        hosts = stateAwareScheduler->scheduleMessagesBatch(
+          state.batchSchedHostMap, messages);
+    }
 
     doEnqueueSchedMessages(hosts, std::move(messages)); // Move ownership
 }
@@ -801,8 +807,8 @@ bool Planner::resetParameter(const std::string& key,
     if (key == "runtime_reconfig") {
         stateAwareScheduler->setRuntimeReconfig(value == 1);
     }
-    if (key == "alpha"){
-        double newAlpha = value / 1000.0; 
+    if (key == "alpha") {
+        double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
         stateAwareScheduler->setAlpha(newAlpha);
     }
@@ -1009,6 +1015,16 @@ void Planner::updateRuntimeStats()
         }
         if (totalCount > 0) {
             stateAwareScheduler->runtimeDistTune(localChainedMap);
+        }
+
+        if (scheduleMode == 8) {
+            std::map<std::string, int> queueSizes;
+            for (const auto& [ip, stats] : results) {
+                if (stats) {
+                    queueSizes[ip] = stats->totalwaitingqueuesize();
+                }
+            }
+            stateAwareScheduler->updateWorkerQueueSizes(queueSizes);
         }
 
         results.clear();

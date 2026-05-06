@@ -1,6 +1,7 @@
 #include <faabric/state/RedisStateKeyValue.h>
 #include <faabric/util/logging.h>
 #include <faabric/util/macros.h>
+#include <faabric/util/serialization.h>
 #include <faabric/util/state.h>
 #include <faabric/util/timing.h>
 
@@ -11,18 +12,27 @@
  * within the class.
  */
 
+namespace {
+static std::string funcStateKey(const std::string& user,
+                                const std::string& func,
+                                int parallelismId)
+{
+    return "state_" + faabric::util::keyForFunction(user, func, parallelismId);
+}
+}
+
 namespace faabric::state {
 RedisStateKeyValue::RedisStateKeyValue(const std::string& userIn,
                                        const std::string& keyIn,
                                        size_t sizeIn)
   : StateKeyValue(userIn, keyIn, sizeIn)
-  , joinedKey(faabric::util::keyForUser(user, key)){
+  , joinedKey(faabric::util::keyForUser(user, key)) {
 
   };
 
 RedisStateKeyValue::RedisStateKeyValue(const std::string& userIn,
                                        const std::string& keyIn)
-  : RedisStateKeyValue(userIn, keyIn, 0){
+  : RedisStateKeyValue(userIn, keyIn, 0) {
 
   };
 
@@ -45,6 +55,69 @@ void RedisStateKeyValue::clearAll(bool global)
     if (global) {
         redis::Redis::getState().flushAll();
     }
+}
+
+std::map<std::string, std::vector<uint8_t>>
+RedisStateKeyValue::readKeysFromRemote(const std::string& user,
+                                       const std::string& func,
+                                       int parallelismId,
+                                       const std::set<std::string>& keys)
+{
+    std::string prefix = funcStateKey(user, func, parallelismId) + "_";
+
+    std::vector<std::string> redisKeys;
+    redisKeys.reserve(keys.size());
+    for (const auto& key : keys) {
+        redisKeys.push_back(prefix + key);
+    }
+
+    auto redisResult = redis::Redis::getState().mget(redisKeys);
+
+    std::map<std::string, std::vector<uint8_t>> result;
+    for (const auto& key : keys) {
+        std::string redisKey = prefix + key;
+        if (redisResult.contains(redisKey)) {
+            result[key] = std::move(redisResult[redisKey]);
+        } else {
+            result[key] = {};
+        }
+    }
+    return result;
+}
+
+void RedisStateKeyValue::setKeysToRemote(const std::string& user,
+                                         const std::string& func,
+                                         int parallelismId,
+                                         std::vector<uint8_t>& data)
+{
+    std::string prefix = funcStateKey(user, func, parallelismId) + "_";
+
+    auto stateMap = faabric::util::deserializeParState(data);
+
+    std::map<std::string, std::vector<uint8_t>> redisKvs;
+    for (const auto& [key, value] : stateMap) {
+        redisKvs.emplace(prefix + key, value);
+    }
+    redis::Redis::getState().mset(redisKvs);
+}
+
+std::vector<uint8_t> RedisStateKeyValue::readFuncStateFromRemote(
+  const std::string& user,
+  const std::string& func,
+  int parallelismId)
+{
+    std::string key = funcStateKey(user, func, parallelismId);
+    return redis::Redis::getState().get(key);
+}
+
+void RedisStateKeyValue::setFuncStateToRemote(const std::string& user,
+                                              const std::string& func,
+                                              int parallelismId,
+                                              const uint8_t* buffer,
+                                              size_t bufferLen)
+{
+    std::string key = funcStateKey(user, func, parallelismId);
+    redis::Redis::getState().set(key, buffer, bufferLen);
 }
 
 void RedisStateKeyValue::pullFromRemote()

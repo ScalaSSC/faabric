@@ -33,7 +33,8 @@ State::State(std::string thisIPIn)
   : thisIP(thisIPIn)
 {}
 
-void State::updateHosts(faabric::batch_scheduler::HostMap hostMap) {
+void State::updateHosts(faabric::batch_scheduler::HostMap hostMap)
+{
     hosts = hostMap;
 }
 
@@ -296,25 +297,16 @@ size_t State::getFunctionStateSize(const std::string& user,
     return targetFs->size();
 }
 
-// int State::readFuncState(const std::string& user,
-//                          const std::string& func,
-//                          int32_t parallelismId,
-//                          char* buffer)
-// {
-//     auto targetFs = doGetFS(user, func, parallelismId);
-
-//     targetFs->get(reinterpret_cast<uint8_t*>(buffer));
-//     return targetFs->size();
-// }
-
 std::vector<uint8_t> State::readFuncStateLock(const std::string& user,
                                               const std::string& func,
                                               int32_t parallelismId,
                                               bool lock)
 {
+    if (scheduleMode == 8) {
+        return RedisStateKeyValue::readFuncStateFromRemote(
+          user, func, parallelismId);
+    }
     auto targetFs = doGetFS(user, func, parallelismId);
-
-    // Lock the state and read it
     std::vector<uint8_t> stateVec = targetFs->getFuncStateLock(lock);
     return stateVec;
 }
@@ -326,8 +318,16 @@ void State::setFuncState(const std::string& user,
                          int32_t bufferLen,
                          bool unlock)
 {
+    if (scheduleMode == 8) {
+        RedisStateKeyValue::setFuncStateToRemote(
+          user,
+          func,
+          parallelismId,
+          reinterpret_cast<const uint8_t*>(buffer),
+          bufferLen);
+        return;
+    }
     auto targetFs = doGetFS(user, func, parallelismId);
-
     targetFs->set(reinterpret_cast<uint8_t*>(buffer), bufferLen, unlock);
 }
 
@@ -358,8 +358,11 @@ std::map<std::string, std::vector<uint8_t>> State::readIndivFuncStateLock(
   int32_t parallelismId,
   std::set<std::string>& keys)
 {
+    if (scheduleMode == 8) {
+        return RedisStateKeyValue::readKeysFromRemote(
+          user, func, parallelismId, keys);
+    }
     auto targetFs = doGetFS(user, func, parallelismId);
-
     return targetFs->readPartitionStateLock(keys);
 }
 
@@ -368,8 +371,11 @@ void State::writeIndivFuncStateUnlock(const std::string& user,
                                       int32_t parallelismId,
                                       std::vector<uint8_t>& data)
 {
+    if (scheduleMode == 8) {
+        RedisStateKeyValue::setKeysToRemote(user, func, parallelismId, data);
+        return;
+    }
     auto targetFs = doGetFS(user, func, parallelismId);
-
     targetFs->writePartitionStateUnlocks(data);
 }
 
