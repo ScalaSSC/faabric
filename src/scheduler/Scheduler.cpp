@@ -761,7 +761,8 @@ void Scheduler::dispatchChainedMsgs()
         }
 
         // scheduleMode 8: offload chained msgs that exceed maxWaitingMessages
-        // to the planner; remaining msgs fall through to decentralized scheduling
+        // to the planner; remaining msgs fall through to decentralized
+        // scheduling
         if (scheduleMode == 8) {
             faabric::util::FullLock chainedCallLock(chainedCallMsgsMx);
             if (static_cast<int>(chainedCallMsgs.size()) > maxWaitingMessages) {
@@ -777,9 +778,8 @@ void Scheduler::dispatchChainedMsgs()
                     *message = std::move(*chainedCallMsgs[i]);
                 }
                 chainedCallMsgs.resize(maxWaitingMessages);
-                SPDLOG_DEBUG(
-                  "scheduleMode 8: {} overflow msgs sent to planner",
-                  req->messages_size());
+                SPDLOG_DEBUG("scheduleMode 8: {} overflow msgs sent to planner",
+                             req->messages_size());
                 plannerCli.enqueueFunctions(req);
             }
             // Lock released here; remaining msgs processed by decentralized
@@ -991,7 +991,9 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
     // max replicas are limited. Total number of executors won't exceed the
     // maxExecutors. If current current replicas is less than the max size,
     // return true.
-    int maxReplicas = util::getOrThrow(maxReplicasMap, funcStr);
+    auto maxReplicasIt = maxReplicasMap.find(funcStr);
+    int maxReplicas =
+      (maxReplicasIt != maxReplicasMap.end()) ? maxReplicasIt->second : 1;
     if (thisExecutors.size() < maxReplicas) {
         return true;
     } else {

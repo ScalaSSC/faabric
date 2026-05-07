@@ -65,18 +65,35 @@ RedisStateKeyValue::readKeysFromRemote(const std::string& user,
 {
     std::string prefix = funcStateKey(user, func, parallelismId) + "_";
 
-    std::vector<std::string> redisKeys;
-    redisKeys.reserve(keys.size());
-    for (const auto& key : keys) {
-        redisKeys.push_back(prefix + key);
+    // Convert set to vector for indexed access
+    std::vector<std::string> keyVec(keys.begin(), keys.end());
+
+    // Try to acquire a lock for each key (SETNX); skip already-locked keys
+    std::vector<std::string> lockKeys;
+    lockKeys.reserve(keyVec.size());
+    for (const auto& key : keyVec) {
+        lockKeys.push_back("lock_" + prefix + key);
     }
 
-    auto redisResult = redis::Redis::getState().mget(redisKeys);
+    redis::Redis& redis = redis::Redis::getState();
+    auto lockResults = redis.tryAcquireLocksNX(lockKeys);
+
+    // Collect only the keys whose lock was acquired
+    std::vector<std::string> acquiredRedisKeys;
+    std::vector<std::string> acquiredPartitionKeys;
+    for (size_t i = 0; i < keyVec.size(); i++) {
+        if (lockResults[i]) {
+            acquiredPartitionKeys.push_back(keyVec[i]);
+            acquiredRedisKeys.push_back(prefix + keyVec[i]);
+        }
+    }
+
+    auto redisResult = redis.mget(acquiredRedisKeys);
 
     std::map<std::string, std::vector<uint8_t>> result;
-    for (const auto& key : keys) {
+    for (const auto& key : acquiredPartitionKeys) {
         std::string redisKey = prefix + key;
-        if (redisResult.contains(redisKey)) {
+        if (redisResult.count(redisKey) > 0) {
             result[key] = std::move(redisResult[redisKey]);
         } else {
             result[key] = {};
@@ -95,10 +112,15 @@ void RedisStateKeyValue::setKeysToRemote(const std::string& user,
     auto stateMap = faabric::util::deserializeParState(data);
 
     std::map<std::string, std::vector<uint8_t>> redisKvs;
+    std::vector<std::string> lockKeys;
     for (const auto& [key, value] : stateMap) {
         redisKvs.emplace(prefix + key, value);
+        lockKeys.push_back("lock_" + prefix + key);
     }
-    redis::Redis::getState().mset(redisKvs);
+
+    redis::Redis& redis = redis::Redis::getState();
+    redis.mset(redisKvs);
+    redis.delBatch(lockKeys);
 }
 
 std::vector<uint8_t> RedisStateKeyValue::readFuncStateFromRemote(
@@ -107,7 +129,11 @@ std::vector<uint8_t> RedisStateKeyValue::readFuncStateFromRemote(
   int parallelismId)
 {
     std::string key = funcStateKey(user, func, parallelismId);
-    return redis::Redis::getState().get(key);
+    std::string lockKey = "lock_" + key;
+
+    redis::Redis& redis = redis::Redis::getState();
+    redis.acquireLockBlocking(lockKey);
+    return redis.get(key);
 }
 
 void RedisStateKeyValue::setFuncStateToRemote(const std::string& user,
@@ -117,7 +143,11 @@ void RedisStateKeyValue::setFuncStateToRemote(const std::string& user,
                                               size_t bufferLen)
 {
     std::string key = funcStateKey(user, func, parallelismId);
-    redis::Redis::getState().set(key, buffer, bufferLen);
+    std::string lockKey = "lock_" + key;
+
+    redis::Redis& redis = redis::Redis::getState();
+    redis.set(key, buffer, bufferLen);
+    redis.del(lockKey);
 }
 
 void RedisStateKeyValue::pullFromRemote()

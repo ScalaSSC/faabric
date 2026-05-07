@@ -124,6 +124,12 @@ class Redis
 
     void mset(const std::map<std::string, std::vector<uint8_t>>& kvs);
 
+    std::vector<bool> tryAcquireLocksNX(const std::vector<std::string>& keys);
+
+    void delBatch(const std::vector<std::string>& keys);
+
+    void acquireLockBlocking(const std::string& lockKey);
+
     std::map<std::string, std::vector<uint8_t>> mget(
       const std::vector<std::string>& keys);
 

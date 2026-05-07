@@ -1,5 +1,6 @@
 #include <faabric/redis/Redis.h>
 
+#include <chrono>
 #include <cstdarg>
 #include <faabric/util/bytes.h>
 #include <faabric/util/config.h>
@@ -392,6 +393,55 @@ void Redis::mset(const std::map<std::string, std::vector<uint8_t>>& kvs)
 
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
         throw std::runtime_error("MSET failed");
+    }
+}
+
+std::vector<bool> Redis::tryAcquireLocksNX(const std::vector<std::string>& keys)
+{
+    if (keys.empty()) {
+        return {};
+    }
+    for (const auto& key : keys) {
+        redisAppendCommand(context, "SET %s 1 NX", key.c_str());
+    }
+    std::vector<bool> results;
+    results.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); i++) {
+        void* reply;
+        redisGetReply(context, &reply);
+        auto r = wrapReply((redisReply*)reply);
+        results.push_back(r && r->type == REDIS_REPLY_STATUS);
+    }
+    return results;
+}
+
+void Redis::delBatch(const std::vector<std::string>& keys)
+{
+    if (keys.empty()) {
+        return;
+    }
+    std::vector<const char*> argv;
+    std::vector<size_t> argvlen;
+    argv.reserve(1 + keys.size());
+    argvlen.reserve(1 + keys.size());
+    argv.push_back("DEL");
+    argvlen.push_back(3);
+    for (const auto& key : keys) {
+        argv.push_back(key.c_str());
+        argvlen.push_back(key.size());
+    }
+    wrapReply((redisReply*)redisCommandArgv(
+      context, argv.size(), argv.data(), argvlen.data()));
+}
+
+void Redis::acquireLockBlocking(const std::string& lockKey)
+{
+    while (true) {
+        auto reply = safeRedisCommand(context, "SET %s 1 NX", lockKey.c_str());
+        if (reply && reply->type == REDIS_REPLY_STATUS) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

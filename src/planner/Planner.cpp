@@ -973,58 +973,67 @@ void Planner::updateRuntimeStats()
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeReconfigPeriod));
 
-        faabric::util::FullLock rflock(reconfigMx);
+        try {
+            faabric::util::FullLock rflock(reconfigMx);
 
-        std::vector<std::future<void>> futures;
-        // Iterate over all hosts.
-        for (const auto& [ip, hostInfo] : state.batchSchedHostMap) {
-            // Launch an asynchronous task for each host.
-            futures.emplace_back(std::async(
-              std::launch::async, [&results, &resultsMutex, &request, ip]() {
-                  // Fetch the runtime stats for the host using its IP.
-                  auto stats = faabric::scheduler::getFunctionCallClient(ip)
-                                 ->getRuntimeStats(request);
+            std::vector<std::future<void>> futures;
+            // Iterate over all hosts.
+            for (const auto& [ip, hostInfo] : state.batchSchedHostMap) {
+                // Launch an asynchronous task for each host.
+                futures.emplace_back(std::async(
+                  std::launch::async,
+                  [&results, &resultsMutex, &request, ip]() {
+                      // Fetch the runtime stats for the host using its IP.
+                      auto stats = faabric::scheduler::getFunctionCallClient(ip)
+                                     ->getRuntimeStats(request);
 
-                  // Lock the results map before writing.
-                  std::lock_guard<std::mutex> lock(resultsMutex);
-                  results[ip] = std::move(stats);
-              }));
-        }
-
-        // Wait for all the async tasks to complete.
-        for (auto& fut : futures) {
-            fut.get();
-        }
-
-        // Update the request with the results.
-        request.clear_collectedstats();
-        for (const auto& [ip, stats] : results) {
-            if (!stats) {
-                continue;
+                      // Lock the results map before writing.
+                      std::lock_guard<std::mutex> lock(resultsMutex);
+                      results[ip] = std::move(stats);
+                  }));
             }
-            auto* newStats = request.add_collectedstats();
-            newStats->CopyFrom(*stats);
-        }
 
-        int totalCount = 0;
-        auto localStats = runtimeStats.getAllStats();
-        std::map<std::string, std::map<std::string, int>> localChainedMap;
-        for (const auto& [instName, stats] : localStats) {
-            localChainedMap[instName] = stats.chainedCallStats;
-            totalCount += stats.chainedCallStats.size();
-        }
-        if (totalCount > 0) {
-            stateAwareScheduler->runtimeDistTune(localChainedMap);
-        }
+            // Wait for all the async tasks to complete.
+            for (auto& fut : futures) {
+                fut.get();
+            }
 
-        if (scheduleMode == 8) {
-            std::map<std::string, int> queueSizes;
+            // Update the request with the results.
+            request.clear_collectedstats();
             for (const auto& [ip, stats] : results) {
-                if (stats) {
-                    queueSizes[ip] = stats->totalwaitingqueuesize();
+                if (!stats) {
+                    continue;
                 }
+                auto* newStats = request.add_collectedstats();
+                newStats->CopyFrom(*stats);
             }
-            stateAwareScheduler->updateWorkerQueueSizes(queueSizes);
+
+            int totalCount = 0;
+            auto localStats = runtimeStats.getAllStats();
+            std::map<std::string, std::map<std::string, int>> localChainedMap;
+            for (const auto& [instName, stats] : localStats) {
+                localChainedMap[instName] = stats.chainedCallStats;
+                totalCount += stats.chainedCallStats.size();
+            }
+            if (totalCount > 0) {
+                stateAwareScheduler->runtimeDistTune(localChainedMap);
+            }
+
+            if (scheduleMode == 8) {
+                std::map<std::string, int> queueSizes;
+                for (const auto& [ip, stats] : results) {
+                    if (stats) {
+                        queueSizes[ip] = stats->totalwaitingqueuesize();
+                    }
+                }
+                stateAwareScheduler->updateWorkerQueueSizes(queueSizes);
+            }
+        } catch (const std::exception& e) {
+            SPDLOG_WARN("updateRuntimeStats round failed, skipping: {}",
+                        e.what());
+        } catch (...) {
+            SPDLOG_WARN(
+              "updateRuntimeStats round failed with unknown error, skipping");
         }
 
         results.clear();
