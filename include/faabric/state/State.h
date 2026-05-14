@@ -5,6 +5,8 @@
 #include <faabric/state/PersistentState.h>
 #include <faabric/state/StateKeyValue.h>
 
+#include <atomic>
+#include <semaphore>
 #include <shared_mutex>
 #include <string>
 
@@ -154,6 +156,10 @@ class State
 
     void updateHosts(faabric::batch_scheduler::HostMap hostMap);
 
+    bool persistentLock = false;
+
+    void resetPersistentLockState();
+
   private:
     const std::string thisIP;
 
@@ -165,6 +171,8 @@ class State
 
     std::shared_mutex mapMutex;
     std::shared_mutex fsmapMutex;
+    std::binary_semaphore persistentStateSem{ 1 };
+    std::atomic<bool> persistentStateLockHeld{ false };
 
     std::shared_ptr<StateKeyValue> doGetKV(const std::string& user,
                                            const std::string& key,

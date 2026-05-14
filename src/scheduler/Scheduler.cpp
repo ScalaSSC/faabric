@@ -321,6 +321,9 @@ void Scheduler::reset()
     migrationHistory.clear();
 
     runtimeStats.reset();
+
+    faabric::state::getGlobalState().resetPersistentLockState();
+    faabric::state::getGlobalState().persistentLock = false;
 }
 
 void Scheduler::shutdown()
@@ -615,8 +618,8 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
 
     std::string funcStr = user + "/" + func + "/" + par;
 
-    auto loopDeadlineMs = faabric::util::getGlobalClock().epochMillis() +
-                          batchCheckPeriod;
+    auto loopDeadlineMs =
+      faabric::util::getGlobalClock().epochMillis() + batchCheckPeriod;
 
     while (waitingQueue.getMessagesCount() != 0) {
 
@@ -1057,6 +1060,10 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
         decentralScheduler.setAlpha(newAlpha);
+    } else if (key == "persistent_lock") {
+        faabric::state::getGlobalState().resetPersistentLockState();
+        faabric::state::getGlobalState().persistentLock = (value == 1);
+        SPDLOG_INFO("Persistent lock: {}", value == 1 ? "ON" : "OFF");
     } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));

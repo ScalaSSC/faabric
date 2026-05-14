@@ -500,6 +500,23 @@ void PlannerClient::preloadSchedulingDecision(
 // Function State calls
 // ------
 
+std::string PlannerClient::getPersistentStateFromWorker(const std::string& key)
+{
+    auto req = std::make_shared<faabric::planner::MapMessage>();
+    req->mutable_payload()->insert({ "key", key });
+
+    faabric::planner::MapMessage resp;
+    syncSend(PlannerCalls::GetPersistentState, req.get(), &resp);
+    return resp.payload().at(key);
+}
+
+void PlannerClient::setPersistentStateFromWorker(
+  std::shared_ptr<faabric::planner::MapMessage> req)
+{
+    faabric::EmptyResponse resp;
+    syncSend(PlannerCalls::SetPersistentState, req.get(), &resp);
+}
+
 // -----------------------------------
 // Static setter/getters
 // -----------------------------------

@@ -124,6 +124,11 @@ class PlannerClient final : public faabric::transport::MessageEndpointClient
     // Function State calls
     // ------
 
+    std::string getPersistentStateFromWorker(const std::string& key);
+
+    void setPersistentStateFromWorker(
+      std::shared_ptr<faabric::planner::MapMessage> req);
+
   private:
     std::mutex plannerCacheMx;
     PlannerCache cache;

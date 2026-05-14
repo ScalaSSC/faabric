@@ -2,6 +2,8 @@
 #include <faabric/planner/PlannerEndpointHandler.h>
 #include <faabric/planner/PlannerServer.h>
 #include <faabric/snapshot/SnapshotServer.h>
+#include <faabric/state/State.h>
+#include <faabric/state/StateServer.h>
 #include <faabric/util/config.h>
 #include <faabric/util/crash.h>
 #include <faabric/util/logging.h>
@@ -25,6 +27,11 @@ int main()
     faabric::snapshot::SnapshotServer snapshotServer;
     snapshotServer.start();
 
+    // Start a state server to handle function state requests
+    SPDLOG_INFO("Starting planner state server");
+    faabric::state::StateServer stateServer(faabric::state::getGlobalState());
+    stateServer.start();
+
     // The faabric endpoint starts in the foreground
     SPDLOG_INFO("Starting planner endpoint");
     // We get the port from the global config, but the number of threads from
@@ -34,6 +41,9 @@ int main()
       faabric::planner::getPlanner().getConfig().numthreadshttpserver(),
       std::make_shared<faabric::planner::PlannerEndpointHandler>());
     endpoint.start(faabric::endpoint::EndpointMode::SIGNAL);
+
+    SPDLOG_INFO("Planner state server shutting down");
+    stateServer.stop();
 
     SPDLOG_INFO("Planner snapshot server shutting down");
     snapshotServer.stop();

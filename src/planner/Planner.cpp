@@ -4,6 +4,7 @@
 #include <faabric/scheduler/FunctionCallClient.h>
 #include <faabric/snapshot/SnapshotClient.h>
 #include <faabric/state/FunctionStateClient.h>
+#include <faabric/state/State.h>
 #include <faabric/transport/PointToPointBroker.h>
 #include <faabric/util/batch.h>
 #include <faabric/util/clock.h>
@@ -130,6 +131,9 @@ bool Planner::reset()
     flushExecutors();
 
     flushHosts();
+
+    faabric::state::getGlobalState().resetPersistentLockState();
+    faabric::state::getGlobalState().persistentLock = false;
 
     return true;
 }
@@ -983,6 +987,12 @@ bool Planner::resetParameter(
         }
         return true;
     }
+    if (key == "persistent_lock") {
+        bool lockVal = (value == 1);
+        faabric::state::getGlobalState().resetPersistentLockState();
+        faabric::state::getGlobalState().persistentLock = lockVal;
+        SPDLOG_INFO("Persistent lock: {}", lockVal ? "ON" : "OFF");
+    }
     if (key == "schedule_mode") {
         // Schedule Mode 0: Decentralized Scheduler with Binpack.
         // Schedule Mode 3: FaaSFlow Scheduler.
@@ -1082,6 +1092,22 @@ void Planner::setPersistentState(const faabric::planner::MapMessage& mapMsg)
     }
 }
 
+std::string Planner::getPersistentStateFromWorker(const std::string& key)
+{
+    return faabric::state::getGlobalState().readPersistentState(key);
+}
+
+void Planner::setPersistentStateFromWorker(
+  const faabric::planner::MapMessage& mapMsg)
+{
+    auto& localState = faabric::state::getGlobalState();
+    for (const auto& [k, v] : mapMsg.payload()) {
+        std::string key = k;
+        std::string val = v;
+        localState.writePersistentState(key, val);
+    }
+}
+
 std::string Planner::outputResult()
 {
     faabric::util::FullLock reqStatusLock(state.reqStatusMx);
@@ -1154,75 +1180,6 @@ std::string Planner::outputResult()
     doc.Accept(writer);
     return buffer.GetString();
 }
-
-// // This function is not running in the new research.
-// void Planner::updateRuntimeStats()
-// {
-//     // It doesn't need to be thread-safe, since all the stats in each worker
-//     // are thread-safe. Map to accumulate the runtime stats from each host.
-//     std::map<std::string, std::unique_ptr<faabric::RuntimeStatsResult>>
-//     results; faabric::RuntimeStatsUpdateRequest request; std::mutex
-//     resultsMutex; // Protects access to results.
-
-//     // We fetch the runtime stats periodically. Each iteration sends the
-//     stats
-//     // in the last iteration and feteches the new stats.
-//     while (!stopThreadTimer) {
-//         // Sleep for a while to batch the scheduled requests
-//         std::this_thread::sleep_for(
-//           std::chrono::milliseconds(runtimeReconfigPeriod));
-
-//         if (stateAwareScheduler->getRuntimeReconfig() == false) {
-//             continue;
-//         }
-
-//         faabric::util::FullLock rflock(reconfigMx);
-
-//         std::vector<std::future<void>> futures;
-//         // Iterate over all hosts.
-//         for (const auto& [ip, hostInfo] : state.activeHosts) {
-//             // Launch an asynchronous task for each host.
-//             futures.emplace_back(std::async(
-//               std::launch::async, [&results, &resultsMutex, &request, ip]() {
-//                   // Fetch the runtime stats for the host using its IP.
-//                   auto stats = faabric::scheduler::getFunctionCallClient(ip)
-//                                  ->getRuntimeStats(request);
-
-//                   // Lock the results map before writing.
-//                   std::lock_guard<std::mutex> lock(resultsMutex);
-//                   results[ip] = std::move(stats);
-//               }));
-//         }
-
-//         // Wait for all the async tasks to complete.
-//         for (auto& fut : futures) {
-//             fut.get();
-//         }
-
-//         // Update the request with the results.
-//         request.clear_collectedstats();
-//         for (const auto& [ip, stats] : results) {
-//             if (!stats) {
-//                 continue;
-//             }
-//             auto* newStats = request.add_collectedstats();
-//             newStats->CopyFrom(*stats);
-//         }
-
-//         int totalCount = 0;
-//         auto localStats = runtimeStats.getAllStats();
-//         std::map<std::string, std::map<std::string, int>> localChainedMap;
-//         for (const auto& [instName, stats] : localStats) {
-//             localChainedMap[instName] = stats.chainedCallStats;
-//             totalCount += stats.chainedCallStats.size();
-//         }
-//         if (totalCount > 0) {
-//             stateAwareScheduler->runtimeDistTune(localChainedMap);
-//         }
-
-//         results.clear();
-//     }
-// }
 
 std::map<std::string, std::unique_ptr<faabric::WorkerStats>>
 Planner::fetchWorkerStatsAsync(const std::vector<std::string>& targetIps)

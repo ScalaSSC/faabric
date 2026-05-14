@@ -23,7 +23,7 @@ std::string PersistentState::read(const std::string& key) const
     faabric::util::SharedLock lock(mutex_);
     auto it = store_.find(key);
     if (it == store_.end()) {
-        return emptyString;
+        return "not_found";
     }
     return it->second;
 }
@@ -37,7 +37,7 @@ std::vector<std::string> PersistentState::readBatch(
     for (const auto& key : keys) {
         auto it = store_.find(key);
         if (it == store_.end()) {
-            results.emplace_back(emptyString);
+            results.emplace_back("not_found");
         } else {
             results.emplace_back(it->second);
         }

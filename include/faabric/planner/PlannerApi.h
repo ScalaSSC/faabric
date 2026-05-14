@@ -20,5 +20,7 @@ enum PlannerCalls
     PreloadSchedulingDecision = 14,
     SetMessageResultBatch = 15,
     EnqueueBatch = 16,
+    GetPersistentState = 17,
+    SetPersistentState = 18,
 };
 }

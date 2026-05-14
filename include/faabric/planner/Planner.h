@@ -113,6 +113,10 @@ class Planner
 
     void setPersistentState(const faabric::planner::MapMessage& mapMsg);
 
+    std::string getPersistentStateFromWorker(const std::string& key);
+
+    void setPersistentStateFromWorker(const faabric::planner::MapMessage& mapMsg);
+
     // ----------
     // Metrics public API
     // ----------

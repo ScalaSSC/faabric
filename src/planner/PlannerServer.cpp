@@ -77,6 +77,12 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::doSyncRecv(
         case PlannerCalls::EnqueueBatch: {
             return recvEnqueueBatch(message.udata());
         }
+        case PlannerCalls::GetPersistentState: {
+            return recvGetPersistentStateFromWorker(message.udata());
+        }
+        case PlannerCalls::SetPersistentState: {
+            return recvSetPersistentStateFromWorker(message.udata());
+        }
         default: {
             // If we don't recognise the header, let the client fail, but don't
             // crash the planner
@@ -250,6 +256,27 @@ std::unique_ptr<google::protobuf::Message> PlannerServer::recvEnqueueBatch(
 
     planner.scheduleMessages(req, true);
 
+    return std::make_unique<faabric::EmptyResponse>();
+}
+
+std::unique_ptr<google::protobuf::Message>
+PlannerServer::recvGetPersistentStateFromWorker(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::planner::MapMessage, buffer.data(), buffer.size());
+    std::string key = parsedMsg.payload().at("key");
+
+    std::string value = planner.getPersistentStateFromWorker(key);
+
+    faabric::planner::MapMessage response;
+    response.mutable_payload()->insert({ key, value });
+    return std::make_unique<faabric::planner::MapMessage>(std::move(response));
+}
+
+std::unique_ptr<google::protobuf::Message>
+PlannerServer::recvSetPersistentStateFromWorker(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::planner::MapMessage, buffer.data(), buffer.size());
+    planner.setPersistentStateFromWorker(parsedMsg);
     return std::make_unique<faabric::EmptyResponse>();
 }
 
