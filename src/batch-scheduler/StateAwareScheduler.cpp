@@ -2076,7 +2076,7 @@ void StateAwareScheduler::rescheduleAppBinpack(const HostMap& hostMap)
         if (!changed)
             continue;
 
-        for (const auto& [k, v] : ipRemap)
+        for ([[maybe_unused]] const auto& [k, v] : ipRemap)
             SPDLOG_DEBUG("Binpack group {}: remap {} -> {}", gi, k, v);
 
         // Apply to newStateHost.
@@ -2794,7 +2794,7 @@ void StateAwareScheduler::rescheduleAppStepConf(const HostMap& hostMap)
         if (!changed)
             continue;
 
-        for (const auto& [k, v] : ipRemap)
+        for ([[maybe_unused]] const auto& [k, v] : ipRemap)
             SPDLOG_DEBUG("StepConf group {}: remap {} -> {}", gi, k, v);
 
         for (auto& [key, ip] : newStateHost)
