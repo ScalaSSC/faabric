@@ -488,9 +488,8 @@ std::string StateAwareScheduler::scheduleStatefulMessage(
     return host;
 }
 
-std::string StateAwareScheduler::scheduleMessage(
-  const HostMap& hostMap,
-  const faabric::Message& msg)
+std::string StateAwareScheduler::scheduleMessage(const HostMap& hostMap,
+                                                 const faabric::Message& msg)
 {
     auto* nonConstMsg = const_cast<faabric::Message*>(&msg);
     std::unique_ptr<faabric::Message> tempWrapper(nonConstMsg);
@@ -516,7 +515,7 @@ std::string StateAwareScheduler::scheduleMessage(
     }
     // stateless operator
     else {
-        if (scheduleMode == 0 || scheduleMode == 5) {
+        if (scheduleMode == 0 || scheduleMode == 5 || scheduleMode == 11) {
             host = scheduleStatelessMessageApportion(userFunc, hostMap, msg);
         } else {
             // when scheduleMode is 3, 7, we use round robin
@@ -994,16 +993,7 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
     return scheduledOperatorsGroup;
 }
 
-/***
- * The steps of reschedule App:
- * 1. Calculate the workload of each operator, which is based on the executed
- * requests number.
- * 2. Group the operators into groups. TODO - combine the partitioned stateful
- * with same attribute.
- * 3. Map groups to hosts.
- * 4. Arrange the states accordingly.
- * ***/
-void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
+void StateAwareScheduler::scheduleApp(const HostMap& hostMap)
 {
 
     //--------------------------------------------------------------------------
@@ -1033,6 +1023,339 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
 
     if (scheduleMode == 0) {
         rescheduleAppBinpack(hostMap);
+        return;
+    }
+
+    if (scheduleMode == 11) {
+        rescheduleAppStepConf(hostMap);
+        return;
+    }
+
+    SPDLOG_INFO("StateAwareScheduler: Reschedule the application according to "
+                "the metrics");
+
+    //--------------------------------------------------------------------------
+    // 2. Partition the application into sub-groups.
+    //--------------------------------------------------------------------------
+
+    std::vector<NodeGroup> groups;
+    std::unordered_set<std::string> visited;
+
+    for (const auto& inputNode : application->getInputNodes()) {
+        groupNodesStrictHelper(inputNode, groups, visited);
+    }
+
+    {
+        std::stringstream ss;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            const auto& [nodes, partition] = groups[i];
+
+            if (i > 0) {
+                ss << "; ";
+            }
+
+            ss << "Group " << i << "(partition=\"" << partition << "\"): [";
+
+            bool first = true;
+            for (const auto& nodePtr : nodes) {
+                if (!first)
+                    ss << ", ";
+                ss << nodePtr->name;
+                first = false;
+            }
+            ss << "]";
+        }
+
+        SPDLOG_INFO("All groups:\n {}", ss.str());
+    }
+    //--------------------------------------------------------------------------
+    // 3. Map groups to hosts.
+    //--------------------------------------------------------------------------
+
+    std::map<std::string, double> workerRemaining;
+    for (const auto& [ip, host] : hostMap) {
+        workerRemaining[ip] = 1.0;
+    }
+
+    // For each group, how much resource is allocated to each worker. The order
+    // of groups is the same as groups variable.
+    // MAP <ip, allocated resource>
+    std::vector<std::map<std::string, double>> groupAllocations;
+
+    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+        double groupReqResource = 0.0;
+        for (const auto& node : std::get<0>(groups[groupIndex])) {
+            groupReqResource += node->reqResource;
+        }
+
+        // Map of this group resource distribution (IP -> allocated resource).
+        std::map<std::string, double> groupAllocation;
+        // Greedily fill the available workers.
+        for (auto& [ip, available] : workerRemaining) {
+            if (available <= 0)
+                continue;
+            if (groupReqResource <= 0)
+                break;
+
+            if (available >= groupReqResource) {
+                // If the available resource on worker is enough.
+                groupAllocation[ip] = groupReqResource;
+                available -= groupReqResource;
+                groupReqResource = 0;
+                break;
+            } else {
+                // Otherwise (not enough).
+                groupAllocation[ip] = available;
+                groupReqResource -= available;
+                available = 0;
+            }
+        }
+
+        // 1e-9 is rounding up tolerance.
+        if (groupReqResource > 1e-9) {
+            SPDLOG_WARN("Not enough resources to assign group {}", groupIndex);
+            throw std::runtime_error("Insufficient resources across workers");
+        }
+
+        groupAllocations.push_back(groupAllocation);
+    }
+
+    //--------------------------------------------------------------------------
+    // 4. Arrange the states accordingly.
+    // We change the parallelism of partitioned stateful operators to the number
+    // of workers in its group. We don't change the parallelism of the stateful
+    // function.
+    //--------------------------------------------------------------------------
+
+    std::map<std::string, std::string> newStateHost;
+    std::map<std::string, int> newFunctionParallelism;
+    // MAP <USER_FUNC_PARALLELISM, MAP<IP, proportion>>
+    std::map<std::string, std::map<std::string, double>> newStatelessReqWeight;
+    // MAP <USER_FUNC, MAP<PARALLELISM_IDX, proportion>>
+    std::map<std::string, std::map<int, double>> newParStateReqWeight;
+
+    // For each group, statistics its states and assigns states to workers.
+    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+        const auto& group = std::get<0>(groups[groupIndex]);
+        auto groupAllocation = groupAllocations[groupIndex];
+
+        // If the group only has one stateful operator. Assgin it.
+        if (group.size() == 1 && group[0]->type == STATEFUL) {
+            auto node = group[0];
+            std::string UserFunc = node->name;
+            // We don't change the parallelism of the stateful function.
+            int para = node->parallelism;
+            newFunctionParallelism[UserFunc] = para;
+            for (int i = 0; i < para; ++i) {
+                // Find the worker with the maximum available resource in this
+                // group.
+                std::string bestWorker;
+                double bestAvail = -1.0;
+                for (const auto& [ip, value] : groupAllocation) {
+                    if (value > bestAvail) {
+                        bestAvail = value;
+                        bestWorker = ip;
+                    }
+                }
+                newStateHost[UserFunc + "_" + std::to_string(i)] = bestWorker;
+                // Update the available resource for the selected worker.
+                double reqRes = (node->reqResource) / para;
+                groupAllocation[bestWorker] =
+                  std::max(0.0, groupAllocation[bestWorker] - reqRes);
+            }
+            continue;
+        }
+
+        // Otherwise, it contains partitioned stateful and stateless operators
+        // For partitioned stateful, we assign it to every workers,
+        // (who has higher than 10% resource).
+
+        // Sanity check: if the group has stateful operator, throw error.
+        for (const auto& node : group) {
+            if (node->type == STATEFUL) {
+                SPDLOG_ERROR("Group {} contains multiple operators with "
+                             "stateful operator {}, which is not "
+                             "supported in rescheduling",
+                             groupIndex,
+                             node->name);
+            }
+        }
+
+        // Do assign the stateless and partitioned stateful operators.
+        double groupResource = 0;
+        for (const auto& node : group) {
+            groupResource += node->reqResource;
+        }
+
+        for (const auto& node : group) {
+            std::string userFunc = node->name;
+            if (node->type == STATELESS) {
+                double nodeReqResource = node->reqResource;
+                double scale = nodeReqResource / groupResource;
+                std::map<std::string, double> nodeAllocation;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
+                    double nodeAlloc = groupWeight * scale;
+                    if (nodeAlloc > 0) {
+                        nodeAllocation[ip] = nodeAlloc;
+                    }
+                }
+                newStatelessReqWeight[userFunc + "_0"] = nodeAllocation;
+            }
+            if (node->type == PARTITIONED_STATEFUL) {
+                int index = 0;
+                newFunctionParallelism[userFunc] = groupAllocation.size();
+                double nodeReqResource = node->reqResource;
+                double scale = nodeReqResource / groupResource;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
+                    std::string userFuncPar =
+                      userFunc + "_" + std::to_string(index);
+                    newParStateReqWeight[userFunc][index] = groupWeight * scale;
+                    newStateHost[userFuncPar] = ip;
+                    index++;
+                }
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 5. Collocate stateless operators with partitioned stateful operators.
+    // For each operator, we try to assign the stateless operators with states
+    // being acted up by the following partitioned stateful operators.
+    //--------------------------------------------------------------------------
+    std::map<std::string, std::string> newOptsCollocateMap;
+    for (const auto& group : groups) {
+        const auto& groupNodes = std::get<0>(group);
+
+        std::unordered_set<std::string> groupNodeNames;
+        for (const auto& node : groupNodes) {
+            groupNodeNames.insert(node->name);
+        }
+
+        const auto& groupPartition = std::get<1>(group);
+        if (groupPartition == NONE_STRING) {
+            continue;
+        }
+        // Fetch the partitioned stateful operators.
+        std::vector<std::shared_ptr<Node>> psNodes;
+        for (const auto& node : groupNodes) {
+            if (node->type == PARTITIONED_STATEFUL) {
+                psNodes.push_back(node);
+            }
+        }
+        // For the preceding stateless operators, we try to collocate them with
+        // this partitioned stateful operator.
+        if (psNodes.empty()) {
+            continue;
+        }
+
+        for (const auto& psNode : psNodes) {
+            const auto& psName = psNode->name;
+            auto psNodePartition = psNode->partitionBy;
+            auto sources = application->getSource(psName);
+            for (const auto& srcNode : sources) {
+                collectCollocation(srcNode->name,
+                                   psName,
+                                   psNodePartition,
+                                   newOptsCollocateMap,
+                                   groupNodeNames);
+            }
+        }
+    }
+
+    // Update the state host and parallelism info.
+    stateHost = newStateHost;
+    functionParallelism = newFunctionParallelism;
+
+    // Build the scheduledOperatorsMap
+    scheduledOperatorsMap.clear();
+    for (int groupId = 0; groupId < groups.size(); ++groupId) {
+        auto grpMap =
+          buildScheduledOperatorsForGroup(groupId,
+                                          std::get<0>(groups[groupId]),
+                                          newOptsCollocateMap,
+                                          newStatelessReqWeight,
+                                          newParStateReqWeight);
+        scheduledOperatorsMap.insert(grpMap.begin(), grpMap.end());
+    }
+
+    // Init the runtime summary.
+    runtimeSummary.initScheduledOperators(
+      *application, scheduledOperatorsMap, true, scheduleMode);
+
+    // Initialize the State Information for stateful and partitioned stateful
+    // operators.
+    stateHashRing.clear();
+
+    redis::Redis& redis = redis::Redis::getState();
+    redis.flushAll();
+    for (const auto& [stateName, ip] : stateHost) {
+        registerStateToRedis(stateName, ip);
+    }
+
+    for (const auto& [userFunction, partitionBy] : statePartitionBy) {
+        if (!functionParallelism.contains(userFunction)) {
+            SPDLOG_ERROR("Function {} has no parallelism", userFunction);
+            throw std::runtime_error("Function parallelism not found");
+        }
+        auto weightDist = newParStateReqWeight[userFunction];
+        stateHashRing[userFunction] =
+          std::make_shared<faabric::util::ConsistentHashRing>(weightDist);
+    }
+
+    printScheduleInfomation();
+}
+
+/***
+ * The steps of reschedule App:
+ * 1. Calculate the workload of each operator, which is based on the executed
+ * requests number.
+ * 2. Group the operators into groups. TODO - combine the partitioned stateful
+ * with same attribute.
+ * 3. Map groups to hosts.
+ * 4. Arrange the states accordingly.
+ * ***/
+void StateAwareScheduler::rescheduleApp(
+  const HostMap& hostMap,
+  const faabric::planner::ApplicationMetrics* metrics)
+{
+
+    //--------------------------------------------------------------------------
+    // 1. Calculate the workload of each operator.
+    //--------------------------------------------------------------------------
+
+    scheduledOperatorsMap.clear();
+
+    if (!application) {
+        SPDLOG_WARN("No application registered");
+        return;
+    }
+    auto& appNodes = application->getNodes();
+    if (appNodes.empty()) {
+        SPDLOG_WARN("No nodes recorded in the application");
+        return;
+    }
+
+    // TODO - scale the number of hosts.
+    application->quantiseResources(hostMap.size(), scheduleMode);
+    application->showConnections();
+
+    if (scheduleMode == 7) {
+        rescheduleAppFaaSFlow(hostMap);
+        return;
+    }
+
+    if (scheduleMode == 3) {
+        rescheduleAppFaaSFlowAdaptive(hostMap, metrics);
+        return;
+    }
+
+    if (scheduleMode == 0) {
+        rescheduleAppBinpack(hostMap);
+        return;
+    }
+
+    if (scheduleMode == 11) {
+        rescheduleAppStepConf(hostMap);
         return;
     }
 
@@ -1367,22 +1690,37 @@ StateAwareScheduler::groupNodesGreedily(const HostMap& hostMap)
     }
 
     // --- Initial Group Creation and Placement (Done ONCE) ---
-    // Each node starts as its own group, assigned to the best available worker.
+    // Each node starts as its own group. If reqResource > 1.0 the load is
+    // spread across multiple workers (cap 1.0 per worker).
     for (const auto& [nodeName, node] : appNodes) {
         groups.push_back({ { node }, NONE_STRING });
 
-        // Find the worker with maximum available resource.
-        std::string bestWorker;
-        double bestAvail = std::numeric_limits<double>::lowest();
-        for (const auto& [ip, value] : workerRemaining) {
-            if (value > bestAvail) {
-                bestAvail = value;
-                bestWorker = ip;
+        std::map<std::string, double> nodeAllocation;
+        double remaining = node->reqResource;
+
+        while (remaining > 1e-9) {
+            // Find the worker with most available capacity not yet used by
+            // this node.
+            std::string bestWorker;
+            double bestAvail = std::numeric_limits<double>::lowest();
+            for (const auto& [ip, avail] : workerRemaining) {
+                if (nodeAllocation.count(ip))
+                    continue;
+                if (avail > bestAvail) {
+                    bestAvail = avail;
+                    bestWorker = ip;
+                }
             }
+            if (bestWorker.empty())
+                break;
+
+            double allocation = std::min(1.0, remaining);
+            nodeAllocation[bestWorker] = allocation;
+            workerRemaining[bestWorker] -= allocation;
+            remaining -= allocation;
         }
 
-        groupAllocations.push_back({ { bestWorker, node->reqResource } });
-        workerRemaining[bestWorker] -= node->reqResource;
+        groupAllocations.push_back(std::move(nodeAllocation));
     }
 
     // --- Iterative Merging Loop ---
@@ -1640,6 +1978,128 @@ void StateAwareScheduler::rescheduleAppBinpack(const HostMap& hostMap)
     }
 
     //--------------------------------------------------------------------------
+    // 3. Greedy IP remapping per group to minimise state migration.
+    //    Since all workers are homogeneous, we can permute IPs within each
+    //    group without affecting load distribution.
+    //    Score priority: (1) state partition locality (+2 per match),
+    //                    (2) identity preference / operator locality (+1).
+    //--------------------------------------------------------------------------
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+        const auto& groupAllocation = groupAllocations[gi];
+        if (groupAllocation.size() <= 1)
+            continue;
+
+        std::set<std::string> ipSet;
+        for (const auto& [ip, _] : groupAllocation)
+            ipSet.insert(ip);
+
+        // scoreMx[newIp][oldIp] = benefit of the bijection φ(newIp)=oldIp.
+        // Priority 1 (+1000 per match): stateful state partition stays on its
+        // old host. Priority 2 (up to ~999): stateless traffic overlap
+        // min(newW,oldW)*10 per op. The multiplier gap ensures state always
+        // dominates stateless in the ranking.
+        std::map<std::string, std::map<std::string, int>> scoreMx;
+        for (const auto& newIp : ipSet)
+            for (const auto& oldIp : ipSet)
+                scoreMx[newIp][oldIp] = 0;
+
+        // Priority 1: stateful state locality.
+        for (const auto& [key, newIp] : newStateHost) {
+            if (!ipSet.count(newIp))
+                continue;
+            auto it = stateHost.find(key);
+            if (it != stateHost.end() && ipSet.count(it->second))
+                scoreMx[newIp][it->second] += 1000;
+        }
+
+        // Priority 2: stateless operator locality.
+        // For φ(newIp)=oldIp, score += min(new_weight[newIp],
+        // old_weight[oldIp]) * 10 per stateless operator. This favours mappings
+        // where the physical host oldIp continues to handle a similar
+        // proportion of stateless traffic.
+        for (const auto& [funcPar, wMap] : newStatelessReqWeight) {
+            bool inGroup =
+              std::any_of(wMap.begin(), wMap.end(), [&ipSet](const auto& kv) {
+                  return ipSet.count(kv.first) > 0;
+              });
+            if (!inGroup)
+                continue;
+            std::string func = funcPar.substr(0, funcPar.rfind('_'));
+            auto sopIt = scheduledOperatorsMap.find(func);
+            if (sopIt == scheduledOperatorsMap.end())
+                continue;
+            for (const auto& [newIp, newW] : wMap) {
+                if (!ipSet.count(newIp))
+                    continue;
+                for (const auto& oldIp : ipSet) {
+                    double oldW = 0;
+                    auto wit = sopIt->second.weightDist.find(oldIp);
+                    if (wit != sopIt->second.weightDist.end())
+                        oldW = wit->second;
+                    scoreMx[newIp][oldIp] +=
+                      static_cast<int>(std::min(newW, oldW) * 10);
+                }
+            }
+        }
+
+        // Greedy bipartite matching: maximise Σ scoreMx[newIp][φ(newIp)].
+        std::vector<std::tuple<int, std::string, std::string>> cands;
+        cands.reserve(ipSet.size() * ipSet.size());
+        for (const auto& newIp : ipSet)
+            for (const auto& oldIp : ipSet)
+                cands.emplace_back(scoreMx[newIp][oldIp], newIp, oldIp);
+        std::sort(cands.rbegin(), cands.rend());
+
+        std::map<std::string, std::string> ipRemap;
+        std::set<std::string> freeNew = ipSet;
+        std::set<std::string> freeOld = ipSet;
+
+        for (const auto& [s, newIp, oldIp] : cands) {
+            if (freeNew.count(newIp) && freeOld.count(oldIp)) {
+                ipRemap[newIp] = oldIp;
+                freeNew.erase(newIp);
+                freeOld.erase(oldIp);
+            }
+        }
+        for (const auto& newIp : freeNew) {
+            ipRemap[newIp] = *freeOld.begin();
+            freeOld.erase(freeOld.begin());
+        }
+
+        // Skip groups where the mapping is the identity.
+        bool changed = false;
+        for (const auto& [k, v] : ipRemap)
+            if (k != v) {
+                changed = true;
+                break;
+            }
+        if (!changed)
+            continue;
+
+        for (const auto& [k, v] : ipRemap)
+            SPDLOG_DEBUG("Binpack group {}: remap {} -> {}", gi, k, v);
+
+        // Apply to newStateHost.
+        for (auto& [key, ip] : newStateHost)
+            if (ipRemap.count(ip))
+                ip = ipRemap.at(ip);
+
+        // Apply to newStatelessReqWeight (IP-keyed weight maps).
+        for (auto& [funcPar, wMap] : newStatelessReqWeight) {
+            bool inGroup =
+              std::any_of(wMap.begin(), wMap.end(), [&ipSet](const auto& kv) {
+                  return ipSet.count(kv.first);
+              });
+            if (!inGroup)
+                continue;
+            std::map<std::string, double> remapped;
+            for (const auto& [ip, w] : wMap)
+                remapped[ipRemap.count(ip) ? ipRemap.at(ip) : ip] = w;
+            wMap = std::move(remapped);
+        }
+    }
+
+    //--------------------------------------------------------------------------
     // 4. Build the scheduledOperatorsMap.
     //--------------------------------------------------------------------------
 
@@ -1860,6 +2320,528 @@ void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
 
     for (const auto& [userFunction, partitionBy] : statePartitionBy) {
         if (!functionParallelism.contains(userFunction)) {
+            SPDLOG_ERROR("Function {} has no parallelism", userFunction);
+            throw std::runtime_error("Function parallelism not found");
+        }
+        auto weightDist = newParStateReqWeight[userFunction];
+        stateHashRing[userFunction] =
+          std::make_shared<faabric::util::ConsistentHashRing>(weightDist);
+    }
+
+    printScheduleInfomation();
+}
+
+void StateAwareScheduler::rescheduleAppFaaSFlowAdaptive(
+  const HostMap& hostMap,
+  const faabric::planner::ApplicationMetrics* metrics)
+{
+    SPDLOG_INFO("Rescheduling the application in FaaSFlow Adaptive Mode");
+
+    const int numHosts = static_cast<int>(hostMap.size());
+
+    double avgInputRate = 0.0;
+    if (metrics) {
+        auto signals = metrics->getScalingSignals(3);
+        avgInputRate = signals.avgInputRate;
+        SPDLOG_INFO("Adaptive: avgInputRate(3s)={:.1f}", avgInputRate);
+    }
+
+    int usedHostCount =
+      metrics ? metrics->computeAdaptiveHostCount(avgInputRate, numHosts) : numHosts;
+    SPDLOG_INFO("Adaptive: usedHostCount={}", usedHostCount);
+
+    // Distribute reqResource proportionally to each operator's processedTuples.
+    if (avgInputRate > 0.0) {
+        double totalRequired = static_cast<double>(usedHostCount);
+        double totalProcessed = 0.0;
+        for (const auto& [name, node] : application->getNodes())
+            totalProcessed +=
+              static_cast<double>(std::max(1L, node->processedTuples));
+        for (auto& [name, node] : application->getNodes()) {
+            double frac =
+              static_cast<double>(std::max(1L, node->processedTuples)) /
+              totalProcessed;
+            node->reqResource = frac * totalRequired;
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 3: Build a limited host map with only usedHostCount workers.
+    //--------------------------------------------------------------------------
+    HostMap limitedHostMap;
+    {
+        int cnt = 0;
+        for (const auto& [ip, host] : hostMap) {
+            if (cnt >= usedHostCount)
+                break;
+            limitedHostMap[ip] = host;
+            ++cnt;
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 4: Greedy grouping on the limited host map.
+    //--------------------------------------------------------------------------
+    auto [groups, groupAllocations, workerRemaining] =
+      groupNodesGreedily(limitedHostMap);
+
+    {
+        std::stringstream ss;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            const auto& [nodes, partition] = groups[i];
+            if (i > 0)
+                ss << "; ";
+            ss << "Group " << i << "(partition=\"" << partition << "\"): [";
+            bool first = true;
+            for (const auto& nodePtr : nodes) {
+                if (!first)
+                    ss << ", ";
+                ss << nodePtr->name;
+                first = false;
+            }
+            ss << "]";
+        }
+        SPDLOG_INFO("Adaptive groups:\n {}", ss.str());
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 5: Allocate any unused workers (within limitedHostMap) to groups.
+    //--------------------------------------------------------------------------
+    for (const auto& [ip, host] : limitedHostMap) {
+        if (workerRemaining.at(ip) != 1.0)
+            continue;
+
+        int targetIdx = -1;
+        double maxResource = std::numeric_limits<double>::lowest();
+        for (int i = 0; i < static_cast<int>(groupAllocations.size()); ++i) {
+            for (const auto& [workerIp, resource] : groupAllocations[i]) {
+                if (resource >= maxResource) {
+                    maxResource = resource;
+                    targetIdx = i;
+                }
+            }
+        }
+
+        if (targetIdx != -1) {
+            double totalResource = 0;
+            for (const auto& [_, resource] : groupAllocations[targetIdx])
+                totalResource += resource;
+            groupAllocations[targetIdx][ip] = 0.0;
+            double newEvenShare =
+              totalResource / groupAllocations[targetIdx].size();
+            for (auto& [workerIp, allocatedResource] :
+                 groupAllocations[targetIdx]) {
+                workerRemaining[workerIp] += allocatedResource;
+                allocatedResource = newEvenShare;
+                workerRemaining[workerIp] -= newEvenShare;
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 6: Arrange states.
+    //--------------------------------------------------------------------------
+    std::map<std::string, std::string> newStateHost;
+    std::map<std::string, int> newFunctionParallelism;
+    std::map<std::string, std::map<std::string, double>> newStatelessReqWeight;
+    std::map<std::string, std::map<int, double>> newParStateReqWeight;
+
+    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+        const auto& group = std::get<0>(groups[groupIndex]);
+        auto groupAllocation = groupAllocations[groupIndex];
+
+        double groupResource = 0;
+        for (const auto& node : group)
+            groupResource += node->reqResource;
+
+        for (const auto& node : group) {
+            std::string userFunc = node->name;
+            if (node->type == STATELESS) {
+                double scale = node->reqResource / groupResource;
+                std::map<std::string, double> nodeAllocation;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
+                    double nodeAlloc = groupWeight * scale;
+                    if (nodeAlloc > 0)
+                        nodeAllocation[ip] = nodeAlloc;
+                }
+                newStatelessReqWeight[userFunc + "_0"] = nodeAllocation;
+            } else if (node->type == PARTITIONED_STATEFUL) {
+                int index = 0;
+                newFunctionParallelism[userFunc] = groupAllocation.size();
+                double scale = node->reqResource / groupResource;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
+                    std::string userFuncPar =
+                      userFunc + "_" + std::to_string(index);
+                    newParStateReqWeight[userFunc][index] = groupWeight * scale;
+                    newStateHost[userFuncPar] = ip;
+                    ++index;
+                }
+            } else if (node->type == STATEFUL) {
+                int para = node->parallelism;
+                newFunctionParallelism[userFunc] = para;
+                for (int i = 0; i < para; ++i) {
+                    int workerRB = i % groupAllocation.size();
+                    std::string worker =
+                      faabric::util::getNthKey(groupAllocation, workerRB);
+                    newStateHost[userFunc + "_" + std::to_string(i)] = worker;
+                }
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 7: Build scheduledOperatorsMap and commit.
+    //--------------------------------------------------------------------------
+    stateHost = newStateHost;
+    functionParallelism = newFunctionParallelism;
+
+    scheduledOperatorsMap.clear();
+    for (int groupId = 0; groupId < static_cast<int>(groups.size());
+         ++groupId) {
+        auto grpMap =
+          buildScheduledOperatorsForGroup(groupId,
+                                          std::get<0>(groups[groupId]),
+                                          {},
+                                          newStatelessReqWeight,
+                                          newParStateReqWeight);
+        scheduledOperatorsMap.insert(grpMap.begin(), grpMap.end());
+    }
+
+    runtimeSummary.initScheduledOperators(
+      *application, scheduledOperatorsMap, true, scheduleMode);
+
+    stateHashRing.clear();
+
+    redis::Redis& redis = redis::Redis::getState();
+    redis.flushAll();
+    for (const auto& [stateName, ip] : stateHost)
+        registerStateToRedis(stateName, ip);
+
+    for (const auto& [userFunction, partitionBy] : statePartitionBy) {
+        if (functionParallelism.find(userFunction) ==
+            functionParallelism.end()) {
+            SPDLOG_ERROR("Function {} has no parallelism", userFunction);
+            throw std::runtime_error("Function parallelism not found");
+        }
+        auto weightDist = newParStateReqWeight[userFunction];
+        stateHashRing[userFunction] =
+          std::make_shared<faabric::util::ConsistentHashRing>(weightDist);
+    }
+
+    printScheduleInfomation();
+}
+
+void StateAwareScheduler::rescheduleAppStepConf(const HostMap& hostMap)
+{
+    SPDLOG_INFO("Rescheduling the application in StepConf Mode");
+
+    // DoP is already set by quantiseResources(): di ∝ αi (same as Binpack).
+
+    //--------------------------------------------------------------------------
+    // Step 1: Critical-path DP on the operator DAG.
+    //   critWeight[v] = reqResource[v] + max(critWeight[pred] for pred of v)
+    // We traverse in DFS topological order, which guarantees predecessors are
+    // processed before any successor.
+    //--------------------------------------------------------------------------
+    auto appNodes = application->getNodesDFSOrder();
+
+    std::map<std::string, double> critWeight;
+    std::map<std::string, std::string> critPred;
+
+    for (const auto& [nodeName, node] : appNodes) {
+        double maxPredW = 0.0;
+        std::string bestPred;
+        for (const auto& predNode : application->getSource(nodeName)) {
+            auto it = critWeight.find(predNode->name);
+            if (it != critWeight.end() && it->second > maxPredW) {
+                maxPredW = it->second;
+                bestPred = predNode->name;
+            }
+        }
+        critWeight[nodeName] = node->reqResource + maxPredW;
+        critPred[nodeName] = bestPred;
+    }
+
+    // Find the sink with the maximum critical weight.
+    std::string sinkName;
+    double maxCrit = -1.0;
+    for (const auto& [name, w] : critWeight) {
+        if (w > maxCrit) {
+            maxCrit = w;
+            sinkName = name;
+        }
+    }
+
+    // Reconstruct critical path (sink → source, stored in reverse so we can
+    // mark members quickly with a set).
+    std::unordered_set<std::string> critSet;
+    {
+        std::string cur = sinkName;
+        while (!cur.empty()) {
+            critSet.insert(cur);
+            cur = critPred.count(cur) ? critPred.at(cur) : "";
+        }
+    }
+
+    SPDLOG_INFO("StepConf: critical path length={:.3f}, {} nodes",
+                maxCrit,
+                critSet.size());
+
+    //--------------------------------------------------------------------------
+    // Step 2: Reorder operators — critical path first, then the rest.
+    //   Both sub-lists maintain their original DFS topological order.
+    //--------------------------------------------------------------------------
+    std::vector<std::pair<std::string, std::shared_ptr<Node>>> orderedNodes;
+    orderedNodes.reserve(appNodes.size());
+
+    // Pass 1: critical path nodes in topo order.
+    for (const auto& [name, node] : appNodes) {
+        if (critSet.count(name))
+            orderedNodes.emplace_back(name, node);
+    }
+    // Pass 2: non-critical nodes in topo order.
+    for (const auto& [name, node] : appNodes) {
+        if (!critSet.count(name))
+            orderedNodes.emplace_back(name, node);
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 3: Sequential bin-packing in critical-path-first order.
+    //   Identical fill logic to groupNodesTopo(), but operating on
+    //   orderedNodes.
+    //--------------------------------------------------------------------------
+    std::vector<NodeGroup> groups;
+    std::vector<std::map<std::string, double>> groupAllocations;
+    std::map<std::string, double> workerRemaining;
+
+    for (const auto& [ip, host] : hostMap)
+        workerRemaining[ip] = 1.0;
+
+    auto it = hostMap.begin();
+    const double TOLERANCE = 1e-9;
+
+    for (const auto& [nodeName, node] : orderedNodes) {
+        std::map<std::string, double> currentNodeAllocation;
+        double remainReq = node->reqResource;
+
+        while (remainReq > TOLERANCE) {
+            if (it == hostMap.end()) {
+                // Floating-point dust: absorb into the last host.
+                std::string lastIp = hostMap.rbegin()->first;
+                SPDLOG_WARN(
+                  "StepConf: FP drift {:.2e} -> {}", remainReq, lastIp);
+                currentNodeAllocation[lastIp] += remainReq;
+                workerRemaining[lastIp] -= remainReq;
+                remainReq = 0.0;
+                continue;
+            }
+            std::string ip = it->first;
+            double avail = workerRemaining[ip];
+            if (avail > TOLERANCE) {
+                if (avail >= remainReq) {
+                    currentNodeAllocation[ip] += remainReq;
+                    workerRemaining[ip] -= remainReq;
+                    remainReq = 0.0;
+                } else {
+                    currentNodeAllocation[ip] += avail;
+                    remainReq -= avail;
+                    workerRemaining[ip] = 0.0;
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+        groups.push_back({ { node }, NONE_STRING });
+        groupAllocations.push_back(currentNodeAllocation);
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 4: Assign state hosts (same logic as rescheduleAppBinpack Step 2).
+    //--------------------------------------------------------------------------
+    std::map<std::string, std::string> newStateHost;
+    std::map<std::string, int> newFunctionParallelism;
+    std::map<std::string, std::map<std::string, double>> newStatelessReqWeight;
+    std::map<std::string, std::map<int, double>> newParStateReqWeight;
+
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+        const auto& group = std::get<0>(groups[gi]);
+        auto groupAllocation = groupAllocations[gi];
+
+        double groupResource = 0;
+        for (const auto& n : group)
+            groupResource += n->reqResource;
+
+        for (const auto& node : group) {
+            std::string userFunc = node->name;
+            if (node->type == STATELESS) {
+                double nodeReqResource = node->reqResource;
+                double scale = nodeReqResource / groupResource;
+                std::map<std::string, double> nodeAllocation;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
+                    double alloc = groupWeight * scale;
+                    if (alloc > 0)
+                        nodeAllocation[ip] = alloc;
+                }
+                newStatelessReqWeight[userFunc + "_0"] = nodeAllocation;
+            } else if (node->type == PARTITIONED_STATEFUL) {
+                int index = 0;
+                newFunctionParallelism[userFunc] = groupAllocation.size();
+                double nodeReqResource = node->reqResource;
+                double scale = nodeReqResource / groupResource;
+                for (const auto& [ip, groupWeight] : groupAllocation) {
+                    std::string userFuncPar =
+                      userFunc + "_" + std::to_string(index);
+                    newParStateReqWeight[userFunc][index] = groupWeight * scale;
+                    newStateHost[userFuncPar] = ip;
+                    index++;
+                }
+            } else if (node->type == STATEFUL) {
+                int para = node->parallelism;
+                newFunctionParallelism[userFunc] = para;
+                for (int i = 0; i < para; ++i) {
+                    int workerRB = i % groupAllocation.size();
+                    std::string worker =
+                      faabric::util::getNthKey(groupAllocation, workerRB);
+                    newStateHost[userFunc + "_" + std::to_string(i)] = worker;
+                }
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 5: Greedy IP remapping per group to minimise state migration.
+    //   Copied verbatim from rescheduleAppBinpack Step 3.
+    //--------------------------------------------------------------------------
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+        const auto& groupAllocation = groupAllocations[gi];
+        if (groupAllocation.size() <= 1)
+            continue;
+
+        std::set<std::string> ipSet;
+        for (const auto& [ip, _] : groupAllocation)
+            ipSet.insert(ip);
+
+        std::map<std::string, std::map<std::string, int>> scoreMx;
+        for (const auto& newIp : ipSet)
+            for (const auto& oldIp : ipSet)
+                scoreMx[newIp][oldIp] = 0;
+
+        // Priority 1: stateful state locality (+1000 per partition match).
+        for (const auto& [key, newIp] : newStateHost) {
+            if (!ipSet.count(newIp))
+                continue;
+            auto sit = stateHost.find(key);
+            if (sit != stateHost.end() && ipSet.count(sit->second))
+                scoreMx[newIp][sit->second] += 1000;
+        }
+
+        // Priority 2: stateless operator locality.
+        for (const auto& [funcPar, wMap] : newStatelessReqWeight) {
+            bool inGroup =
+              std::any_of(wMap.begin(), wMap.end(), [&ipSet](const auto& kv) {
+                  return ipSet.count(kv.first) > 0;
+              });
+            if (!inGroup)
+                continue;
+            std::string func = funcPar.substr(0, funcPar.rfind('_'));
+            auto sopIt = scheduledOperatorsMap.find(func);
+            if (sopIt == scheduledOperatorsMap.end())
+                continue;
+            for (const auto& [newIp, newW] : wMap) {
+                if (!ipSet.count(newIp))
+                    continue;
+                for (const auto& oldIp : ipSet) {
+                    double oldW = 0;
+                    auto wit = sopIt->second.weightDist.find(oldIp);
+                    if (wit != sopIt->second.weightDist.end())
+                        oldW = wit->second;
+                    scoreMx[newIp][oldIp] +=
+                      static_cast<int>(std::min(newW, oldW) * 10);
+                }
+            }
+        }
+
+        // Greedy bipartite matching.
+        std::vector<std::tuple<int, std::string, std::string>> cands;
+        cands.reserve(ipSet.size() * ipSet.size());
+        for (const auto& newIp : ipSet)
+            for (const auto& oldIp : ipSet)
+                cands.emplace_back(scoreMx[newIp][oldIp], newIp, oldIp);
+        std::sort(cands.rbegin(), cands.rend());
+
+        std::map<std::string, std::string> ipRemap;
+        std::set<std::string> freeNew = ipSet;
+        std::set<std::string> freeOld = ipSet;
+        for (const auto& [s, newIp, oldIp] : cands) {
+            if (freeNew.count(newIp) && freeOld.count(oldIp)) {
+                ipRemap[newIp] = oldIp;
+                freeNew.erase(newIp);
+                freeOld.erase(oldIp);
+            }
+        }
+        for (const auto& nip : freeNew) {
+            ipRemap[nip] = *freeOld.begin();
+            freeOld.erase(freeOld.begin());
+        }
+
+        bool changed = false;
+        for (const auto& [k, v] : ipRemap)
+            if (k != v) {
+                changed = true;
+                break;
+            }
+        if (!changed)
+            continue;
+
+        for (const auto& [k, v] : ipRemap)
+            SPDLOG_DEBUG("StepConf group {}: remap {} -> {}", gi, k, v);
+
+        for (auto& [key, ip] : newStateHost)
+            if (ipRemap.count(ip))
+                ip = ipRemap.at(ip);
+
+        for (auto& [funcPar, wMap] : newStatelessReqWeight) {
+            bool inGroup =
+              std::any_of(wMap.begin(), wMap.end(), [&ipSet](const auto& kv) {
+                  return ipSet.count(kv.first);
+              });
+            if (!inGroup)
+                continue;
+            std::map<std::string, double> remapped;
+            for (const auto& [ip, w] : wMap)
+                remapped[ipRemap.count(ip) ? ipRemap.at(ip) : ip] = w;
+            wMap = std::move(remapped);
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 6: Commit and publish.
+    //--------------------------------------------------------------------------
+    stateHost = newStateHost;
+    functionParallelism = newFunctionParallelism;
+
+    scheduledOperatorsMap.clear();
+    for (int gi = 0; gi < (int)groups.size(); ++gi) {
+        auto grpMap = buildScheduledOperatorsForGroup(gi,
+                                                      std::get<0>(groups[gi]),
+                                                      {},
+                                                      newStatelessReqWeight,
+                                                      newParStateReqWeight);
+        scheduledOperatorsMap.insert(grpMap.begin(), grpMap.end());
+    }
+
+    runtimeSummary.initScheduledOperators(
+      *application, scheduledOperatorsMap, true, scheduleMode);
+
+    stateHashRing.clear();
+    redis::Redis& redis = redis::Redis::getState();
+    redis.flushAll();
+    for (const auto& [stateName, ip] : stateHost)
+        registerStateToRedis(stateName, ip);
+
+    for (const auto& [userFunction, partitionBy] : statePartitionBy) {
+        if (!functionParallelism.count(userFunction)) {
             SPDLOG_ERROR("Function {} has no parallelism", userFunction);
             throw std::runtime_error("Function parallelism not found");
         }

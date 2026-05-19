@@ -3,6 +3,7 @@
 #include <faabric/batch-scheduler/Application.h>
 #include <faabric/batch-scheduler/BatchScheduler.h>
 #include <faabric/batch-scheduler/RuntimeSummary.h>
+#include <faabric/planner/ApplicationMetrics.h>
 #include <faabric/planner/FunctionMetrics.h>
 #include <faabric/util/config.h>
 #include <faabric/util/hash.h>
@@ -139,7 +140,11 @@ class StateAwareScheduler : public BatchScheduler
       const std::map<std::string, long>& nodeWorkloads,
       const std::map<std::string, std::map<std::string, int>> edgeWeightMap);
 
-    void rescheduleApp(const HostMap& hostMap);
+    void scheduleApp(const HostMap& hostMap);
+
+    void rescheduleApp(
+      const HostMap& hostMap,
+      const faabric::planner::ApplicationMetrics* metrics = nullptr);
 
     std::tuple<std::vector<NodeGroup>,
                std::vector<std::map<std::string, double>>,
@@ -154,6 +159,12 @@ class StateAwareScheduler : public BatchScheduler
     void rescheduleAppBinpack(const HostMap& hostMap);
 
     void rescheduleAppFaaSFlow(const HostMap& hostMap);
+
+    void rescheduleAppFaaSFlowAdaptive(
+      const HostMap& hostMap,
+      const faabric::planner::ApplicationMetrics* metrics);
+
+    void rescheduleAppStepConf(const HostMap& hostMap);
 
     const std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>&
     getStateHashRing() const

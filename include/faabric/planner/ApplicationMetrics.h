@@ -993,6 +993,59 @@ class ApplicationMetrics
         return sig;
     }
 
+    struct RuntimeRecordSummary
+    {
+        int count = 0;
+        int workersNum = 0;
+    };
+
+    // Returns up to the last `n` records where plannerQueueSaturated == true,
+    // newest first.
+    std::vector<RuntimeRecordSummary> getLastNSaturatedRecords(int n) const
+    {
+        faabric::util::SharedLock lock(opMx);
+        std::vector<RuntimeRecordSummary> result;
+        result.reserve(n);
+        for (auto it = runtimeMetricsHistory.rbegin();
+             it != runtimeMetricsHistory.rend() && (int)result.size() < n;
+             ++it) {
+            if (!it->second.plannerQueueSaturated)
+                continue;
+            result.push_back({ it->second.count, it->second.workersNum });
+        }
+        return result;
+    }
+
+    // Computes the adaptive target host count using the FaaSFlow Adaptive
+    // algorithm: derives avgCountPerWorker from the last N saturated records
+    // and divides avgInputRate by it, clamped to [1, numHosts].
+    int computeAdaptiveHostCount(double avgInputRate, int numHosts) const
+    {
+        double avgCountPerWorker = 0.0;
+        auto saturated = getLastNSaturatedRecords(10);
+        if (!saturated.empty()) {
+            double total = 0.0;
+            int valid = 0;
+            for (const auto& rec : saturated) {
+                if (rec.workersNum > 0) {
+                    total += static_cast<double>(rec.count) / rec.workersNum;
+                    ++valid;
+                }
+            }
+            if (valid > 0)
+                avgCountPerWorker = total / valid;
+        }
+
+        if (avgCountPerWorker <= 0.0 || avgInputRate <= 0.0)
+            return numHosts;
+
+        double totalRequired =
+          std::max(1.0,
+                   std::min(static_cast<double>(numHosts),
+                            avgInputRate / avgCountPerWorker));
+        return std::min(numHosts, static_cast<int>(std::ceil(totalRequired)));
+    }
+
     // Called from updateRuntimeStats to snapshot the planner's waiting queue.
     // Saturation is computed here so getScalingSignals just reads the result.
     void recordQueueSnapshot(int queueSize, int64_t queueAgeMicros)

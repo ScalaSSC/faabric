@@ -704,7 +704,7 @@ bool Planner::registerApp(faabric::planner::RegisterApplicationRequest& rawReq,
           faabric::util::getFirstNElements(tempHostMap, schedHostNum);
     }
     stateAwareScheduler->initApp(state.activeHosts);
-    stateAwareScheduler->rescheduleApp(state.activeHosts);
+    stateAwareScheduler->scheduleApp(state.activeHosts);
     int curVersion = migrationVersion++;
     doDistributeStatesInfo(curVersion, {}, true);
 
@@ -1063,7 +1063,31 @@ void Planner::rescheduleApp(int rescheduleMode, int hostNum)
     auto preOperatorsMap = stateAwareScheduler->getScheduledOperatorsMap();
     // Update the processed tuples.
     stateAwareScheduler->updateApp(operatorWorkloadMap, edgeWeightMap);
-    stateAwareScheduler->rescheduleApp(state.activeHosts);
+    stateAwareScheduler->rescheduleApp(state.activeHosts,
+                                       state.applicationMetrics.get());
+
+    // For adaptive mode the scheduler may use fewer workers than activeHosts.
+    // Rebuild activeHosts from the IPs that are actually in the schedule.
+    if (scheduleMode == 7) {
+        std::set<std::string> usedIps;
+        for (const auto& [func, op] :
+             stateAwareScheduler->getScheduledOperatorsMap()) {
+            for (const auto& [ip, _] : op.weightDist)
+                usedIps.insert(ip);
+        }
+        faabric::batch_scheduler::HostMap newActiveHosts;
+        for (const auto& [ip, host] : state.activeHosts) {
+            if (usedIps.count(ip))
+                newActiveHosts[ip] = host;
+        }
+        if (!newActiveHosts.empty()) {
+            state.activeHosts = newActiveHosts;
+            schedHostNum = static_cast<int>(newActiveHosts.size());
+            SPDLOG_INFO("Adaptive: activeHosts updated to {} workers",
+                        schedHostNum);
+        }
+    }
+
     SPDLOG_INFO("Planner reschedules application done");
 
     // Reschedule the states and messages in queue
@@ -1440,15 +1464,30 @@ bool Planner::evaluateReschedule(
     if (!inputRateTriggered && !periodicTriggered)
         return false;
 
-    int targetN = computeTargetHostNum(signals, schedHostNum, maxHostNum);
-    lastPeriodicRescheduleMs = nowMs;
+    if (scheduleMode == 0) {
+        int targetN = computeTargetHostNum(signals, schedHostNum, maxHostNum);
+        lastPeriodicRescheduleMs = nowMs;
 
-    if (targetN <= 0 || targetN == schedHostNum)
-        return false;
+        if (targetN <= 0 || targetN == schedHostNum)
+            return false;
 
-    stableInputRate = currentRate;
-    inputRateChangeDetectedMs = 0;
-    rescheduleApp(0, targetN);
+        stableInputRate = currentRate;
+        inputRateChangeDetectedMs = 0;
+        rescheduleApp(0, targetN);
+    } else if (scheduleMode == 3) {
+        int targetN = state.applicationMetrics
+                        ? state.applicationMetrics->computeAdaptiveHostCount(
+                            signals.avgInputRate, maxHostNum)
+                        : maxHostNum;
+        lastPeriodicRescheduleMs = nowMs;
+        if (targetN <= 0 || targetN == schedHostNum)
+            return false;
+
+        rescheduleApp(0, maxHostNum);
+        stableInputRate = currentRate;
+        inputRateChangeDetectedMs = 0;
+    }
+
     return true;
 }
 

@@ -1417,11 +1417,14 @@ void Scheduler::updateStatesInfo(
 {
     auto startTime = faabric::util::getGlobalClock().epochMillis();
 
+    SPDLOG_DEBUG("State Update: Starting state update for migration version {}",
+                migrationVersion);
     isUpdateState.store(true, std::memory_order_release);
     faabric::util::FullLock stateLock(stateUpdateMx);
-
+    SPDLOG_DEBUG("State Update: Acquired stateUpdateMx lock");
     faabric::util::FullLock lock(mx);
     faabric::util::FullLock rflock(reconfigMx);
+    SPDLOG_DEBUG("State Update: Acquired mx and reconfigMx locks");
     // 1. Update the local max replicas map based on the new scheduling
     // decision.
     calculateMaxReplicas(scheduledOperatorMap);
