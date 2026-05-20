@@ -1068,7 +1068,7 @@ void Planner::rescheduleApp(int rescheduleMode, int hostNum)
 
     // For adaptive mode the scheduler may use fewer workers than activeHosts.
     // Rebuild activeHosts from the IPs that are actually in the schedule.
-    if (scheduleMode == 7) {
+    if (scheduleMode == 3) {
         std::set<std::string> usedIps;
         for (const auto& [func, op] :
              stateAwareScheduler->getScheduledOperatorsMap()) {

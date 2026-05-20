@@ -165,6 +165,8 @@ class Redis
 
     uint32_t acquireLock(const std::string& key, int expirySeconds);
 
+    void acquireLockBlocking(const std::string& lockKey);
+
     void releaseLock(const std::string& key, uint32_t lockId);
 
     void delIfEq(const std::string& key, uint32_t value);

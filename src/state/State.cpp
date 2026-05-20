@@ -1,4 +1,5 @@
 #include <faabric/planner/PlannerClient.h>
+#include <faabric/redis/Redis.h>
 #include <faabric/scheduler/FunctionCallClient.h>
 #include <faabric/state/InMemoryStateKeyValue.h>
 #include <faabric/state/RedisStateKeyValue.h>
@@ -468,9 +469,16 @@ std::vector<std::string> State::readPersistentStateBatch(
 
 std::string State::readPersistentStateRemote(const std::string& key)
 {
-    SPDLOG_DEBUG("Reading persistent state key {} from planner", key);
-    return faabric::planner::getPlannerClient().getPersistentStateFromWorker(
-      key);
+    redis::Redis& redis = redis::Redis::getState();
+    if (persistentLock) {
+        redis.acquireLockBlocking(key + "_lock");
+    }
+    auto bytes = redis.get(key);
+    if (bytes.empty()) {
+        SPDLOG_DEBUG("Persistent state key {} not found in Redis", key);
+        return "test";
+    }
+    return std::string(bytes.begin(), bytes.end());
 }
 
 void State::writePersistentState(std::string& key, std::string& value)
@@ -492,12 +500,13 @@ void State::writePersistentStateBatch(
 
 void State::writePersistentStateRemote(std::string& key, std::string& value)
 {
-    persistentState.write(key, value);
-
-    SPDLOG_DEBUG("Writing persistent state key {} to planner", key);
-    auto req = std::make_shared<faabric::planner::MapMessage>();
-    req->mutable_payload()->insert({ key, value });
-    faabric::planner::getPlannerClient().setPersistentStateFromWorker(req);
+    redis::Redis& redis = redis::Redis::getState();
+    redis.set(key,
+              reinterpret_cast<const uint8_t*>(value.data()),
+              value.size());
+    if (persistentLock) {
+        redis.del(key + "_lock");
+    }
 }
 
 void State::flushState()

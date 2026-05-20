@@ -8,6 +8,7 @@
 #include <faabric/util/network.h>
 #include <faabric/util/random.h>
 #include <faabric/util/timing.h>
+#include <chrono>
 #include <thread>
 
 namespace faabric::redis {
@@ -510,6 +511,13 @@ uint32_t Redis::acquireLock(const std::string& key, int expirySeconds)
         return lockId;
     } else {
         return 0;
+    }
+}
+
+void Redis::acquireLockBlocking(const std::string& lockKey)
+{
+    while (!this->setnxex(lockKey, 1, 30)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 }
 
