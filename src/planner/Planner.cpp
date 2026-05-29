@@ -886,7 +886,19 @@ void Planner::doDistributeStatesInfo(
 
     long endTime = faabric::util::getGlobalClock().epochMillis();
     int migrationDuration = endTime - startTime;
-    migrationDurations[curVersion] = migrationDuration;
+
+    std::set<std::string> oldHostSet, newHostSet;
+    for (const auto& [func, op] : preOperatorsMap) {
+        for (const auto& [host, _] : op.weightDist)
+            oldHostSet.insert(host);
+    }
+    for (const auto& [func, op] : scheduledOperatorsMap) {
+        for (const auto& [host, _] : op.weightDist)
+            newHostSet.insert(host);
+    }
+    migrationDurations[curVersion] = { migrationDuration,
+                                       (int)oldHostSet.size(),
+                                       (int)newHostSet.size() };
 
     SPDLOG_INFO("Planner distributes state info finished");
 }
@@ -1185,10 +1197,14 @@ std::string Planner::outputResult()
           rapidjson::Value(ip.c_str(), alloc).Move(), migrationArr, alloc);
     }
 
-    for (const auto& [version, duration] : migrationDurations) {
+    for (const auto& [version, record] : migrationDurations) {
         std::string versionStr = std::to_string(version);
         rapidjson::Value k(versionStr.c_str(), alloc);
-        migrationDurationsObj.AddMember(k, duration, alloc);
+        rapidjson::Value recordObj(rapidjson::kObjectType);
+        recordObj.AddMember("duration", record.duration, alloc);
+        recordObj.AddMember("oldHosts", record.oldHosts, alloc);
+        recordObj.AddMember("newHosts", record.newHosts, alloc);
+        migrationDurationsObj.AddMember(k, recordObj, alloc);
     }
 
     doc.AddMember("workerStats", workerStatsObj, alloc);

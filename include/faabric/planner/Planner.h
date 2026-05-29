@@ -170,8 +170,14 @@ class Planner
     // has received all the migrated messages and states.
     int migrationVersion = 0;
 
-    // Record migration duration for each migration version.
-    std::map<int, int> migrationDurations;
+    struct MigrationRecord
+    {
+        int duration;
+        int oldHosts;
+        int newHosts;
+    };
+    // Record duration and old/new worker counts for each migration version.
+    std::map<int, MigrationRecord> migrationDurations;
 
     // std::atomic<unsigned int> atomicChainedCounter{ 1 };
 
