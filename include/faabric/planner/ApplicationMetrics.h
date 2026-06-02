@@ -736,8 +736,8 @@ class ApplicationMetrics
             double hostThroughput = 0.0;
             long long hostExecTimeSum = 0;
             long long hostExecTimeCount = 0;
-            double hostChainedCalls = 0.0;
-            std::set<std::string> hostDestHostSet;
+            double hostLocalChainedCalls = 0.0;
+            double hostRemoteChainedCalls = 0.0;
             long long hostQueueNumSum = 0;
             long long hostQueueNumCount = 0;
             long long hostQueueTimeSum = 0;
@@ -770,9 +770,10 @@ class ApplicationMetrics
                     hostQueueTimeCount += rec.workerQueueTime.count;
                 }
                 for (const auto& [dest, cnt] : rec.chainedCallHistory) {
-                    hostChainedCalls += cnt;
-                    if (!dest.empty()) {
-                        hostDestHostSet.insert(dest);
+                    if (dest.empty() || dest == ip) {
+                        hostLocalChainedCalls += cnt;
+                    } else {
+                        hostRemoteChainedCalls += cnt;
                     }
                 }
             }
@@ -799,21 +800,21 @@ class ApplicationMetrics
                 hostExecTimeCount > 0) {
                 double avgExecTime =
                   static_cast<double>(hostExecTimeSum) / hostExecTimeCount;
-                double numDestHosts =
-                  static_cast<double>(hostDestHostSet.size());
-                coeffEstimator.update(
-                  hostThroughput, avgExecTime, hostChainedCalls, numDestHosts);
+                coeffEstimator.update(hostThroughput,
+                                      avgExecTime,
+                                      hostLocalChainedCalls,
+                                      hostRemoteChainedCalls);
                 SPDLOG_DEBUG(
                   "CoeffEstimator updated for host {}: alpha={:.4f}, "
                   "beta={:.4f} (throughput={:.0f}, execTime={:.1f}us, "
-                  "chained={:.0f}, destHosts={:.0f})",
+                  "localChained={:.0f}, remoteChained={:.0f})",
                   ip,
                   coeffEstimator.alpha(),
                   coeffEstimator.beta(),
                   hostThroughput,
                   avgExecTime,
-                  hostChainedCalls,
-                  numDestHosts);
+                  hostLocalChainedCalls,
+                  hostRemoteChainedCalls);
             }
 
             int totalQueueSize = 0;
@@ -1085,6 +1086,15 @@ class ApplicationMetrics
         if (!coeffEstimator.set(key, value))
             return false;
         SPDLOG_INFO("ApplicationMetrics: set coeff {} = {:.4f}", key, value);
+        return true;
+    }
+
+    bool setRlsParam(const std::string& key, double value)
+    {
+        faabric::util::FullLock lock(opMx);
+        if (!coeffEstimator.setRlsParam(key, value))
+            return false;
+        SPDLOG_INFO("ApplicationMetrics: set RLS param {} = {:.6f}", key, value);
         return true;
     }
 

@@ -954,6 +954,9 @@ bool Planner::resetParameter(
         "coeff_c",
         "coeff_a",
         "coeff_b",
+        "rls_lambda",
+        "rls_p",
+        "rls_w_ema",
         "periodic_reschedule_interval",
         "input_rate_stability_window",
         "input_rate_deviation",
@@ -986,6 +989,11 @@ bool Planner::resetParameter(
         } else if (key == "coeff_c" || key == "coeff_a" || key == "coeff_b") {
             if (state.applicationMetrics) {
                 state.applicationMetrics->setCoeff(key, req.value_double());
+            }
+        } else if (key == "rls_lambda" || key == "rls_p" ||
+                   key == "rls_w_ema") {
+            if (state.applicationMetrics) {
+                state.applicationMetrics->setRlsParam(key, req.value_double());
             }
         } else if (key == "periodic_reschedule_interval") {
             periodicRescheduleIntervalMs = value;
@@ -1232,7 +1240,8 @@ Planner::fetchWorkerStatsAsync(const std::vector<std::string>& targetIps)
             futures.emplace_back(
               std::async(std::launch::async, [&results, &resultsMutex, ip]() {
                   try {
-                      SPDLOG_DEBUG("Fetching runtime stats from host {}", ip);
+                      //   SPDLOG_DEBUG("Fetching runtime stats from host {}",
+                      //   ip);
                       auto stats = faabric::scheduler::getFunctionCallClient(ip)
                                      ->getWorkerRuntimeStats();
                       std::lock_guard<std::mutex> lock(resultsMutex);
@@ -1253,7 +1262,7 @@ Planner::fetchWorkerStatsAsync(const std::vector<std::string>& targetIps)
               "Failed to spawn async thread for {}: {}", ip, e.what());
         }
     }
-    SPDLOG_DEBUG("All async tasks for fetching stats have been launched");
+    // SPDLOG_DEBUG("All async tasks for fetching stats have been launched");
     for (auto& fut : futures) {
         try {
             if (fut.valid()) {
@@ -1330,7 +1339,7 @@ void Planner::updateRuntimeStats()
             state.applicationMetrics->recordQueueSnapshot(qSize, qAgeMicros);
         }
 
-        SPDLOG_DEBUG("Planner finished updating runtime stats");
+        // SPDLOG_DEBUG("Planner finished updating runtime stats");
 
         if (!state.applicationMetrics || isWarmup.load() ||
             !autoScalingEnabled.load()) {

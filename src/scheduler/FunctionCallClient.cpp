@@ -101,7 +101,7 @@ FunctionCallClient::getRuntimeStats(faabric::RuntimeStatsUpdateRequest req)
 std::unique_ptr<faabric::WorkerStats>
 FunctionCallClient::getWorkerRuntimeStats()
 {
-    SPDLOG_DEBUG("Getting worker runtime stats from host {}", host);
+    SPDLOG_TRACE("Getting worker runtime stats from host {}", host);
     faabric::EmptyRequest req;
     faabric::WorkerStats resp;
     syncSend(
