@@ -42,11 +42,11 @@ namespace faabric::planner {
 //
 //   Y_NORM      = typical (processedNum × execTime) = 2000 × 400 = 800000
 //   CHAIN_NORM  = typical alpha = 40  us/local-call
-//   REMOTE_NORM = typical beta  = 350 us/remote-call (network RTT + scheduling)
+//   REMOTE_NORM = typical beta  = 100 us/remote-call (network RTT + scheduling)
 //
 // Prior-informed initial values:
 //   alpha ≈ 40  us/local-call  → alphaS = 1.0   (light IPC overhead)
-//   beta  ≈ 350 us/remote-call → betaS  = 1.0   (network round-trip dominated)
+//   beta  ≈ 100 us/remote-call → betaS  = 1.0   (network round-trip dominated)
 //   W     ≈ 880000 us/s        → W_est  = 880000 (N=2000, t_e=400, small
 //   overhead)
 // -----------------------------------------------------------------------
@@ -56,21 +56,17 @@ struct CoeffEstimator
       800000.0; // typical processedNum × execTime
     static constexpr double CHAIN_NORM = 40.0; // typical alpha (us/local-call)
     static constexpr double REMOTE_NORM =
-      350.0; // typical beta  (us/remote-call)
+      100.0; // typical beta  (us/remote-call)
 
-    static constexpr double ALPHAS_MIN = 0.25,
-                            ALPHAS_MAX = 4.0; // α: 10-160 us/local-call
-    static constexpr double BETAS_MIN = 0.25,
-                            BETAS_MAX = 4.0; // β: 87.5-1400 us/remote-call
     // Max normalized change per RLS step (prevents a single noisy diff from
-    // driving a parameter to its clamp boundary in one shot).
+    // causing a large parameter jump in one shot).
     static constexpr double MAX_RLS_STEP = 0.15;
 
     // Normalized RLS state: theta = [alphaS, betaS]
     double alphaS =
       1.0; // alpha ≈ 40  us/local-call  (alphaS = alpha / CHAIN_NORM)
     double betaS =
-      1.0; // beta  ≈ 350 us/remote-call  (betaS  = beta  / REMOTE_NORM)
+      1.0; // beta  ≈ 100 us/remote-call  (betaS  = beta  / REMOTE_NORM)
     double lambda = 0.97; // RLS forgetting factor
 
     // 2×2 RLS covariance matrix, row-major.
@@ -186,17 +182,10 @@ struct CoeffEstimator
         double pred = x[0] * alphaS + x[1] * betaS;
         double err = y - pred;
 
-        // Per-step clamp then range clamp: cap |ΔalphaS|/|ΔbetaS| to
-        // maxRlsStep so a single noisy diff cannot drive a parameter to its
-        // boundary in one shot (P-inflation guard).
-        alphaS =
-          std::clamp(alphaS + std::clamp(K[0] * err, -maxRlsStep, maxRlsStep),
-                     ALPHAS_MIN,
-                     ALPHAS_MAX);
-        betaS =
-          std::clamp(betaS + std::clamp(K[1] * err, -maxRlsStep, maxRlsStep),
-                     BETAS_MIN,
-                     BETAS_MAX);
+        // Per-step clamp: cap |ΔalphaS|/|ΔbetaS| to maxRlsStep so a single
+        // noisy diff cannot cause a large parameter jump in one shot.
+        alphaS += std::clamp(K[0] * err, -maxRlsStep, maxRlsStep);
+        betaS += std::clamp(K[1] * err, -maxRlsStep, maxRlsStep);
 
         // Update W_est using freshly updated alpha/beta.
         double W_obs = NtE + alphaS * localChainedCalls * CHAIN_NORM +
@@ -259,9 +248,9 @@ struct CoeffEstimator
         if (key == "coeff_c") {
             W_est = value;
         } else if (key == "coeff_a") {
-            alphaS = std::clamp(value / CHAIN_NORM, ALPHAS_MIN, ALPHAS_MAX);
+            alphaS = value / CHAIN_NORM;
         } else if (key == "coeff_b") {
-            betaS = std::clamp(value / REMOTE_NORM, BETAS_MIN, BETAS_MAX);
+            betaS = value / REMOTE_NORM;
         } else {
             return false;
         }

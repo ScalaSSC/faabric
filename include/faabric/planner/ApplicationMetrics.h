@@ -197,6 +197,16 @@ class ApplicationMetrics
           0.0; // weighted avg exec time across instances (us)
         double avgChainedRatio = 0.0; // chained calls per processed request
         double avgNumDestHosts = 0.0; // avg distinct dest hosts per worker
+        // Each entry records one coeffEstimator.update() call (one per
+        // saturated host per second): throughput / execTime / local / remote.
+        struct RlsUpdateEntry
+        {
+            double throughput;
+            double execTime;
+            double localChained;
+            double remoteChained;
+        };
+        std::vector<RlsUpdateEntry> rlsUpdates;
     };
 
     rapidjson::Document getMetrics() const
@@ -617,6 +627,40 @@ class ApplicationMetrics
           workerMetricDetailsObj,
           alloc);
 
+        // Per-second RLS update inputs: one entry per saturated host per
+        // second. Format: throughput / execTime(us) / localChained /
+        // remoteChained
+        rapidjson::Value rlsHistObj(rapidjson::kObjectType);
+        if (!runtimeMetricsHistory.empty()) {
+            int64_t startSec = runtimeMetricsHistory.begin()->first;
+            int64_t endSec = runtimeMetricsHistory.rbegin()->first;
+            for (int64_t s = startSec; s <= endSec; ++s) {
+                auto it = runtimeMetricsHistory.find(s);
+                if (it == runtimeMetricsHistory.end() ||
+                    it->second.rlsUpdates.empty())
+                    continue;
+                rapidjson::Value arr(rapidjson::kArrayType);
+                for (const auto& u : it->second.rlsUpdates) {
+                    char buf[128];
+                    snprintf(buf,
+                             sizeof(buf),
+                             "%.1f / %.1f / %.1f / %.1f",
+                             u.throughput,
+                             u.execTime,
+                             u.localChained,
+                             u.remoteChained);
+                    arr.PushBack(rapidjson::Value(buf, alloc).Move(), alloc);
+                }
+                std::string secKey = std::to_string(s);
+                rlsHistObj.AddMember(
+                  rapidjson::Value(secKey.c_str(), alloc).Move(), arr, alloc);
+            }
+        }
+        doc.AddMember("rlsUpdateHistory: throughput / execTime(us) / "
+                      "localChained / remoteChained",
+                      rlsHistObj,
+                      alloc);
+
         return doc;
     }
 
@@ -804,6 +848,11 @@ class ApplicationMetrics
                                       avgExecTime,
                                       hostLocalChainedCalls,
                                       hostRemoteChainedCalls);
+                runtimeMetricsHistory[currentTime].rlsUpdates.push_back(
+                  { hostThroughput,
+                    avgExecTime,
+                    hostLocalChainedCalls,
+                    hostRemoteChainedCalls });
                 SPDLOG_DEBUG(
                   "CoeffEstimator updated for host {}: alpha={:.4f}, "
                   "beta={:.4f} (throughput={:.0f}, execTime={:.1f}us, "
@@ -1094,7 +1143,8 @@ class ApplicationMetrics
         faabric::util::FullLock lock(opMx);
         if (!coeffEstimator.setRlsParam(key, value))
             return false;
-        SPDLOG_INFO("ApplicationMetrics: set RLS param {} = {:.6f}", key, value);
+        SPDLOG_INFO(
+          "ApplicationMetrics: set RLS param {} = {:.6f}", key, value);
         return true;
     }
 
