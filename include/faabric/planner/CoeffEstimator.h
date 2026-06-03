@@ -42,11 +42,11 @@ namespace faabric::planner {
 //
 //   Y_NORM      = typical (processedNum × execTime) = 2000 × 400 = 800000
 //   CHAIN_NORM  = typical alpha = 40  us/local-call
-//   REMOTE_NORM = typical beta  = 400 us/remote-call (network RTT + scheduling)
+//   REMOTE_NORM = typical beta  = 350 us/remote-call (network RTT + scheduling)
 //
 // Prior-informed initial values:
 //   alpha ≈ 40  us/local-call  → alphaS = 1.0   (light IPC overhead)
-//   beta  ≈ 400 us/remote-call → betaS  = 1.0   (network round-trip dominated)
+//   beta  ≈ 350 us/remote-call → betaS  = 1.0   (network round-trip dominated)
 //   W     ≈ 880000 us/s        → W_est  = 880000 (N=2000, t_e=400, small
 //   overhead)
 // -----------------------------------------------------------------------
@@ -56,18 +56,21 @@ struct CoeffEstimator
       800000.0; // typical processedNum × execTime
     static constexpr double CHAIN_NORM = 40.0; // typical alpha (us/local-call)
     static constexpr double REMOTE_NORM =
-      400.0; // typical beta  (us/remote-call)
+      350.0; // typical beta  (us/remote-call)
 
     static constexpr double ALPHAS_MIN = 0.25,
                             ALPHAS_MAX = 4.0; // α: 10-160 us/local-call
     static constexpr double BETAS_MIN = 0.25,
-                            BETAS_MAX = 4.0; // β: 125-2000 us/remote-call
+                            BETAS_MAX = 4.0; // β: 87.5-1400 us/remote-call
+    // Max normalized change per RLS step (prevents a single noisy diff from
+    // driving a parameter to its clamp boundary in one shot).
+    static constexpr double MAX_RLS_STEP = 0.15;
 
     // Normalized RLS state: theta = [alphaS, betaS]
     double alphaS =
       1.0; // alpha ≈ 40  us/local-call  (alphaS = alpha / CHAIN_NORM)
     double betaS =
-      1.0; // beta  ≈ 400 us/remote-call  (betaS  = beta  / REMOTE_NORM)
+      1.0; // beta  ≈ 350 us/remote-call  (betaS  = beta  / REMOTE_NORM)
     double lambda = 0.97; // RLS forgetting factor
 
     // 2×2 RLS covariance matrix, row-major.
@@ -82,6 +85,15 @@ struct CoeffEstimator
     // alpha/beta estimates. Used only in maxProcessed(); not a RLS parameter.
     double W_est = 880000.0;
     double wEma = 0.05;
+
+    // Per-step cap on alphaS/betaS change (normalized units). Prevents P
+    // matrix inflation from causing a parameter collapse on a single outlier.
+    double maxRlsStep = MAX_RLS_STEP;
+    // Per-dimension gate (calls/s). When localChainedCalls < threshold, K[0]
+    // is zeroed so alphaS is not updated; similarly K[1]/betaS for remote.
+    // Prevents noisy RLS updates when chained-call volume is too sparse to
+    // carry a reliable signal. 0 = disabled (always update).
+    double minChainedForRls = 10.0;
 
     // Previous observation stored for differencing.
     // prevNtE < 0 signals "no prior observation yet".
@@ -152,23 +164,50 @@ struct CoeffEstimator
 
         double K[2] = { Px[0] / denom, Px[1] / denom };
 
+        // Per-dimension gate: if a chained-call count is below minChainedForRls
+        // its signal is noise-dominated — zero that gain so the corresponding
+        // parameter is not updated (alphaS frozen when local is sparse,
+        // betaS frozen when remote is sparse).
+        // Pxeff mirrors the zeroing so the P rank-1 update K·Pxeff' stays
+        // symmetric; zeroing only K while leaving Px intact would break P
+        // symmetry (P_new[0,1] != P_new[1,0]).
+        double Pxeff[2] = { Px[0], Px[1] };
+        if (minChainedForRls > 0.0) {
+            if (localChainedCalls < minChainedForRls) {
+                K[0] = 0.0;
+                Pxeff[0] = 0.0;
+            }
+            if (remoteChainedCalls < minChainedForRls) {
+                K[1] = 0.0;
+                Pxeff[1] = 0.0;
+            }
+        }
+
         double pred = x[0] * alphaS + x[1] * betaS;
         double err = y - pred;
 
-        // Hard-clamp after RLS step to prevent runaway from a single noisy
-        // diff.
-        alphaS = std::clamp(alphaS + K[0] * err, ALPHAS_MIN, ALPHAS_MAX);
-        betaS = std::clamp(betaS + K[1] * err, BETAS_MIN, BETAS_MAX);
+        // Per-step clamp then range clamp: cap |ΔalphaS|/|ΔbetaS| to
+        // maxRlsStep so a single noisy diff cannot drive a parameter to its
+        // boundary in one shot (P-inflation guard).
+        alphaS =
+          std::clamp(alphaS + std::clamp(K[0] * err, -maxRlsStep, maxRlsStep),
+                     ALPHAS_MIN,
+                     ALPHAS_MAX);
+        betaS =
+          std::clamp(betaS + std::clamp(K[1] * err, -maxRlsStep, maxRlsStep),
+                     BETAS_MIN,
+                     BETAS_MAX);
 
         // Update W_est using freshly updated alpha/beta.
         double W_obs = NtE + alphaS * localChainedCalls * CHAIN_NORM +
                        betaS * remoteChainedCalls * REMOTE_NORM;
         W_est = (1.0 - wEma) * W_est + wEma * W_obs;
 
-        // P = (P - K·Px') / lambda  (rank-1 update)
+        // P = (P - K·Pxeff') / lambda  (rank-1 update, uses Pxeff to keep P
+        // symmetric)
         for (int i = 0; i < 2; i++)
             for (int j = 0; j < 2; j++)
-                P[i * 2 + j] = (P[i * 2 + j] - K[i] * Px[j]) / lambda;
+                P[i * 2 + j] = (P[i * 2 + j] - K[i] * Pxeff[j]) / lambda;
 
         SPDLOG_DEBUG("CoeffEstimator: alpha={:.3f}us/local-call, "
                      "beta={:.3f}us/remote-call, "
@@ -185,9 +224,11 @@ struct CoeffEstimator
     }
 
     // Set an RLS tuning parameter by name.
-    // rls_lambda : forgetting factor      (0.9 – 0.9999)
-    // rls_p      : reset P diagonal to value (> 0)
-    // rls_w_ema  : W EMA smoothing factor (0.001 – 0.5)
+    // rls_lambda      : forgetting factor            (0.9 – 0.9999)
+    // rls_p           : reset P diagonal to value    (> 0)
+    // rls_w_ema       : W EMA smoothing factor       (0.001 – 0.5)
+    // rls_max_step    : per-step normalized cap       (> 0.01)
+    // rls_min_chained : min total chained calls/s to run RLS (0 = disabled)
     // Returns false if key is unrecognized.
     bool setRlsParam(const std::string& key, double value)
     {
@@ -201,6 +242,10 @@ struct CoeffEstimator
             P[3] = v;
         } else if (key == "rls_w_ema") {
             wEma = std::clamp(value, 0.001, 0.5);
+        } else if (key == "rls_max_step") {
+            maxRlsStep = std::max(value, 0.01);
+        } else if (key == "rls_min_chained") {
+            minChainedForRls = std::max(value, 0.0);
         } else {
             return false;
         }
