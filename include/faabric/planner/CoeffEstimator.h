@@ -85,11 +85,12 @@ struct CoeffEstimator
     // Per-step cap on alphaS/betaS change (normalized units). Prevents P
     // matrix inflation from causing a parameter collapse on a single outlier.
     double maxRlsStep = MAX_RLS_STEP;
-    // Per-dimension gate (calls/s). When localChainedCalls < threshold, K[0]
-    // is zeroed so alphaS is not updated; similarly K[1]/betaS for remote.
-    // Prevents noisy RLS updates when chained-call volume is too sparse to
-    // carry a reliable signal. 0 = disabled (always update).
-    double minChainedForRls = 10.0;
+    // Whole-observation remote gate (remote calls/s). When remoteChainedCalls
+    // < threshold, the entire RLS step is skipped and prev* is frozen, so
+    // differencing only ever happens between remote-heavy (fan-out) hosts.
+    // Set between the non-fan-out and fan-out remote modes (e.g. ~100 when
+    // fan-out hosts do ~1000+ remote calls/s). 0 = disabled (always update).
+    double minChainedForRls = 100.0;
 
     // Previous observation stored for differencing.
     // prevNtE < 0 signals "no prior observation yet".
@@ -116,6 +117,18 @@ struct CoeffEstimator
             return;
 
         double NtE = processedNum * execTime;
+
+        // Whole-observation gate. A host with too few remote chained calls is
+        // not a fan-out host and carries no reliable beta signal. Skip the
+        // ENTIRE RLS step WITHOUT touching prev* — this freezes prev at the
+        // last qualifying (remote-heavy) observation, so differencing only ever
+        // happens between fan-out hosts.
+        if (minChainedForRls > 0.0 && remoteChainedCalls < minChainedForRls) {
+            double W_obs = NtE + alphaS * localChainedCalls * CHAIN_NORM +
+                           betaS * remoteChainedCalls * REMOTE_NORM;
+            W_est = (1.0 - wEma) * W_est + wEma * W_obs;
+            return;
+        }
 
         if (prevNtE < 0.0) {
             prevNtE = NtE;
@@ -160,25 +173,6 @@ struct CoeffEstimator
 
         double K[2] = { Px[0] / denom, Px[1] / denom };
 
-        // Per-dimension gate: if a chained-call count is below minChainedForRls
-        // its signal is noise-dominated — zero that gain so the corresponding
-        // parameter is not updated (alphaS frozen when local is sparse,
-        // betaS frozen when remote is sparse).
-        // Pxeff mirrors the zeroing so the P rank-1 update K·Pxeff' stays
-        // symmetric; zeroing only K while leaving Px intact would break P
-        // symmetry (P_new[0,1] != P_new[1,0]).
-        double Pxeff[2] = { Px[0], Px[1] };
-        if (minChainedForRls > 0.0) {
-            if (localChainedCalls < minChainedForRls) {
-                K[0] = 0.0;
-                Pxeff[0] = 0.0;
-            }
-            if (remoteChainedCalls < minChainedForRls) {
-                K[1] = 0.0;
-                Pxeff[1] = 0.0;
-            }
-        }
-
         double pred = x[0] * alphaS + x[1] * betaS;
         double err = y - pred;
 
@@ -192,11 +186,10 @@ struct CoeffEstimator
                        betaS * remoteChainedCalls * REMOTE_NORM;
         W_est = (1.0 - wEma) * W_est + wEma * W_obs;
 
-        // P = (P - K·Pxeff') / lambda  (rank-1 update, uses Pxeff to keep P
-        // symmetric)
+        // P = (P - K·Px') / lambda  (rank-1 update)
         for (int i = 0; i < 2; i++)
             for (int j = 0; j < 2; j++)
-                P[i * 2 + j] = (P[i * 2 + j] - K[i] * Pxeff[j]) / lambda;
+                P[i * 2 + j] = (P[i * 2 + j] - K[i] * Px[j]) / lambda;
 
         SPDLOG_DEBUG("CoeffEstimator: alpha={:.3f}us/local-call, "
                      "beta={:.3f}us/remote-call, "
@@ -217,7 +210,8 @@ struct CoeffEstimator
     // rls_p           : reset P diagonal to value    (> 0)
     // rls_w_ema       : W EMA smoothing factor       (0.001 – 0.5)
     // rls_max_step    : per-step normalized cap       (> 0.01)
-    // rls_min_chained : min total chained calls/s to run RLS (0 = disabled)
+    // rls_min_chained : min remote chained calls/s to run RLS; below this the
+    //                   whole observation is skipped and prev frozen (0 = off)
     // Returns false if key is unrecognized.
     bool setRlsParam(const std::string& key, double value)
     {
