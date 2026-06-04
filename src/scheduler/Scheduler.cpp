@@ -982,6 +982,20 @@ void Scheduler::dispatchChainedMsgs()
             }
         }
 
+        // Worker-level chain recording: aggregate by dest host only (ignore
+        // which instance produced it). This feeds WorkerStats.workerChainHistory
+        // and is Scheduler-only, so it is not polluted by the Planner's
+        // initial dispatch recording.
+        std::map<std::string, int> workerChainByHost;
+        for (auto& [instancesName, hostCounter] : chainedCallsCounter) {
+            for (auto& [host, count] : hostCounter) {
+                workerChainByHost[host] += count;
+            }
+        }
+        for (auto& [host, count] : workerChainByHost) {
+            runtimeStats.recordWorkerOutgoingChain(host, count);
+        }
+
         faabric::util::FullLock lock(scheduledMsgsMapMx);
         if (scheduledMsgsMap.empty()) {
             lock.unlock();

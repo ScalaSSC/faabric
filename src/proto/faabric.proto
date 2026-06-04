@@ -430,4 +430,8 @@ message WorkerStats{
     map<string, int32> instanceQueueNum = 7;
     double executorsNum = 8;
     double cpuLoad = 9;
+    // Worker-level outgoing chained calls: timestamp -> (destHost -> count)
+    // Recorded by the Scheduler only (not Planner), so campaign_0 won't be
+    // polluted by the Planner's initial dispatch recording.
+    map<int64, ChainedCallSecondProto> workerChainHistory = 10;
 }

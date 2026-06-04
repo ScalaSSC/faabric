@@ -718,6 +718,9 @@ class ApplicationMetrics
         std::map<time_t, double> cpuLoadHistory;
         std::map<time_t, double> executorsHistory;
         std::map<time_t, bool> saturatedHistory;
+        // Worker-level outgoing chained calls: time -> (destHost -> count).
+        // Sourced from WorkerStats.workerChainHistory (Scheduler-only).
+        std::map<time_t, std::map<std::string, int>> chainHistory;
     };
 
     // Adds or updates the worker stats fetched from a specific host.
@@ -787,6 +790,7 @@ class ApplicationMetrics
             long long hostQueueTimeSum = 0;
             long long hostQueueTimeCount = 0;
 
+
             for (const auto& [instanceName, metricsProto] :
                  statsPtr->workermetrics()) {
                 auto& rec = clusterWorkerMetrics[ip]
@@ -813,7 +817,17 @@ class ApplicationMetrics
                       rec.workerQueueTime.count;
                     hostQueueTimeCount += rec.workerQueueTime.count;
                 }
-                for (const auto& [dest, cnt] : rec.chainedCallHistory) {
+            }
+
+            // Worker-level chain counts: read from WorkerStats.workerChainHistory
+            // (proto field 10), aggregated by dest host. dest == ip (or empty)
+            // is local, anything else is remote. Also persist into
+            // clusterWorkerMetrics for the snapshot block below.
+            auto& persistedChain =
+              clusterWorkerMetrics[ip].chainHistory[currentTime];
+            for (const auto& [ts, secProto] : statsPtr->workerchainhistory()) {
+                for (const auto& [dest, cnt] : secProto.hostcount()) {
+                    persistedChain[dest] += cnt;
                     if (dest.empty() || dest == ip) {
                         hostLocalChainedCalls += cnt;
                     } else {
@@ -887,7 +901,6 @@ class ApplicationMetrics
             int workerCount = 0;
 
             for (const auto& [workerIp, workerNode] : clusterWorkerMetrics) {
-                double workerDestHosts = 0.0;
                 bool workerHasData = false;
                 for (const auto& [instName, timeSeries] :
                      workerNode.instances) {
@@ -901,21 +914,25 @@ class ApplicationMetrics
                           r.workerExecTime.count;
                         execTimeCount += r.workerExecTime.count;
                     }
-                    long long chained = 0;
+                    totalThroughput += r.throughput;
+                    workerHasData = true;
+                }
+
+                // Worker-level chained calls + distinct dest hosts come from
+                // chainHistory (Scheduler-recorded), not per-instance data.
+                auto chainIt = workerNode.chainHistory.find(currentTime);
+                if (chainIt != workerNode.chainHistory.end()) {
                     std::set<std::string> destSet;
-                    for (const auto& [dest, cnt] : r.chainedCallHistory) {
-                        chained += cnt;
+                    for (const auto& [dest, cnt] : chainIt->second) {
+                        totalChained += cnt;
                         if (!dest.empty())
                             destSet.insert(dest);
                     }
-                    totalChained += chained;
-                    totalThroughput += r.throughput;
-                    workerDestHosts =
-                      std::max(workerDestHosts, (double)destSet.size());
+                    totalDestHosts += (double)destSet.size();
                     workerHasData = true;
                 }
+
                 if (workerHasData) {
-                    totalDestHosts += workerDestHosts;
                     workerCount++;
                 }
             }
@@ -969,6 +986,11 @@ class ApplicationMetrics
                    workerNode.saturatedHistory.begin()->first < cutoffTime) {
                 workerNode.saturatedHistory.erase(
                   workerNode.saturatedHistory.begin());
+            }
+
+            while (!workerNode.chainHistory.empty() &&
+                   workerNode.chainHistory.begin()->first < cutoffTime) {
+                workerNode.chainHistory.erase(workerNode.chainHistory.begin());
             }
         }
 

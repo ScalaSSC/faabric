@@ -42,11 +42,11 @@ namespace faabric::planner {
 //
 //   Y_NORM      = typical (processedNum × execTime) = 2000 × 400 = 800000
 //   CHAIN_NORM  = typical alpha = 40  us/local-call
-//   REMOTE_NORM = typical beta  = 100 us/remote-call (network RTT + scheduling)
+//   REMOTE_NORM = typical beta  = 300 us/remote-call (network RTT + scheduling)
 //
 // Prior-informed initial values:
 //   alpha ≈ 40  us/local-call  → alphaS = 1.0   (light IPC overhead)
-//   beta  ≈ 100 us/remote-call → betaS  = 1.0   (network round-trip dominated)
+//   beta  ≈ 300 us/remote-call → betaS  = 1.0   (network round-trip dominated)
 //   W     ≈ 880000 us/s        → W_est  = 880000 (N=2000, t_e=400, small
 //   overhead)
 // -----------------------------------------------------------------------
@@ -56,7 +56,7 @@ struct CoeffEstimator
       800000.0; // typical processedNum × execTime
     static constexpr double CHAIN_NORM = 40.0; // typical alpha (us/local-call)
     static constexpr double REMOTE_NORM =
-      100.0; // typical beta  (us/remote-call)
+      300.0; // typical beta  (us/remote-call)
 
     // Max normalized change per RLS step (prevents a single noisy diff from
     // causing a large parameter jump in one shot).
@@ -66,7 +66,7 @@ struct CoeffEstimator
     double alphaS =
       1.0; // alpha ≈ 40  us/local-call  (alphaS = alpha / CHAIN_NORM)
     double betaS =
-      1.0; // beta  ≈ 100 us/remote-call  (betaS  = beta  / REMOTE_NORM)
+      1.0; // beta  ≈ 300 us/remote-call  (betaS  = beta  / REMOTE_NORM)
     double lambda = 0.97; // RLS forgetting factor
 
     // 2×2 RLS covariance matrix, row-major.

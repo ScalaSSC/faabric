@@ -380,6 +380,17 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
     out.set_executorsnum(executorsCount);
     out.set_cpuload(cpuLoadVal);
 
+    // Worker-level outgoing chained calls (Scheduler-recorded, not Planner).
+    auto workerChainSnap = scheduler.getLastSecWorkerChain();
+    if (!workerChainSnap.empty()) {
+        auto* chainProto = out.mutable_workerchainhistory();
+        auto ts = faabric::util::getGlobalClock().epochSeconds() - 1;
+        auto& secProto = (*chainProto)[ts];
+        for (const auto& [destHost, cnt] : workerChainSnap) {
+            (*secProto.mutable_hostcount())[destHost] = cnt;
+        }
+    }
+
     return std::make_unique<faabric::WorkerStats>(std::move(out));
 }
 

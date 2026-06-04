@@ -173,6 +173,11 @@ class Scheduler
     std::map<std::string, InstanceMetricsResult> getWorkerMetrics(
       bool isRuntime = false);
 
+    std::map<std::string, int> getLastSecWorkerChain()
+    {
+        return runtimeStats.getLastSecWorkerChain();
+    }
+
     std::tuple<std::map<std::string, int>, double, double> getStatsSnapshot();
 
     void notifyExecutorFinished();
