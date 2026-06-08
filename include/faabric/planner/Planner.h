@@ -115,7 +115,8 @@ class Planner
 
     std::string getPersistentStateFromWorker(const std::string& key);
 
-    void setPersistentStateFromWorker(const faabric::planner::MapMessage& mapMsg);
+    void setPersistentStateFromWorker(
+      const faabric::planner::MapMessage& mapMsg);
 
     // ----------
     // Metrics public API
@@ -125,6 +126,10 @@ class Planner
     std::map<std::string, FunctionMetrics> collectMetrics();
 
     std::string outputResult();
+
+    // Predict how many hosts are needed for a given input rate using the
+    // current model parameters, without triggering a reschedule.
+    int predictHostNum(double inputRate);
 
   private:
     std::shared_ptr<batch_scheduler::StateAwareScheduler> stateAwareScheduler =
@@ -227,7 +232,7 @@ class Planner
     long inputRateChangeDetectedMs = 0; // 0 = no change pending
     int inputRateStabilityWindowMs = 5000; // ms to wait for stability
     double inputRateDeviationRatio = 0.2;  // tolerance: 0.2 = 20%
-    double pendingDevToleranceRatio = 0.2; // tolerance for pending input rate deviation
+    double pendingDevToleranceRatio = 0.2;
 
     int computeTargetHostNum(
       const faabric::planner::ApplicationMetrics::ScalingSignals& signals,

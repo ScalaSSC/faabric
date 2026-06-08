@@ -298,6 +298,28 @@ void PlannerEndpointHandler::onRequest(
 
                 faabric::planner::getPlanner().rescheduleApp(scheduleMode,
                                                              numHosts);
+            } else if (key == "predict_host_num") {
+                // value: input rate (messages/s) as a decimal string
+                double inputRate = 0.0;
+                try {
+                    inputRate = std::stod(value);
+                } catch (const std::exception& e) {
+                    SPDLOG_ERROR(
+                      "predict_host_num: invalid input rate '{}': {}",
+                      value,
+                      e.what());
+                    response.result(beast::http::status::bad_request);
+                    response.body() = std::string("Invalid input rate value");
+                    return ctx.sendFunction(std::move(response));
+                }
+                int targetN =
+                  faabric::planner::getPlanner().predictHostNum(inputRate);
+                SPDLOG_INFO("predict_host_num: inputRate={:.1f} -> targetN={}",
+                            inputRate,
+                            targetN);
+                response.result(beast::http::status::ok);
+                response.body() = std::to_string(targetN);
+                return ctx.sendFunction(std::move(response));
             } else {
                 SPDLOG_ERROR("Unrecognized custom request key {}", key);
                 response.result(beast::http::status::bad_request);

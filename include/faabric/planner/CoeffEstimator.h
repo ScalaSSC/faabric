@@ -92,6 +92,9 @@ struct CoeffEstimator
     // fan-out hosts do ~1000+ remote calls/s). 0 = disabled (always update).
     double minChainedForRls = 100.0;
 
+    // When true, update() returns immediately without modifying any estimates.
+    bool coeffParamFix = false;
+
     // Previous observation stored for differencing.
     // prevNtE < 0 signals "no prior observation yet".
     double prevNtE = -1.0;
@@ -113,6 +116,9 @@ struct CoeffEstimator
                 double localChainedCalls,
                 double remoteChainedCalls)
     {
+        if (coeffParamFix)
+            return;
+
         if (processedNum <= 0.0 || execTime <= 0.0)
             return;
 
@@ -245,6 +251,8 @@ struct CoeffEstimator
             alphaS = value / CHAIN_NORM;
         } else if (key == "coeff_b") {
             betaS = value / REMOTE_NORM;
+        } else if (key == "coeff_param_fix") {
+            coeffParamFix = (value != 0.0);
         } else {
             return false;
         }

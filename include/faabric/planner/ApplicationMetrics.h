@@ -196,6 +196,10 @@ class ApplicationMetrics
         double avgExecTime =
           0.0; // weighted avg exec time across instances (us)
         double avgChainedRatio = 0.0; // chained calls per processed request
+        double avgLocalChainedRatio =
+          0.0; // local chained calls per processed request
+        double avgRemoteChainedRatio =
+          0.0; // remote chained calls per processed request
         double avgNumDestHosts = 0.0; // avg distinct dest hosts per worker
         // Each entry records one coeffEstimator.update() call (one per
         // saturated host per second): throughput / execTime / local / remote.
@@ -790,7 +794,6 @@ class ApplicationMetrics
             long long hostQueueTimeSum = 0;
             long long hostQueueTimeCount = 0;
 
-
             for (const auto& [instanceName, metricsProto] :
                  statsPtr->workermetrics()) {
                 auto& rec = clusterWorkerMetrics[ip]
@@ -819,10 +822,11 @@ class ApplicationMetrics
                 }
             }
 
-            // Worker-level chain counts: read from WorkerStats.workerChainHistory
-            // (proto field 10), aggregated by dest host. dest == ip (or empty)
-            // is local, anything else is remote. Also persist into
-            // clusterWorkerMetrics for the snapshot block below.
+            // Worker-level chain counts: read from
+            // WorkerStats.workerChainHistory (proto field 10), aggregated by
+            // dest host. dest == ip (or empty) is local, anything else is
+            // remote. Also persist into clusterWorkerMetrics for the snapshot
+            // block below.
             auto& persistedChain =
               clusterWorkerMetrics[ip].chainHistory[currentTime];
             for (const auto& [ts, secProto] : statsPtr->workerchainhistory()) {
@@ -896,6 +900,8 @@ class ApplicationMetrics
             long long execTimeSum = 0;
             long execTimeCount = 0;
             long long totalChained = 0;
+            long long totalLocalChained = 0;
+            long long totalRemoteChained = 0;
             long long totalThroughput = 0;
             double totalDestHosts = 0.0;
             int workerCount = 0;
@@ -925,8 +931,12 @@ class ApplicationMetrics
                     std::set<std::string> destSet;
                     for (const auto& [dest, cnt] : chainIt->second) {
                         totalChained += cnt;
-                        if (!dest.empty())
+                        if (dest.empty() || dest == workerIp) {
+                            totalLocalChained += cnt;
+                        } else {
+                            totalRemoteChained += cnt;
                             destSet.insert(dest);
+                        }
                     }
                     totalDestHosts += (double)destSet.size();
                     workerHasData = true;
@@ -945,6 +955,14 @@ class ApplicationMetrics
               totalThroughput > 0
                 ? static_cast<double>(totalChained) / totalThroughput
                 : 0.0;
+            double avgLocalChainedRatio =
+              totalThroughput > 0
+                ? static_cast<double>(totalLocalChained) / totalThroughput
+                : 0.0;
+            double avgRemoteChainedRatio =
+              totalThroughput > 0
+                ? static_cast<double>(totalRemoteChained) / totalThroughput
+                : 0.0;
             double avgNumDestHosts =
               workerCount > 0 ? totalDestHosts / workerCount : 0.0;
 
@@ -956,6 +974,8 @@ class ApplicationMetrics
               coeffEstimator.maxProcessed(avgExecTime, 0.0, 0.0);
             snap.avgExecTime = avgExecTime;
             snap.avgChainedRatio = avgChainedRatio;
+            snap.avgLocalChainedRatio = avgLocalChainedRatio;
+            snap.avgRemoteChainedRatio = avgRemoteChainedRatio;
             snap.avgNumDestHosts = avgNumDestHosts;
         }
 
@@ -1008,11 +1028,16 @@ class ApplicationMetrics
         int64_t plannerWaitingQueueAgeMicros = 0;
         bool plannerQueueSaturated = false;
         // CoeffEstimator-derived fields for capacity estimation
-        double coeffC = 0.0;          // physical CPU budget per worker (us/s)
-        double alpha = 0.0;           // chained-call overhead (us/call/req)
-        double beta = 0.0;            // fan-out host overhead (us/host)
-        double avgExecTime = 0.0;     // avg exec time per request (us)
-        double avgChainedRatio = 0.0; // chained calls per processed request
+        double coeffC = 0.0;      // physical CPU budget per worker (us/s)
+        double alpha = 0.0;       // local chained-call overhead (us/call)
+        double beta = 0.0;        // remote chained-call overhead (us/call)
+        double avgExecTime = 0.0; // avg exec time per request (us)
+        double avgChainedRatio =
+          0.0; // total chained calls per processed request
+        double avgLocalChainedRatio =
+          0.0; // local chained calls per processed request
+        double avgRemoteChainedRatio =
+          0.0; // remote chained calls per processed request
         double avgNumDestHosts = 0.0; // avg distinct dest hosts per worker
         // totalLoad = inputRate + inputRate × chainedMultiplier
         // chainedMultiplier = chainedOperatorCount / inputOperatorCount
@@ -1025,6 +1050,7 @@ class ApplicationMetrics
         int64_t nowSec = faabric::util::getGlobalClock().epochSeconds();
         int totalInput = 0, totalQueue = 0, validSecs = 0;
         double totalExecTime = 0.0, totalChainedRatio = 0.0,
+               totalLocalChainedRatio = 0.0, totalRemoteChainedRatio = 0.0,
                totalDestHosts = 0.0;
 
         for (int64_t s = nowSec - windowSec; s < nowSec; s++) {
@@ -1036,6 +1062,8 @@ class ApplicationMetrics
                 totalQueue += q;
             totalExecTime += it->second.avgExecTime;
             totalChainedRatio += it->second.avgChainedRatio;
+            totalLocalChainedRatio += it->second.avgLocalChainedRatio;
+            totalRemoteChainedRatio += it->second.avgRemoteChainedRatio;
             totalDestHosts += it->second.avgNumDestHosts;
             validSecs++;
         }
@@ -1046,6 +1074,8 @@ class ApplicationMetrics
             sig.avgQueueSize = (double)totalQueue / validSecs;
             sig.avgExecTime = totalExecTime / validSecs;
             sig.avgChainedRatio = totalChainedRatio / validSecs;
+            sig.avgLocalChainedRatio = totalLocalChainedRatio / validSecs;
+            sig.avgRemoteChainedRatio = totalRemoteChainedRatio / validSecs;
             sig.avgNumDestHosts = totalDestHosts / validSecs;
         }
 

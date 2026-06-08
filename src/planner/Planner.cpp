@@ -954,6 +954,7 @@ bool Planner::resetParameter(
         "coeff_c",
         "coeff_a",
         "coeff_b",
+        "coeff_param_fix",
         "rls_lambda",
         "rls_p",
         "rls_w_ema",
@@ -986,6 +987,11 @@ bool Planner::resetParameter(
             maxInflightApps.store(value);
         } else if (key == "max_waiting_queue_size") {
             maxWaitingQueueSize = value;
+        } else if (key == "coeff_param_fix") {
+            if (state.applicationMetrics) {
+                state.applicationMetrics->setCoeff(key,
+                                                   static_cast<double>(value));
+            }
         } else if (key == "coeff_c" || key == "coeff_a" || key == "coeff_b") {
             if (state.applicationMetrics) {
                 state.applicationMetrics->setCoeff(key, req.value_double());
@@ -1380,23 +1386,18 @@ int Planner::computeTargetHostNum(
     // Require a valid C estimate before making any scaling decision.
     if (signals.coeffC <= 0.0 || signals.avgExecTime <= 0.0)
         return currentHostNum;
-    // Equation for capacity per worker (processedNum):
-    // C= processedNum × execTime + a × chainedCalls + b × numDestHosts
-    // C - b × numDestHosts = processedNum × (execTime + a × chainedRatio)
-    // capPerWorker = (C - b × numDestHosts) / (execTime + a × chainedRatio)
-    double numDestHosts = signals.avgNumDestHosts;
-    // betaOverhead = beta × numDestHosts
-    double betaOverhead = std::max(0.0, signals.beta) * numDestHosts;
-    // numerator = C - beta × numDestHosts
-    double numerator = signals.coeffC - betaOverhead;
-    // denominator = execTime + alpha × chainedRatio
-    double denominator = signals.avgExecTime +
-                         std::max(0.0, signals.alpha) * signals.avgChainedRatio;
+    // Capacity model (from CoeffEstimator):
+    //   W = N × (t_e + alpha × localRatio + beta × remoteRatio)
+    //   capPerWorker = W / (t_e + alpha × localRatio + beta × remoteRatio)
+    double denominator =
+      signals.avgExecTime +
+      std::max(0.0, signals.alpha) * signals.avgLocalChainedRatio +
+      std::max(0.0, signals.beta) * signals.avgRemoteChainedRatio;
 
-    if (numerator <= 0.0 || denominator <= 0.0)
+    if (denominator <= 0.0)
         return currentHostNum;
 
-    double capPerWorker = numerator / denominator;
+    double capPerWorker = signals.coeffC / denominator;
     if (capPerWorker <= 0.0)
         return currentHostNum;
 
@@ -1410,16 +1411,16 @@ int Planner::computeTargetHostNum(
     targetN = std::max(1, std::min(targetN, maxHostNum));
 
     SPDLOG_DEBUG("computeTargetHostNum: C={:.0f}us/s, alpha={:.3f}, "
-                 "beta={:.3f}, execTime={:.1f}us, chainedRatio={:.3f}, "
-                 "numDestHosts={:.1f}, capPerWorker={:.1f}, "
-                 "inputRate={:.1f}, chainedMultiplier={:.2f}, "
-                 "totalLoad={:.1f} -> targetN={}",
+                 "beta={:.3f}, execTime={:.1f}us, "
+                 "localRatio={:.3f}, remoteRatio={:.3f}, "
+                 "capPerWorker={:.1f}, inputRate={:.1f}, "
+                 "chainedMultiplier={:.2f}, totalLoad={:.1f} -> targetN={}",
                  signals.coeffC,
                  signals.alpha,
                  signals.beta,
                  signals.avgExecTime,
-                 signals.avgChainedRatio,
-                 numDestHosts,
+                 signals.avgLocalChainedRatio,
+                 signals.avgRemoteChainedRatio,
                  capPerWorker,
                  signals.avgInputRate,
                  signals.chainedMultiplier,
@@ -1514,6 +1515,46 @@ bool Planner::evaluateReschedule(
     }
 
     return true;
+}
+
+int Planner::predictHostNum(double inputRate)
+{
+    faabric::util::SharedLock lock(plannerMx);
+    if (!state.applicationMetrics) {
+        return schedHostNum;
+    }
+    int maxHostNum = (int)state.hostMap.size();
+    if (maxHostNum == 0) {
+        return 0;
+    }
+
+    if (scheduleMode == 3) {
+        return state.applicationMetrics->computeAdaptiveHostCount(inputRate,
+                                                                  maxHostNum);
+    }
+
+    // scheduleMode == 0 (default): model-based prediction
+    auto signals = state.applicationMetrics->getScalingSignals(
+      scalingDecisionPeriodMs / 1000);
+    signals.avgInputRate = inputRate;
+
+    if (stateAwareScheduler) {
+        const auto& inputNodeNames = stateAwareScheduler->getInputNodeNames();
+        if (!inputNodeNames.empty()) {
+            auto workloads = state.applicationMetrics->getOptWorkloads();
+            long inputCount = 0, totalCount = 0;
+            for (const auto& [name, count] : workloads)
+                totalCount += count;
+            for (const auto& inputName : inputNodeNames)
+                if (workloads.count(inputName))
+                    inputCount += workloads.at(inputName);
+            if (inputCount > 0)
+                signals.chainedMultiplier =
+                  static_cast<double>(totalCount - inputCount) / inputCount;
+        }
+    }
+
+    return computeTargetHostNum(signals, schedHostNum, maxHostNum);
 }
 
 Planner& getPlanner()
