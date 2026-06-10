@@ -166,7 +166,8 @@ void Application::displayApplication() const
     SPDLOG_INFO("{}", logStream.str());
 }
 
-double Application::computePreWorkloads(int scheduleMode)
+double Application::computePreWorkloads(int scheduleMode,
+                                        double chainedCostCoeff)
 {
     // Get the minimum processed tuples operator in the application.
     long minimizedInput = std::numeric_limits<long>::max();
@@ -189,8 +190,22 @@ double Application::computePreWorkloads(int scheduleMode)
     double totalPreWorkload = 0;
     for (auto& [nodeName, node] : nodes) {
         double estimateWork = static_cast<double>(node->processedTuples);
-        if (scheduleMode != 0 && scheduleMode != 3 && scheduleMode != 7 &&
-            connectionsWithWeight.count(nodeName) > 0) {
+        if (scheduleMode == 0) {
+            // Binpack: weight outgoing chained calls by their estimated CPU
+            // cost (chainedCostCoeff = avg per-call cost / t_e, in units of
+            // processed tuples), so operators that emit many — especially
+            // remote — chained calls get a larger share of workers. When the
+            // coefficient is 0 (e.g. before the estimator warms up), this
+            // degrades to the original process-only weighting.
+            if (chainedCostCoeff > 0.0 &&
+                connectionsWithWeight.count(nodeName) > 0) {
+                for (const auto& [_, weight] :
+                     connectionsWithWeight.at(nodeName)) {
+                    estimateWork += chainedCostCoeff * static_cast<double>(weight);
+                }
+            }
+        } else if (scheduleMode != 3 && scheduleMode != 7 &&
+                   connectionsWithWeight.count(nodeName) > 0) {
             for (const auto& [_, weight] : connectionsWithWeight.at(nodeName)) {
                 if (minimizedInput == 1) {
                     estimateWork += 0.1;
@@ -281,34 +296,36 @@ Application::NodeList Application::getNodesDFSOrder()
     return orderedNodes;
 }
 
-void Application::quantiseResources(const int numHosts, int scheduleMode)
+std::map<std::string, double> Application::quantiseFromPreWorkloads(
+  const std::map<std::string, double>& preWorkloads,
+  int numHosts)
 {
-    double totalPreWorkload = computePreWorkloads(scheduleMode);
-
-    // Update the resource required for each operator (number of workers).
-    auto& appNodes = nodes;
+    double totalPreWorkload = 0.0;
+    for (const auto& [name, pw] : preWorkloads) {
+        totalPreWorkload += pw;
+    }
 
     struct Quantised
     {
-        std::shared_ptr<Node> node; // pointer to the original node object
-        int units;                  // 1 unit == 0.1 workers
-        double frac;                // fractional part kept for tie‑breaks
+        std::string name; // operator name
+        int units;        // 1 unit == 0.1 workers
+        double frac;      // fractional part kept for tie‑breaks
     };
 
     const int TOTAL_UNITS = numHosts * 10; // 0.1‑granularity budget
     std::vector<Quantised> bucket;
-    bucket.reserve(appNodes.size());
+    bucket.reserve(preWorkloads.size());
 
     int usedUnits = 0;
 
     //--------------------------------------------------------------------------
     // step 1: convert each exact share to "baseUnits" (floor in 0.1 steps)
     //--------------------------------------------------------------------------
-    for (auto& [name, n] : appNodes) {
+    for (const auto& [name, pw] : preWorkloads) {
 
-        double exactShare = static_cast<double>(numHosts) * n->preWorkload /
-                            totalPreWorkload; // original
-        double rawUnitsD = exactShare * 10.0; // 0.1 units
+        double exactShare =
+          static_cast<double>(numHosts) * pw / totalPreWorkload; // original
+        double rawUnitsD = exactShare * 10.0;                    // 0.1 units
         int baseUnits = static_cast<int>(std::floor(rawUnitsD));
 
         if (baseUnits == 0) // enforce the 0.1 minimum
@@ -316,7 +333,7 @@ void Application::quantiseResources(const int numHosts, int scheduleMode)
 
         double frac = rawUnitsD - baseUnits; // 0 ≤ frac < 1
 
-        bucket.push_back({ n, baseUnits, frac });
+        bucket.push_back({ name, baseUnits, frac });
         usedUnits += baseUnits;
     }
 
@@ -376,15 +393,30 @@ void Application::quantiseResources(const int numHosts, int scheduleMode)
     //--------------------------------------------------------------------------
     // step 3: write the quantised values back to each node
     //--------------------------------------------------------------------------
+    std::map<std::string, double> reqResource;
     for (auto& q : bucket)
-        q.node->reqResource = q.units / 10.0; // 0.1‑granularity
+        reqResource[q.name] = q.units / 10.0;
 
-#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG
-    std::ostringstream oss;
-    for (auto& [name, n] : appNodes) {
-        oss << name << "(" << n->reqResource << "), ";
+    return reqResource;
+}
+
+void Application::quantiseResources(const int numHosts,
+                                    int scheduleMode,
+                                    double chainedCostCoeff)
+{
+    computePreWorkloads(scheduleMode, chainedCostCoeff);
+
+    // Gather each operator's preWorkload and run the shared quantisation.
+    std::map<std::string, double> preWorkloads;
+    for (auto& [name, n] : nodes) {
+        preWorkloads[name] = n->preWorkload;
     }
-    SPDLOG_DEBUG("Node workloads: {}", oss.str());
-#endif
+
+    auto reqResource = quantiseFromPreWorkloads(preWorkloads, numHosts);
+
+    // Write the quantised values back to each node.
+    for (auto& [name, n] : nodes) {
+        n->reqResource = reqResource.at(name);
+    }
 }
 }

@@ -8,12 +8,20 @@
 #include <faabric/util/string_tools.h>
 
 #include <algorithm>
+#include <cmath>
+#include <functional>
 #include <limits>
 #include <sstream>
 
 #define MAIN_KEY_PREFIX "main_"
 
 namespace faabric::batch_scheduler {
+
+// Shared contiguous Binpack bin-fill helper (defined below). Lays
+// (operator, reqResource) pairs onto a tape of unit-capacity slots.
+static std::map<std::string, std::map<int, double>> binpackTapeFill(
+  const std::vector<std::pair<std::string, double>>& ordered,
+  int numSlots);
 
 /* Virtual functions which must be implemented. However, it is not used in
  * StateAwareScheduler.
@@ -1335,8 +1343,18 @@ void StateAwareScheduler::rescheduleApp(
         return;
     }
 
+    // For Binpack, weight each operator's chained calls by their estimated CPU
+    // cost so remote-heavy operators get more workers. The coefficient is the
+    // cluster-average per-call cost (alpha·localShare + beta·(1-localShare))
+    // normalised by t_e, derived from the live metrics. Other modes ignore it.
+    double chainedCostCoeff = 0.0;
+    if (scheduleMode == 0 && metrics != nullptr) {
+        chainedCostCoeff =
+          computeChainedCostCoeff(metrics->getScalingSignals(kChainedCostWindowSec));
+    }
+
     // TODO - scale the number of hosts.
-    application->quantiseResources(hostMap.size(), scheduleMode);
+    application->quantiseResources(hostMap.size(), scheduleMode, chainedCostCoeff);
     application->showConnections();
 
     if (scheduleMode == 7) {
@@ -1817,6 +1835,10 @@ std::tuple<std::vector<NodeGroup>,
 StateAwareScheduler::groupNodesTopo(const HostMap& hostMap)
 {
     SPDLOG_INFO("Maping nodes to operators based on topology");
+    if (hostMap.empty()) {
+        SPDLOG_ERROR("Host map is empty, cannot schedule.");
+        throw std::runtime_error("Host map is empty");
+    }
     auto appNodes = application->getNodesDFSOrder();
 
     std::vector<NodeGroup> groups;
@@ -1827,62 +1849,32 @@ StateAwareScheduler::groupNodesTopo(const HostMap& hostMap)
         workerRemaining[ip] = 1.0;
     }
 
-    auto it = hostMap.begin();
-    const double TOLERANCE = 1e-9;
+    // Contiguous Binpack layout via the shared helper, keyed by slot index;
+    // map each slot index back to its IP (hostMap iteration order).
+    std::vector<std::string> ipByIdx;
+    ipByIdx.reserve(hostMap.size());
+    for (const auto& [ip, host] : hostMap) {
+        ipByIdx.push_back(ip);
+    }
 
-    // Estimate the resource requirement for each node.
+    std::vector<std::pair<std::string, double>> ordered;
+    ordered.reserve(appNodes.size());
     for (const auto& [nodeName, node] : appNodes) {
+        ordered.emplace_back(nodeName, node->reqResource);
+    }
 
+    auto placementByIdx =
+      binpackTapeFill(ordered, static_cast<int>(hostMap.size()));
+
+    // Rebuild the per-node IP-keyed allocations and the leftover capacity.
+    for (const auto& [nodeName, node] : appNodes) {
         std::map<std::string, double> currentNodeAllocation;
-        double remainReqResource = node->reqResource;
-
-        while (remainReqResource > TOLERANCE) {
-            if (it == hostMap.end()) {
-                if (hostMap.empty()) {
-                    SPDLOG_ERROR("Host map is empty, cannot schedule.");
-                    throw std::runtime_error("Host map is empty");
-                }
-
-                // RECOVERY: Assign the "floating point dust" to the last host
-                // in the list
-                std::string lastIp = hostMap.rbegin()->first;
-
-                SPDLOG_WARN("Floating point precision drift detected. "
-                            "Forcing remaining {} to last host {}",
-                            remainReqResource,
-                            lastIp);
-
-                currentNodeAllocation[lastIp] += remainReqResource;
-                workerRemaining[lastIp] -= remainReqResource;
-                remainReqResource = 0.0;
-                continue;
-            }
-
-            std::string ip = it->first;
-            double workerAvail = workerRemaining[ip];
-            // 4e. Check if the current host has any capacity left
-            if (workerAvail > TOLERANCE) {
-                if (workerAvail >= remainReqResource) {
-                    // Case 1: Host has *enough* capacity for the remainder.
-                    // Allocate, update, and we're done with this node.
-                    currentNodeAllocation[ip] += remainReqResource;
-                    workerRemaining[ip] -= remainReqResource;
-                    remainReqResource = 0.0;
-
-                } else {
-                    // Case 2: Host has *some* capacity, but *not enough*.
-                    // Allocate all of this host's remaining capacity.
-                    currentNodeAllocation[ip] += workerAvail;
-                    remainReqResource -= workerAvail;
-                    workerRemaining[ip] = 0.0;
-
-                    // This host is now full. Move to the next host.
-                    ++it;
-                }
-            } else {
-                // Case 3: This host is already full.
-                // Skip it and move to the next host.
-                ++it;
+        auto pit = placementByIdx.find(nodeName);
+        if (pit != placementByIdx.end()) {
+            for (const auto& [idx, amount] : pit->second) {
+                const std::string& ip = ipByIdx[idx];
+                currentNodeAllocation[ip] += amount;
+                workerRemaining[ip] -= amount;
             }
         }
         groups.push_back({ { node }, NONE_STRING });
@@ -1911,6 +1903,309 @@ StateAwareScheduler::groupNodesTopo(const HostMap& hostMap)
         SPDLOG_INFO("  -> Worker Allocations: {}", allocation);
     }
     return { groups, groupAllocations, workerRemaining };
+}
+
+// Greedy contiguous bin-fill — the deterministic core of the Binpack layout.
+// Lay each (key, resource) in `ordered` onto a tape of `numSlots`
+// unit-capacity slots, the slot cursor persisting across keys so that adjacent
+// operators land on overlapping slots. Returns key -> { slotIndex -> amount
+// placed on that slot }. Mirrors the fill loop in groupNodesTopo, including the
+// floating-point-dust recovery onto the last slot. Used by both groupNodesTopo
+// (which maps slot index -> IP) and predictBinpackLocalShare.
+static std::map<std::string, std::map<int, double>> binpackTapeFill(
+  const std::vector<std::pair<std::string, double>>& ordered,
+  int numSlots)
+{
+    std::map<std::string, std::map<int, double>> placement;
+    if (numSlots <= 0) {
+        return placement;
+    }
+
+    std::vector<double> slotRemaining(numSlots, 1.0);
+    const double TOLERANCE = 1e-9;
+    int it = 0;
+    for (const auto& [key, resource] : ordered) {
+        double remainReq = resource;
+        while (remainReq > TOLERANCE) {
+            if (it >= numSlots) {
+                // Floating-point dust: assign to the last slot.
+                placement[key][numSlots - 1] += remainReq;
+                slotRemaining[numSlots - 1] -= remainReq;
+                remainReq = 0.0;
+                break;
+            }
+            double avail = slotRemaining[it];
+            if (avail > TOLERANCE) {
+                if (avail >= remainReq) {
+                    placement[key][it] += remainReq;
+                    slotRemaining[it] -= remainReq;
+                    remainReq = 0.0;
+                } else {
+                    placement[key][it] += avail;
+                    remainReq -= avail;
+                    slotRemaining[it] = 0.0;
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+    }
+    return placement;
+}
+
+std::map<std::string, std::map<int, double>>
+StateAwareScheduler::computeBinpackPlacement(int numHosts) const
+{
+    std::map<std::string, std::map<int, double>> placement;
+    if (!application || numHosts <= 0) {
+        return placement;
+    }
+
+    auto& nodes = application->getNodes();
+    if (nodes.empty()) {
+        return placement;
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 1: read each operator's preWorkload — the N-independent share the
+    // Binpack quantiser uses, computed at the last reschedule. Floored to 1.0
+    // to match computePreWorkloads (and to stay well-defined before the first
+    // reschedule, where it degrades to a uniform split). Read-only.
+    //--------------------------------------------------------------------------
+    std::map<std::string, double> preWorkloads;
+    for (const auto& [name, node] : nodes) {
+        double pw = node->preWorkload;
+        if (pw < 1.0) {
+            pw = 1.0;
+        }
+        preWorkloads[name] = pw;
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 2: quantise to per-operator reqResource at 0.1-worker granularity,
+    // reusing the exact same routine the real Binpack scheduler runs.
+    //--------------------------------------------------------------------------
+    std::map<std::string, double> reqResource;
+    try {
+        reqResource =
+          Application::quantiseFromPreWorkloads(preWorkloads, numHosts);
+    } catch (const std::exception& e) {
+        // quantiseFromPreWorkloads throws if it cannot rebalance to 0.1 units.
+        // This is only a prediction, so degrade gracefully to the fallback.
+        SPDLOG_WARN("computeBinpackPlacement: quantisation failed: {}",
+                    e.what());
+        return {};
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 3: lay operators out contiguously on a tape of `numHosts` workers in
+    // DFS order, reusing the shared binpackTapeFill helper (the deterministic
+    // Binpack layout). placement[op] = { workerIdx -> fraction of op }.
+    //--------------------------------------------------------------------------
+    std::vector<std::pair<std::string, double>> ordered;
+    {
+        std::set<std::string> visited;
+        const auto& conns = application->getConnections();
+        std::function<void(const std::string&)> visit =
+          [&](const std::string& n) {
+              visited.insert(n);
+              auto rIt = reqResource.find(n);
+              if (rIt != reqResource.end()) {
+                  ordered.emplace_back(n, rIt->second);
+              }
+              auto cIt = conns.find(n);
+              if (cIt != conns.end()) {
+                  for (const auto& succ : cIt->second) {
+                      if (!visited.count(succ)) {
+                          visit(succ);
+                      }
+                  }
+              }
+          };
+        for (const auto& input : application->getInputNodes()) {
+            if (!visited.count(input)) {
+                visit(input);
+            }
+        }
+    }
+
+    placement = binpackTapeFill(ordered, numHosts);
+
+    // Normalise each operator's per-worker amounts into fractions summing to 1.
+    for (auto& [name, wmap] : placement) {
+        double sum = 0.0;
+        for (const auto& [w, amt] : wmap) {
+            sum += amt;
+        }
+        if (sum > 0.0) {
+            for (auto& [w, amt] : wmap) {
+                amt /= sum;
+            }
+        }
+    }
+
+    return placement;
+}
+
+double StateAwareScheduler::predictBinpackLocalShare(int numHosts) const
+{
+    auto placement = computeBinpackPlacement(numHosts);
+    if (placement.empty()) {
+        return -1.0;
+    }
+
+    //--------------------------------------------------------------------------
+    // Weighted local share over chained edges. For an edge A->B the
+    // source/destination hosts are approximately independent (round-robin /
+    // apportion for stateless, hash for partitioned stateful), so the local
+    // probability is Σ_w A_w·B_w. Weight each edge by its observed chained call
+    // count.
+    //--------------------------------------------------------------------------
+    auto weightedEdges = application->getConnectionsWithWeight();
+    double weightedLocal = 0.0;
+    double weightedTotal = 0.0;
+    for (const auto& edge : weightedEdges) {
+        if (edge.weight <= 0) {
+            continue;
+        }
+        auto aIt = placement.find(edge.input);
+        auto bIt = placement.find(edge.output);
+        if (aIt == placement.end() || bIt == placement.end()) {
+            continue;
+        }
+        double localFrac = 0.0;
+        for (const auto& [w, aFrac] : aIt->second) {
+            auto bw = bIt->second.find(w);
+            if (bw != bIt->second.end()) {
+                localFrac += aFrac * bw->second;
+            }
+        }
+        weightedLocal += edge.weight * localFrac;
+        weightedTotal += edge.weight;
+    }
+
+    if (weightedTotal <= 0.0) {
+        return -1.0;
+    }
+    return weightedLocal / weightedTotal;
+}
+
+std::vector<double> StateAwareScheduler::predictBinpackWorkerLoads(
+  int numHosts,
+  double totalLoad,
+  double tE,
+  double alpha,
+  double beta,
+  double chainedRatio) const
+{
+    auto placement = computeBinpackPlacement(numHosts);
+    if (placement.empty() || numHosts <= 0 || totalLoad <= 0.0) {
+        return {};
+    }
+
+    //--------------------------------------------------------------------------
+    // Per-operator processing share == preWorkload share, floored to 1.0 to
+    // match computeBinpackPlacement. An operator's absolute rate is then
+    // totalLoad·share, so the per-worker process rates sum back to totalLoad.
+    //--------------------------------------------------------------------------
+    auto& nodes = application->getNodes();
+    std::map<std::string, double> preWorkloads;
+    double preWorkloadSum = 0.0;
+    for (const auto& [name, node] : nodes) {
+        double pw = node->preWorkload < 1.0 ? 1.0 : node->preWorkload;
+        preWorkloads[name] = pw;
+        preWorkloadSum += pw;
+    }
+    if (preWorkloadSum <= 0.0) {
+        return {};
+    }
+
+    std::vector<double> workerLoads(numHosts, 0.0);
+
+    //--------------------------------------------------------------------------
+    // Process cost: each operator's absolute rate (totalLoad · its preWorkload
+    // share) attributed to workers by its placement fractions, times tE.
+    //--------------------------------------------------------------------------
+    for (const auto& [name, wmap] : placement) {
+        auto pwIt = preWorkloads.find(name);
+        if (pwIt == preWorkloads.end()) {
+            continue;
+        }
+        double rateOp = totalLoad * (pwIt->second / preWorkloadSum);
+        for (const auto& [w, frac] : wmap) {
+            if (w >= 0 && w < numHosts) {
+                workerLoads[w] += rateOp * frac * tE;
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Chained-call cost: the total chained calls/s (chainedRatio · totalLoad)
+    // split across edges by their observed weight, then attributed to the
+    // worker running the source operator (share A_w). Each such call is local
+    // with probability B_w (destination also on w) and remote otherwise.
+    //--------------------------------------------------------------------------
+    auto weightedEdges = application->getConnectionsWithWeight();
+    double weightTotal = 0.0;
+    for (const auto& edge : weightedEdges) {
+        if (edge.weight > 0) {
+            weightTotal += edge.weight;
+        }
+    }
+    if (weightTotal > 0.0 && chainedRatio > 0.0) {
+        double totalChainedPerSec = chainedRatio * totalLoad;
+        for (const auto& edge : weightedEdges) {
+            if (edge.weight <= 0) {
+                continue;
+            }
+            auto aIt = placement.find(edge.input);
+            auto bIt = placement.find(edge.output);
+            if (aIt == placement.end() || bIt == placement.end()) {
+                continue;
+            }
+            double edgeCallsPerSec =
+              totalChainedPerSec * (edge.weight / weightTotal);
+            for (const auto& [w, aFrac] : aIt->second) {
+                if (w < 0 || w >= numHosts) {
+                    continue;
+                }
+                double bFrac = 0.0;
+                auto bw = bIt->second.find(w);
+                if (bw != bIt->second.end()) {
+                    bFrac = bw->second;
+                }
+                double callsOnW = edgeCallsPerSec * aFrac;
+                workerLoads[w] += callsOnW * bFrac * alpha;        // local
+                workerLoads[w] += callsOnW * (1.0 - bFrac) * beta; // remote
+            }
+        }
+    }
+
+    return workerLoads;
+}
+
+double StateAwareScheduler::computeChainedCostCoeff(
+  const faabric::planner::ApplicationMetrics::ScalingSignals& signals)
+{
+    double tE = signals.avgExecTime;
+    double R = signals.avgChainedRatio;
+    if (tE <= 0.0 || R <= 0.0) {
+        return 0.0;
+    }
+
+    // Cluster-average fraction of chained calls that stay host-local.
+    double localShare = signals.avgLocalChainedRatio / R;
+    localShare = std::clamp(localShare, 0.0, 1.0);
+
+    // Blended per-call cost (us), then normalise by t_e so the coefficient is
+    // in units of processed tuples (the same unit as Node::processedTuples).
+    double perCallCost =
+      signals.alpha * localShare + signals.beta * (1.0 - localShare);
+    if (perCallCost <= 0.0) {
+        return 0.0;
+    }
+    return perCallCost / tE;
 }
 
 void StateAwareScheduler::rescheduleAppBinpack(const HostMap& hostMap)
@@ -2347,7 +2642,8 @@ void StateAwareScheduler::rescheduleAppFaaSFlowAdaptive(
     }
 
     int usedHostCount =
-      metrics ? metrics->computeAdaptiveHostCount(avgInputRate, numHosts) : numHosts;
+      metrics ? metrics->computeAdaptiveHostCount(avgInputRate, numHosts)
+              : numHosts;
     SPDLOG_INFO("Adaptive: usedHostCount={}", usedHostCount);
 
     // Distribute reqResource proportionally to each operator's processedTuples.

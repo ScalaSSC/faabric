@@ -234,6 +234,11 @@ class Planner
     double inputRateDeviationRatio = 0.2;  // tolerance: 0.2 = 20%
     double pendingDevToleranceRatio = 0.2;
 
+    // Per-worker feasibility search: the largest fraction of a worker's CPU
+    // budget C the scaler is allowed to plan up to. Leaving headroom (< 1.0)
+    // absorbs the prediction error and short-term bursts.
+    double workerLoadHeadroom = 0.9;
+
     int computeTargetHostNum(
       const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
       int currentHostNum,

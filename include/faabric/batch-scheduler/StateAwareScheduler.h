@@ -166,6 +166,36 @@ class StateAwareScheduler : public BatchScheduler
 
     void rescheduleAppStepConf(const HostMap& hostMap);
 
+    // Predict the fraction of chained calls that remain host-local when the
+    // application is binpacked onto `numHosts` workers. Read-only: it mirrors
+    // quantiseResources() + groupNodesTopo() (the deterministic Binpack split)
+    // without mutating any application or scheduler state, then estimates the
+    // local share as Σ_edge weight·(Σ_w A_w·B_w) / Σ_edge weight, where A_w/B_w
+    // are the per-worker placement fractions of the edge's two operators.
+    // Returns a value in [0, 1], or -1.0 if prediction is not possible (no
+    // application / no chained edges).
+    double predictBinpackLocalShare(int numHosts) const;
+
+    // Predict the per-worker CPU load (in us/s) when the application is
+    // binpacked onto `numHosts` workers, given the current cost coefficients.
+    // Unlike predictBinpackLocalShare (which collapses the layout to a single
+    // local-share scalar), this attributes process and chained-call cost to
+    // each worker individually, so the caller can detect per-worker overload —
+    // the load imbalance the aggregate capacity model misses. Per worker:
+    //   time_w = procRate_w·tE
+    //          + localCalls_w·alpha + remoteCalls_w·beta
+    // where procRate_w is the operators' processing rate landing on w (their
+    // totalLoad share times their placement fraction), and chained calls are
+    // attributed to the source operator's worker, local with probability B_w
+    // (destination on the same worker) and remote otherwise. Returns a vector
+    // of length numHosts, or empty if prediction is not possible.
+    std::vector<double> predictBinpackWorkerLoads(int numHosts,
+                                                  double totalLoad,
+                                                  double tE,
+                                                  double alpha,
+                                                  double beta,
+                                                  double chainedRatio) const;
+
     const std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>&
     getStateHashRing() const
     {
@@ -245,6 +275,27 @@ class StateAwareScheduler : public BatchScheduler
 
     std::unique_ptr<batch_scheduler::Application> application;
     std::map<std::string, ScheduledOperator> scheduledOperatorsMap;
+
+    // Deterministic Binpack placement of every operator onto `numHosts`
+    // workers, as normalised per-worker fractions (placement[op][w] in [0,1],
+    // Σ_w placement[op][w] = 1). Mirrors quantiseResources() + the contiguous
+    // tape layout without mutating any state. Shared by predictBinpackLocalShare
+    // and predictBinpackWorkerLoads. Empty if no application / quantisation
+    // fails.
+    std::map<std::string, std::map<int, double>> computeBinpackPlacement(
+      int numHosts) const;
+
+    // Window (in seconds) over which computeChainedCostCoeff samples metrics.
+    static constexpr int kChainedCostWindowSec = 10;
+
+    // Estimated CPU cost of one chained call, expressed in units of processed
+    // tuples (avg per-call cost / t_e), derived from the cluster-average
+    // local/remote chained mix: alpha·localShare + beta·(1-localShare). Used to
+    // weight chained calls in the Binpack workload so remote-heavy operators
+    // get more workers. Returns 0.0 when the estimator is not yet warmed up
+    // (degrading Binpack to the original process-only weighting).
+    static double computeChainedCostCoeff(
+      const faabric::planner::ApplicationMetrics::ScalingSignals& signals);
 
     // TODO - This can be detected by state server and planner, but logic will
     // be extreamly complex. (How to create new function state, BALABALA)

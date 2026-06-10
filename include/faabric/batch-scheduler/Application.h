@@ -107,9 +107,26 @@ class Application
     void addConnection(const std::string& src, const std::string& dest);
     void buildInvertConnections();
     void displayApplication() const;
-    double computePreWorkloads(int scheduleMode); // return total workload
+    // Compute each operator's preWorkload (the proportional weight used to
+    // allocate workers). chainedCostCoeff is the estimated CPU cost of one
+    // chained call expressed in units of processed tuples (avg per-call cost /
+    // t_e); when > 0 in Binpack mode, each operator's outgoing chained calls
+    // are added to its workload so remote-heavy operators get more workers.
+    // Defaults to 0.0 (process-only, i.e. the original behaviour).
+    double computePreWorkloads(int scheduleMode, double chainedCostCoeff = 0.0);
     // TODO - Now we only support homogenous cluster.
-    void quantiseResources(const int numHosts, int scheduleMode);
+    void quantiseResources(const int numHosts,
+                           int scheduleMode,
+                           double chainedCostCoeff = 0.0);
+
+    // Pure quantisation: distribute `numHosts` workers across operators in
+    // proportion to their preWorkload share, rounded to 0.1-worker units (>=
+    // 0.1 each, summing to numHosts). Returns operator -> reqResource without
+    // touching any Node. Shared by quantiseResources() (which writes the result
+    // back to the nodes) and by the Binpack capacity predictor.
+    static std::map<std::string, double> quantiseFromPreWorkloads(
+      const std::map<std::string, double>& preWorkloads,
+      int numHosts);
 
     std::vector<std::shared_ptr<Node>> getSource(const std::string& node) const;
 

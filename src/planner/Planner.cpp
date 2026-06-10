@@ -961,6 +961,7 @@ bool Planner::resetParameter(
         "periodic_reschedule_interval",
         "input_rate_stability_window",
         "input_rate_deviation",
+        "worker_load_headroom",
     };
 
     faabric::util::FullLock lock(plannerMx);
@@ -1007,6 +1008,10 @@ bool Planner::resetParameter(
             inputRateStabilityWindowMs = value;
         } else if (key == "input_rate_deviation") {
             inputRateDeviationRatio = req.value_double();
+        } else if (key == "worker_load_headroom") {
+            workerLoadHeadroom = req.value_double();
+            SPDLOG_INFO("Planner worker load headroom set to {:.3f}",
+                        workerLoadHeadroom);
         } else if (state.applicationMetrics &&
                    state.applicationMetrics->setThreshold(key, value)) {
             // threshold keys handled inside ApplicationMetrics
@@ -1386,20 +1391,9 @@ int Planner::computeTargetHostNum(
     // Require a valid C estimate before making any scaling decision.
     if (signals.coeffC <= 0.0 || signals.avgExecTime <= 0.0)
         return currentHostNum;
-    // Capacity model (from CoeffEstimator):
-    //   W = N × (t_e + alpha × localRatio + beta × remoteRatio)
-    //   capPerWorker = W / (t_e + alpha × localRatio + beta × remoteRatio)
-    double denominator =
-      signals.avgExecTime +
-      std::max(0.0, signals.alpha) * signals.avgLocalChainedRatio +
-      std::max(0.0, signals.beta) * signals.avgRemoteChainedRatio;
 
-    if (denominator <= 0.0)
-        return currentHostNum;
-
-    double capPerWorker = signals.coeffC / denominator;
-    if (capPerWorker <= 0.0)
-        return currentHostNum;
+    double alpha = std::max(0.0, signals.alpha);
+    double beta = std::max(0.0, signals.beta);
 
     // totalLoad = inputRate + inputRate × chainedMultiplier
     // where chainedMultiplier = chainedOperatorCount / inputOperatorCount
@@ -1407,21 +1401,122 @@ int Planner::computeTargetHostNum(
     // chain)
     double totalLoad =
       signals.avgInputRate * signals.chainedMultiplier + signals.avgInputRate;
-    int targetN = static_cast<int>(std::ceil(totalLoad / capPerWorker));
-    targetN = std::max(1, std::min(targetN, maxHostNum));
+    if (totalLoad <= 0.0)
+        return currentHostNum;
+
+    double R = signals.avgChainedRatio;
+
+    // --- Per-worker feasibility search (preferred) ---------------------------
+    // The Binpack layout spreads each operator unevenly across workers, so the
+    // observed local/remote ratios and process load differ per worker. Rather
+    // than collapsing to one average capacity, simulate the Binpack placement
+    // at each candidate N and require *every* worker's predicted CPU load to
+    // stay within budget C (with headroom). This captures the load imbalance
+    // the aggregate model below cannot. Pick the smallest feasible N.
+    if (stateAwareScheduler) {
+        const double budget = signals.coeffC * workerLoadHeadroom;
+        int hi = std::max(1, maxHostNum);
+        bool predictionUsable = false;
+        for (int n = 1; n <= hi; ++n) {
+            auto loads = stateAwareScheduler->predictBinpackWorkerLoads(
+              n, totalLoad, signals.avgExecTime, alpha, beta, R);
+            if (loads.empty()) {
+                // Prediction not possible (e.g. before the first reschedule);
+                // abandon the per-worker path and fall back to the aggregate
+                // model below.
+                predictionUsable = false;
+                break;
+            }
+            predictionUsable = true;
+            double maxLoad = 0.0;
+            for (double l : loads)
+                maxLoad = std::max(maxLoad, l);
+            if (maxLoad <= budget) {
+                SPDLOG_DEBUG(
+                  "computeTargetHostNum(per-worker): C={:.0f}us/s, "
+                  "budget={:.0f}us/s, totalLoad={:.1f}, R={:.3f} -> targetN={} "
+                  "(maxLoad={:.0f}us/s)",
+                  signals.coeffC,
+                  budget,
+                  totalLoad,
+                  R,
+                  n,
+                  maxLoad);
+                return n;
+            }
+        }
+        // No N within [1, maxHostNum] keeps every worker under budget: the
+        // cluster is saturated, so request the maximum.
+        if (predictionUsable) {
+            SPDLOG_DEBUG("computeTargetHostNum(per-worker): saturated, "
+                         "totalLoad={:.1f} -> targetN={} (maxHostNum)",
+                         totalLoad,
+                         maxHostNum);
+            return std::max(1, maxHostNum);
+        }
+    }
+
+    // --- Aggregate fallback --------------------------------------------------
+    // The capacity model is:
+    //   capPerWorker = C / (t_e + alpha × localRatio + beta × remoteRatio)
+    // The observed local/remote chained ratios are cluster-size-dependent: as
+    // we add workers the Binpack scheduler spreads each operator over more
+    // hosts, so chained calls increasingly cross host boundaries (remoteRatio
+    // grows, localRatio shrinks). Reusing the *observed* ratios — measured at
+    // the current host count — therefore over-estimates capacity at a larger N.
+    //
+    // Instead we keep the total chained ratio R (an application property,
+    // R = avgChainedRatio) fixed and re-derive the local/remote split for each
+    // candidate N by simulating the deterministic Binpack split
+    // (predictBinpackLocalShare). Because the split depends on N and N depends
+    // on the split, iterate to a fixed point.
+    auto capacityFor = [&](double localRatio, double remoteRatio) {
+        return signals.coeffC /
+               (signals.avgExecTime + alpha * localRatio + beta * remoteRatio);
+    };
+
+    int targetN = std::max(1, std::min(currentHostNum, maxHostNum));
+    double localRatio = signals.avgLocalChainedRatio;
+    double remoteRatio = signals.avgRemoteChainedRatio;
+    double localShare = -1.0;
+    const int maxIter = 8;
+    for (int iter = 0; iter < maxIter; ++iter) {
+        // Predict the local/remote chained split at the candidate host count.
+        localShare = stateAwareScheduler
+                       ? stateAwareScheduler->predictBinpackLocalShare(targetN)
+                       : -1.0;
+        if (localShare >= 0.0 && R > 0.0) {
+            localRatio = R * localShare;
+            remoteRatio = R * (1.0 - localShare);
+        }
+        // else: fall back to the observed ratios (best available estimate).
+
+        double capPerWorker = capacityFor(localRatio, remoteRatio);
+        if (capPerWorker <= 0.0)
+            return currentHostNum;
+
+        int newN = std::max(
+          1,
+          std::min(static_cast<int>(std::ceil(totalLoad / capPerWorker)),
+                   maxHostNum));
+        if (newN == targetN)
+            break;
+        targetN = newN;
+    }
 
     SPDLOG_DEBUG("computeTargetHostNum: C={:.0f}us/s, alpha={:.3f}, "
-                 "beta={:.3f}, execTime={:.1f}us, "
-                 "localRatio={:.3f}, remoteRatio={:.3f}, "
-                 "capPerWorker={:.1f}, inputRate={:.1f}, "
-                 "chainedMultiplier={:.2f}, totalLoad={:.1f} -> targetN={}",
+                 "beta={:.3f}, execTime={:.1f}us, R={:.3f}, "
+                 "localShare={:.3f}, localRatio={:.3f}, remoteRatio={:.3f}, "
+                 "inputRate={:.1f}, chainedMultiplier={:.2f}, "
+                 "totalLoad={:.1f} -> targetN={}",
                  signals.coeffC,
                  signals.alpha,
                  signals.beta,
                  signals.avgExecTime,
-                 signals.avgLocalChainedRatio,
-                 signals.avgRemoteChainedRatio,
-                 capPerWorker,
+                 R,
+                 localShare,
+                 localRatio,
+                 remoteRatio,
                  signals.avgInputRate,
                  signals.chainedMultiplier,
                  totalLoad,
