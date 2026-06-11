@@ -954,10 +954,15 @@ bool Planner::resetParameter(
         "coeff_c",
         "coeff_a",
         "coeff_b",
+        "coeff_g",
         "coeff_param_fix",
         "rls_lambda",
         "rls_p",
         "rls_w_ema",
+        "rls_y_norm",
+        "rls_chain_norm",
+        "rls_remote_norm",
+        "rls_host_norm",
         "periodic_reschedule_interval",
         "input_rate_stability_window",
         "input_rate_deviation",
@@ -993,12 +998,15 @@ bool Planner::resetParameter(
                 state.applicationMetrics->setCoeff(key,
                                                    static_cast<double>(value));
             }
-        } else if (key == "coeff_c" || key == "coeff_a" || key == "coeff_b") {
+        } else if (key == "coeff_c" || key == "coeff_a" || key == "coeff_b" ||
+                   key == "coeff_g") {
             if (state.applicationMetrics) {
                 state.applicationMetrics->setCoeff(key, req.value_double());
             }
         } else if (key == "rls_lambda" || key == "rls_p" ||
-                   key == "rls_w_ema") {
+                   key == "rls_w_ema" || key == "rls_y_norm" ||
+                   key == "rls_chain_norm" || key == "rls_remote_norm" ||
+                   key == "rls_host_norm") {
             if (state.applicationMetrics) {
                 state.applicationMetrics->setRlsParam(key, req.value_double());
             }
@@ -1394,6 +1402,7 @@ int Planner::computeTargetHostNum(
 
     double alpha = std::max(0.0, signals.alpha);
     double beta = std::max(0.0, signals.beta);
+    double gamma = std::max(0.0, signals.gamma);
 
     // totalLoad = inputRate + inputRate × chainedMultiplier
     // where chainedMultiplier = chainedOperatorCount / inputOperatorCount
@@ -1419,7 +1428,7 @@ int Planner::computeTargetHostNum(
         bool predictionUsable = false;
         for (int n = 1; n <= hi; ++n) {
             auto loads = stateAwareScheduler->predictBinpackWorkerLoads(
-              n, totalLoad, signals.avgExecTime, alpha, beta, R);
+              n, totalLoad, signals.avgExecTime, alpha, beta, gamma, R);
             if (loads.empty()) {
                 // Prediction not possible (e.g. before the first reschedule);
                 // abandon the per-worker path and fall back to the aggregate
@@ -1470,8 +1479,11 @@ int Planner::computeTargetHostNum(
     // candidate N by simulating the deterministic Binpack split
     // (predictBinpackLocalShare). Because the split depends on N and N depends
     // on the split, iterate to a fixed point.
-    auto capacityFor = [&](double localRatio, double remoteRatio) {
-        return signals.coeffC /
+    // budget = C minus the fixed per-worker host-fanout overhead (gamma per
+    // distinct remote dest host). The remaining budget is shared by the
+    // throughput-proportional process + chained-call cost.
+    auto capacityFor = [&](double budget, double localRatio, double remoteRatio) {
+        return budget /
                (signals.avgExecTime + alpha * localRatio + beta * remoteRatio);
     };
 
@@ -1479,6 +1491,7 @@ int Planner::computeTargetHostNum(
     double localRatio = signals.avgLocalChainedRatio;
     double remoteRatio = signals.avgRemoteChainedRatio;
     double localShare = -1.0;
+    double nHosts = 0.0;
     const int maxIter = 8;
     for (int iter = 0; iter < maxIter; ++iter) {
         // Predict the local/remote chained split at the candidate host count.
@@ -1491,7 +1504,21 @@ int Planner::computeTargetHostNum(
         }
         // else: fall back to the observed ratios (best available estimate).
 
-        double capPerWorker = capacityFor(localRatio, remoteRatio);
+        // Fixed per-worker host overhead at this candidate N. A worker can fan
+        // out to at most (targetN - 1) other hosts; use the observed distinct
+        // dest-host count as the estimate, capped by that physical bound. (No
+        // placement is available on this fallback path, so this is the best
+        // estimate we have.)
+        nHosts = std::min(static_cast<double>(std::max(0, targetN - 1)),
+                          std::max(0.0, signals.avgNumDestHosts));
+        double budget = signals.coeffC - gamma * nHosts;
+        if (budget <= 0.0) {
+            // Host-fanout overhead alone exceeds the CPU budget: the cluster
+            // cannot keep up at this size, request the maximum.
+            return std::max(1, maxHostNum);
+        }
+
+        double capPerWorker = capacityFor(budget, localRatio, remoteRatio);
         if (capPerWorker <= 0.0)
             return currentHostNum;
 
@@ -1505,13 +1532,15 @@ int Planner::computeTargetHostNum(
     }
 
     SPDLOG_DEBUG("computeTargetHostNum: C={:.0f}us/s, alpha={:.3f}, "
-                 "beta={:.3f}, execTime={:.1f}us, R={:.3f}, "
-                 "localShare={:.3f}, localRatio={:.3f}, remoteRatio={:.3f}, "
-                 "inputRate={:.1f}, chainedMultiplier={:.2f}, "
+                 "beta={:.3f}, gamma={:.1f}, nHosts={:.1f}, execTime={:.1f}us, "
+                 "R={:.3f}, localShare={:.3f}, localRatio={:.3f}, "
+                 "remoteRatio={:.3f}, inputRate={:.1f}, chainedMultiplier={:.2f}, "
                  "totalLoad={:.1f} -> targetN={}",
                  signals.coeffC,
                  signals.alpha,
                  signals.beta,
+                 gamma,
+                 nHosts,
                  signals.avgExecTime,
                  R,
                  localShare,

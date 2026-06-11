@@ -190,8 +190,9 @@ class ApplicationMetrics
         bool plannerQueueSaturated = false;
         // CoeffEstimator snapshot at this second
         double coeffC = 0.0; // physical CPU budget C (us/s)
-        double alpha = 0.0;  // chained-call overhead coefficient (us/call)
-        double beta = 0.0;   // fan-out host overhead coefficient (us/host)
+        double alpha = 0.0;  // local chained-call overhead coefficient (us/call)
+        double beta = 0.0;   // remote chained-call overhead coefficient (us/call)
+        double gamma = 0.0;  // per-dest-host fixed overhead coefficient (us/host)
         double maxProcessed = 0.0; // C / avgExecTime — baseline max req/s
         double avgExecTime =
           0.0; // weighted avg exec time across instances (us)
@@ -202,13 +203,15 @@ class ApplicationMetrics
           0.0; // remote chained calls per processed request
         double avgNumDestHosts = 0.0; // avg distinct dest hosts per worker
         // Each entry records one coeffEstimator.update() call (one per
-        // saturated host per second): throughput / execTime / local / remote.
+        // saturated host per second): throughput / execTime / local / remote /
+        // distinct remote hosts.
         struct RlsUpdateEntry
         {
             double throughput;
             double execTime;
             double localChained;
             double remoteChained;
+            double remoteHosts;
         };
         std::vector<RlsUpdateEntry> rlsUpdates;
     };
@@ -374,6 +377,7 @@ class ApplicationMetrics
                 double coeffC = 0.0;
                 double alpha = 0.0;
                 double beta = 0.0;
+                double gamma = 0.0;
                 double maxProcessed = 0.0;
 
                 if (runtimeMetricsHistory.count(s)) {
@@ -386,6 +390,7 @@ class ApplicationMetrics
                     coeffC = record.coeffC;
                     alpha = record.alpha;
                     beta = record.beta;
+                    gamma = record.gamma;
                     maxProcessed = record.maxProcessed;
 
                     for (const auto& [hostIp, qSize] : record.hostQueueSize) {
@@ -475,11 +480,12 @@ class ApplicationMetrics
                                       ? (totalCpuLoad / hostCountWithCpu)
                                       : 0.0;
                 char cpuBuffer[32], coeffCBuf[32], alphaBuf[32], betaBuf[32],
-                  maxProcBuf[32];
+                  gammaBuf[32], maxProcBuf[32];
                 snprintf(cpuBuffer, sizeof(cpuBuffer), "%.2f", avgCpuLoad);
                 snprintf(coeffCBuf, sizeof(coeffCBuf), "%.0f", coeffC);
                 snprintf(alphaBuf, sizeof(alphaBuf), "%.4f", alpha);
                 snprintf(betaBuf, sizeof(betaBuf), "%.4f", beta);
+                snprintf(gammaBuf, sizeof(gammaBuf), "%.4f", gamma);
                 snprintf(maxProcBuf, sizeof(maxProcBuf), "%.1f", maxProcessed);
 
                 std::string entryStr = std::to_string(inputRate) + " / " +
@@ -498,6 +504,7 @@ class ApplicationMetrics
                                        " / " + std::string(coeffCBuf) + " / " +
                                        std::string(alphaBuf) + " / " +
                                        std::string(betaBuf) + " / " +
+                                       std::string(gammaBuf) + " / " +
                                        std::string(maxProcBuf);
 
                 historyArray.PushBack(
@@ -509,7 +516,7 @@ class ApplicationMetrics
                       "queue_size / avg_wait / avg_exec / executors / "
                       "average_executors / avg_cpu / p50latency (ms) / "
                       "p95latency (ms) / p99latency (ms) / planner_saturated"
-                      " / coeff_C / alpha / beta / max_processed",
+                      " / coeff_C / alpha / beta / gamma / max_processed",
                       historyArray,
                       alloc);
 
@@ -829,6 +836,7 @@ class ApplicationMetrics
             // block below.
             auto& persistedChain =
               clusterWorkerMetrics[ip].chainHistory[currentTime];
+            std::set<std::string> remoteDestHosts;
             for (const auto& [ts, secProto] : statsPtr->workerchainhistory()) {
                 for (const auto& [dest, cnt] : secProto.hostcount()) {
                     persistedChain[dest] += cnt;
@@ -836,9 +844,12 @@ class ApplicationMetrics
                         hostLocalChainedCalls += cnt;
                     } else {
                         hostRemoteChainedCalls += cnt;
+                        remoteDestHosts.insert(dest);
                     }
                 }
             }
+            double hostRemoteHostCount =
+              static_cast<double>(remoteDestHosts.size());
 
             // Host is saturated when the host-wide weighted average queue depth
             // and wait time both exceed their thresholds.
@@ -865,23 +876,28 @@ class ApplicationMetrics
                 coeffEstimator.update(hostThroughput,
                                       avgExecTime,
                                       hostLocalChainedCalls,
-                                      hostRemoteChainedCalls);
+                                      hostRemoteChainedCalls,
+                                      hostRemoteHostCount);
                 runtimeMetricsHistory[currentTime].rlsUpdates.push_back(
                   { hostThroughput,
                     avgExecTime,
                     hostLocalChainedCalls,
-                    hostRemoteChainedCalls });
+                    hostRemoteChainedCalls,
+                    hostRemoteHostCount });
                 SPDLOG_DEBUG(
                   "CoeffEstimator updated for host {}: alpha={:.4f}, "
-                  "beta={:.4f} (throughput={:.0f}, execTime={:.1f}us, "
-                  "localChained={:.0f}, remoteChained={:.0f})",
+                  "beta={:.4f}, gamma={:.4f} (throughput={:.0f}, "
+                  "execTime={:.1f}us, localChained={:.0f}, "
+                  "remoteChained={:.0f}, remoteHosts={:.0f})",
                   ip,
                   coeffEstimator.alpha(),
                   coeffEstimator.beta(),
+                  coeffEstimator.gamma(),
                   hostThroughput,
                   avgExecTime,
                   hostLocalChainedCalls,
-                  hostRemoteChainedCalls);
+                  hostRemoteChainedCalls,
+                  hostRemoteHostCount);
             }
 
             int totalQueueSize = 0;
@@ -970,8 +986,9 @@ class ApplicationMetrics
             snap.coeffC = coeffEstimator.C();
             snap.alpha = coeffEstimator.alpha();
             snap.beta = coeffEstimator.beta();
+            snap.gamma = coeffEstimator.gamma();
             snap.maxProcessed =
-              coeffEstimator.maxProcessed(avgExecTime, 0.0, 0.0);
+              coeffEstimator.maxProcessed(avgExecTime, 0.0, 0.0, 0.0);
             snap.avgExecTime = avgExecTime;
             snap.avgChainedRatio = avgChainedRatio;
             snap.avgLocalChainedRatio = avgLocalChainedRatio;
@@ -1031,6 +1048,7 @@ class ApplicationMetrics
         double coeffC = 0.0;      // physical CPU budget per worker (us/s)
         double alpha = 0.0;       // local chained-call overhead (us/call)
         double beta = 0.0;        // remote chained-call overhead (us/call)
+        double gamma = 0.0;       // per-dest-host fixed overhead (us/host)
         double avgExecTime = 0.0; // avg exec time per request (us)
         double avgChainedRatio =
           0.0; // total chained calls per processed request
@@ -1084,6 +1102,7 @@ class ApplicationMetrics
         sig.coeffC = coeffEstimator.C();
         sig.alpha = coeffEstimator.alpha();
         sig.beta = coeffEstimator.beta();
+        sig.gamma = coeffEstimator.gamma();
 
         // Latest planner waiting queue snapshot
         if (!runtimeMetricsHistory.empty()) {

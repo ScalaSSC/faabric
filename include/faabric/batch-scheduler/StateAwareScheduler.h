@@ -187,13 +187,17 @@ class StateAwareScheduler : public BatchScheduler
     // where procRate_w is the operators' processing rate landing on w (their
     // totalLoad share times their placement fraction), and chained calls are
     // attributed to the source operator's worker, local with probability B_w
-    // (destination on the same worker) and remote otherwise. Returns a vector
-    // of length numHosts, or empty if prediction is not possible.
+    // (destination on the same worker) and remote otherwise. On top of that a
+    // fixed gamma cost is added once per distinct remote worker that w fans out
+    // to (gamma·|distinct remote dest hosts of w|), independent of call volume.
+    // Returns a vector of length numHosts, or empty if prediction is not
+    // possible.
     std::vector<double> predictBinpackWorkerLoads(int numHosts,
                                                   double totalLoad,
                                                   double tE,
                                                   double alpha,
                                                   double beta,
+                                                  double gamma,
                                                   double chainedRatio) const;
 
     const std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>&

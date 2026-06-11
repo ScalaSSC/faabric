@@ -2097,6 +2097,7 @@ std::vector<double> StateAwareScheduler::predictBinpackWorkerLoads(
   double tE,
   double alpha,
   double beta,
+  double gamma,
   double chainedRatio) const
 {
     auto placement = computeBinpackPlacement(numHosts);
@@ -2153,6 +2154,10 @@ std::vector<double> StateAwareScheduler::predictBinpackWorkerLoads(
             weightTotal += edge.weight;
         }
     }
+    // Distinct remote dest workers each source worker fans out to. A fixed
+    // gamma cost is charged once per entry below (per-host overhead, not
+    // per-call), so it is independent of how many calls each edge carries.
+    std::vector<std::set<int>> remoteDestHosts(numHosts);
     if (weightTotal > 0.0 && chainedRatio > 0.0) {
         double totalChainedPerSec = chainedRatio * totalLoad;
         for (const auto& edge : weightedEdges) {
@@ -2167,7 +2172,7 @@ std::vector<double> StateAwareScheduler::predictBinpackWorkerLoads(
             double edgeCallsPerSec =
               totalChainedPerSec * (edge.weight / weightTotal);
             for (const auto& [w, aFrac] : aIt->second) {
-                if (w < 0 || w >= numHosts) {
+                if (w < 0 || w >= numHosts || aFrac <= 0.0) {
                     continue;
                 }
                 double bFrac = 0.0;
@@ -2178,7 +2183,24 @@ std::vector<double> StateAwareScheduler::predictBinpackWorkerLoads(
                 double callsOnW = edgeCallsPerSec * aFrac;
                 workerLoads[w] += callsOnW * bFrac * alpha;        // local
                 workerLoads[w] += callsOnW * (1.0 - bFrac) * beta; // remote
+
+                // Record every distinct remote destination worker (w' != w
+                // with a non-zero placement fraction) this source worker w
+                // sends to, for the per-host gamma cost below.
+                for (const auto& [destW, destFrac] : bIt->second) {
+                    if (destW != w && destW >= 0 && destW < numHosts &&
+                        destFrac > 0.0) {
+                        remoteDestHosts[w].insert(destW);
+                    }
+                }
             }
+        }
+    }
+
+    // Fixed per-destination-host overhead: gamma us per distinct remote worker.
+    if (gamma > 0.0) {
+        for (int w = 0; w < numHosts; ++w) {
+            workerLoads[w] += gamma * static_cast<double>(remoteDestHosts[w].size());
         }
     }
 
