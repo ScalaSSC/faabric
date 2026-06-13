@@ -47,15 +47,15 @@ namespace faabric::planner {
 // normalized coefficient is initialised at 1.0):
 //
 //   Y_NORM      = typical (processedNum × execTime) = 2000 × 400 = 800000
-//   CHAIN_NORM  = typical alpha = 40   us/local-call
-//   REMOTE_NORM = typical beta  = 300  us/remote-call (network RTT +
-//   scheduling) HOST_NORM   = typical gamma = 50000 us/dest-host  (per-host
-//   fixed overhead)
+//   CHAIN_NORM  = typical alpha = 38.5  us/local-call
+//   REMOTE_NORM = typical beta  = 275   us/remote-call (network RTT +
+//                 scheduling)
+//   HOST_NORM   = typical gamma = 51500 us/dest-host  (per-host fixed overhead)
 //
 // Prior-informed initial values:
-//   alpha ≈ 40    us/local-call → alphaS = 1.0  (light IPC overhead)
-//   beta  ≈ 300   us/remote-call→ betaS  = 1.0  (network round-trip dominated)
-//   gamma ≈ 50000 us/dest-host  → gammaS = 1.0  (per-destination fixed cost)
+//   alpha ≈ 38.5  us/local-call → alphaS = 1.0  (light IPC overhead)
+//   beta  ≈ 275   us/remote-call→ betaS  = 1.0  (network round-trip dominated)
+//   gamma ≈ 51500 us/dest-host  → gammaS = 1.0  (per-destination fixed cost)
 //   W     ≈ 880000 us/s        → W_est  = 880000 (N=2000, t_e=400, small
 //   overhead)
 // -----------------------------------------------------------------------
@@ -67,9 +67,9 @@ struct CoeffEstimator
     // NORM rescales the corresponding physical coefficient, since
     // alpha()=alphaS×CHAIN_NORM etc. (alphaS/betaS/gammaS are left untouched).
     double Y_NORM = 800000.0;   // typical processedNum × execTime
-    double CHAIN_NORM = 40.0;   // typical alpha (us/local-call)
-    double REMOTE_NORM = 300.0; // typical beta  (us/remote-call)
-    double HOST_NORM = 50000.0; // typical gamma (us/dest-host)
+    double CHAIN_NORM = 38.5;   // typical alpha (us/local-call)
+    double REMOTE_NORM = 275.0; // typical beta  (us/remote-call)
+    double HOST_NORM = 51500.0; // typical gamma (us/dest-host)
 
     // Max normalized change per RLS step (prevents a single noisy diff from
     // causing a large parameter jump in one shot).
@@ -77,11 +77,11 @@ struct CoeffEstimator
 
     // Normalized RLS state: theta = [alphaS, betaS, gammaS]
     double alphaS =
-      1.0; // alpha ≈ 40   us/local-call (alphaS = alpha / CHAIN_NORM)
+      1.0; // alpha ≈ 38.5 us/local-call (alphaS = alpha / CHAIN_NORM)
     double betaS =
-      1.0; // beta  ≈ 300  us/remote-call (betaS  = beta  / REMOTE_NORM)
+      1.0; // beta  ≈ 275  us/remote-call (betaS  = beta  / REMOTE_NORM)
     double gammaS =
-      1.0; // gamma ≈ 50000 us/dest-host (gammaS = gamma / HOST_NORM)
+      1.0; // gamma ≈ 51500 us/dest-host (gammaS = gamma / HOST_NORM)
     double lambda = 0.97; // RLS forgetting factor
 
     // 3×3 RLS covariance matrix, row-major.
