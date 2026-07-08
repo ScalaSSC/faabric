@@ -3130,12 +3130,9 @@ void StateAwareScheduler::commitGroupAllocations(
 
 long StateAwareScheduler::predictNonlinearInstanceTotal(
   double inputRate,
-  const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
-  double avgSlotsPerHost,
-  long maxInstances) const
+  const faabric::planner::ApplicationMetrics::ScalingSignals& signals) const
 {
-    if (!application || inputRate <= 0.0 || signals.coeffC <= 0.0 ||
-        avgSlotsPerHost <= 0.0 || maxInstances <= 0) {
+    if (!application || inputRate <= 0.0) {
         return -1;
     }
     auto& nodes = application->getNodes();
@@ -3191,16 +3188,21 @@ long StateAwareScheduler::predictNonlinearInstanceTotal(
           totalTuples;
         double rate = totalLoad * share;
         if (te > 0.0 && rate > 0.0) {
-            double cInst = signals.coeffC / avgSlotsPerHost / te; // records/s
-            for (; p <= maxInstances; ++p) {
+            double cInst = nlCpuBudgetPerExecutorUs / te; // records/s
+            // r(p) is clamped to <= nlMaxOverheadRatio, so the smallest
+            // satisfying p is bounded by the demand at worst-case overhead.
+            // The demand is deliberately NOT capped by cluster capacity;
+            // excess instances are overcommitted at placement time.
+            long pMax = static_cast<long>(std::ceil(
+                          rate / (cInst * (1.0 - nlMaxOverheadRatio) *
+                                  capacityHeadroom))) +
+                        1;
+            for (; p < pMax; ++p) {
                 double capEff = p * cInst * (1.0 - nlPredictR(name, p)) *
                                 capacityHeadroom;
                 if (capEff >= rate) {
                     break;
                 }
-            }
-            if (p > maxInstances) {
-                p = maxInstances;
             }
         }
         total += std::max<long>(1, p);
@@ -3322,7 +3324,7 @@ StateAwareScheduler::NlFit StateAwareScheduler::nlFitCurve(
         if (den <= 0.0) {
             continue;
         }
-        double b = std::clamp(num / den, 0.0, 0.95);
+        double b = std::clamp(num / den, 0.0, nlMaxOverheadRatio);
         if (b <= 0.0) {
             continue;
         }
@@ -3343,6 +3345,9 @@ StateAwareScheduler::NlFit StateAwareScheduler::nlFitCurve(
 
 double StateAwareScheduler::nlPredictR(const std::string& op, double p) const
 {
+    if (p <= 0.0) {
+        return 0.0;
+    }
     const NlFit* f = nullptr;
     auto it = nlFits.find(op);
     if (it != nlFits.end() && it->second.valid) {
@@ -3350,10 +3355,14 @@ double StateAwareScheduler::nlPredictR(const std::string& op, double p) const
     } else if (nlGlobalFit.valid) {
         f = &nlGlobalFit;
     }
-    if (f == nullptr || p <= 0.0) {
-        return 0.0;
+    if (f == nullptr) {
+        // Cold start: fall back to the prior curve until a fit is valid.
+        return std::clamp(nlPriorB * (1.0 - std::exp(-nlPriorK * p)),
+                          0.0,
+                          nlMaxOverheadRatio);
     }
-    return std::clamp(f->b * (1.0 - std::exp(-f->k * p)), 0.0, 0.95);
+    return std::clamp(
+      f->b * (1.0 - std::exp(-f->k * p)), 0.0, nlMaxOverheadRatio);
 }
 
 std::map<std::string, std::map<std::string, int>>
@@ -3366,7 +3375,7 @@ StateAwareScheduler::softAffinityPlace(
     std::map<std::string, int> slotsOf;
     std::map<std::string, int> used;
     for (const auto& [ip, host] : hostMap) {
-        slotsOf[ip] = std::max(1, host->slots);
+        slotsOf[ip] = nlHostCapacity(host->slots);
         used[ip] = 0;
     }
 
@@ -3527,25 +3536,28 @@ void StateAwareScheduler::rescheduleAppNonlinear(
         totalLoad = signals.avgInputRate * (totalTuples / inputTuples);
     }
 
-    int totalSlots = 0;
+    // Per-worker executor capacity: max_executors when configured (one
+    // executor = one CPU), otherwise the host's reported slots.
+    long totalCapacity = 0;
     for (const auto& [ip, host] : hostMap) {
-        totalSlots += std::max(1, host->slots);
+        totalCapacity += nlHostCapacity(host->slots);
     }
-    double avgSlots =
-      static_cast<double>(totalSlots) / static_cast<double>(hostMap.size());
 
-    bool warm = signals.coeffC > 0.0 && signals.avgInputRate > 0.0;
+    bool warm = signals.avgInputRate > 0.0;
 
     //--------------------------------------------------------------------------
     // 4. Target parallelism per operator: smallest p with
     //    p · c · (1 - r(p)) · headroom ≥ rate_o  (the paper's n* = n/(1-r)
     //    solved as a search, since capacity is monotone in p). Per-instance
-    //    capacity c = (C/slotsPerHost)/t_e in records/s.
+    //    capacity c = nlCpuBudgetPerExecutorUs/t_e in records/s (one executor
+    //    = one CPU, per the paper's experimental setup). The demand is NOT
+    //    capped by cluster capacity — when it exceeds the available
+    //    executors, softAffinityPlace overcommits beyond each worker's
+    //    capacity.
     //--------------------------------------------------------------------------
     std::map<std::string, int> target;
-    bool saturated = false;
     for (const auto& [name, node] : nodes) {
-        int p = 1;
+        long p = 1;
         if (warm) {
             double te = teDen.count(name) && teDen[name] > 0
                           ? teNum[name] / teDen[name]
@@ -3555,41 +3567,30 @@ void StateAwareScheduler::rescheduleAppNonlinear(
               totalTuples;
             double rate = totalLoad * share;
             if (te > 0.0 && rate > 0.0) {
-                double cInst = signals.coeffC / avgSlots / te; // records/s
-                for (; p <= totalSlots; ++p) {
+                double cInst = nlCpuBudgetPerExecutorUs / te; // records/s
+                // r(p) <= nlMaxOverheadRatio bounds the smallest satisfying
+                // p by the demand at worst-case overhead.
+                long pMax = static_cast<long>(std::ceil(
+                              rate / (cInst * (1.0 - nlMaxOverheadRatio) *
+                                      capacityHeadroom))) +
+                            1;
+                for (; p < pMax; ++p) {
                     double capEff = p * cInst * (1.0 - nlPredictR(name, p)) *
                                     capacityHeadroom;
                     if (capEff >= rate) {
                         break;
                     }
                 }
-                if (p > totalSlots) {
-                    p = totalSlots;
-                    saturated = true;
-                }
             }
         }
-        target[name] = std::max(1, p);
+        target[name] = static_cast<int>(std::max<long>(1, p));
     }
 
-    // Global cap: shave the largest operators until the plan fits the
-    // cluster (every operator keeps at least one instance).
     long planned = 0;
     for (const auto& [op, n] : target) {
         planned += n;
     }
-    while (planned > totalSlots) {
-        auto big = std::max_element(
-          target.begin(), target.end(), [](const auto& a, const auto& b) {
-              return a.second < b.second;
-          });
-        if (big == target.end() || big->second <= 1) {
-            break;
-        }
-        big->second--;
-        planned--;
-        saturated = true;
-    }
+    bool saturated = planned > totalCapacity;
 
     //--------------------------------------------------------------------------
     // 5. Topological order (upstream first, so Data_N sees placed sources),
@@ -3669,10 +3670,11 @@ void StateAwareScheduler::rescheduleAppNonlinear(
     for (const auto& [op, n] : target) {
         ss << op << "=" << n << " (r=" << nlPredictR(op, n) << ") ";
     }
-    SPDLOG_INFO("Non-linear mode: total instances {}/{} slots{} -> {}",
+    SPDLOG_INFO("Non-linear mode: total instances {}/{} executor capacity{} "
+                "-> {}",
                 planned,
-                totalSlots,
-                saturated ? " [SATURATED]" : "",
+                totalCapacity,
+                saturated ? " [OVERCOMMITTED]" : "",
                 ss.str());
 }
 

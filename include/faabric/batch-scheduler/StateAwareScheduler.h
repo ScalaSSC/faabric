@@ -216,6 +216,11 @@ class StateAwareScheduler : public BatchScheduler
     // Synced via resetParameter("nl_min_fit_samples").
     void setNlMinFitSamples(int n) { nlMinFitSamples = n < 2 ? 2 : n; }
 
+    void setMaxExecutorsPerWorker(int n)
+    {
+        maxExecutorsPerWorker = n < 0 ? 0 : n;
+    }
+
     void rescheduleAppFaaSFlow(const HostMap& hostMap);
 
     void rescheduleAppFaaSFlowAdaptive(
@@ -260,17 +265,18 @@ class StateAwareScheduler : public BatchScheduler
 
     // Predict the total instance demand Σ n*_o at a hypothetical `inputRate`
     // under the mode-4 non-linear model: per operator the smallest p with
-    // p·c·(1-r(p))·headroom ≥ rate_o, using the fitted r(p) curves and the
+    // p·c·(1-r(p))·headroom ≥ rate_o, where c = nlCpuBudgetPerExecutorUs/t_e
+    // (one executor = one CPU), using the fitted r(p) curves and the
     // per-operator exec times remembered from the last reschedule
-    // (nlLastSnap). STRICTLY READ-ONLY — mutates no scheduler or application
-    // state; serves the planner's predict_host_num query. The per-operator
-    // search is capped at maxInstances. Returns -1 when prediction is not
-    // possible (no application / cold estimator).
+    // (nlLastSnap). The demand is NOT capped by the cluster's capacity —
+    // when it exceeds what the workers can provide, placement overcommits.
+    // STRICTLY READ-ONLY — mutates no scheduler or application state; serves
+    // the planner's predict_host_num query. Returns -1 when prediction is
+    // not possible (no application / no input rate).
     long predictNonlinearInstanceTotal(
       double inputRate,
-      const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
-      double avgSlotsPerHost,
-      long maxInstances) const;
+      const faabric::planner::ApplicationMetrics::ScalingSignals& signals)
+      const;
 
     const std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>&
     getStateHashRing() const
@@ -363,6 +369,31 @@ class StateAwareScheduler : public BatchScheduler
     double softAffinityWb = 0.5;
     // Minimum samples before a fitted r(p) curve is used.
     int nlMinFitSamples = 3;
+    // Paper assumption: one executor is pinned to one CPU, so each instance's
+    // CPU budget is a full core (10^6 us of CPU time per second) and a
+    // worker's budget scales with the executors allocated to it.
+    static constexpr double nlCpuBudgetPerExecutorUs = 1e6;
+    // Upper clamp on the (fitted or predicted) overhead ratio r(p).
+    static constexpr double nlMaxOverheadRatio = 0.95;
+    // Cold-start prior for r(p) = b·(1 - e^{-k·p}) (the paper's
+    // r = a·e^{-kp} + b with a = -b). Used by nlPredictR until a real fit
+    // becomes valid, so early reschedules/predictions do not run with zero
+    // overhead.
+    double nlPriorK = 0.155;
+    double nlPriorB = 0.335;
+    // Per-worker executor capacity (= CPU cores), configured through the
+    // planner's max_executors parameter. 0 = not configured; fall back to
+    // the host's reported slots.
+    int maxExecutorsPerWorker = 0;
+
+    // Executor capacity of one worker under the mode-4 model.
+    int nlHostCapacity(int slots) const
+    {
+        if (maxExecutorsPerWorker > 0) {
+            return maxExecutorsPerWorker;
+        }
+        return slots < 1 ? 1 : slots;
+    }
 
     // Fitted scheduling-overhead curve r(p) = b·(1 - e^{-k·p}). This is the
     // paper's r = a·e^{-kp} + b with the (0,0) pre-fit point folded in as the

@@ -1082,6 +1082,16 @@ bool Planner::resetParameter(
     if (key == "runtime_reconfig") {
         stateAwareScheduler->setRuntimeReconfig(value == 1);
     }
+    if (key == "max_executors") {
+        // Worker-side parameter (still forwarded below); keep a copy as the
+        // per-worker executor capacity for the mode-4 model (one executor =
+        // one CPU).
+        maxExecutorsPerWorker = value;
+        if (stateAwareScheduler) {
+            stateAwareScheduler->setMaxExecutorsPerWorker(value);
+        }
+        SPDLOG_INFO("Planner per-worker executor capacity set to {}", value);
+    }
     if (key == "alpha") {
         double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
@@ -1715,20 +1725,25 @@ int Planner::predictHostNum(double inputRate)
         }
         auto signals = state.applicationMetrics->getScalingSignals(
           scalingDecisionPeriodMs / 1000);
-        long totalSlots = 0;
-        for (const auto& [ip, host] : state.hostMap) {
-            totalSlots += std::max(1, static_cast<int>(host->slots()));
+        // Per-worker executor capacity: max_executors when configured (one
+        // executor = one CPU), otherwise the average reported slots.
+        double capPerHost = static_cast<double>(maxExecutorsPerWorker);
+        if (capPerHost <= 0.0) {
+            long totalSlots = 0;
+            for (const auto& [ip, host] : state.hostMap) {
+                totalSlots += std::max(1, static_cast<int>(host->slots()));
+            }
+            capPerHost = static_cast<double>(totalSlots) /
+                         static_cast<double>(state.hostMap.size());
         }
-        if (totalSlots <= 0) {
+        if (capPerHost <= 0.0) {
             return schedHostNum;
         }
-        double avgSlots = static_cast<double>(totalSlots) /
-                          static_cast<double>(state.hostMap.size());
         long totalInstances =
-          stateAwareScheduler->predictNonlinearInstanceTotal(
-            inputRate, signals, avgSlots, totalSlots);
+          stateAwareScheduler->predictNonlinearInstanceTotal(inputRate,
+                                                             signals);
         if (totalInstances <= 0) {
-            // Cold estimator / no application: no better answer than the
+            // No application / no input rate: no better answer than the
             // currently scheduled host count.
             SPDLOG_INFO("predictHostNum(mode 4): model cold, returning "
                         "current schedHostNum={}",
@@ -1736,14 +1751,14 @@ int Planner::predictHostNum(double inputRate)
             return schedHostNum;
         }
         int hosts = static_cast<int>(
-          std::ceil(static_cast<double>(totalInstances) / avgSlots));
+          std::ceil(static_cast<double>(totalInstances) / capPerHost));
         hosts = std::min(std::max(hosts, 1), maxHostNum);
         SPDLOG_INFO("predictHostNum(mode 4): rate={:.1f} -> {} instances "
-                    "-> {} hosts (avgSlots={:.1f}, max={})",
+                    "-> {} hosts (capPerHost={:.1f}, max={})",
                     inputRate,
                     totalInstances,
                     hosts,
-                    avgSlots,
+                    capPerHost,
                     maxHostNum);
         return hosts;
     }

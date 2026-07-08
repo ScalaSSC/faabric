@@ -254,6 +254,11 @@ class Planner
     // trusted. Pushed via resetParameter("nl_min_fit_samples").
     int nlMinFitSamples = 3;
 
+    // Per-worker executor capacity (one executor = one CPU) recorded when
+    // resetParameter("max_executors") passes through on its way to the
+    // workers. 0 = not configured;
+    int maxExecutorsPerWorker = 0;
+
     int computeTargetHostNum(
       const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
       int currentHostNum,
