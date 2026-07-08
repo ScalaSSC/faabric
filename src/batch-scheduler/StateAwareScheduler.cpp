@@ -523,10 +523,10 @@ std::string StateAwareScheduler::scheduleMessage(
     }
     // stateless operator
     else {
-        if (scheduleMode == 0 || scheduleMode == 5 || scheduleMode == 11) {
+        if (scheduleMode == 0 || scheduleMode == 5 ||  scheduleMode == 11) {
             host = scheduleStatelessMessageApportion(userFunc, hostMap, msg);
         } else {
-            // when scheduleMode is 3, 7, we use round robin
+            // when scheduleMode is 3, 4, 7, we use round robin
             host = scheduleStatelessMessageRoundRobin(userFunc, hostMap, msg);
         }
     }
@@ -1347,10 +1347,14 @@ void StateAwareScheduler::rescheduleApp(
     // cost so remote-heavy operators get more workers. The coefficient is the
     // cluster-average per-call cost (alpha·localShare + beta·(1-localShare))
     // normalised by t_e, derived from the live metrics. Other modes ignore it.
+    faabric::planner::ApplicationMetrics::ScalingSignals signals;
+    bool haveSignals = metrics != nullptr;
+    if (haveSignals) {
+        signals = metrics->getScalingSignals(kChainedCostWindowSec);
+    }
     double chainedCostCoeff = 0.0;
-    if (scheduleMode == 0 && metrics != nullptr) {
-        chainedCostCoeff =
-          computeChainedCostCoeff(metrics->getScalingSignals(kChainedCostWindowSec));
+    if (scheduleMode == 0 && haveSignals) {
+        chainedCostCoeff = computeChainedCostCoeff(signals);
     }
 
     // TODO - scale the number of hosts.
@@ -1367,8 +1371,13 @@ void StateAwareScheduler::rescheduleApp(
         return;
     }
 
+    if (scheduleMode == 4) {
+        rescheduleAppNonlinear(hostMap, metrics);
+        return;
+    }
+
     if (scheduleMode == 0) {
-        rescheduleAppBinpack(hostMap);
+        rescheduleAppBinpack(hostMap, haveSignals ? &signals : nullptr);
         return;
     }
 
@@ -1829,6 +1838,636 @@ StateAwareScheduler::groupNodesGreedily(const HostMap& hostMap)
     return { groups, groupAllocations, workerRemaining };
 }
 
+namespace {
+
+// One chained edge a->b carrying `calls` chained calls per second (absolute).
+struct CapEdge
+{
+    std::string a;
+    std::string b;
+    double calls;
+};
+
+// Exact per-worker CPU load (us/s) for a placement expressed as ABSOLUTE
+// processing load: effProc[op][ip] = op's processing cost (us/s) landing on
+// worker ip. This is the four-term CoeffEstimator capacity model:
+//   L_k = Σ_op effProc[op][k]
+//       + alpha·localCalls_k + beta·remoteCalls_k + gamma·#remoteDestHosts_k
+// The per-worker fraction of op is recovered as effProc[op][k]/procDemand[op],
+// so this works for PARTIAL placements (an operator only partly placed, or a
+// not-yet-placed operator represented by its coarse destination hint). For edge
+// a->b a call leaving worker k is local with probability frac_b(k) (destination
+// routed proportionally to b's weight) and remote otherwise; gamma is charged
+// once per distinct remote destination worker k fans out to.
+std::map<std::string, double> capEvalWorkerLoadsProc(
+  const std::map<std::string, std::map<std::string, double>>& effProc,
+  const std::vector<std::string>& ips,
+  const std::map<std::string, double>& procDemand,
+  const std::vector<CapEdge>& edges,
+  double alpha,
+  double beta,
+  double gamma)
+{
+    std::map<std::string, double> load;
+    for (const auto& ip : ips) {
+        load[ip] = 0.0;
+    }
+
+    // Processing cost (effProc is already absolute us/s).
+    for (const auto& [op, m] : effProc) {
+        for (const auto& [ip, v] : m) {
+            load[ip] += v;
+        }
+    }
+
+    // Chained-call cost + distinct remote dest hosts per sender worker.
+    std::map<std::string, std::set<std::string>> remoteDestHosts;
+    for (const auto& e : edges) {
+        auto ia = effProc.find(e.a);
+        if (ia == effProc.end()) {
+            continue;
+        }
+        auto da = procDemand.find(e.a);
+        if (da == procDemand.end() || da->second <= 0.0) {
+            continue;
+        }
+        auto ib = effProc.find(e.b);
+        double db = 0.0;
+        if (ib != effProc.end()) {
+            auto it = procDemand.find(e.b);
+            if (it != procDemand.end()) {
+                db = it->second;
+            }
+        }
+        for (const auto& [ipA, vA] : ia->second) {
+            double fracA = vA / da->second;
+            if (fracA <= 0.0) {
+                continue;
+            }
+            double bFrac = 0.0;
+            if (ib != effProc.end() && db > 0.0) {
+                auto f = ib->second.find(ipA);
+                if (f != ib->second.end()) {
+                    bFrac = f->second / db;
+                }
+            }
+            double callsOnA = e.calls * fracA;
+            load[ipA] += callsOnA * bFrac * alpha;         // local
+            load[ipA] += callsOnA * (1.0 - bFrac) * beta;  // remote
+            if (ib != effProc.end() && db > 0.0) {
+                for (const auto& [ipB, vB] : ib->second) {
+                    if (ipB != ipA && vB > 0.0) {
+                        remoteDestHosts[ipA].insert(ipB);
+                    }
+                }
+            }
+        }
+    }
+    if (gamma > 0.0) {
+        for (const auto& [ip, hosts] : remoteDestHosts) {
+            load[ip] += gamma * static_cast<double>(hosts.size());
+        }
+    }
+
+    return load;
+}
+
+} // namespace
+
+std::tuple<std::vector<NodeGroup>,
+           std::vector<std::map<std::string, double>>,
+           std::map<std::string, double>>
+StateAwareScheduler::groupNodesCapacity(
+  const HostMap& hostMap,
+  const faabric::planner::ApplicationMetrics::ScalingSignals& sig)
+{
+    SPDLOG_INFO("Mapping nodes to workers with capacity-aware open-ended "
+                "Binpack (mode 0)");
+
+    // Deterministic worker order; workers are opened from this list on demand.
+    std::vector<std::string> allIps;
+    allIps.reserve(hostMap.size());
+    for (const auto& [ip, host] : hostMap) {
+        allIps.push_back(ip);
+    }
+    const int maxHosts = static_cast<int>(allIps.size());
+
+    // ---- Cost model (us, us/s) from the live estimator -----------------------
+    const double W = sig.coeffC;
+    const double tE = sig.avgExecTime;
+    const double alpha = std::max(0.0, sig.alpha);
+    const double beta = std::max(0.0, sig.beta);
+    const double gamma = std::max(0.0, sig.gamma);
+    const double R = std::max(0.0, sig.avgChainedRatio);
+    const double budget = W * capacityHeadroom;
+    const double EPS = 1e-9;
+
+    // ---- Per-operator absolute processing demand (us/s) ----------------------
+    // rate_o = totalLoad · (processedTuples_o / Σ processedTuples), with
+    // totalLoad = avgInputRate · (Σ processedTuples / Σ input processedTuples)
+    // (= avgInputRate scaled to total processing across the DAG). procDemand =
+    // rate_o · t_e. This mirrors the units used by predictBinpackWorkerLoads, so
+    // L_k is directly comparable to the budget W. Processing share is taken from
+    // raw processedTuples (NOT the chained-weighted preWorkload) because chained
+    // cost is modelled explicitly here and must not be double-counted.
+    auto& nodes = application->getNodes();
+    double totalTuples = 0.0;
+    double inputTuples = 0.0;
+    for (const auto& [name, node] : nodes) {
+        totalTuples += static_cast<double>(std::max<long>(1, node->processedTuples));
+    }
+    for (const auto& inName : application->getInputNodes()) {
+        auto it = nodes.find(inName);
+        if (it != nodes.end()) {
+            inputTuples +=
+              static_cast<double>(std::max<long>(1, it->second->processedTuples));
+        }
+    }
+    double totalLoad = sig.avgInputRate;
+    if (inputTuples > 0.0) {
+        totalLoad = sig.avgInputRate * (totalTuples / inputTuples);
+    }
+
+    std::map<std::string, double> procDemand;
+    std::map<std::string, double> procShare;
+    for (const auto& [name, node] : nodes) {
+        double share =
+          static_cast<double>(std::max<long>(1, node->processedTuples)) /
+          totalTuples;
+        procShare[name] = share;
+        procDemand[name] = totalLoad * share * tE;
+    }
+
+    // ---- Chained edges with absolute call rates (calls/s) --------------------
+    auto edgesW = application->getConnectionsWithWeight();
+    double sumW = 0.0;
+    for (const auto& e : edgesW) {
+        if (e.weight > 0) {
+            sumW += e.weight;
+        }
+    }
+    const double totalChained = R * totalLoad;
+    std::vector<CapEdge> edges;
+    std::map<std::string, double> edgeShare;
+    for (const auto& e : edgesW) {
+        if (e.weight <= 0) {
+            continue;
+        }
+        double calls = sumW > 0.0 ? totalChained * (e.weight / sumW) : 0.0;
+        edgeShare[e.input + "->" + e.output] =
+          sumW > 0.0 ? e.weight / sumW : 0.0;
+        edges.push_back({ e.input, e.output, calls });
+    }
+
+    // DFS order, used only to emit one group per operator (see below).
+    auto topo = application->getNodesDFSOrder();
+
+    // Outgoing-edge index: op -> indices of edges leaving it.
+    std::map<std::string, std::vector<int>> succEdges;
+    for (int i = 0; i < static_cast<int>(edges.size()); ++i) {
+        succEdges[edges[i].a].push_back(i);
+    }
+
+    // Reverse-topological order (postorder DFS = successors before the node), so
+    // that when we place an operator ALL its chained destinations are already
+    // placed. This removes the placement<->locality circular dependency: an
+    // operator's outgoing chained cost is exact at decision time, and its
+    // incoming edges are charged to predecessors' workers when those are placed
+    // later. No coarse / destination-hint stage is needed.
+    //
+    // At each node we recurse into successors in descending chained-weight order,
+    // so the heaviest chain is explored (and therefore laid out) first and most
+    // contiguously — it gets the nearest leftover capacity of its successor and
+    // thus the best chance of a local edge.
+    std::vector<std::string> revTopo;
+    {
+        std::set<std::string> vis;
+        const auto& conns = application->getConnections();
+        std::function<void(const std::string&)> post =
+          [&](const std::string& n) {
+              vis.insert(n);
+              // Unique successors of n with their chained-call weight (0 if the
+              // edge was filtered out as zero-weight above).
+              std::map<std::string, double> succCalls;
+              auto sit = succEdges.find(n);
+              if (sit != succEdges.end()) {
+                  for (int ei : sit->second) {
+                      succCalls[edges[ei].b] = edges[ei].calls;
+                  }
+              }
+              auto cit = conns.find(n);
+              if (cit != conns.end()) {
+                  for (const auto& s : cit->second) {
+                      succCalls.emplace(s, 0.0);
+                  }
+              }
+              // Heaviest-traffic successor first.
+              std::vector<std::pair<double, std::string>> order;
+              order.reserve(succCalls.size());
+              for (const auto& [s, c] : succCalls) {
+                  order.emplace_back(c, s);
+              }
+              std::sort(order.rbegin(), order.rend());
+              for (const auto& [c, s] : order) {
+                  if (!vis.count(s)) {
+                      post(s);
+                  }
+              }
+              revTopo.push_back(n);
+          };
+        for (const auto& in : application->getInputNodes()) {
+            if (!vis.count(in)) {
+                post(in);
+            }
+        }
+        for (const auto& [name, node] : application->getNodes()) {
+            if (!vis.count(name)) {
+                post(name);
+            }
+        }
+    }
+
+    // ---- Backward single-pass placement (sink-first) -------------------------
+    // Place operators in reverse-topological order so that when an operator is
+    // placed all its chained destinations are already fixed; capEvalWorkerLoadsProc
+    // is then exact. runBackward(scale) runs this pass with the projected load
+    // scaled by `scale` (i.e. at input rate scale·lambda_p): it fills every
+    // operator with the analytic max-fill and opens workers on demand, returning
+    // the placement, the workers used, and whether it saturated (ran out of
+    // workers, or an operator's fan-out alone exceeds the budget).
+    auto runBackward =
+      [&](double scale)
+      -> std::tuple<std::map<std::string, std::map<std::string, double>>,
+                    std::vector<std::string>,
+                    bool> {
+        std::map<std::string, double> D; // demand scaled to scale·lambda_p
+        for (const auto& [o, d] : procDemand) {
+            D[o] = d * scale;
+        }
+        std::vector<CapEdge> E = edges; // chained rates scaled likewise
+        for (auto& e : E) {
+            e.calls *= scale;
+        }
+
+        std::map<std::string, std::map<std::string, double>> placeAbs;
+        std::vector<std::string> opened;
+        int nextHostIdx = 0;
+        auto openWorker = [&]() -> std::string {
+            if (nextHostIdx >= maxHosts) {
+                return "";
+            }
+            std::string ip = allIps[nextHostIdx++];
+            opened.push_back(ip);
+            return ip;
+        };
+        openWorker();
+
+        bool saturated = false;
+        for (const auto& name : revTopo) {
+            auto dit = D.find(name);
+            if (dit == D.end() || dit->second <= 0.0) {
+                continue;
+            }
+            double demand = dit->second;
+
+            // Successors are all placed (reverse-topo): destOfO = the workers any
+            // successor occupies = o's potential remote destinations.
+            std::set<std::string> destOfO;
+            for (int ei : succEdges[name]) {
+                auto bit = placeAbs.find(E[ei].b);
+                if (bit == placeAbs.end()) {
+                    continue;
+                }
+                for (const auto& [ip, v] : bit->second) {
+                    if (v > 0.0) {
+                        destOfO.insert(ip);
+                    }
+                }
+            }
+
+            // Base load (everything placed so far, excluding o) and each worker's
+            // current remote destination set (for the gamma step).
+            auto baseLoads =
+              capEvalWorkerLoadsProc(placeAbs, opened, D, E, alpha, beta, gamma);
+            std::map<std::string, std::set<std::string>> remoteSets;
+            if (gamma > 0.0) {
+                for (const auto& e : E) {
+                    auto ia = placeAbs.find(e.a);
+                    if (ia == placeAbs.end()) {
+                        continue;
+                    }
+                    auto ib = placeAbs.find(e.b);
+                    if (ib == placeAbs.end()) {
+                        continue;
+                    }
+                    for (const auto& [ipA, vA] : ia->second) {
+                        if (vA <= 0.0) {
+                            continue;
+                        }
+                        for (const auto& [ipB, vB] : ib->second) {
+                            if (ipB != ipA && vB > 0.0) {
+                                remoteSets[ipA].insert(ipB);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Per-worker quantities for placing o on k (constant in the amount p):
+            //   aff(k) = Σ_{o->b} c_ob (β-α) sh_b(k),  sh_b(k)=Φ[b][k]/D_b
+            //   m_k    = 1 + (1/D_o) Σ_{o->b} c_ob[α sh_b(k)+β(1-sh_b(k))]
+            //   γ·G_k  = γ · #new remote dest workers k opens for o
+            // Max fit: p_max = (budget - baseLoad_k - γ·G_k) / m_k.
+            auto affOf = [&](const std::string& k) {
+                double a = 0.0;
+                for (int ei : succEdges[name]) {
+                    const auto& e = E[ei];
+                    auto bit = placeAbs.find(e.b);
+                    double db = D.count(e.b) ? D.at(e.b) : 0.0;
+                    if (bit == placeAbs.end() || db <= 0.0) {
+                        continue;
+                    }
+                    auto f = bit->second.find(k);
+                    if (f != bit->second.end()) {
+                        a += (f->second / db) * e.calls * (beta - alpha);
+                    }
+                }
+                return a;
+            };
+            auto slopeOf = [&](const std::string& k) {
+                double m = 1.0;
+                for (int ei : succEdges[name]) {
+                    const auto& e = E[ei];
+                    auto bit = placeAbs.find(e.b);
+                    double db = D.count(e.b) ? D.at(e.b) : 0.0;
+                    if (bit == placeAbs.end() || db <= 0.0) {
+                        continue;
+                    }
+                    double sh = 0.0;
+                    auto f = bit->second.find(k);
+                    if (f != bit->second.end()) {
+                        sh = f->second / db;
+                    }
+                    m += (e.calls / demand) * (alpha * sh + beta * (1.0 - sh));
+                }
+                return m;
+            };
+            auto gammaStep = [&](const std::string& k) {
+                if (gamma <= 0.0) {
+                    return 0.0;
+                }
+                auto rit = remoteSets.find(k);
+                int g = 0;
+                for (const auto& d : destOfO) {
+                    if (d == k) {
+                        continue;
+                    }
+                    if (rit == remoteSets.end() || !rit->second.count(d)) {
+                        ++g;
+                    }
+                }
+                return gamma * static_cast<double>(g);
+            };
+            auto maxFit = [&](const std::string& k, double rem) {
+                double avail = budget - baseLoads[k] - gammaStep(k);
+                if (avail <= EPS) {
+                    return 0.0;
+                }
+                return std::min(rem, std::max(0.0, avail / slopeOf(k)));
+            };
+
+            double rem = demand;
+            // Fill opened workers, highest locality first (fills the leftover
+            // capacity of successors' workers -> local edges).
+            std::vector<std::pair<double, std::string>> order;
+            order.reserve(opened.size());
+            for (const auto& ip : opened) {
+                order.emplace_back(affOf(ip), ip);
+            }
+            std::sort(order.rbegin(), order.rend());
+            for (const auto& [a, ip] : order) {
+                if (rem <= EPS) {
+                    break;
+                }
+                double p = maxFit(ip, rem);
+                if (p > EPS) {
+                    placeAbs[name][ip] += p;
+                    rem -= p;
+                }
+            }
+            // Open new workers for the remainder.
+            while (rem > EPS) {
+                std::string fresh = openWorker();
+                if (fresh.empty()) {
+                    saturated = true;
+                    break;
+                }
+                baseLoads[fresh] = 0.0;
+                double p = maxFit(fresh, rem);
+                if (p <= EPS) {
+                    saturated = true;
+                    break;
+                }
+                placeAbs[name][fresh] += p;
+                rem -= p;
+            }
+            if (saturated) {
+                break;
+            }
+        }
+        return { std::move(placeAbs), std::move(opened), saturated };
+    };
+
+    // Place at the requested rate. If the cluster is saturated, binary-search the
+    // largest sustainable rate whose backward placement fits. Upper bound = the
+    // communication-free capacity ceiling (single-worker throughput × workers =
+    // maxHosts·budget/ΣD, as a fraction of the requested rate), capped at the
+    // requested rate; stop at a coarse tolerance (100 req/s). The planner then
+    // admits input at the found rate; the surplus queues/sheds.
+    auto initial = runBackward(1.0);
+    auto placeAbs = std::move(std::get<0>(initial));
+    auto opened = std::move(std::get<1>(initial));
+    bool saturated = std::get<2>(initial);
+    double lambdaMult = -1.0; // < 0 means "not saturated"
+
+    // Under sustained overload, reuse the cached max-rate placement from a
+    // previous saturation search: it only depends on the capacity model, not
+    // on the requested rate, so it stays valid while the model inputs are
+    // within tolerance (10% on coefficients, 0.05 on DAG shares, identical
+    // host set).
+    bool reusedSatCache = false;
+    if (saturated && capSatCache.valid) {
+        auto relClose = [](double a, double b) {
+            double m = std::max({ std::fabs(a), std::fabs(b), 1e-9 });
+            return std::fabs(a - b) / m <= 0.1;
+        };
+        auto mapClose = [](const std::map<std::string, double>& a,
+                           const std::map<std::string, double>& b) {
+            if (a.size() != b.size()) {
+                return false;
+            }
+            for (const auto& [k, v] : a) {
+                auto it = b.find(k);
+                if (it == b.end() || std::fabs(v - it->second) > 0.05) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        bool usable =
+          capSatCache.hostIps == allIps && relClose(capSatCache.W, W) &&
+          relClose(capSatCache.tE, tE) && relClose(capSatCache.alpha, alpha) &&
+          relClose(capSatCache.beta, beta) &&
+          relClose(capSatCache.gamma, gamma) &&
+          relClose(capSatCache.chainedRatio, R) &&
+          mapClose(capSatCache.procShare, procShare) &&
+          mapClose(capSatCache.edgeShare, edgeShare) &&
+          sig.avgInputRate > 0.0 &&
+          capSatCache.sustainedAbsRate <= sig.avgInputRate;
+        if (usable) {
+            placeAbs = capSatCache.placeAbs;
+            opened = capSatCache.opened;
+            lambdaMult =
+              std::min(1.0, capSatCache.sustainedAbsRate / sig.avgInputRate);
+            reusedSatCache = true;
+            SPDLOG_WARN(
+              "Capacity Binpack: cluster SATURATED at requested rate; reusing "
+              "cached max-rate placement (~{:.2f}x of requested, ~{:.1f} "
+              "req/s) on {} workers",
+              lambdaMult,
+              capSatCache.sustainedAbsRate,
+              opened.size());
+        }
+    }
+
+    if (saturated && !reusedSatCache) {
+        double totalD = 0.0;
+        for (const auto& [o, d] : procDemand) {
+            totalD += d;
+        }
+        double hi =
+          totalD > 0.0 ? std::min(1.0, maxHosts * budget / totalD) : 1.0;
+        double lo = 0.0;
+        // Convert the absolute search tolerance (req/s, tunable via
+        // resetParameter("capacity_search_tol")) into a scale fraction. Clamp
+        // it below the search interval width: an absolute tolerance wider
+        // than [lo, hi] (low input rates) would otherwise skip the search
+        // entirely and keep the saturated partial placement.
+        double tolScale = sig.avgInputRate > 0.0
+                            ? capacitySearchTolRate / sig.avgInputRate
+                            : 0.01;
+        tolScale = std::clamp(tolScale, 1e-4, 0.05);
+        std::map<std::string, std::map<std::string, double>> bestPlace;
+        std::vector<std::string> bestOpened;
+        double bestScale = 0.0;
+        while (hi - lo > tolScale) {
+            double mid = 0.5 * (lo + hi);
+            auto probe = runBackward(mid);
+            if (!std::get<2>(probe)) { // fits
+                bestPlace = std::move(std::get<0>(probe));
+                bestOpened = std::move(std::get<1>(probe));
+                bestScale = mid;
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        if (!bestPlace.empty()) {
+            placeAbs = std::move(bestPlace);
+            opened = std::move(bestOpened);
+            lambdaMult = bestScale;
+            // Refresh the saturation cache with this search result.
+            capSatCache.valid = true;
+            capSatCache.hostIps = allIps;
+            capSatCache.W = W;
+            capSatCache.tE = tE;
+            capSatCache.alpha = alpha;
+            capSatCache.beta = beta;
+            capSatCache.gamma = gamma;
+            capSatCache.chainedRatio = R;
+            capSatCache.procShare = procShare;
+            capSatCache.edgeShare = edgeShare;
+            capSatCache.placeAbs = placeAbs;
+            capSatCache.opened = opened;
+            capSatCache.sustainedAbsRate = lambdaMult * sig.avgInputRate;
+        }
+        SPDLOG_WARN(
+          "Capacity Binpack: cluster SATURATED at requested rate; scheduling "
+          "for max sustainable rate (~{:.2f}x of requested, ~{:.1f} req/s) on "
+          "{} workers",
+          lambdaMult,
+          lambdaMult > 0.0 ? lambdaMult * sig.avgInputRate : 0.0,
+          opened.size());
+    }
+
+    // ---- Emit one single-node group per operator (groupNodesTopo shape) -------
+    std::vector<NodeGroup> groups;
+    std::vector<std::map<std::string, double>> groupAllocations;
+    std::map<std::string, double> workerRemaining;
+    for (const auto& ip : allIps) {
+        workerRemaining[ip] = 1.0;
+    }
+    // Evaluate final loads in the same units as placeAbs: when the placement
+    // was scaled down to the max sustainable rate, scale the demand/call
+    // totals likewise, so capEvalWorkerLoadsProc recovers true placement
+    // fractions (bFrac is a probability and must not shrink with the rate).
+    // finalLoads is then the per-worker load at the ADMITTED rate.
+    std::map<std::string, double> evalDemand = procDemand;
+    std::vector<CapEdge> evalEdges = edges;
+    if (lambdaMult > 0.0) {
+        for (auto& [op, d] : evalDemand) {
+            d *= lambdaMult;
+        }
+        for (auto& e : evalEdges) {
+            e.calls *= lambdaMult;
+        }
+    }
+    auto finalLoads = capEvalWorkerLoadsProc(
+      placeAbs, opened, evalDemand, evalEdges, alpha, beta, gamma);
+    for (const auto& ip : opened) {
+        workerRemaining[ip] = std::max(0.0, 1.0 - finalLoads[ip] / W);
+    }
+
+    // Normalise each operator's absolute placement into fractions (Σ_ip = 1).
+    for (const auto& [name, node] : topo) {
+        std::map<std::string, double> alloc;
+        auto it = placeAbs.find(name);
+        if (it != placeAbs.end()) {
+            double tot = 0.0;
+            for (const auto& [ip, v] : it->second) {
+                tot += v;
+            }
+            if (tot > 0.0) {
+                for (const auto& [ip, v] : it->second) {
+                    alloc[ip] = v / tot;
+                }
+            }
+        }
+        if (alloc.empty()) {
+            // Fallback: pin to the first opened worker so downstream always has
+            // a placement (should only happen for zero-demand operators).
+            alloc[opened.front()] = 1.0;
+        }
+        groups.push_back({ { node }, NONE_STRING });
+        groupAllocations.push_back(alloc);
+    }
+
+    SPDLOG_INFO("Capacity Binpack (backward): opened {}/{} workers, max worker "
+                "load {:.0f}us/s (budget {:.0f}us/s){}",
+                opened.size(),
+                maxHosts,
+                [&]() {
+                    double m = 0.0;
+                    for (const auto& ip : opened)
+                        m = std::max(m, finalLoads[ip]);
+                    return m;
+                }(),
+                budget,
+                saturated ? " [SATURATED]" : "");
+
+    return { groups, groupAllocations, workerRemaining };
+}
+
 std::tuple<std::vector<NodeGroup>,
            std::vector<std::map<std::string, double>>,
            std::map<std::string, double>>
@@ -2230,12 +2869,33 @@ double StateAwareScheduler::computeChainedCostCoeff(
     return perCallCost / tE;
 }
 
-void StateAwareScheduler::rescheduleAppBinpack(const HostMap& hostMap)
+void StateAwareScheduler::rescheduleAppBinpack(
+  const HostMap& hostMap,
+  const faabric::planner::ApplicationMetrics::ScalingSignals* signals)
 {
     SPDLOG_INFO("Rescheduling the application in Binpack Mode");
-    // 1. Map and assign operators to hosts based on topology.
-    auto [groups, groupAllocations, workerRemaining] = groupNodesTopo(hostMap);
+    // 1. Map and assign operators to hosts.
+    //    Use the capacity-aware open-ended packer once the estimator has warmed
+    //    up (valid C / exec time / input rate); otherwise fall back to the
+    //    legacy topology tape layout (e.g. on the first schedule).
+    bool useCapacity = signals != nullptr && signals->coeffC > 0.0 &&
+                       signals->avgExecTime > 0.0 && signals->avgInputRate > 0.0;
+    auto [groups, groupAllocations, workerRemaining] =
+      useCapacity ? groupNodesCapacity(hostMap, *signals)
+                  : groupNodesTopo(hostMap);
 
+    commitGroupAllocations(groups, groupAllocations);
+}
+
+// Shared commit tail for full-replan modes (Binpack mode 0 and Non-linear
+// mode 4): takes per-operator groups plus per-host allocation fractions and
+// rebuilds the whole schedule state (state hosts, parallelism, request
+// weights, IP remapping to minimise migration, scheduledOperatorsMap, redis
+// registration and hash rings).
+void StateAwareScheduler::commitGroupAllocations(
+  const std::vector<NodeGroup>& groups,
+  const std::vector<std::map<std::string, double>>& groupAllocations)
+{
     // 2. Arrange the states accordingly.
     std::map<std::string, std::string> newStateHost;
     std::map<std::string, int> newFunctionParallelism;
@@ -2461,6 +3121,559 @@ void StateAwareScheduler::rescheduleAppBinpack(const HostMap& hostMap)
     }
 
     printScheduleInfomation();
+}
+
+//--------------------------------------------------------------------------
+// Schedule mode 4: scaling by non-linear performance model + soft-affinity
+// placement (Zhang et al., HPCC'24).
+//--------------------------------------------------------------------------
+
+long StateAwareScheduler::predictNonlinearInstanceTotal(
+  double inputRate,
+  const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
+  double avgSlotsPerHost,
+  long maxInstances) const
+{
+    if (!application || inputRate <= 0.0 || signals.coeffC <= 0.0 ||
+        avgSlotsPerHost <= 0.0 || maxInstances <= 0) {
+        return -1;
+    }
+    auto& nodes = application->getNodes();
+    if (nodes.empty()) {
+        return -1;
+    }
+
+    // Per-operator exec time from the last lifecycle snapshots (cumulative
+    // averages, count-weighted across the operator's instances), falling
+    // back to the cluster average.
+    std::map<std::string, double> teNum;
+    std::map<std::string, long> teDen;
+    for (const auto& [inst, s] : nlLastSnap) {
+        auto pos = inst.rfind('_');
+        if (pos == std::string::npos || s.count <= 0 ||
+            s.workerExecTime <= 0.0) {
+            continue;
+        }
+        std::string op = inst.substr(0, pos);
+        teNum[op] += s.workerExecTime * static_cast<double>(s.count);
+        teDen[op] += s.count;
+    }
+
+    // Demand split, same derivation as rescheduleAppNonlinear but at the
+    // hypothetical input rate.
+    double totalTuples = 0.0;
+    double inputTuples = 0.0;
+    for (const auto& [name, node] : nodes) {
+        totalTuples +=
+          static_cast<double>(std::max<long>(1, node->processedTuples));
+    }
+    for (const auto& inName : application->getInputNodes()) {
+        auto it = nodes.find(inName);
+        if (it != nodes.end()) {
+            inputTuples += static_cast<double>(
+              std::max<long>(1, it->second->processedTuples));
+        }
+    }
+    double totalLoad = inputRate;
+    if (inputTuples > 0.0) {
+        totalLoad = inputRate * (totalTuples / inputTuples);
+    }
+
+    long total = 0;
+    for (const auto& [name, node] : nodes) {
+        long p = 1;
+        auto dit = teDen.find(name);
+        double te = (dit != teDen.end() && dit->second > 0)
+                      ? teNum.at(name) / static_cast<double>(dit->second)
+                      : signals.avgExecTime;
+        double share =
+          static_cast<double>(std::max<long>(1, node->processedTuples)) /
+          totalTuples;
+        double rate = totalLoad * share;
+        if (te > 0.0 && rate > 0.0) {
+            double cInst = signals.coeffC / avgSlotsPerHost / te; // records/s
+            for (; p <= maxInstances; ++p) {
+                double capEff = p * cInst * (1.0 - nlPredictR(name, p)) *
+                                capacityHeadroom;
+                if (capEff >= rate) {
+                    break;
+                }
+            }
+            if (p > maxInstances) {
+                p = maxInstances;
+            }
+        }
+        total += std::max<long>(1, p);
+    }
+    return total;
+}
+
+void StateAwareScheduler::nlCollectSamples(
+  const std::map<std::string, faabric::planner::InstanceMetrics::Snapshot>&
+    snaps)
+{
+    // Per-operator interval sums, weighted by each instance's message count.
+    std::map<std::string, double> tsSum;
+    std::map<std::string, double> teSum;
+    std::map<std::string, long> msgCount;
+
+    for (const auto& [inst, cur] : snaps) {
+        auto pit = nlLastSnap.find(inst);
+        if (pit == nlLastSnap.end()) {
+            continue;
+        }
+        const auto& prev = pit->second;
+        long d = cur.count - prev.count;
+        if (d <= 0) {
+            continue;
+        }
+        // Interval per-message average recovered from two cumulative
+        // averages. dispatchTime only averages the non-negative samples
+        // (no-NTP guard), so its delta is a slight approximation.
+        auto delta = [&](double a2, double a1) {
+            return (a2 * static_cast<double>(cur.count) -
+                    a1 * static_cast<double>(prev.count)) /
+                   static_cast<double>(d);
+        };
+        double ts = delta(cur.plannerQueueTime, prev.plannerQueueTime) +
+                    delta(cur.plannerConsumeTime, prev.plannerConsumeTime) +
+                    delta(cur.dispatchTime, prev.dispatchTime) +
+                    delta(cur.workerQueueTime, prev.workerQueueTime);
+        double te = delta(cur.workerExecTime, prev.workerExecTime);
+        if (te <= 0.0) {
+            continue;
+        }
+        auto pos = inst.rfind('_');
+        if (pos == std::string::npos) {
+            continue;
+        }
+        std::string op = inst.substr(0, pos);
+        tsSum[op] += std::max(0.0, ts) * static_cast<double>(d);
+        teSum[op] += te * static_cast<double>(d);
+        msgCount[op] += d;
+    }
+
+    bool newSamples = false;
+    for (const auto& [op, cnt] : msgCount) {
+        if (cnt <= 0 || teSum[op] <= 0.0) {
+            continue;
+        }
+        auto lit = nlLastParallelism.find(op);
+        if (lit == nlLastParallelism.end() || lit->second <= 0) {
+            // Interval parallelism unknown (operator appeared between two
+            // reschedules); the sample cannot be tagged with a p.
+            continue;
+        }
+        double r = tsSum[op] / (tsSum[op] + teSum[op]);
+        auto& buf = nlSamples[op];
+        buf.emplace_back(static_cast<double>(lit->second), r);
+        if (buf.size() > 64) {
+            buf.erase(buf.begin());
+        }
+        nlFits[op] = nlFitCurve(buf, nlMinFitSamples);
+        newSamples = true;
+        SPDLOG_INFO("Non-linear mode: sample op={} p={} r={:.4f} ({} msgs) -> "
+                    "fit(k={:.3f}, b={:.3f}, valid={})",
+                    op,
+                    lit->second,
+                    r,
+                    cnt,
+                    nlFits[op].k,
+                    nlFits[op].b,
+                    nlFits[op].valid);
+    }
+
+    if (newSamples) {
+        std::vector<std::pair<double, double>> all;
+        for (const auto& [op, buf] : nlSamples) {
+            all.insert(all.end(), buf.begin(), buf.end());
+        }
+        nlGlobalFit = nlFitCurve(all, nlMinFitSamples);
+    }
+
+    nlLastSnap = snaps;
+}
+
+StateAwareScheduler::NlFit StateAwareScheduler::nlFitCurve(
+  const std::vector<std::pair<double, double>>& samples,
+  int minSamples)
+{
+    NlFit fit;
+    if (static_cast<int>(samples.size()) < minSamples) {
+        return fit;
+    }
+    // r(p) = b·(1 - e^{-kp}) is linear in b for fixed k, so grid-search k in
+    // log space and solve b in closed form (least squares through the
+    // implicit (0,0) pre-fit point).
+    constexpr int kSteps = 40;
+    constexpr double kMin = 0.01;
+    constexpr double kMax = 5.0;
+    double bestSse = std::numeric_limits<double>::max();
+    for (int i = 0; i < kSteps; ++i) {
+        double k = kMin * std::pow(kMax / kMin,
+                                   static_cast<double>(i) / (kSteps - 1));
+        double num = 0.0;
+        double den = 0.0;
+        for (const auto& [p, r] : samples) {
+            double x = 1.0 - std::exp(-k * p);
+            num += r * x;
+            den += x * x;
+        }
+        if (den <= 0.0) {
+            continue;
+        }
+        double b = std::clamp(num / den, 0.0, 0.95);
+        if (b <= 0.0) {
+            continue;
+        }
+        double sse = 0.0;
+        for (const auto& [p, r] : samples) {
+            double e = b * (1.0 - std::exp(-k * p)) - r;
+            sse += e * e;
+        }
+        if (sse < bestSse) {
+            bestSse = sse;
+            fit.k = k;
+            fit.b = b;
+            fit.valid = true;
+        }
+    }
+    return fit;
+}
+
+double StateAwareScheduler::nlPredictR(const std::string& op, double p) const
+{
+    const NlFit* f = nullptr;
+    auto it = nlFits.find(op);
+    if (it != nlFits.end() && it->second.valid) {
+        f = &it->second;
+    } else if (nlGlobalFit.valid) {
+        f = &nlGlobalFit;
+    }
+    if (f == nullptr || p <= 0.0) {
+        return 0.0;
+    }
+    return std::clamp(f->b * (1.0 - std::exp(-f->k * p)), 0.0, 0.95);
+}
+
+std::map<std::string, std::map<std::string, int>>
+StateAwareScheduler::softAffinityPlace(
+  const HostMap& hostMap,
+  const std::vector<std::pair<std::string, int>>& orderedTargets)
+{
+    constexpr double EPS = 1e-9;
+
+    std::map<std::string, int> slotsOf;
+    std::map<std::string, int> used;
+    for (const auto& [ip, host] : hostMap) {
+        slotsOf[ip] = std::max(1, host->slots);
+        used[ip] = 0;
+    }
+
+    // Upstream edge index: op -> [(source op, chained weight)].
+    std::map<std::string, std::vector<std::pair<std::string, int>>> upEdges;
+    for (const auto& e : application->getConnectionsWithWeight()) {
+        if (e.weight > 0) {
+            upEdges[e.output].emplace_back(e.input, e.weight);
+        }
+    }
+
+    std::map<std::string, std::map<std::string, int>> placement;
+    long totalUsed = 0;
+    bool warnedOvercommit = false;
+
+    for (const auto& [op, n] : orderedTargets) {
+        // S[ip]: data volume the upstream instances on ip send towards this
+        // operator (edge weight split by the upstream's instance fractions).
+        // Paper eq (9).
+        std::map<std::string, double> S;
+        auto ueIt = upEdges.find(op);
+        if (ueIt != upEdges.end()) {
+            for (const auto& [src, w] : ueIt->second) {
+                auto pit = placement.find(src);
+                if (pit == placement.end()) {
+                    continue;
+                }
+                long nSrc = 0;
+                for (const auto& [ip, c] : pit->second) {
+                    nSrc += c;
+                }
+                if (nSrc <= 0) {
+                    continue;
+                }
+                for (const auto& [ip, c] : pit->second) {
+                    S[ip] += static_cast<double>(w) * c / nSrc;
+                }
+            }
+        }
+        double sumSInit = 0.0;
+        for (const auto& [ip, v] : S) {
+            sumSInit += v;
+        }
+        // Eq (11): every placed instance "consumes" S_avg of affinity volume.
+        double sAvg = n > 0 ? sumSInit / n : 0.0;
+
+        auto& B = placement[op];
+        for (int i = 0; i < n; ++i) {
+            double curSum = 0.0;
+            for (const auto& [ip, v] : S) {
+                curSum += v;
+            }
+            double denom = curSum - sAvg; // eq (10) denominator
+
+            std::string best;
+            double bestScore = std::numeric_limits<double>::lowest();
+            for (const auto& [ip, cap] : slotsOf) {
+                double data = 0.0;
+                auto sit = S.find(ip);
+                if (sit != S.end()) {
+                    if (denom > EPS) {
+                        data = (sit->second - sAvg) / denom; // eq (10)
+                    } else if (curSum > EPS) {
+                        data = std::max(0.0, sit->second) / curSum; // eq (9)
+                    }
+                }
+                double balance =
+                  totalUsed > 0
+                    ? 1.0 - static_cast<double>(used[ip]) / totalUsed
+                    : 1.0; // eq (12)
+                double score = softAffinityWs * data + softAffinityWb * balance;
+                // Full nodes only win when every node is full (overcommit).
+                if (used[ip] >= cap) {
+                    score -= 1e6;
+                }
+                if (best.empty() || score > bestScore) {
+                    best = ip;
+                    bestScore = score;
+                }
+            }
+            if (bestScore < -1e5 && !warnedOvercommit) {
+                SPDLOG_WARN("Soft affinity: all hosts full, overcommitting "
+                            "instances beyond slot capacity");
+                warnedOvercommit = true;
+            }
+            B[best]++;
+            used[best]++;
+            totalUsed++;
+            auto sit = S.find(best);
+            if (sit != S.end()) {
+                sit->second -= sAvg; // paper's dynamic update after eq (10)
+            }
+        }
+    }
+    return placement;
+}
+
+void StateAwareScheduler::rescheduleAppNonlinear(
+  const HostMap& hostMap,
+  const faabric::planner::ApplicationMetrics* metrics)
+{
+    SPDLOG_INFO("Rescheduling the application in Non-linear AutoTuning mode "
+                "(mode 4)");
+    if (!application || hostMap.empty()) {
+        SPDLOG_WARN("Non-linear mode: no application or empty host map");
+        return;
+    }
+
+    //--------------------------------------------------------------------------
+    // 1. Ingest fresh overhead samples and refresh the r(p) fits.
+    //--------------------------------------------------------------------------
+    std::map<std::string, faabric::planner::InstanceMetrics::Snapshot> snaps;
+    faabric::planner::ApplicationMetrics::ScalingSignals signals;
+    if (metrics != nullptr) {
+        snaps = metrics->getInstanceLifecycleSnapshots();
+        nlCollectSamples(snaps);
+        signals = metrics->getScalingSignals(kChainedCostWindowSec);
+    }
+
+    //--------------------------------------------------------------------------
+    // 2. Per-operator exec time (count-weighted cumulative average across the
+    //    operator's instances), falling back to the cluster average.
+    //--------------------------------------------------------------------------
+    std::map<std::string, double> teNum;
+    std::map<std::string, long> teDen;
+    for (const auto& [inst, s] : snaps) {
+        auto pos = inst.rfind('_');
+        if (pos == std::string::npos || s.count <= 0 ||
+            s.workerExecTime <= 0.0) {
+            continue;
+        }
+        std::string op = inst.substr(0, pos);
+        teNum[op] += s.workerExecTime * static_cast<double>(s.count);
+        teDen[op] += s.count;
+    }
+
+    //--------------------------------------------------------------------------
+    // 3. Per-operator demand (records/s): input rate scaled to total DAG
+    //    processing, split by processedTuples share (same derivation as the
+    //    capacity packer).
+    //--------------------------------------------------------------------------
+    auto& nodes = application->getNodes();
+    double totalTuples = 0.0;
+    double inputTuples = 0.0;
+    for (const auto& [name, node] : nodes) {
+        totalTuples +=
+          static_cast<double>(std::max<long>(1, node->processedTuples));
+    }
+    for (const auto& inName : application->getInputNodes()) {
+        auto it = nodes.find(inName);
+        if (it != nodes.end()) {
+            inputTuples += static_cast<double>(
+              std::max<long>(1, it->second->processedTuples));
+        }
+    }
+    double totalLoad = signals.avgInputRate;
+    if (inputTuples > 0.0) {
+        totalLoad = signals.avgInputRate * (totalTuples / inputTuples);
+    }
+
+    int totalSlots = 0;
+    for (const auto& [ip, host] : hostMap) {
+        totalSlots += std::max(1, host->slots);
+    }
+    double avgSlots =
+      static_cast<double>(totalSlots) / static_cast<double>(hostMap.size());
+
+    bool warm = signals.coeffC > 0.0 && signals.avgInputRate > 0.0;
+
+    //--------------------------------------------------------------------------
+    // 4. Target parallelism per operator: smallest p with
+    //    p · c · (1 - r(p)) · headroom ≥ rate_o  (the paper's n* = n/(1-r)
+    //    solved as a search, since capacity is monotone in p). Per-instance
+    //    capacity c = (C/slotsPerHost)/t_e in records/s.
+    //--------------------------------------------------------------------------
+    std::map<std::string, int> target;
+    bool saturated = false;
+    for (const auto& [name, node] : nodes) {
+        int p = 1;
+        if (warm) {
+            double te = teDen.count(name) && teDen[name] > 0
+                          ? teNum[name] / teDen[name]
+                          : signals.avgExecTime;
+            double share =
+              static_cast<double>(std::max<long>(1, node->processedTuples)) /
+              totalTuples;
+            double rate = totalLoad * share;
+            if (te > 0.0 && rate > 0.0) {
+                double cInst = signals.coeffC / avgSlots / te; // records/s
+                for (; p <= totalSlots; ++p) {
+                    double capEff = p * cInst * (1.0 - nlPredictR(name, p)) *
+                                    capacityHeadroom;
+                    if (capEff >= rate) {
+                        break;
+                    }
+                }
+                if (p > totalSlots) {
+                    p = totalSlots;
+                    saturated = true;
+                }
+            }
+        }
+        target[name] = std::max(1, p);
+    }
+
+    // Global cap: shave the largest operators until the plan fits the
+    // cluster (every operator keeps at least one instance).
+    long planned = 0;
+    for (const auto& [op, n] : target) {
+        planned += n;
+    }
+    while (planned > totalSlots) {
+        auto big = std::max_element(
+          target.begin(), target.end(), [](const auto& a, const auto& b) {
+              return a.second < b.second;
+          });
+        if (big == target.end() || big->second <= 1) {
+            break;
+        }
+        big->second--;
+        planned--;
+        saturated = true;
+    }
+
+    //--------------------------------------------------------------------------
+    // 5. Topological order (upstream first, so Data_N sees placed sources),
+    //    then soft-affinity placement.
+    //--------------------------------------------------------------------------
+    std::vector<std::pair<std::string, int>> orderedTargets;
+    {
+        std::set<std::string> vis;
+        std::vector<std::string> post;
+        const auto& conns = application->getConnections();
+        std::function<void(const std::string&)> dfs =
+          [&](const std::string& n) {
+              vis.insert(n);
+              auto cit = conns.find(n);
+              if (cit != conns.end()) {
+                  for (const auto& s : cit->second) {
+                      if (!vis.count(s)) {
+                          dfs(s);
+                      }
+                  }
+              }
+              post.push_back(n);
+          };
+        for (const auto& in : application->getInputNodes()) {
+            if (!vis.count(in)) {
+                dfs(in);
+            }
+        }
+        for (const auto& [name, node] : nodes) {
+            if (!vis.count(name)) {
+                dfs(name);
+            }
+        }
+        for (auto it = post.rbegin(); it != post.rend(); ++it) {
+            if (target.count(*it)) {
+                orderedTargets.emplace_back(*it, target.at(*it));
+            }
+        }
+    }
+
+    auto placement = softAffinityPlace(hostMap, orderedTargets);
+
+    //--------------------------------------------------------------------------
+    // 6. Emit one single-node group per operator (Binpack commit shape) and
+    //    commit through the shared tail.
+    //--------------------------------------------------------------------------
+    std::vector<NodeGroup> groups;
+    std::vector<std::map<std::string, double>> groupAllocations;
+    auto topo = application->getNodesDFSOrder();
+    for (const auto& [name, node] : topo) {
+        std::map<std::string, double> alloc;
+        auto pit = placement.find(name);
+        int n = target.count(name) ? target.at(name) : 1;
+        if (pit != placement.end() && n > 0) {
+            for (const auto& [ip, c] : pit->second) {
+                if (c > 0) {
+                    alloc[ip] = static_cast<double>(c) / n;
+                }
+            }
+        }
+        if (alloc.empty()) {
+            alloc[hostMap.begin()->first] = 1.0;
+        }
+        // With single-node groups reqResource only matters for the intra-group
+        // scale factor (=1); the instance count is its natural value here.
+        node->reqResource = static_cast<double>(n);
+        groups.push_back({ { node }, NONE_STRING });
+        groupAllocations.push_back(alloc);
+    }
+
+    commitGroupAllocations(groups, groupAllocations);
+
+    // Remember the parallelism the next sampling interval runs with.
+    nlLastParallelism = target;
+
+    std::stringstream ss;
+    for (const auto& [op, n] : target) {
+        ss << op << "=" << n << " (r=" << nlPredictR(op, n) << ") ";
+    }
+    SPDLOG_INFO("Non-linear mode: total instances {}/{} slots{} -> {}",
+                planned,
+                totalSlots,
+                saturated ? " [SATURATED]" : "",
+                ss.str());
 }
 
 void StateAwareScheduler::rescheduleAppFaaSFlow(const HostMap& hostMap)
@@ -3275,6 +4488,7 @@ void StateAwareScheduler::resetScheduler()
     stateHashRing.clear();
     statePartitionBy.clear();
     funcStateRegMap.clear();
+    capSatCache = CapacitySaturationCache{};
     runtimeSummary.reset();
 }
 

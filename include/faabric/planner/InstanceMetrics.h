@@ -28,6 +28,27 @@ class InstanceMetrics
         return count;
     }
 
+    // Plain-value copy of the running lifecycle averages, for numeric
+    // consumers (e.g. the mode-4 non-linear scaling model). Counts and
+    // averages are cumulative since start/reset; interval values are obtained
+    // by count-weighted deltas between two snapshots.
+    struct Snapshot
+    {
+        long count = 0;
+        double plannerQueueTime = 0.0;
+        double plannerConsumeTime = 0.0;
+        double dispatchTime = 0.0;
+        double workerQueueTime = 0.0;
+        double workerExecTime = 0.0;
+    };
+
+    Snapshot snapshot() const
+    {
+        faabric::util::SharedLock lock(instMx);
+        return { count,           avgPlannerQueueTime, avgPlannerConsumeTime,
+                 avgDispatchTime, avgWorkerQueueTime,  avgWorkerExecuteTime };
+    }
+
     void record(const std::shared_ptr<faabric::Message>& msg)
     {
         faabric::util::FullLock lock(instMx);

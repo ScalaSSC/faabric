@@ -190,9 +190,10 @@ class ApplicationMetrics
         bool plannerQueueSaturated = false;
         // CoeffEstimator snapshot at this second
         double coeffC = 0.0; // physical CPU budget C (us/s)
-        double alpha = 0.0;  // local chained-call overhead coefficient (us/call)
-        double beta = 0.0;   // remote chained-call overhead coefficient (us/call)
-        double gamma = 0.0;  // per-dest-host fixed overhead coefficient (us/host)
+        double alpha = 0.0; // local chained-call overhead coefficient (us/call)
+        double beta = 0.0; // remote chained-call overhead coefficient (us/call)
+        double gamma =
+          0.0; // per-dest-host fixed overhead coefficient (us/host)
         double maxProcessed = 0.0; // C / avgExecTime — baseline max req/s
         double avgExecTime =
           0.0; // weighted avg exec time across instances (us)
@@ -488,24 +489,23 @@ class ApplicationMetrics
                 snprintf(gammaBuf, sizeof(gammaBuf), "%.4f", gamma);
                 snprintf(maxProcBuf, sizeof(maxProcBuf), "%.1f", maxProcessed);
 
-                std::string entryStr = std::to_string(inputRate) + " / " +
-                                       std::to_string(currentCount) + " / " +
-                                       std::to_string(workersNum) + " / " +
-                                       std::to_string(totalQueueSize) + " / " +
-                                       std::to_string(avgWaitTime) + " / " +
-                                       std::to_string(avgExecTime) + " / " +
-                                       std::to_string(totalExecutors) + " / " +
-                                       std::to_string(avgExecutors) + " / " +
-                                       std::string(cpuBuffer) + " / " +
-                                       std::to_string(secMedianLat) + " / " +
-                                       std::to_string(secP95Lat) + " / " +
-                                       std::to_string(secP99Lat) + " / " +
-                                       (plannerSaturated ? "saturated" : "no") +
-                                       " / " + std::string(coeffCBuf) + " / " +
-                                       std::string(alphaBuf) + " / " +
-                                       std::string(betaBuf) + " / " +
-                                       std::string(gammaBuf) + " / " +
-                                       std::string(maxProcBuf);
+                std::string entryStr =
+                  std::to_string(inputRate) + " / " +
+                  std::to_string(currentCount) + " / " +
+                  std::to_string(workersNum) + " / " +
+                  std::to_string(totalQueueSize) + " / " +
+                  std::to_string(avgWaitTime) + " / " +
+                  std::to_string(avgExecTime) + " / " +
+                  std::to_string(totalExecutors) + " / " +
+                  std::to_string(avgExecutors) + " / " +
+                  std::string(cpuBuffer) + " / " +
+                  std::to_string(secMedianLat) + " / " +
+                  std::to_string(secP95Lat) + " / " +
+                  std::to_string(secP99Lat) + " / " +
+                  (plannerSaturated ? "saturated" : "no") + " / " +
+                  std::string(coeffCBuf) + " / " + std::string(alphaBuf) +
+                  " / " + std::string(betaBuf) + " / " + std::string(gammaBuf) +
+                  " / " + std::string(maxProcBuf);
 
                 historyArray.PushBack(
                   rapidjson::Value(entryStr.c_str(), alloc).Move(), alloc);
@@ -1061,6 +1061,21 @@ class ApplicationMetrics
         // chainedMultiplier = chainedOperatorCount / inputOperatorCount
         double chainedMultiplier = 0.0;
     };
+
+    // Numeric per-instance lifecycle snapshot (instanceName = User_Func_Par),
+    // fed by record() from each request's payload timestamps. Consumed by the
+    // mode-4 non-linear scaling model, which turns snapshot deltas into
+    // scheduling-overhead-ratio samples.
+    std::map<std::string, InstanceMetrics::Snapshot>
+    getInstanceLifecycleSnapshots() const
+    {
+        faabric::util::SharedLock lock(opMx);
+        std::map<std::string, InstanceMetrics::Snapshot> out;
+        for (const auto& [name, inst] : instances) {
+            out[name] = inst->snapshot();
+        }
+        return out;
+    }
 
     ScalingSignals getScalingSignals(int windowSec) const
     {

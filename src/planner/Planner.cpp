@@ -967,6 +967,10 @@ bool Planner::resetParameter(
         "input_rate_stability_window",
         "input_rate_deviation",
         "worker_load_headroom",
+        "capacity_search_tol",
+        "soft_affinity_ws",
+        "soft_affinity_wb",
+        "nl_min_fit_samples",
     };
 
     faabric::util::FullLock lock(plannerMx);
@@ -1018,8 +1022,39 @@ bool Planner::resetParameter(
             inputRateDeviationRatio = req.value_double();
         } else if (key == "worker_load_headroom") {
             workerLoadHeadroom = req.value_double();
+            if (stateAwareScheduler) {
+                stateAwareScheduler->setCapacityHeadroom(workerLoadHeadroom);
+            }
             SPDLOG_INFO("Planner worker load headroom set to {:.3f}",
                         workerLoadHeadroom);
+        } else if (key == "capacity_search_tol") {
+            capacitySearchTol = req.value_double();
+            if (stateAwareScheduler) {
+                stateAwareScheduler->setCapacitySearchTol(capacitySearchTol);
+            }
+            SPDLOG_INFO("Planner capacity search tolerance set to {:.1f} req/s",
+                        capacitySearchTol);
+        } else if (key == "soft_affinity_ws" || key == "soft_affinity_wb") {
+            if (key == "soft_affinity_ws") {
+                softAffinityWs = req.value_double();
+            } else {
+                softAffinityWb = req.value_double();
+            }
+            if (stateAwareScheduler) {
+                stateAwareScheduler->setSoftAffinityWeights(softAffinityWs,
+                                                            softAffinityWb);
+            }
+            SPDLOG_INFO(
+              "Planner soft affinity weights set to ws={:.2f} wb={:.2f}",
+              softAffinityWs,
+              softAffinityWb);
+        } else if (key == "nl_min_fit_samples") {
+            nlMinFitSamples = value;
+            if (stateAwareScheduler) {
+                stateAwareScheduler->setNlMinFitSamples(nlMinFitSamples);
+            }
+            SPDLOG_INFO("Planner non-linear min fit samples set to {}",
+                        nlMinFitSamples);
         } else if (state.applicationMetrics &&
                    state.applicationMetrics->setThreshold(key, value)) {
             // threshold keys handled inside ApplicationMetrics
@@ -1105,9 +1140,12 @@ void Planner::rescheduleApp(int rescheduleMode, int hostNum)
     stateAwareScheduler->rescheduleApp(state.activeHosts,
                                        state.applicationMetrics.get());
 
-    // For adaptive mode the scheduler may use fewer workers than activeHosts.
-    // Rebuild activeHosts from the IPs that are actually in the schedule.
-    if (scheduleMode == 3) {
+    // For adaptive mode (3) and open-ended Binpack (0) the scheduler may use
+    // fewer workers than activeHosts. Rebuild activeHosts from the IPs that are
+    // actually in the schedule, so schedHostNum reflects the worker count the
+    // packer chose (the "predicted N" is now an output of the packer, not a
+    // separate model).
+    if (scheduleMode == 3 || scheduleMode == 0) {
         std::set<std::string> usedIps;
         for (const auto& [func, op] :
              stateAwareScheduler->getScheduledOperatorsMap()) {
@@ -1482,7 +1520,8 @@ int Planner::computeTargetHostNum(
     // budget = C minus the fixed per-worker host-fanout overhead (gamma per
     // distinct remote dest host). The remaining budget is shared by the
     // throughput-proportional process + chained-call cost.
-    auto capacityFor = [&](double budget, double localRatio, double remoteRatio) {
+    auto capacityFor = [&](
+                         double budget, double localRatio, double remoteRatio) {
         return budget /
                (signals.avgExecTime + alpha * localRatio + beta * remoteRatio);
     };
@@ -1531,25 +1570,26 @@ int Planner::computeTargetHostNum(
         targetN = newN;
     }
 
-    SPDLOG_DEBUG("computeTargetHostNum: C={:.0f}us/s, alpha={:.3f}, "
-                 "beta={:.3f}, gamma={:.1f}, nHosts={:.1f}, execTime={:.1f}us, "
-                 "R={:.3f}, localShare={:.3f}, localRatio={:.3f}, "
-                 "remoteRatio={:.3f}, inputRate={:.1f}, chainedMultiplier={:.2f}, "
-                 "totalLoad={:.1f} -> targetN={}",
-                 signals.coeffC,
-                 signals.alpha,
-                 signals.beta,
-                 gamma,
-                 nHosts,
-                 signals.avgExecTime,
-                 R,
-                 localShare,
-                 localRatio,
-                 remoteRatio,
-                 signals.avgInputRate,
-                 signals.chainedMultiplier,
-                 totalLoad,
-                 targetN);
+    SPDLOG_DEBUG(
+      "computeTargetHostNum: C={:.0f}us/s, alpha={:.3f}, "
+      "beta={:.3f}, gamma={:.1f}, nHosts={:.1f}, execTime={:.1f}us, "
+      "R={:.3f}, localShare={:.3f}, localRatio={:.3f}, "
+      "remoteRatio={:.3f}, inputRate={:.1f}, chainedMultiplier={:.2f}, "
+      "totalLoad={:.1f} -> targetN={}",
+      signals.coeffC,
+      signals.alpha,
+      signals.beta,
+      gamma,
+      nHosts,
+      signals.avgExecTime,
+      R,
+      localShare,
+      localRatio,
+      remoteRatio,
+      signals.avgInputRate,
+      signals.chainedMultiplier,
+      totalLoad,
+      targetN);
 
     return targetN;
 }
@@ -1615,15 +1655,15 @@ bool Planner::evaluateReschedule(
         return false;
 
     if (scheduleMode == 0) {
-        int targetN = computeTargetHostNum(signals, schedHostNum, maxHostNum);
+        // Open-ended Binpack: do NOT predict the worker count. Hand the full
+        // host set to the capacity-aware packer (groupNodesCapacity), which
+        // opens workers on demand under the per-worker capacity budget and lets
+        // the actual N fall out of the placement. rescheduleApp() then rebuilds
+        // activeHosts/schedHostNum from the workers the packer actually used.
         lastPeriodicRescheduleMs = nowMs;
-
-        if (targetN <= 0 || targetN == schedHostNum)
-            return false;
-
         stableInputRate = currentRate;
         inputRateChangeDetectedMs = 0;
-        rescheduleApp(0, targetN);
+        rescheduleApp(0, maxHostNum);
     } else if (scheduleMode == 3) {
         int targetN = state.applicationMetrics
                         ? state.applicationMetrics->computeAdaptiveHostCount(
@@ -1636,6 +1676,15 @@ bool Planner::evaluateReschedule(
         rescheduleApp(0, maxHostNum);
         stableInputRate = currentRate;
         inputRateChangeDetectedMs = 0;
+    } else if (scheduleMode == 4) {
+        // Non-linear AutoTuning: v1 does not drive host scaling, so keep the
+        // current active host set (hostNum = 0). The reschedule itself is the
+        // continuous-fitting loop: it snapshots the overhead metrics, refits
+        // r(p) and retunes per-operator parallelism + placement.
+        lastPeriodicRescheduleMs = nowMs;
+        stableInputRate = currentRate;
+        inputRateChangeDetectedMs = 0;
+        rescheduleApp(0, 0);
     }
 
     return true;
@@ -1655,6 +1704,48 @@ int Planner::predictHostNum(double inputRate)
     if (scheduleMode == 3) {
         return state.applicationMetrics->computeAdaptiveHostCount(inputRate,
                                                                   maxHostNum);
+    }
+
+    if (scheduleMode == 4) {
+        // Non-linear model prediction: instance demand from the fitted r(p)
+        // curves, folded to a host count. STRICTLY READ-ONLY — this only
+        // computes and returns; schedHostNum / activeHosts are not touched.
+        if (!stateAwareScheduler) {
+            return schedHostNum;
+        }
+        auto signals = state.applicationMetrics->getScalingSignals(
+          scalingDecisionPeriodMs / 1000);
+        long totalSlots = 0;
+        for (const auto& [ip, host] : state.hostMap) {
+            totalSlots += std::max(1, static_cast<int>(host->slots()));
+        }
+        if (totalSlots <= 0) {
+            return schedHostNum;
+        }
+        double avgSlots = static_cast<double>(totalSlots) /
+                          static_cast<double>(state.hostMap.size());
+        long totalInstances =
+          stateAwareScheduler->predictNonlinearInstanceTotal(
+            inputRate, signals, avgSlots, totalSlots);
+        if (totalInstances <= 0) {
+            // Cold estimator / no application: no better answer than the
+            // currently scheduled host count.
+            SPDLOG_INFO("predictHostNum(mode 4): model cold, returning "
+                        "current schedHostNum={}",
+                        schedHostNum);
+            return schedHostNum;
+        }
+        int hosts = static_cast<int>(
+          std::ceil(static_cast<double>(totalInstances) / avgSlots));
+        hosts = std::min(std::max(hosts, 1), maxHostNum);
+        SPDLOG_INFO("predictHostNum(mode 4): rate={:.1f} -> {} instances "
+                    "-> {} hosts (avgSlots={:.1f}, max={})",
+                    inputRate,
+                    totalInstances,
+                    hosts,
+                    avgSlots,
+                    maxHostNum);
+        return hosts;
     }
 
     // scheduleMode == 0 (default): model-based prediction

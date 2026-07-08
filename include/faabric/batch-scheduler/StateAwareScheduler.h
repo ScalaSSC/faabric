@@ -156,7 +156,65 @@ class StateAwareScheduler : public BatchScheduler
                std::map<std::string, double>>
     groupNodesTopo(const HostMap& hostMap);
 
-    void rescheduleAppBinpack(const HostMap& hostMap);
+    // Open-ended, capacity-aware Binpack placement (schedule mode 0).
+    // Unlike groupNodesTopo (which fills a fixed tape of `numHosts` unit-capacity
+    // slots ranked only by processing share), this places each operator under
+    // the *physical* worker capacity model
+    //   L_k = Σ procRate·t_e + alpha·local + beta·remote + gamma·#remoteHosts ≤ W·headroom
+    // It opens workers on demand (so the worker count N is an OUTPUT, not a
+    // prediction), greedily co-locates chained-call neighbours to convert remote
+    // calls (beta) into local ones (alpha) while limiting fan-out (gamma), then
+    // runs an exact local-refinement pass that recomputes L_k after every move to
+    // close the placement→local/remote→load feedback loop. Returns the same
+    // {groups, groupAllocations, workerRemaining} shape as groupNodesTopo so the
+    // rest of rescheduleAppBinpack is unchanged.
+    std::tuple<std::vector<NodeGroup>,
+               std::vector<std::map<std::string, double>>,
+               std::map<std::string, double>>
+    groupNodesCapacity(
+      const HostMap& hostMap,
+      const faabric::planner::ApplicationMetrics::ScalingSignals& signals);
+
+    // signals != nullptr (and warmed up) selects the capacity-aware packer
+    // (groupNodesCapacity); otherwise it falls back to the legacy groupNodesTopo
+    // tape layout (used on the very first schedule, before metrics exist).
+    void rescheduleAppBinpack(
+      const HostMap& hostMap,
+      const faabric::planner::ApplicationMetrics::ScalingSignals* signals =
+        nullptr);
+
+    // Per-worker safety margin applied to the capacity budget (budget =
+    // W·headroom) in groupNodesCapacity. Mirrors the planner's
+    // workerLoadHeadroom; kept in sync via resetParameter("worker_load_headroom").
+    void setCapacityHeadroom(double value) { capacityHeadroom = value; }
+
+    // Absolute tolerance (req/s) of the saturation binary search in
+    // groupNodesCapacity. Mirrors the planner's capacitySearchTol; kept in
+    // sync via resetParameter("capacity_search_tol").
+    void setCapacitySearchTol(double value) { capacitySearchTolRate = value; }
+
+    // Reschedule with the non-linear performance model + soft-affinity
+    // placement (schedule mode 4), after Zhang et al., HPCC'24. Per-operator
+    // parallelism comes from the fitted scheduling-overhead curve
+    // r(p) = b·(1-e^{-kp}) (min p with p·c·(1-r(p))·headroom ≥ rate); the
+    // instances are then placed host-by-host with the greedy
+    // Score = ws·Data + wb·Balance policy (paper's Algorithm 1).
+    void rescheduleAppNonlinear(
+      const HostMap& hostMap,
+      const faabric::planner::ApplicationMetrics* metrics);
+
+    // Weights of the soft-affinity scheduling score (mode 4):
+    // Score_N = ws·Data_N + wb·Balance_N. Kept in sync with the planner via
+    // resetParameter("soft_affinity_ws" / "soft_affinity_wb").
+    void setSoftAffinityWeights(double ws, double wb)
+    {
+        softAffinityWs = ws;
+        softAffinityWb = wb;
+    }
+
+    // Minimum observed samples before an r(p) curve is trusted (mode 4).
+    // Synced via resetParameter("nl_min_fit_samples").
+    void setNlMinFitSamples(int n) { nlMinFitSamples = n < 2 ? 2 : n; }
 
     void rescheduleAppFaaSFlow(const HostMap& hostMap);
 
@@ -199,6 +257,20 @@ class StateAwareScheduler : public BatchScheduler
                                                   double beta,
                                                   double gamma,
                                                   double chainedRatio) const;
+
+    // Predict the total instance demand Σ n*_o at a hypothetical `inputRate`
+    // under the mode-4 non-linear model: per operator the smallest p with
+    // p·c·(1-r(p))·headroom ≥ rate_o, using the fitted r(p) curves and the
+    // per-operator exec times remembered from the last reschedule
+    // (nlLastSnap). STRICTLY READ-ONLY — mutates no scheduler or application
+    // state; serves the planner's predict_host_num query. The per-operator
+    // search is capped at maxInstances. Returns -1 when prediction is not
+    // possible (no application / cold estimator).
+    long predictNonlinearInstanceTotal(
+      double inputRate,
+      const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
+      double avgSlotsPerHost,
+      long maxInstances) const;
 
     const std::map<std::string, std::shared_ptr<util::ConsistentHashRing>>&
     getStateHashRing() const
@@ -249,6 +321,100 @@ class StateAwareScheduler : public BatchScheduler
 
     bool isplanner = true;
     int scheduleMode = 0;
+
+    // Per-worker capacity safety margin for groupNodesCapacity. Default matches
+    // the planner's workerLoadHeadroom default.
+    double capacityHeadroom = 0.9;
+
+    // Tolerance (req/s) at which the saturation binary search in
+    // groupNodesCapacity stops. Default matches the planner's
+    // capacitySearchTol default.
+    double capacitySearchTolRate = 100.0;
+
+    // Cached result of the saturation binary search in groupNodesCapacity
+    // (mode 0). The max-sustainable-rate placement depends only on the
+    // capacity model (coefficients, DAG shares, host set) and NOT on the
+    // requested rate, so under sustained overload it can be reused across
+    // reschedules instead of redoing the ~10 runBackward probes — as long as
+    // the model inputs stay within tolerance (checked at reuse time).
+    struct CapacitySaturationCache
+    {
+        bool valid = false;
+        // Input signature at cache time.
+        std::vector<std::string> hostIps;
+        double W = 0.0;
+        double tE = 0.0;
+        double alpha = 0.0;
+        double beta = 0.0;
+        double gamma = 0.0;
+        double chainedRatio = 0.0;
+        std::map<std::string, double> procShare; // op -> tuple share
+        std::map<std::string, double> edgeShare; // "a->b" -> weight share
+        // Cached result.
+        std::map<std::string, std::map<std::string, double>> placeAbs;
+        std::vector<std::string> opened;
+        double sustainedAbsRate = 0.0; // bestScale · avgInputRate (req/s)
+    };
+    CapacitySaturationCache capSatCache;
+
+    // ---- Schedule mode 4: non-linear model + soft affinity -----------------
+    // Soft-affinity score weights (paper eq. 7).
+    double softAffinityWs = 0.5;
+    double softAffinityWb = 0.5;
+    // Minimum samples before a fitted r(p) curve is used.
+    int nlMinFitSamples = 3;
+
+    // Fitted scheduling-overhead curve r(p) = b·(1 - e^{-k·p}). This is the
+    // paper's r = a·e^{-kp} + b with the (0,0) pre-fit point folded in as the
+    // exact constraint a = -b, which guarantees r(0) = 0 and r monotonically
+    // increasing towards the asymptote b.
+    struct NlFit
+    {
+        double k = 0.0;
+        double b = 0.0;
+        bool valid = false;
+    };
+
+    // Per-operator overhead samples (p = instance count during the interval,
+    // r = ts/(ts+te)) and their fitted curves; the global fit pools all
+    // operators' samples as the cold-start fallback.
+    std::map<std::string, std::vector<std::pair<double, double>>> nlSamples;
+    std::map<std::string, NlFit> nlFits;
+    NlFit nlGlobalFit;
+    // Per-instance lifecycle averages at the last reschedule, and the
+    // parallelism each operator ran with since then (the p a new delta
+    // sample is tagged with).
+    std::map<std::string, faabric::planner::InstanceMetrics::Snapshot>
+      nlLastSnap;
+    std::map<std::string, int> nlLastParallelism;
+
+    // Ingest fresh lifecycle snapshots: derive each operator's interval
+    // overhead ratio via count-weighted snapshot deltas, append samples and
+    // refit the curves.
+    void nlCollectSamples(
+      const std::map<std::string, faabric::planner::InstanceMetrics::Snapshot>&
+        snaps);
+
+    static NlFit nlFitCurve(const std::vector<std::pair<double, double>>& samples,
+                            int minSamples);
+
+    // Predicted overhead ratio for `op` at parallelism p; falls back to the
+    // global curve, then to 0 (pure linear model) when nothing is fitted yet.
+    double nlPredictR(const std::string& op, double p) const;
+
+    // Paper's Algorithm 1: place n_o instances per operator (in the given
+    // topological order, upstream first) onto hosts by
+    // Score = ws·Data + wb·Balance, capped by host slots. Returns
+    // op -> host -> instance count.
+    std::map<std::string, std::map<std::string, int>> softAffinityPlace(
+      const HostMap& hostMap,
+      const std::vector<std::pair<std::string, int>>& orderedTargets);
+
+    // Shared commit tail used by rescheduleAppBinpack and
+    // rescheduleAppNonlinear.
+    void commitGroupAllocations(
+      const std::vector<NodeGroup>& groups,
+      const std::vector<std::map<std::string, double>>& groupAllocations);
 
     // hostAssign Counter is used when assign states to the hosts.
     std::atomic<unsigned int> stateRbCounter{ 0 };

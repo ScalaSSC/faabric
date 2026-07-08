@@ -239,6 +239,21 @@ class Planner
     // absorbs the prediction error and short-term bursts.
     double workerLoadHeadroom = 0.9;
 
+    // Absolute tolerance (req/s) of the capacity Binpack saturation binary
+    // search (StateAwareScheduler::groupNodesCapacity). Pushed to the
+    // scheduler via resetParameter("capacity_search_tol").
+    double capacitySearchTol = 100.0;
+
+    // Soft-affinity score weights for schedule mode 4
+    // (Score = ws·Data + wb·Balance). Pushed to the scheduler via
+    // resetParameter("soft_affinity_ws" / "soft_affinity_wb").
+    double softAffinityWs = 0.5;
+    double softAffinityWb = 0.5;
+
+    // Minimum samples before the mode-4 non-linear overhead curve r(p) is
+    // trusted. Pushed via resetParameter("nl_min_fit_samples").
+    int nlMinFitSamples = 3;
+
     int computeTargetHostNum(
       const faabric::planner::ApplicationMetrics::ScalingSignals& signals,
       int currentHostNum,
