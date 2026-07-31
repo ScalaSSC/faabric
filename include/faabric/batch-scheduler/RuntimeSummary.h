@@ -106,6 +106,11 @@ struct ScheduledOperator
     // Idx -> IP distribution. (only for partitioned stateful operators)
     std::map<int, std::string> parallelismDist;
     enum LocalStatelessOperatorType localType = UNKNOWN;
+    // Only used for stateless operators. True if both the direct
+    // predecessor and direct successor are partitioned-stateful operators
+    // in the same group, i.e. this operator's collocate host is pinned by
+    // the partition key on both sides and should never be runtime-tuned.
+    bool isSandwichedByPartitioned = false;
 };
 
 static const char* localNodeTypeToString(NodeType t)

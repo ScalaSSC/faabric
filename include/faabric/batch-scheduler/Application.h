@@ -68,6 +68,10 @@ class Node
     std::set<std::string> inputFeilds;
     std::string partitionBy;
     long processedTuples = 0;
+    // Average execution time (us) of a single request on this operator in
+    // the last window. Defaults to 1.0 so workload estimation is unaffected
+    // until real metrics are observed.
+    double avgExecTime = 1.0;
     // Used for rescheduling. It the records the metrics in the last window.
     double preWorkload = 0;
     double reqResource = 0;

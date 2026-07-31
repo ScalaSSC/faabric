@@ -851,9 +851,11 @@ void Planner::rescheduleApp(int rescheduleMode)
     // Fetch the workload from metrics at first.
     auto operatorWorkloadMap = state.applicationMetrics->getOptWorkloads();
     auto edgeWeightMap = state.applicationMetrics->getEdgeWeightMap();
+    auto operatorExecTimeMap = state.applicationMetrics->getOptExecTimes();
 
     // Update the processed tuples.
-    stateAwareScheduler->updateApp(operatorWorkloadMap, edgeWeightMap);
+    stateAwareScheduler->updateApp(
+      operatorWorkloadMap, edgeWeightMap, operatorExecTimeMap);
     stateAwareScheduler->rescheduleApp(state.batchSchedHostMap);
     SPDLOG_INFO("Planner reschedules application done");
 

@@ -389,7 +389,15 @@ std::string StateAwareScheduler::scheduleStatelessMessageApportion(
             throw std::runtime_error("StateHost is not initialized");
         }
         std::string collocateHost = stateHost[collocateUserFuncPar];
-        host = runtimeSummary.getHost(userFuncPar, collocateHost);
+
+        if (shceduledOperator.isSandwichedByPartitioned) {
+            // Both neighbours are partitioned-stateful operators in the
+            // same group, so the collocate host is pinned by the partition
+            // key on both sides. Skip runtime tuning and always use it.
+            host = collocateHost;
+        } else {
+            host = runtimeSummary.getHost(userFuncPar, collocateHost);
+        }
     } else {
         // Otherwise the request by using round robin.
         auto localCounter = getNextCounter(userFunc);
@@ -639,7 +647,8 @@ StateAwareScheduler::getStateInfo()
 
 void StateAwareScheduler::updateApp(
   const std::map<std::string, long>& nodeWorkloads,
-  const std::map<std::string, std::map<std::string, int>> edgeWeightMap)
+  const std::map<std::string, std::map<std::string, int>> edgeWeightMap,
+  const std::map<std::string, double>& nodeExecTimes)
 {
     if (!application) {
         SPDLOG_WARN("Scheduler: No application registered");
@@ -656,6 +665,18 @@ void StateAwareScheduler::updateApp(
         SPDLOG_DEBUG("Scheduler: Node {} processed {} tuples",
                      nodeName,
                      application->getNodes().at(nodeName)->processedTuples);
+    }
+
+    for (const auto& [nodeName, execTime] : nodeExecTimes) {
+        if (!application->getNodes().contains(nodeName)) {
+            SPDLOG_WARN("Scheduler: Node {} not found in the application",
+                        nodeName);
+            continue;
+        }
+        application->getNodes().at(nodeName)->avgExecTime = execTime;
+        SPDLOG_DEBUG("Scheduler: Node {} avg exec time {}",
+                     nodeName,
+                     application->getNodes().at(nodeName)->avgExecTime);
     }
 
     application->updateConnectionsWithWeight(edgeWeightMap);
@@ -923,6 +944,20 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
   const
 {
     std::map<std::string, ScheduledOperator> scheduledOperatorsGroup;
+
+    std::unordered_set<std::string> groupNodeNames;
+    for (const auto& node : group) {
+        groupNodeNames.insert(node->name);
+    }
+    // True if `name` is a partitioned-stateful operator that belongs to
+    // this same group.
+    auto isPartitionedStatefulInGroup = [&](const std::string& name) {
+        if (!groupNodeNames.contains(name)) {
+            return false;
+        }
+        return application->getNodes().at(name)->type == PARTITIONED_STATEFUL;
+    };
+
     // If the source of the group is not in the same group, it is the head.
     for (const auto& node : group) {
         // Initialize the information.
@@ -998,6 +1033,30 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
                                      weightDist,
                                      parallelismDist,
                                      LocalStatelessOperatorType::UNKNOWN);
+
+        if (type == STATELESS) {
+            bool hasPartitionedSource = false;
+            for (const auto& srcNode : application->getSource(userFunction)) {
+                if (isPartitionedStatefulInGroup(srcNode->name)) {
+                    hasPartitionedSource = true;
+                    break;
+                }
+            }
+
+            bool hasPartitionedSuccessor = false;
+            auto connIt = application->getConnections().find(userFunction);
+            if (connIt != application->getConnections().end()) {
+                for (const auto& succName : connIt->second) {
+                    if (isPartitionedStatefulInGroup(succName)) {
+                        hasPartitionedSuccessor = true;
+                        break;
+                    }
+                }
+            }
+
+            sop.isSandwichedByPartitioned =
+              hasPartitionedSource && hasPartitionedSuccessor;
+        }
 
         scheduledOperatorsGroup.emplace(node->name, sop);
     }

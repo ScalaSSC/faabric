@@ -92,6 +92,7 @@ void serializeScheduledOperatorMap(
         }
 
         pbOp->set_local_type(toProto(op.localType));
+        pbOp->set_is_sandwiched_by_partitioned(op.isSandwichedByPartitioned);
     }
 }
 
@@ -126,6 +127,7 @@ parseScheduledOperatorMap(const faabric::planner::SyncStatesInfoRequest& req)
           {},
           {},
           batch_scheduler::fromProto(pbOp.local_type()));
+        sop.isSandwichedByPartitioned = pbOp.is_sandwiched_by_partitioned();
 
         // copy the maps back
         for (auto const& entry : pbOp.weight_dist()) {

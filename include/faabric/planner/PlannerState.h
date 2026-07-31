@@ -33,6 +33,12 @@ class InstanceMetrics
         return count;
     }
 
+    double getAvgWorkerExecuteTime() const
+    {
+        faabric::util::FullLock lock(instMx);
+        return avgWorkerExecuteTime;
+    }
+
     void record(const std::shared_ptr<faabric::Message>& msg)
     {
         faabric::util::FullLock lock(instMx);
@@ -315,6 +321,34 @@ class ApplicationMetrics
     {
         faabric::util::FullLock lock(opMx);
         return edgeWeightMap;
+    }
+
+    // Average execution time (us) per operator, aggregated across all its
+    // parallel instances and weighted by each instance's request count.
+    std::map<std::string, double> getOptExecTimes()
+    {
+        faabric::util::FullLock lock(opMx);
+
+        std::map<std::string, double> weightedSum;
+        std::map<std::string, long> weightTotal;
+
+        for (const auto& [instName, instancePtr] : instances) {
+            auto userFuncParTuple = util::splitUserFuncPar(instName);
+            std::string funcName = std::get<0>(userFuncParTuple) + "_" +
+                                   std::get<1>(userFuncParTuple);
+            long cnt = instancePtr->getCount();
+            weightedSum[funcName] +=
+              instancePtr->getAvgWorkerExecuteTime() * static_cast<double>(cnt);
+            weightTotal[funcName] += cnt;
+        }
+
+        std::map<std::string, double> operatorExecTimeMap;
+        for (const auto& [funcName, total] : weightedSum) {
+            long w = weightTotal[funcName];
+            operatorExecTimeMap[funcName] = (w > 0) ? total / w : 0.0;
+        }
+
+        return operatorExecTimeMap;
     }
 
     rapidjson::Document getMetrics() const

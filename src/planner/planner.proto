@@ -169,6 +169,7 @@ message ScheduledOperator {
   map<string, double> weight_dist = 6;
   map<int32, string> parallelism_dist = 7;
   LocalStatelessOperatorType local_type = 8;
+  bool is_sandwiched_by_partitioned = 9;
 }
 
 message SyncStatesInfoRequest {

@@ -1,5 +1,6 @@
 #include <faabric/batch-scheduler/Application.h>
 #include <faabric/util/logging.h>
+#include <algorithm>
 #include <sstream>
 namespace faabric::batch_scheduler {
 std::string nodeTypeToString(NodeType type)
@@ -189,6 +190,13 @@ double Application::computePreWorkloads(int scheduleMode)
     double totalPreWorkload = 0;
     for (auto& [nodeName, node] : nodes) {
         double estimateWork = static_cast<double>(node->processedTuples);
+
+        // Binpack mode: weigh by processed requests *and* how expensive
+        // each request is to execute, not just the raw request count.
+        if (scheduleMode == 0) {
+            estimateWork *= node->avgExecTime;
+        }
+
         if (scheduleMode != 0 && scheduleMode != 3 && scheduleMode != 7 &&
             connectionsWithWeight.count(nodeName) > 0) {
             for (const auto& [_, weight] : connectionsWithWeight.at(nodeName)) {
@@ -230,14 +238,30 @@ void Application::dfsVisit(const std::string& nodeName,
 
     orderedNodes.push_back({ nodeName, nodeIt->second });
 
-    // 3. Find successors (this part is unchanged)
+    // 3. Find successors
     const auto& allConnections = getConnections();
     auto connIt = allConnections.find(nodeName);
 
     if (connIt != allConnections.end()) {
-        const std::vector<std::string>& successors = connIt->second;
+        std::vector<std::string> successors = connIt->second;
 
-        // 4. Recurse for each successor (this part is unchanged)
+        // Visit the successor reached by the heaviest edge (most chained
+        // requests) first.
+        auto weightIt = connectionsWithWeight.find(nodeName);
+        if (weightIt != connectionsWithWeight.end()) {
+            const auto& weights = weightIt->second;
+            std::sort(successors.begin(),
+                      successors.end(),
+                      [&weights](const std::string& a, const std::string& b) {
+                          auto itA = weights.find(a);
+                          auto itB = weights.find(b);
+                          int wa = itA != weights.end() ? itA->second : 0;
+                          int wb = itB != weights.end() ? itB->second : 0;
+                          return wa > wb;
+                      });
+        }
+
+        // 4. Recurse for each successor, heaviest edge first.
         for (const std::string& successorName : successors) {
             if (visited.find(successorName) == visited.end()) {
                 dfsVisit(successorName, visited, orderedNodes);
