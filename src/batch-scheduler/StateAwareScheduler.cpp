@@ -783,7 +783,27 @@ void StateAwareScheduler::groupNodesStrictHelper(
         // Find all successors
         auto connIt = application->getConnections().find(current);
         if (connIt != application->getConnections().end()) {
-            for (const auto& succName : connIt->second) {
+            std::vector<std::string> successors = connIt->second;
+
+            // Explore the heaviest (most chained-requests) edge first. This
+            // is a stack, so we sort ascending: the heaviest successor is
+            // pushed last, ends up on top, and is popped (explored) first.
+            if (scheduleMode == 5) {
+                const auto& weights =
+                  application->getOutgoingWeights(current);
+                std::sort(
+                  successors.begin(),
+                  successors.end(),
+                  [&weights](const std::string& a, const std::string& b) {
+                      auto itA = weights.find(a);
+                      auto itB = weights.find(b);
+                      int wa = itA != weights.end() ? itA->second : 0;
+                      int wb = itB != weights.end() ? itB->second : 0;
+                      return wa < wb;
+                  });
+            }
+
+            for (const auto& succName : successors) {
                 auto succ = application->getNodes().at(succName);
                 bool canJoin = false;
 
@@ -1092,7 +1112,7 @@ void StateAwareScheduler::rescheduleApp(const HostMap& hostMap)
     }
 
     // TODO - scale the number of hosts.
-    application->quantiseResources(hostMap.size(), scheduleMode);
+    application->quantiseResources(hostMap.size(), scheduleMode, alphaWeight);
     application->showConnections();
 
     if (scheduleMode == 3 || scheduleMode == 7) {
@@ -2114,6 +2134,12 @@ void StateAwareScheduler::setRuntimeReconfig(bool value)
 void StateAwareScheduler::setAlpha(double value)
 {
     runtimeSummary.setAlpha(value);
+}
+
+void StateAwareScheduler::setAlphaWeight(double value)
+{
+    SPDLOG_INFO("Scheduler: alpha weight set to {}", value);
+    alphaWeight = value;
 }
 
 void StateAwareScheduler::resetScheduler()

@@ -1,6 +1,6 @@
+#include <algorithm>
 #include <faabric/batch-scheduler/Application.h>
 #include <faabric/util/logging.h>
-#include <algorithm>
 #include <sstream>
 namespace faabric::batch_scheduler {
 std::string nodeTypeToString(NodeType type)
@@ -115,6 +115,14 @@ std::vector<Connection> Application::getConnectionsWithWeight()
     return result;
 }
 
+const std::map<std::string, int>& Application::getOutgoingWeights(
+  const std::string& nodeName) const
+{
+    static const std::map<std::string, int> empty;
+    auto it = connectionsWithWeight.find(nodeName);
+    return it != connectionsWithWeight.end() ? it->second : empty;
+}
+
 void Application::addConnection(const std::string& src, const std::string& dest)
 {
     connections[src].push_back(dest);
@@ -167,7 +175,7 @@ void Application::displayApplication() const
     SPDLOG_INFO("{}", logStream.str());
 }
 
-double Application::computePreWorkloads(int scheduleMode)
+double Application::computePreWorkloads(int scheduleMode, double alphaWeight)
 {
     // Get the minimum processed tuples operator in the application.
     long minimizedInput = std::numeric_limits<long>::max();
@@ -191,19 +199,21 @@ double Application::computePreWorkloads(int scheduleMode)
     for (auto& [nodeName, node] : nodes) {
         double estimateWork = static_cast<double>(node->processedTuples);
 
-        // Binpack mode: weigh by processed requests *and* how expensive
-        // each request is to execute, not just the raw request count.
-        if (scheduleMode == 0) {
-            estimateWork *= node->avgExecTime;
+        // LcSched: weigh by processed requests *and* how expensive each request
+        // is to execute, not just the raw request count. avgExecTime is in
+        // us; convert to ms so this stays comparable in scale to the edge
+        // weight correction below (otherwise it swamps that term).
+        if (scheduleMode == 5) {
+            estimateWork *= node->avgExecTime / 1000.0;
         }
 
         if (scheduleMode != 0 && scheduleMode != 3 && scheduleMode != 7 &&
             connectionsWithWeight.count(nodeName) > 0) {
             for (const auto& [_, weight] : connectionsWithWeight.at(nodeName)) {
                 if (minimizedInput == 1) {
-                    estimateWork += 0.1;
+                    estimateWork += alphaWeight;
                 } else {
-                    estimateWork += 0.1 * static_cast<double>(weight);
+                    estimateWork += alphaWeight * static_cast<double>(weight);
                 }
             }
         }
@@ -305,9 +315,11 @@ Application::NodeList Application::getNodesDFSOrder()
     return orderedNodes;
 }
 
-void Application::quantiseResources(const int numHosts, int scheduleMode)
+void Application::quantiseResources(const int numHosts,
+                                    int scheduleMode,
+                                    double alphaWeight)
 {
-    double totalPreWorkload = computePreWorkloads(scheduleMode);
+    double totalPreWorkload = computePreWorkloads(scheduleMode, alphaWeight);
 
     // Update the resource required for each operator (number of workers).
     auto& appNodes = nodes;

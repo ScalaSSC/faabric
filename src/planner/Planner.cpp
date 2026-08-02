@@ -812,6 +812,12 @@ bool Planner::resetParameter(const std::string& key,
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
         stateAwareScheduler->setAlpha(newAlpha);
     }
+    if (key == "alpha_weight") {
+        double newAlphaWeight = value / 1000.0;
+        SPDLOG_INFO("Alpha weight is set to {}", newAlphaWeight);
+        stateAwareScheduler->setAlphaWeight(newAlphaWeight);
+        return true;
+    }
 
     // Reset the parameter of the worker hosts
     auto availableHosts = getAvailableHosts(true);

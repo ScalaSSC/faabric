@@ -192,6 +192,10 @@ class StateAwareScheduler : public BatchScheduler
 
     void setAlpha(double value);
 
+    // Weight given to the edge (chained-request) correction term in
+    // computePreWorkloads, e.g. LcSched (scheduleMode 5). Default 0.1.
+    void setAlphaWeight(double value);
+
     void updateWorkerQueueSizes(const std::map<std::string, int>& sizes);
 
     std::map<std::string, int> getWorkerQueueSizes() const;
@@ -208,6 +212,11 @@ class StateAwareScheduler : public BatchScheduler
 
     bool isplanner = true;
     int scheduleMode = 0;
+
+    // Weight of the edge (chained-request) correction term used in
+    // Application::computePreWorkloads. Settable via the planner's
+    // "alpha_weight" parameter. Default 0.1.
+    double alphaWeight = 0.1;
 
     // hostAssign Counter is used when assign states to the hosts.
     std::atomic<unsigned int> stateRbCounter{ 0 };

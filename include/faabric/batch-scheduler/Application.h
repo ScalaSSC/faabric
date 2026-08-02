@@ -111,9 +111,13 @@ class Application
     void addConnection(const std::string& src, const std::string& dest);
     void buildInvertConnections();
     void displayApplication() const;
-    double computePreWorkloads(int scheduleMode); // return total workload
+    // return total workload. alphaWeight scales the edge (chained-request)
+    // correction term.
+    double computePreWorkloads(int scheduleMode, double alphaWeight = 0.1);
     // TODO - Now we only support homogenous cluster.
-    void quantiseResources(const int numHosts, int scheduleMode);
+    void quantiseResources(const int numHosts,
+                           int scheduleMode,
+                           double alphaWeight = 0.1);
 
     std::vector<std::shared_ptr<Node>> getSource(const std::string& node) const;
 
@@ -143,6 +147,12 @@ class Application
       const ConnectionInfoWithWeight& newConnectionsWithWeight);
 
     std::vector<Connection> getConnectionsWithWeight();
+
+    // Outgoing edge weights (chained-request rate) for a single node, keyed
+    // by successor name. Returns an empty map if the node has no weighted
+    // outgoing connections.
+    const std::map<std::string, int>& getOutgoingWeights(
+      const std::string& nodeName) const;
 
     const void showConnections() const
     {
