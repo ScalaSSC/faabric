@@ -169,6 +169,10 @@ message ScheduledOperator {
   map<string, double> weight_dist = 6;
   map<int32, string> parallelism_dist = 7;
   LocalStatelessOperatorType local_type = 8;
+  // Absolute executor budget per host, computed by the planner (Binpack mode
+  // 0 only). When present, the worker uses these counts verbatim instead of
+  // deriving replica counts from weight_dist * maxExecutors.
+  map<string, int32> executor_dist = 9;
 }
 
 message SyncStatesInfoRequest {

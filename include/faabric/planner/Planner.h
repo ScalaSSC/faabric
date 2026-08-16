@@ -244,6 +244,11 @@ class Planner
     // scheduler via resetParameter("capacity_search_tol").
     double capacitySearchTol = 100.0;
 
+    // Per-round growth ceiling of the Binpack executor budget, as a multiple
+    // of the executors currently running. Pushed to the scheduler via
+    // resetParameter("exec_budget_growth_cap").
+    double execBudgetGrowthCap = 2.0;
+
     // Soft-affinity score weights for schedule mode 4
     // (Score = ws·Data + wb·Balance). Pushed to the scheduler via
     // resetParameter("soft_affinity_ws" / "soft_affinity_wb").
@@ -258,6 +263,12 @@ class Planner
     // resetParameter("max_executors") passes through on its way to the
     // workers. 0 = not configured;
     int maxExecutorsPerWorker = 0;
+
+    // CLAST-placement hybrid for schedule modes 3 and 4: keep only their
+    // worker-count estimate and place the operators with the mode-0 (CLAST)
+    // capacity packer. Pushed to the scheduler via
+    // resetParameter("clast_placement"). Ignored by every other schedule mode.
+    bool isClastPlacement = false;
 
     int computeTargetHostNum(
       const faabric::planner::ApplicationMetrics::ScalingSignals& signals,

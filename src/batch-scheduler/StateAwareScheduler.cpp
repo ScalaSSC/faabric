@@ -1024,6 +1024,12 @@ void StateAwareScheduler::scheduleApp(const HostMap& hostMap)
     application->quantiseResources(hostMap.size(), scheduleMode);
     application->showConnections();
 
+    if (isClastPlacement && (scheduleMode == 3 || scheduleMode == 4)) {
+        application->quantiseResources(hostMap.size(), 0);
+        rescheduleAppBinpack(hostMap);
+        return;
+    }
+
     if (scheduleMode == 3 || scheduleMode == 7) {
         rescheduleAppFaaSFlow(hostMap);
         return;
@@ -1352,14 +1358,24 @@ void StateAwareScheduler::rescheduleApp(
     if (haveSignals) {
         signals = metrics->getScalingSignals(kChainedCostWindowSec);
     }
+    // The CLAST-placement hybrid lays modes 3/4 out with the mode-0 packer, so
+    // it needs the mode-0 chained-call pricing too.
+    bool clastPlacement =
+      isClastPlacement && (scheduleMode == 3 || scheduleMode == 4);
     double chainedCostCoeff = 0.0;
-    if (scheduleMode == 0 && haveSignals) {
+    if ((scheduleMode == 0 || clastPlacement) && haveSignals) {
         chainedCostCoeff = computeChainedCostCoeff(signals);
     }
 
     // TODO - scale the number of hosts.
     application->quantiseResources(hostMap.size(), scheduleMode, chainedCostCoeff);
     application->showConnections();
+
+    if (clastPlacement) {
+        rescheduleAppClastPlacement(
+          hostMap, metrics, haveSignals ? &signals : nullptr, chainedCostCoeff);
+        return;
+    }
 
     if (scheduleMode == 7) {
         rescheduleAppFaaSFlow(hostMap);
@@ -1377,7 +1393,8 @@ void StateAwareScheduler::rescheduleApp(
     }
 
     if (scheduleMode == 0) {
-        rescheduleAppBinpack(hostMap, haveSignals ? &signals : nullptr);
+        rescheduleAppBinpack(
+          hostMap, haveSignals ? &signals : nullptr, metrics);
         return;
     }
 
@@ -2871,7 +2888,8 @@ double StateAwareScheduler::computeChainedCostCoeff(
 
 void StateAwareScheduler::rescheduleAppBinpack(
   const HostMap& hostMap,
-  const faabric::planner::ApplicationMetrics::ScalingSignals* signals)
+  const faabric::planner::ApplicationMetrics::ScalingSignals* signals,
+  const faabric::planner::ApplicationMetrics* metrics)
 {
     SPDLOG_INFO("Rescheduling the application in Binpack Mode");
     // 1. Map and assign operators to hosts.
@@ -2885,13 +2903,181 @@ void StateAwareScheduler::rescheduleAppBinpack(
                   : groupNodesTopo(hostMap);
 
     commitGroupAllocations(groups, groupAllocations);
+    if (signals != nullptr && scheduleMode == 0) {
+        applyExecutorDist(*signals, metrics);
+    }
 }
 
-// Shared commit tail for full-replan modes (Binpack mode 0 and Non-linear
-// mode 4): takes per-operator groups plus per-host allocation fractions and
-// rebuilds the whole schedule state (state hosts, parallelism, request
-// weights, IP remapping to minimise migration, scheduledOperatorsMap, redis
-// registration and hash rings).
+std::map<std::string, double> StateAwareScheduler::perOperatorExecTime(
+  const faabric::planner::ApplicationMetrics* metrics) const
+{
+    std::map<std::string, double> execTime;
+    if (metrics == nullptr) {
+        return execTime;
+    }
+
+    // snapshot() carries a running average and a cumulative count per
+    // instance, so folding parallelism instances back into their operator is a
+    // count-weighted mean.
+    std::map<std::string, double> weightedSum;
+    std::map<std::string, long> counts;
+    for (const auto& [instanceName, snap] :
+         metrics->getInstanceLifecycleSnapshots()) {
+        if (snap.count <= 0 || snap.workerExecTime <= 0.0) {
+            continue;
+        }
+        std::string opName;
+        try {
+            auto parts = faabric::util::splitUserFuncPar(instanceName);
+            opName = std::get<0>(parts) + "_" + std::get<1>(parts);
+        } catch (const std::invalid_argument&) {
+            SPDLOG_WARN("Executor budget: cannot parse instance name {}",
+                        instanceName);
+            continue;
+        }
+        weightedSum[opName] += snap.workerExecTime * (double)snap.count;
+        counts[opName] += snap.count;
+    }
+
+    for (const auto& [opName, sum] : weightedSum) {
+        long n = counts.at(opName);
+        if (n > 0) {
+            execTime[opName] = sum / (double)n;
+        }
+    }
+    return execTime;
+}
+
+void StateAwareScheduler::applyExecutorDist(
+  const faabric::planner::ApplicationMetrics::ScalingSignals& sig,
+  const faabric::planner::ApplicationMetrics* metrics)
+{
+    // --- 1. Cluster-wide budget -------------------------------------------
+    // E_new = E_old * (inputRate / throughput). The ratio is the calibration:
+    // E_old executors sustained `throughput` req/s, so serving `inputRate`
+    // req/s needs that many times more. When input and throughput match the
+    // budget holds steady.
+    if (sig.avgTotalExecutors <= 0.0 || sig.avgThroughput <= 0.0 ||
+        sig.avgInputRate <= 0.0) {
+        SPDLOG_DEBUG("Executor budget: signals not usable yet (executors={:.1f}"
+                     ", throughput={:.1f}, inputRate={:.1f}); leaving "
+                     "executorDist empty",
+                     sig.avgTotalExecutors,
+                     sig.avgThroughput,
+                     sig.avgInputRate);
+        return;
+    }
+
+    double totalExecutors =
+      sig.avgTotalExecutors * (sig.avgInputRate / sig.avgThroughput);
+    double growthCeiling = sig.avgTotalExecutors * execBudgetGrowthCap;
+    if (totalExecutors > growthCeiling) {
+        SPDLOG_WARN("Executor budget: {:.1f} capped to {:.1f} by the growth cap"
+                    " ({:.1f}x of {:.1f} running)",
+                    totalExecutors,
+                    growthCeiling,
+                    execBudgetGrowthCap,
+                    sig.avgTotalExecutors);
+        totalExecutors = growthCeiling;
+    }
+
+    // --- 2. Split across operators by CPU demand --------------------------
+    // demand_o = processedTuples_o * t_e,o. Only the ratio between operators
+    // matters, so both factors may stay in their raw cumulative units.
+    // reqResource is deliberately NOT used here: it is quantised to 0.1-worker
+    // steps and normalised to sum to numHosts, which discards exactly the
+    // magnitude information this split needs.
+    auto execTime = perOperatorExecTime(metrics);
+
+    std::map<std::string, double> demand;
+    double totalDemand = 0.0;
+    bool haveExecTime = !execTime.empty();
+    for (const auto& [name, sop] : scheduledOperatorsMap) {
+        double tuples = static_cast<double>(std::max<long>(
+          1, sop.node.processedTuples));
+        auto it = execTime.find(name);
+        if (haveExecTime && it == execTime.end()) {
+            // An operator with no completed request yet has no measured
+            // latency. Falling back to the cluster average for it alone keeps
+            // the split defined without dragging every other operator onto the
+            // average too.
+            demand[name] = tuples * std::max(1.0, sig.avgExecTime);
+        } else if (haveExecTime) {
+            demand[name] = tuples * it->second;
+        } else {
+            // No per-operator latency at all: degrade to the tuple-count-only
+            // weighting, i.e. the pre-existing behaviour.
+            demand[name] = tuples;
+        }
+        totalDemand += demand[name];
+    }
+    if (totalDemand <= 0.0) {
+        SPDLOG_WARN("Executor budget: total demand is 0, skipping");
+        return;
+    }
+    if (!haveExecTime) {
+        SPDLOG_WARN("Executor budget: no per-operator exec latency yet, "
+                    "splitting on processedTuples alone");
+    }
+
+    // --- 3. Split each operator across its workers by weightDist ----------
+    // weightDist is normalised per operator here because the two Binpack
+    // packers scale it differently: groupNodesTopo sums to reqResource (worker
+    // fractions) while groupNodesCapacity sums to 1 (traffic fractions). Only
+    // the relative split across hosts is meaningful either way.
+    int grandTotal = 0;
+    for (auto& [name, sop] : scheduledOperatorsMap) {
+        sop.executorDist.clear();
+
+        double opExecutors = totalExecutors * (demand.at(name) / totalDemand);
+
+        double weightSum = 0.0;
+        for (const auto& [ip, w] : sop.weightDist) {
+            weightSum += w;
+        }
+        if (weightSum <= 0.0 || opExecutors <= 0.0) {
+            // No placement (or no demand): give every host holding this
+            // operator a single executor so it stays runnable.
+            for (const auto& [ip, w] : sop.weightDist) {
+                sop.executorDist[ip] = 1;
+                grandTotal += 1;
+            }
+            continue;
+        }
+
+        for (const auto& [ip, w] : sop.weightDist) {
+            // Ceiling per the agreed rule: a host holding any share of an
+            // operator always gets at least one executor, and the cluster-wide
+            // total is allowed to overshoot the budget as a result.
+            int n = static_cast<int>(std::ceil(opExecutors * (w / weightSum)));
+            if (n < 1) {
+                n = 1;
+            }
+            sop.executorDist[ip] = n;
+            grandTotal += n;
+        }
+    }
+
+    SPDLOG_INFO("Executor budget: {:.1f} req/s in / {:.1f} req/s out over "
+                "{:.1f} executors -> budget {:.1f}, {} after per-worker ceiling",
+                sig.avgInputRate,
+                sig.avgThroughput,
+                sig.avgTotalExecutors,
+                totalExecutors,
+                grandTotal);
+
+    for ([[maybe_unused]] const auto& [name, sop] : scheduledOperatorsMap) {
+        SPDLOG_INFO("Executor budget: {} demand={:.0f} ({:.1f}% of total, "
+                    "tuples={}, execTime={:.1f}us) -> {}",
+                    name,
+                    demand.at(name),
+                    100.0 * demand.at(name) / totalDemand,
+                    sop.node.processedTuples,
+                    execTime.count(name) ? execTime.at(name) : 0.0,
+                    sop.executorDist);
+    }
+}
+
 void StateAwareScheduler::commitGroupAllocations(
   const std::vector<NodeGroup>& groups,
   const std::vector<std::map<std::string, double>>& groupAllocations)
@@ -3473,15 +3659,13 @@ StateAwareScheduler::softAffinityPlace(
     return placement;
 }
 
-void StateAwareScheduler::rescheduleAppNonlinear(
+StateAwareScheduler::NlSizing StateAwareScheduler::nlComputeSizing(
   const HostMap& hostMap,
   const faabric::planner::ApplicationMetrics* metrics)
 {
-    SPDLOG_INFO("Rescheduling the application in Non-linear AutoTuning mode "
-                "(mode 4)");
-    if (!application || hostMap.empty()) {
-        SPDLOG_WARN("Non-linear mode: no application or empty host map");
-        return;
+    NlSizing sizing;
+    if (!application) {
+        return sizing;
     }
 
     //--------------------------------------------------------------------------
@@ -3555,7 +3739,7 @@ void StateAwareScheduler::rescheduleAppNonlinear(
     //    executors, softAffinityPlace overcommits beyond each worker's
     //    capacity.
     //--------------------------------------------------------------------------
-    std::map<std::string, int> target;
+    std::map<std::string, int>& target = sizing.target;
     for (const auto& [name, node] : nodes) {
         long p = 1;
         if (warm) {
@@ -3586,16 +3770,38 @@ void StateAwareScheduler::rescheduleAppNonlinear(
         target[name] = static_cast<int>(std::max<long>(1, p));
     }
 
-    long planned = 0;
     for (const auto& [op, n] : target) {
-        planned += n;
+        sizing.plannedInstances += n;
     }
+    sizing.totalCapacity = totalCapacity;
+    return sizing;
+}
+
+void StateAwareScheduler::rescheduleAppNonlinear(
+  const HostMap& hostMap,
+  const faabric::planner::ApplicationMetrics* metrics)
+{
+    SPDLOG_INFO("Rescheduling the application in Non-linear AutoTuning mode "
+                "(mode 4)");
+    if (!application || hostMap.empty()) {
+        SPDLOG_WARN("Non-linear mode: no application or empty host map");
+        return;
+    }
+
+    //--------------------------------------------------------------------------
+    // 1-4. Refit r(p) and solve the per-operator instance demand.
+    //--------------------------------------------------------------------------
+    auto sizing = nlComputeSizing(hostMap, metrics);
+    const auto& target = sizing.target;
+    const long planned = sizing.plannedInstances;
+    const long totalCapacity = sizing.totalCapacity;
     bool saturated = planned > totalCapacity;
 
     //--------------------------------------------------------------------------
     // 5. Topological order (upstream first, so Data_N sees placed sources),
     //    then soft-affinity placement.
     //--------------------------------------------------------------------------
+    auto& nodes = application->getNodes();
     std::vector<std::pair<std::string, int>> orderedTargets;
     {
         std::set<std::string> vis;
@@ -4062,6 +4268,97 @@ void StateAwareScheduler::rescheduleAppFaaSFlowAdaptive(
     }
 
     printScheduleInfomation();
+}
+
+//--------------------------------------------------------------------------
+// CLAST-placement hybrid: worker count from mode 3 / 4, layout from mode 0.
+//--------------------------------------------------------------------------
+
+void StateAwareScheduler::rescheduleAppClastPlacement(
+  const HostMap& hostMap,
+  const faabric::planner::ApplicationMetrics* metrics,
+  const faabric::planner::ApplicationMetrics::ScalingSignals* signals,
+  double chainedCostCoeff)
+{
+    const int numHosts = static_cast<int>(hostMap.size());
+    if (!application || numHosts == 0) {
+        SPDLOG_WARN("CLAST placement: no application or empty host map");
+        return;
+    }
+
+    //--------------------------------------------------------------------------
+    // 1. Ask the base mode how many workers it thinks the application needs.
+    //    This is the ONLY thing taken from mode 3 / 4 here.
+    //--------------------------------------------------------------------------
+    int targetHosts = numHosts;
+    if (scheduleMode == 3) {
+        double avgInputRate = 0.0;
+        if (metrics != nullptr) {
+            avgInputRate = metrics->getScalingSignals(3).avgInputRate;
+            targetHosts =
+              metrics->computeAdaptiveHostCount(avgInputRate, numHosts);
+        }
+        SPDLOG_INFO("CLAST placement (mode 3 sizing): avgInputRate(3s)={:.1f} "
+                    "-> {} workers",
+                    avgInputRate,
+                    targetHosts);
+    } else if (scheduleMode == 4) {
+        // Same sizing rescheduleAppNonlinear runs on: Σ n*_o instances folded
+        // to a host count by the per-worker executor capacity (1 executor =
+        // 1 CPU). Running it here also keeps the r(p) fitting loop alive,
+        // since nlComputeSizing ingests this interval's overhead samples.
+        auto sizing = nlComputeSizing(hostMap, metrics);
+        double capPerHost = 0.0;
+        if (numHosts > 0 && sizing.totalCapacity > 0) {
+            capPerHost =
+              static_cast<double>(sizing.totalCapacity) / numHosts;
+        }
+        if (capPerHost > 0.0 && sizing.plannedInstances > 0) {
+            targetHosts = static_cast<int>(std::ceil(
+              static_cast<double>(sizing.plannedInstances) / capPerHost));
+        }
+        SPDLOG_INFO("CLAST placement (mode 4 sizing): {} instances / {:.1f} "
+                    "per worker -> {} workers",
+                    sizing.plannedInstances,
+                    capPerHost,
+                    targetHosts);
+        // Remember the parallelism the next sampling interval is tagged with,
+        // exactly as rescheduleAppNonlinear does.
+        nlLastParallelism = sizing.target;
+    }
+    targetHosts = std::clamp(targetHosts, 1, numHosts);
+
+    //--------------------------------------------------------------------------
+    // 2. Restrict the packer to that many workers. groupNodesCapacity opens
+    //    workers on demand and cannot be told "use N"; bounding its host set at
+    //    N makes its saturation binary search solve the dual problem instead —
+    //    the largest input rate whose placement fits in N workers — and place
+    //    the operators at that rate.
+    //--------------------------------------------------------------------------
+    HostMap limitedHostMap;
+    {
+        int cnt = 0;
+        for (const auto& [ip, host] : hostMap) {
+            if (cnt >= targetHosts) {
+                break;
+            }
+            limitedHostMap[ip] = host;
+            ++cnt;
+        }
+    }
+
+    // Re-quantise with the mode-0 weighting (chained calls priced by
+    // chainedCostCoeff) over the restricted worker set: rescheduleApp()
+    // quantised for the base mode and the full host map.
+    application->quantiseResources(
+      limitedHostMap.size(), 0, chainedCostCoeff);
+
+    SPDLOG_INFO("CLAST placement: laying out the application on {}/{} workers "
+                "with the mode-0 capacity packer",
+                limitedHostMap.size(),
+                numHosts);
+
+    rescheduleAppBinpack(limitedHostMap, signals);
 }
 
 void StateAwareScheduler::rescheduleAppStepConf(const HostMap& hostMap)

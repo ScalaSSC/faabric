@@ -90,6 +90,10 @@ void serializeScheduledOperatorMap(
         for (auto const& [idx, ip] : op.parallelismDist) {
             (*pbOp->mutable_parallelism_dist())[idx] = ip;
         }
+        // executorDist (Binpack mode 0 only; empty otherwise)
+        for (auto const& [ip, n] : op.executorDist) {
+            (*pbOp->mutable_executor_dist())[ip] = n;
+        }
 
         pbOp->set_local_type(toProto(op.localType));
     }
@@ -133,6 +137,9 @@ parseScheduledOperatorMap(const faabric::planner::SyncStatesInfoRequest& req)
         }
         for (auto const& entry : pbOp.parallelism_dist()) {
             sop.parallelismDist[entry.first] = entry.second;
+        }
+        for (auto const& entry : pbOp.executor_dist()) {
+            sop.executorDist[entry.first] = entry.second;
         }
 
         // use the same key as your original map

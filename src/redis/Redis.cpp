@@ -558,6 +558,117 @@ bool Redis::setnxex(const std::string& key, long value, int expirySeconds)
     return success;
 }
 
+
+static constexpr int STATE_LOCK_TIMEOUT_SECS = 1;
+
+std::vector<uint8_t> Redis::getAndLock(const std::string& key)
+{
+    std::string lockKey = key + "_lock";
+    uint32_t lockId = faabric::util::generateGid();
+    while (!this->setnxex(lockKey, lockId, STATE_LOCK_TIMEOUT_SECS)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    lockOwners[key] = lockId;
+
+    return this->get(key);
+}
+
+void Redis::setAndUnlock(const std::string& key,
+                         const std::vector<uint8_t>& value)
+{
+    this->set(key, value);
+
+    auto it = lockOwners.find(key);
+    if (it != lockOwners.end()) {
+        this->delIfEq(key + "_lock", it->second);
+        lockOwners.erase(it);
+    } else {
+        this->del(key + "_lock");
+    }
+}
+
+std::map<std::string, std::vector<uint8_t>> Redis::getAndLockMulti(
+  const std::set<std::string>& keys)
+{
+    std::map<std::string, std::vector<uint8_t>> result;
+    if (keys.empty()) {
+        return result;
+    }
+
+    std::map<std::string, uint32_t> lockIds;
+    for (const auto& key : keys) {
+        uint32_t lockId = faabric::util::generateGid();
+        lockIds[key] = lockId;
+        redisAppendCommand(context,
+                           "SET %s_lock %i EX %i NX",
+                           key.c_str(),
+                           lockId,
+                           STATE_LOCK_TIMEOUT_SECS);
+    }
+
+    std::vector<std::string> lockedKeys;
+    for (const auto& key : keys) {
+        void* rawReply = nullptr;
+        redisGetReply(context, &rawReply);
+        auto reply = wrapReply((redisReply*)rawReply);
+        if (reply != nullptr && reply->type != REDIS_REPLY_NIL) {
+            lockedKeys.push_back(key);
+            lockOwners[key] = lockIds[key];
+        }
+    }
+
+    if (lockedKeys.empty()) {
+        return result;
+    }
+
+    for (const auto& key : lockedKeys) {
+        redisAppendCommand(context, "GET %s", key.c_str());
+    }
+
+    for (const auto& key : lockedKeys) {
+        void* rawReply = nullptr;
+        redisGetReply(context, &rawReply);
+        auto reply = wrapReply((redisReply*)rawReply);
+
+        std::vector<uint8_t> value;
+        if (reply != nullptr && reply->type != REDIS_REPLY_NIL) {
+            value = getBytesFromReply(*reply);
+        }
+        result.emplace(key, std::move(value));
+    }
+
+    return result;
+}
+
+void Redis::setAndUnlockMulti(
+  const std::map<std::string, std::vector<uint8_t>>& values)
+{
+    if (values.empty()) {
+        return;
+    }
+
+    for (const auto& [key, value] : values) {
+        redisAppendCommand(
+          context, "SET %s %b", key.c_str(), value.data(), value.size());
+    }
+    flushPipeline((long)values.size());
+
+    for (const auto& [key, value] : values) {
+        auto it = lockOwners.find(key);
+        if (it != lockOwners.end()) {
+            redisAppendCommand(context,
+                               "EVALSHA %s 1 %s_lock %i",
+                               instance.delifeqSha.c_str(),
+                               key.c_str(),
+                               it->second);
+            lockOwners.erase(it);
+        } else {
+            redisAppendCommand(context, "DEL %s_lock", key.c_str());
+        }
+    }
+    flushPipeline((long)values.size());
+}
+
 long Redis::getLong(const std::string& key)
 {
     auto reply = safeRedisCommand(context, "GET %s", key.c_str());

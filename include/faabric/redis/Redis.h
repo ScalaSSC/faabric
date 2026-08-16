@@ -4,6 +4,7 @@
 #include <faabric/util/exception.h>
 
 #include <hiredis/hiredis.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -173,6 +174,18 @@ class Redis
 
     bool setnxex(const std::string& key, long value, int expirySeconds);
 
+    std::vector<uint8_t> getAndLock(const std::string& key);
+
+    void setAndUnlock(const std::string& key, const std::vector<uint8_t>& value);
+
+    // Non-blocking multi-key variants: keys already locked by someone else
+    // are silently skipped rather than waited on.
+    std::map<std::string, std::vector<uint8_t>> getAndLockMulti(
+      const std::set<std::string>& keys);
+
+    void setAndUnlockMulti(
+      const std::map<std::string, std::vector<uint8_t>>& values);
+
     long getLong(const std::string& key);
 
     void setLong(const std::string& key, long value);
@@ -216,6 +229,8 @@ class Redis
     redisContext* context;
 
     const RedisInstance& instance;
+
+    std::map<std::string, uint32_t> lockOwners;
 
     UniqueRedisReply dequeueBase(const std::string& queueName, int timeout);
 };

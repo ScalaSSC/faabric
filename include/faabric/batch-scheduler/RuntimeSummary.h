@@ -105,6 +105,10 @@ struct ScheduledOperator
     std::map<std::string, double> weightDist;
     // Idx -> IP distribution. (only for partitioned stateful operators)
     std::map<int, std::string> parallelismDist;
+    // IP -> absolute executor budget for this operator on that host. Only
+    // filled in by the Binpack scheduler (mode 0); when empty the worker falls
+    // back to deriving replicas from weightDist * maxExecutors.
+    std::map<std::string, int> executorDist;
     enum LocalStatelessOperatorType localType = UNKNOWN;
 };
 

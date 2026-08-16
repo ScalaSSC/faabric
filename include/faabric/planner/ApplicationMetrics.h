@@ -11,7 +11,9 @@
 #include <faabric/util/logging.h>
 #include <faabric/util/string_tools.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -127,6 +129,14 @@ class ApplicationMetrics
             int latencyMs = static_cast<int>(tempTotalLatencyMicro / 1000);
             int binIdx = histConfig.getBinIdx(latencyMs);
             runtimeMetricsHistory[secondKey].latencyBins[binIdx]++;
+
+            // Accumulate the per-second average latency separately: this map
+            // is never trimmed, so the percentiles below always cover the
+            // whole run rather than the trailing window kept in
+            // runtimeMetricsHistory.
+            auto& secondAccum = latencyBySecond[secondKey];
+            secondAccum.sumMicros += tempTotalLatencyMicro;
+            secondAccum.count++;
         }
     }
 
@@ -184,6 +194,8 @@ class ApplicationMetrics
             }
         }
         int workersNum = 0;
+        // Executors running cluster-wide during this second, summed over hosts.
+        int totalExecutors = 0;
         std::atomic<int> inputRate = 0;
         int waitingQueueSize = 0; // planner waiting queue length snapshot
         int64_t waitingQueueAgeMicros = 0; // age of oldest waiting message (us)
@@ -328,6 +340,27 @@ class ApplicationMetrics
         doc.AddMember("medianTotalLatency", medianTotalLatency, alloc);
         doc.AddMember("p95TotalLatency", p95TotalLatency, alloc);
         doc.AddMember("p99TotalLatency", p99TotalLatency, alloc);
+
+
+        std::vector<int64_t> secondAvgLatencies;
+        secondAvgLatencies.reserve(latencyBySecond.size());
+        for (const auto& [secondKey, accum] : latencyBySecond) {
+            if (accum.count > 0) {
+                secondAvgLatencies.push_back(accum.sumMicros / accum.count);
+            }
+        }
+        std::sort(secondAvgLatencies.begin(), secondAvgLatencies.end());
+
+        rapidjson::Value latencyBySecondObj(rapidjson::kObjectType);
+        latencyBySecondObj.AddMember(
+          "seconds", static_cast<int64_t>(secondAvgLatencies.size()), alloc);
+        latencyBySecondObj.AddMember(
+          "medianLatencyUs", nearestRank(secondAvgLatencies, 0.50), alloc);
+        latencyBySecondObj.AddMember(
+          "p95LatencyUs", nearestRank(secondAvgLatencies, 0.95), alloc);
+        latencyBySecondObj.AddMember(
+          "p99LatencyUs", nearestRank(secondAvgLatencies, 0.99), alloc);
+        doc.AddMember("latencyBySecond", latencyBySecondObj, alloc);
 
         // MODIFICATION: Add the runtime count history as a JSON array with
         // version markers.
@@ -911,6 +944,16 @@ class ApplicationMetrics
         int workersNum = results.size();
         runtimeMetricsHistory[currentTime].workersNum = workersNum;
 
+        // Cluster-wide executor count for this second, used by the Binpack
+        // executor budget as the "old parallelism" calibration point.
+        int clusterExecutors = 0;
+        for (const auto& [ip, statsPtr] : results) {
+            if (statsPtr) {
+                clusterExecutors += statsPtr->executorsnum();
+            }
+        }
+        runtimeMetricsHistory[currentTime].totalExecutors = clusterExecutors;
+
         // Snapshot CoeffEstimator state + derived scaling fields.
         {
             long long execTimeSum = 0;
@@ -1040,6 +1083,11 @@ class ApplicationMetrics
     struct ScalingSignals
     {
         double avgInputRate = 0.0;
+        // Completed applications per second over the same window. Paired with
+        // avgTotalExecutors it calibrates how much input one executor sustains.
+        double avgThroughput = 0.0;
+        // Cluster-wide executors running over the window.
+        double avgTotalExecutors = 0.0;
         double avgQueueSize = 0.0;
         int plannerWaitingQueueSize = 0;
         int64_t plannerWaitingQueueAgeMicros = 0;
@@ -1082,6 +1130,9 @@ class ApplicationMetrics
         faabric::util::SharedLock lock(opMx);
         int64_t nowSec = faabric::util::getGlobalClock().epochSeconds();
         int totalInput = 0, totalQueue = 0, validSecs = 0;
+        long totalCompleted = 0;
+        long totalExecutors = 0;
+        int execSecs = 0;
         double totalExecTime = 0.0, totalChainedRatio = 0.0,
                totalLocalChainedRatio = 0.0, totalRemoteChainedRatio = 0.0,
                totalDestHosts = 0.0;
@@ -1091,6 +1142,13 @@ class ApplicationMetrics
             if (it == runtimeMetricsHistory.end())
                 continue;
             totalInput += it->second.inputRate.load(std::memory_order_relaxed);
+            totalCompleted += it->second.count;
+            // Only average over seconds that actually carry a worker-stats
+            // snapshot, so a missed poll does not read as "zero executors".
+            if (it->second.totalExecutors > 0) {
+                totalExecutors += it->second.totalExecutors;
+                execSecs++;
+            }
             for (const auto& [ip, q] : it->second.hostQueueSize)
                 totalQueue += q;
             totalExecTime += it->second.avgExecTime;
@@ -1104,12 +1162,16 @@ class ApplicationMetrics
         ScalingSignals sig;
         if (validSecs > 0) {
             sig.avgInputRate = (double)totalInput / validSecs;
+            sig.avgThroughput = (double)totalCompleted / validSecs;
             sig.avgQueueSize = (double)totalQueue / validSecs;
             sig.avgExecTime = totalExecTime / validSecs;
             sig.avgChainedRatio = totalChainedRatio / validSecs;
             sig.avgLocalChainedRatio = totalLocalChainedRatio / validSecs;
             sig.avgRemoteChainedRatio = totalRemoteChainedRatio / validSecs;
             sig.avgNumDestHosts = totalDestHosts / validSecs;
+        }
+        if (execSecs > 0) {
+            sig.avgTotalExecutors = (double)totalExecutors / execSecs;
         }
 
         // CoeffEstimator physical coefficients (current estimates, not
@@ -1245,6 +1307,7 @@ class ApplicationMetrics
         latenciesOverTen.clear();
         totalLatenciesUnderTen.clear();
         totalLatenciesOverTen.clear();
+        latencyBySecond.clear();
 
         for (auto& [instName, instancePtr] : instances) {
             instancePtr->reset();
@@ -1269,6 +1332,32 @@ class ApplicationMetrics
     std::map<int, int> latenciesUnderTen;
     std::map<int, int> totalLatenciesOverTen;
     std::map<int, int> totalLatenciesUnderTen;
+
+    // Per-second latency aggregate, one entry per wall-clock second. Feeds the
+    // "latencyBySecond" percentiles, which treat each second (not each
+    // request) as one sample.
+    struct LatencySecondAccum
+    {
+        int64_t sumMicros = 0;
+        long count = 0;
+    };
+    std::map<int64_t, LatencySecondAccum> latencyBySecond;
+
+    // Nearest-rank percentile over an ascending-sorted vector: with 600
+    // samples p50 is the 300th, p95 the 570th and p99 the 594th. Matches the
+    // "first bucket whose cumulative count reaches size * p" semantics used by
+    // the histogram-based percentiles.
+    static int64_t nearestRank(const std::vector<int64_t>& sorted, double p)
+    {
+        if (sorted.empty()) {
+            return 0;
+        }
+
+        long size = static_cast<long>(sorted.size());
+        long idx =
+          static_cast<long>(std::ceil(static_cast<double>(size) * p)) - 1;
+        return sorted[std::clamp(idx, 0L, size - 1)];
+    }
 
     long count = 0;
     int64_t startTime = std::numeric_limits<int64_t>::max();

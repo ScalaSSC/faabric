@@ -304,6 +304,16 @@ std::vector<uint8_t> State::readFuncStateLock(const std::string& user,
                                               int32_t parallelismId,
                                               bool lock)
 {
+    if (accessRemote) {
+        std::string key =
+          faabric::util::keyForFunction(user, func, parallelismId);
+        redis::Redis& redis = redis::Redis::getState();
+        if (lock) {
+            return redis.getAndLock(key);
+        }
+        return redis.get(key);
+    }
+
     auto targetFs = doGetFS(user, func, parallelismId);
 
     // Lock the state and read it
@@ -318,6 +328,19 @@ void State::setFuncState(const std::string& user,
                          int32_t bufferLen,
                          bool unlock)
 {
+    if (accessRemote) {
+        std::string key =
+          faabric::util::keyForFunction(user, func, parallelismId);
+        redis::Redis& redis = redis::Redis::getState();
+        std::vector<uint8_t> value(buffer, buffer + bufferLen);
+        if (unlock) {
+            redis.setAndUnlock(key, value);
+        } else {
+            redis.set(key, value);
+        }
+        return;
+    }
+
     auto targetFs = doGetFS(user, func, parallelismId);
 
     targetFs->set(reinterpret_cast<uint8_t*>(buffer), bufferLen, unlock);
@@ -350,6 +373,28 @@ std::map<std::string, std::vector<uint8_t>> State::readIndivFuncStateLock(
   int32_t parallelismId,
   std::set<std::string>& keys)
 {
+    if (accessRemote) {
+        std::string fsKey =
+          faabric::util::keyForFunction(user, func, parallelismId);
+
+        std::set<std::string> redisKeys;
+        for (const auto& key : keys) {
+            redisKeys.insert(fsKey + "_" + key);
+        }
+
+        redis::Redis& redis = redis::Redis::getState();
+        auto redisResult = redis.getAndLockMulti(redisKeys);
+
+        // Strip the function-state prefix back off so the returned map uses
+        // the same bare keys the caller passed in
+        std::map<std::string, std::vector<uint8_t>> result;
+        for (auto& [redisKey, value] : redisResult) {
+            std::string key = redisKey.substr(fsKey.size() + 1);
+            result.emplace(std::move(key), std::move(value));
+        }
+        return result;
+    }
+
     auto targetFs = doGetFS(user, func, parallelismId);
 
     return targetFs->readPartitionStateLock(keys);
@@ -360,6 +405,22 @@ void State::writeIndivFuncStateUnlock(const std::string& user,
                                       int32_t parallelismId,
                                       std::vector<uint8_t>& data)
 {
+    if (accessRemote) {
+        std::string fsKey =
+          faabric::util::keyForFunction(user, func, parallelismId);
+
+        auto stateMap = faabric::util::deserializeParState(data);
+
+        std::map<std::string, std::vector<uint8_t>> redisValues;
+        for (auto& [key, value] : stateMap) {
+            redisValues.emplace(fsKey + "_" + key, std::move(value));
+        }
+
+        redis::Redis& redis = redis::Redis::getState();
+        redis.setAndUnlockMulti(redisValues);
+        return;
+    }
+
     auto targetFs = doGetFS(user, func, parallelismId);
 
     targetFs->writePartitionStateUnlocks(data);

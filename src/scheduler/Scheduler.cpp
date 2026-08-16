@@ -1078,6 +1078,9 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         faabric::state::getGlobalState().resetPersistentLockState();
         faabric::state::getGlobalState().persistentLock = (value == 1);
         SPDLOG_INFO("Persistent lock: {}", value == 1 ? "ON" : "OFF");
+    } else if (key == "access_state_remote") {
+        faabric::state::getGlobalState().accessRemote = (value == 1);
+        SPDLOG_INFO("Access state remote: {}", value == 1 ? "ON" : "OFF");
     } else {
         throw std::runtime_error(
           fmt::format("Unrecognized parameter key: {}", key));
@@ -1525,7 +1528,42 @@ void Scheduler::calculateMaxReplicas(
     scheduledOperatorMap)
 {
     maxReplicasMap.clear();
+    // Weight-derived budgets, renormalised below so they sum to maxExecutors.
     std::map<std::string, int> tempMaxReplicasMap;
+    // Planner-supplied absolute budgets (Binpack mode 0), used verbatim.
+    std::map<std::string, int> absoluteReplicasMap;
+
+    // Spreads an absolute per-host budget over that host's instances of one
+    // operator, remainder to the lowest parallelism ids, at least one each.
+    auto splitAbsolute = [&](const std::string& userFunc,
+                             const std::map<int, std::string>& parallelismDist,
+                             int hostBudget) {
+        int localInstances = 0;
+        for (const auto& [parId, ip] : parallelismDist) {
+            if (ip == thisHost) {
+                localInstances++;
+            }
+        }
+        if (localInstances == 0) {
+            return;
+        }
+        int base = hostBudget / localInstances;
+        int remainder = hostBudget % localInstances;
+        int seen = 0;
+        for (const auto& [parId, ip] : parallelismDist) {
+            if (ip != thisHost) {
+                continue;
+            }
+            int maxReplica = base + (seen < remainder ? 1 : 0);
+            if (maxReplica < 1) {
+                maxReplica = 1;
+            }
+            absoluteReplicasMap[userFunc + "/" + std::to_string(parId)] =
+              maxReplica;
+            seen++;
+        }
+    };
+
     for (const auto& [operatorName, operatorInfo] : scheduledOperatorMap) {
         if (operatorInfo.weightDist.count(thisHost) <= 0) {
             continue;
@@ -1533,54 +1571,94 @@ void Scheduler::calculateMaxReplicas(
         std::string userFunc = util::splitUserFunc(operatorName).first + "/" +
                                util::splitUserFunc(operatorName).second;
 
+        auto execIt = operatorInfo.executorDist.find(thisHost);
+        bool absolute = execIt != operatorInfo.executorDist.end();
+        int hostBudget = absolute ? std::max(1, execIt->second) : 0;
+
         if (operatorInfo.node.type == faabric::batch_scheduler::STATELESS) {
-            int maxReplica =
-              std::round(operatorInfo.weightDist.at(thisHost) * maxExecutors);
-            tempMaxReplicasMap[userFunc + "/0"] = maxReplica;
+            if (absolute) {
+                absoluteReplicasMap[userFunc + "/0"] = hostBudget;
+            } else {
+                int maxReplica = std::round(
+                  operatorInfo.weightDist.at(thisHost) * maxExecutors);
+                tempMaxReplicasMap[userFunc + "/0"] = maxReplica;
+            }
         } else if (operatorInfo.node.type ==
                    faabric::batch_scheduler::STATEFUL) {
-            double totalWeight = operatorInfo.weightDist.at(thisHost);
-            int totalInstsances = 0;
-            for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
-                if (ip == thisHost) {
-                    totalInstsances++;
+            if (absolute) {
+                splitAbsolute(
+                  userFunc, operatorInfo.parallelismDist, hostBudget);
+            } else {
+                double totalWeight = operatorInfo.weightDist.at(thisHost);
+                int totalInstsances = 0;
+                for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
+                    if (ip == thisHost) {
+                        totalInstsances++;
+                    }
                 }
-            }
-            double instanceWeight =
-              totalWeight / static_cast<double>(totalInstsances);
-            for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
-                if (ip == thisHost) {
-                    int maxReplica = std::round(instanceWeight * maxExecutors);
-                    tempMaxReplicasMap[userFunc + "/" + std::to_string(parId)] =
-                      maxReplica;
+                double instanceWeight =
+                  totalWeight / static_cast<double>(totalInstsances);
+                for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
+                    if (ip == thisHost) {
+                        int maxReplica =
+                          std::round(instanceWeight * maxExecutors);
+                        tempMaxReplicasMap[userFunc + "/" +
+                                           std::to_string(parId)] = maxReplica;
+                    }
                 }
             }
         } else if (operatorInfo.node.type ==
                    faabric::batch_scheduler::PARTITIONED_STATEFUL) {
-            for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
-                if (ip == thisHost) {
-                    double weight = operatorInfo.weightDist.at(thisHost);
-                    int maxReplica = std::round(weight * maxExecutors);
-                    tempMaxReplicasMap[userFunc + "/" + std::to_string(parId)] =
-                      maxReplica;
+            if (absolute) {
+                splitAbsolute(
+                  userFunc, operatorInfo.parallelismDist, hostBudget);
+            } else {
+                for (const auto& [parId, ip] : operatorInfo.parallelismDist) {
+                    if (ip == thisHost) {
+                        double weight = operatorInfo.weightDist.at(thisHost);
+                        int maxReplica = std::round(weight * maxExecutors);
+                        tempMaxReplicasMap[userFunc + "/" +
+                                           std::to_string(parId)] = maxReplica;
+                    }
                 }
             }
         }
     }
 
+    int absoluteTotal = 0;
+    for (const auto& [funcStr, maxReplica] : absoluteReplicasMap) {
+        maxReplicasMap[funcStr] = maxReplica;
+        absoluteTotal += maxReplica;
+    }
+
+    // Renormalise whatever is left on the weight-derived path so the host's
+    // replicas add up to maxExecutors, minus what the absolute budgets already
+    // claimed. Absolute budgets are deliberately not rescaled: the planner
+    // sized them against measured throughput and may legitimately exceed
+    // maxExecutors.
     int totalReplicas = 0;
     for (const auto& [funcStr, maxReplica] : tempMaxReplicasMap) {
         totalReplicas += maxReplica;
     }
-    double scaleFactor =
-      static_cast<double>(maxExecutors) / static_cast<double>(totalReplicas);
-    for (const auto& [funcStr, maxReplica] : tempMaxReplicasMap) {
-        int scaledMaxReplica =
-          std::ceil(static_cast<double>(maxReplica) * scaleFactor);
-        if (scaledMaxReplica <= 0) {
-            scaledMaxReplica = 1;
+    if (totalReplicas > 0) {
+        int remainingBudget = std::max(1, maxExecutors - absoluteTotal);
+        double scaleFactor = static_cast<double>(remainingBudget) /
+                             static_cast<double>(totalReplicas);
+        for (const auto& [funcStr, maxReplica] : tempMaxReplicasMap) {
+            int scaledMaxReplica =
+              std::ceil(static_cast<double>(maxReplica) * scaleFactor);
+            if (scaledMaxReplica <= 0) {
+                scaledMaxReplica = 1;
+            }
+            maxReplicasMap[funcStr] = scaledMaxReplica;
         }
-        maxReplicasMap[funcStr] = scaledMaxReplica;
+    }
+
+    if (absoluteTotal > maxExecutors) {
+        SPDLOG_WARN("Planner executor budget for this host is {} but "
+                    "maxExecutors is {}; honouring the planner",
+                    absoluteTotal,
+                    maxExecutors);
     }
 }
 

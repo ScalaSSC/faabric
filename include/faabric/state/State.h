@@ -158,6 +158,10 @@ class State
 
     bool persistentLock = false;
 
+    // When true, persistent state is read/written directly from/to redis
+    // instead of the local in-process map.
+    bool accessRemote = false;
+
     void resetPersistentLockState();
 
   private:

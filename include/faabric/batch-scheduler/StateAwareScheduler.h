@@ -77,6 +77,15 @@ class StateAwareScheduler : public BatchScheduler
 
     void setScheduleMode(int mode);
 
+    // CLAST-placement hybrid (schedule modes 3 and 4). When enabled, the base
+    // mode is used ONLY as a sizing model — how many workers its own model says
+    // the application needs — and the operators are then laid out on that many
+    // workers by CLAST's capacity-aware packer (the mode-0 placement). See
+    // rescheduleAppClastPlacement.
+    void setClastPlacement(bool value) { isClastPlacement = value; }
+
+    bool getClastPlacement() const { return isClastPlacement; }
+
     virtual void resetScheduler();
 
     bool registerApp(std::unique_ptr<batch_scheduler::Application> app);
@@ -178,10 +187,13 @@ class StateAwareScheduler : public BatchScheduler
     // signals != nullptr (and warmed up) selects the capacity-aware packer
     // (groupNodesCapacity); otherwise it falls back to the legacy groupNodesTopo
     // tape layout (used on the very first schedule, before metrics exist).
+    // `metrics` is only used for the mode-0 executor budget (per-operator exec
+    // latency); the placement itself needs nothing beyond `signals`.
     void rescheduleAppBinpack(
       const HostMap& hostMap,
       const faabric::planner::ApplicationMetrics::ScalingSignals* signals =
-        nullptr);
+        nullptr,
+      const faabric::planner::ApplicationMetrics* metrics = nullptr);
 
     // Per-worker safety margin applied to the capacity budget (budget =
     // W·headroom) in groupNodesCapacity. Mirrors the planner's
@@ -192,6 +204,11 @@ class StateAwareScheduler : public BatchScheduler
     // groupNodesCapacity. Mirrors the planner's capacitySearchTol; kept in
     // sync via resetParameter("capacity_search_tol").
     void setCapacitySearchTol(double value) { capacitySearchTolRate = value; }
+
+    // Per-round growth ceiling of the Binpack executor budget, as a multiple
+    // of the executors currently running. Kept in sync via
+    // resetParameter("exec_budget_growth_cap").
+    void setExecBudgetGrowthCap(double value) { execBudgetGrowthCap = value; }
 
     // Reschedule with the non-linear performance model + soft-affinity
     // placement (schedule mode 4), after Zhang et al., HPCC'24. Per-operator
@@ -226,6 +243,24 @@ class StateAwareScheduler : public BatchScheduler
     void rescheduleAppFaaSFlowAdaptive(
       const HostMap& hostMap,
       const faabric::planner::ApplicationMetrics* metrics);
+
+    // CLAST-placement hybrid for schedule modes 3 and 4 (isClastPlacement).
+    // Step 1 asks the base mode for the ONLY thing we keep from it — the number
+    // of workers it thinks the application needs:
+    //   mode 3: ApplicationMetrics::computeAdaptiveHostCount(rate, |hosts|)
+    //   mode 4: ceil(Σ n*_o / per-worker executor capacity) from the non-linear
+    //           model (the same sizing rescheduleAppNonlinear runs on).
+    // Step 2 hands the first N workers to the mode-0 capacity packer
+    // (rescheduleAppBinpack -> groupNodesCapacity). That packer is open-ended
+    // (it takes a rate, not a worker count) but bounded by the host set it is
+    // given, so restricting it to N workers makes its existing saturation
+    // binary search find the largest input rate whose placement fits in N —
+    // i.e. "given N workers, find the admissible rate, then place at it".
+    void rescheduleAppClastPlacement(
+      const HostMap& hostMap,
+      const faabric::planner::ApplicationMetrics* metrics,
+      const faabric::planner::ApplicationMetrics::ScalingSignals* signals,
+      double chainedCostCoeff);
 
     void rescheduleAppStepConf(const HostMap& hostMap);
 
@@ -328,6 +363,12 @@ class StateAwareScheduler : public BatchScheduler
     bool isplanner = true;
     int scheduleMode = 0;
 
+    // Take only the worker-count estimate from schedule mode 3 / 4 and place
+    // the operators with the mode-0 (CLAST) capacity packer. Kept in sync with
+    // the planner via resetParameter("clast_placement"). Ignored by every other
+    // schedule mode.
+    bool isClastPlacement = false;
+
     // Per-worker capacity safety margin for groupNodesCapacity. Default matches
     // the planner's workerLoadHeadroom default.
     double capacityHeadroom = 0.9;
@@ -419,6 +460,25 @@ class StateAwareScheduler : public BatchScheduler
       nlLastSnap;
     std::map<std::string, int> nlLastParallelism;
 
+    // Result of the mode-4 sizing model: the per-operator instance demand and
+    // what the cluster can actually provide.
+    struct NlSizing
+    {
+        std::map<std::string, int> target; // op -> n*_o
+        long plannedInstances = 0;         // Σ target
+        long totalCapacity = 0;            // Σ per-worker executor capacity
+    };
+
+    // Steps 1-4 of the mode-4 reschedule: ingest the fresh overhead samples,
+    // refit r(p), and solve each operator's smallest p with
+    // p·c·(1-r(p))·headroom ≥ rate_o. Split out of rescheduleAppNonlinear so
+    // the CLAST-placement hybrid can reuse the sizing without the
+    // soft-affinity placement. NOT read-only: it advances the r(p) fit state
+    // (nlCollectSamples), so it must run exactly once per reschedule.
+    NlSizing nlComputeSizing(
+      const HostMap& hostMap,
+      const faabric::planner::ApplicationMetrics* metrics);
+
     // Ingest fresh lifecycle snapshots: derive each operator's interval
     // overhead ratio via count-weighted snapshot deltas, append samples and
     // refit the curves.
@@ -446,6 +506,29 @@ class StateAwareScheduler : public BatchScheduler
     void commitGroupAllocations(
       const std::vector<NodeGroup>& groups,
       const std::vector<std::map<std::string, double>>& groupAllocations);
+
+    // Binpack (mode 0) elastic executor budget. Scales the cluster-wide
+    // executor count by inputRate/throughput observed over the last window,
+    // splits it across operators by their CPU demand (processedTuples x
+    // per-operator exec latency) and across workers by each operator's
+    // weightDist, and writes the result into
+    // scheduledOperatorsMap[...].executorDist. Called at the end of
+    // commitGroupAllocations; a no-op when the signals are not usable yet.
+    void applyExecutorDist(
+      const faabric::planner::ApplicationMetrics::ScalingSignals& sig,
+      const faabric::planner::ApplicationMetrics* metrics);
+
+    // Count-weighted average worker execution time per operator (User_Func, in
+    // us), aggregated from the per-instance (User_Func_Par) lifecycle
+    // snapshots. Empty when no instance has completed a request yet.
+    std::map<std::string, double> perOperatorExecTime(
+      const faabric::planner::ApplicationMetrics* metrics) const;
+
+    // Ceiling on how much the cluster-wide executor budget may grow in one
+    // round, as a multiple of the executors currently running. Without it a
+    // momentary throughput dip compounds across consecutive reschedules.
+    // Tunable via resetParameter("exec_budget_growth_cap").
+    double execBudgetGrowthCap = 2.0;
 
     // hostAssign Counter is used when assign states to the hosts.
     std::atomic<unsigned int> stateRbCounter{ 0 };

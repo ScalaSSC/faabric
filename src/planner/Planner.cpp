@@ -968,9 +968,11 @@ bool Planner::resetParameter(
         "input_rate_deviation",
         "worker_load_headroom",
         "capacity_search_tol",
+        "exec_budget_growth_cap",
         "soft_affinity_ws",
         "soft_affinity_wb",
         "nl_min_fit_samples",
+        "clast_placement",
     };
 
     faabric::util::FullLock lock(plannerMx);
@@ -1034,6 +1036,14 @@ bool Planner::resetParameter(
             }
             SPDLOG_INFO("Planner capacity search tolerance set to {:.1f} req/s",
                         capacitySearchTol);
+        } else if (key == "exec_budget_growth_cap") {
+            execBudgetGrowthCap = req.value_double();
+            if (stateAwareScheduler) {
+                stateAwareScheduler->setExecBudgetGrowthCap(
+                  execBudgetGrowthCap);
+            }
+            SPDLOG_INFO("Planner executor budget growth cap set to {:.2f}x",
+                        execBudgetGrowthCap);
         } else if (key == "soft_affinity_ws" || key == "soft_affinity_wb") {
             if (key == "soft_affinity_ws") {
                 softAffinityWs = req.value_double();
@@ -1055,6 +1065,13 @@ bool Planner::resetParameter(
             }
             SPDLOG_INFO("Planner non-linear min fit samples set to {}",
                         nlMinFitSamples);
+        } else if (key == "clast_placement") {
+            isClastPlacement = (value == 1);
+            if (stateAwareScheduler) {
+                stateAwareScheduler->setClastPlacement(isClastPlacement);
+            }
+            SPDLOG_INFO("Planner CLAST placement for schedule modes 3/4: {}",
+                        isClastPlacement ? "ON" : "OFF");
         } else if (state.applicationMetrics &&
                    state.applicationMetrics->setThreshold(key, value)) {
             // threshold keys handled inside ApplicationMetrics
@@ -1068,12 +1085,15 @@ bool Planner::resetParameter(
         SPDLOG_INFO("Persistent lock: {}", lockVal ? "ON" : "OFF");
     }
     if (key == "schedule_mode") {
-        // Schedule Mode 0: Decentralized Scheduler with Binpack.
+        // Schedule Mode 0: CLAST.
         // Schedule Mode 3: FaaSFlow Scheduler.
-        // Scheduler Mode 5: LcSched.
+        // Schedule Mode 4: Zhang et al. Scheduler.
         // Scheduler Mode 7: Centralized Scheduler With FaaSFlow
         SPDLOG_INFO("Planner reset schedule mode to {}", value);
         stateAwareScheduler->setScheduleMode(value);
+        // Re-push the CLAST-placement flag: it may have been set before the
+        // scheduler existed, and it only takes effect for modes 3 and 4.
+        stateAwareScheduler->setClastPlacement(isClastPlacement);
         scheduleMode = value;
     }
     if (key == "dispatch_period") {
@@ -1150,12 +1170,9 @@ void Planner::rescheduleApp(int rescheduleMode, int hostNum)
     stateAwareScheduler->rescheduleApp(state.activeHosts,
                                        state.applicationMetrics.get());
 
-    // For adaptive mode (3) and open-ended Binpack (0) the scheduler may use
-    // fewer workers than activeHosts. Rebuild activeHosts from the IPs that are
-    // actually in the schedule, so schedHostNum reflects the worker count the
-    // packer chose (the "predicted N" is now an output of the packer, not a
-    // separate model).
-    if (scheduleMode == 3 || scheduleMode == 0) {
+
+    if (scheduleMode == 3 || scheduleMode == 0 ||
+        (isClastPlacement && scheduleMode == 4)) {
         std::set<std::string> usedIps;
         for (const auto& [func, op] :
              stateAwareScheduler->getScheduledOperatorsMap()) {
@@ -1680,21 +1697,21 @@ bool Planner::evaluateReschedule(
                             signals.avgInputRate, maxHostNum)
                         : maxHostNum;
         lastPeriodicRescheduleMs = nowMs;
-        if (targetN <= 0 || targetN == schedHostNum)
+        // Natively, mode 3 only ever reacts to a change in the worker count, so
+        // an unchanged N means an unchanged schedule. Under CLAST placement the
+        // layout also depends on the input rate (the capacity packer re-places
+        // at the current rate), so a stable N is no reason to skip.
+        if (targetN <= 0 || (!isClastPlacement && targetN == schedHostNum))
             return false;
 
         rescheduleApp(0, maxHostNum);
         stableInputRate = currentRate;
         inputRateChangeDetectedMs = 0;
     } else if (scheduleMode == 4) {
-        // Non-linear AutoTuning: v1 does not drive host scaling, so keep the
-        // current active host set (hostNum = 0). The reschedule itself is the
-        // continuous-fitting loop: it snapshots the overhead metrics, refits
-        // r(p) and retunes per-operator parallelism + placement.
         lastPeriodicRescheduleMs = nowMs;
         stableInputRate = currentRate;
         inputRateChangeDetectedMs = 0;
-        rescheduleApp(0, 0);
+        rescheduleApp(0, isClastPlacement ? maxHostNum : 0);
     }
 
     return true;
