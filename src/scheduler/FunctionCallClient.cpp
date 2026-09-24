@@ -98,14 +98,18 @@ FunctionCallClient::getRuntimeStats(faabric::RuntimeStatsUpdateRequest req)
     return std::make_unique<faabric::RuntimeStatsResult>(resp);
 }
 
-std::unique_ptr<faabric::WorkerStats>
-FunctionCallClient::getWorkerRuntimeStats()
+std::unique_ptr<faabric::WorkerStats> FunctionCallClient::getWorkerRuntimeStats(
+  const faabric::WorkerRuntimeStatsRequest& req)
 {
     SPDLOG_TRACE("Getting worker runtime stats from host {}", host);
-    faabric::EmptyRequest req;
+    // The planner shares one req across concurrent per-host fetches, so
+    // serialise it here instead of copying it for syncSend(Message*).
+    std::string buffer = req.SerializeAsString();
     faabric::WorkerStats resp;
-    syncSend(
-      faabric::scheduler::FunctionCalls::GetWorkerRuntimeStats, &req, &resp);
+    syncSend(faabric::scheduler::FunctionCalls::GetWorkerRuntimeStats,
+             reinterpret_cast<const uint8_t*>(buffer.data()),
+             buffer.size(),
+             &resp);
     return std::make_unique<faabric::WorkerStats>(resp);
 }
 

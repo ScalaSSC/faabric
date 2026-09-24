@@ -76,4 +76,18 @@ void DecentralizedScheduler::syncStatesInfo(
 
     printScheduleInfomation();
 }
+
+void DecentralizedScheduler::setClusterWorkerStats(
+  std::map<std::string, faabric::WorkerStats>&& stats)
+{
+    faabric::util::FullLock lock(clusterWorkerStatsMx);
+    clusterWorkerStats = std::move(stats);
+}
+
+std::map<std::string, faabric::WorkerStats>
+DecentralizedScheduler::getClusterWorkerStats()
+{
+    faabric::util::SharedLock lock(clusterWorkerStatsMx);
+    return clusterWorkerStats;
+}
 }

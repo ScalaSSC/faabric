@@ -69,18 +69,12 @@ class InstancesRuntimeStats
   private:
     mutable std::shared_mutex statsMx;
 
-    int statsTimeout = 1000;                 // Unit: seconds
-    std::map<time_t, int> versionTimestamps; // version -> timestamp
+    int statsTimeout = 1000; // Unit: seconds
     std::map<std::string, InstanceStats> instanceStatsMap;
 
     // The statistics of chained request calls.
     // MAP<timestamp, MAP<destination worker IP, count>>
     std::map<time_t, std::map<std::string, int>> chainedCallHistory;
-
-    // Worker-level outgoing chained calls recorded by the Scheduler only.
-    // Not per-instance; tracks total calls sent to each dest host per second.
-    // MAP<timestamp, MAP<destHost, count>>
-    std::map<time_t, std::map<std::string, int>> workerChainHistory;
 
     InstanceStatsResult computeInstanceStats(InstanceStats& stats,
                                              const TimePoint now)
@@ -125,13 +119,6 @@ class InstancesRuntimeStats
     }
 
   public:
-    void versionUpdate(int version)
-    {
-        std::unique_lock lock(statsMx);
-        time_t currentTimeT = faabric::util::getEpochSeconds();
-        versionTimestamps[currentTimeT] = version;
-    }
-
     void instanceAdd(const std::string& instanceName,
                      const std::string& source,
                      int count)
@@ -192,40 +179,6 @@ class InstancesRuntimeStats
                 chainedCallHistory.erase(chainedCallHistory.begin());
             }
         }
-    }
-
-    // Record outgoing chained calls at worker level (Scheduler-only, not
-    // Planner). Writes to workerChainHistory keyed by destHost and timestamp.
-    void recordWorkerOutgoingChain(const std::string& destHost, int count)
-    {
-        std::unique_lock lock(statsMx);
-        time_t currentTimeT = faabric::util::getEpochSeconds();
-
-        workerChainHistory[currentTimeT][destHost] += count;
-
-        time_t cutoffT = currentTimeT - statsTimeout;
-        while (!workerChainHistory.empty() &&
-               workerChainHistory.begin()->first < cutoffT) {
-            workerChainHistory.erase(workerChainHistory.begin());
-        }
-    }
-
-    // Returns the last second's worker-level outgoing chain snapshot.
-    std::map<std::string, int> getLastSecWorkerChain() const
-    {
-        std::shared_lock lock(statsMx);
-        time_t lastSec = faabric::util::getEpochSeconds() - 1;
-        auto it = workerChainHistory.find(lastSec);
-        if (it != workerChainHistory.end()) {
-            return it->second;
-        }
-        return {};
-    }
-
-    std::map<time_t, int> getVersionTimestamps()
-    {
-        std::shared_lock lock(statsMx);
-        return versionTimestamps;
     }
 
     // getAllStats iterates over the map only once while holding lock.
@@ -349,9 +302,7 @@ class InstancesRuntimeStats
         std::shared_lock<std::shared_mutex> lock(statsMx);
         std::map<std::string, InstanceMetricsResult> metrics;
 
-        // Note: chained-call data is NOT recorded per-instance here. It is
-        // worker-level and travels via WorkerStats.workerChainHistory (proto
-        // field 10), populated from getLastSecWorkerChain().
+        // Note: chained-call data is not included in these metrics.
 
         if (!isRuntime) {
             for (const auto& [instanceName, stats] : instanceStatsMap) {
@@ -401,10 +352,8 @@ class InstancesRuntimeStats
     void reset()
     {
         std::unique_lock lock(statsMx);
-        versionTimestamps.clear();
         instanceStatsMap.clear();
         chainedCallHistory.clear();
-        workerChainHistory.clear();
     }
 };
 } // namespace faabric::scheduler

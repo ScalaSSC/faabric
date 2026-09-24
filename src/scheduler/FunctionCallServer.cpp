@@ -358,9 +358,16 @@ void serializeWorkerMetrics(
 std::unique_ptr<google::protobuf::Message>
 FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
 {
-    PARSE_MSG(faabric::EmptyRequest, buffer.data(), buffer.size())
+    PARSE_MSG(faabric::WorkerRuntimeStatsRequest, buffer.data(), buffer.size())
 
     // SPDLOG_DEBUG("Getting worker RUNTIME stats for host");
+
+    // Store the planner's previous-round view of all workers
+    std::map<std::string, faabric::WorkerStats> clusterStats;
+    for (auto& [ip, stats] : *parsedMsg.mutable_clusterstats()) {
+        clusterStats[ip] = std::move(stats);
+    }
+    scheduler.setClusterWorkerStats(std::move(clusterStats));
 
     faabric::WorkerStats out;
 
@@ -380,17 +387,6 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
     out.set_executorsnum(executorsCount);
     out.set_cpuload(cpuLoadVal);
 
-    // Worker-level outgoing chained calls (Scheduler-recorded, not Planner).
-    auto workerChainSnap = scheduler.getLastSecWorkerChain();
-    if (!workerChainSnap.empty()) {
-        auto* chainProto = out.mutable_workerchainhistory();
-        auto ts = faabric::util::getGlobalClock().epochSeconds() - 1;
-        auto& secProto = (*chainProto)[ts];
-        for (const auto& [destHost, cnt] : workerChainSnap) {
-            (*secProto.mutable_hostcount())[destHost] = cnt;
-        }
-    }
-
     return std::make_unique<faabric::WorkerStats>(std::move(out));
 }
 
@@ -402,7 +398,6 @@ FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
     SPDLOG_DEBUG("Getting worker stats for host");
     // auto snapshot = scheduler.getCpuRecordHistory();
     auto maxReplicas = scheduler.getMaxReplicasMap();
-    auto migrationHistory = scheduler.getMigrationHistory();
 
     WorkerStats out;
     out.set_ip(faabric::util::getSystemConfig().endpointHost);
@@ -422,20 +417,9 @@ FunctionCallServer::recvGetWorkerStats(std::span<const uint8_t> buffer)
         rec->set_replicas(count);
     }
 
-    auto* protoMigrationHistory = out.mutable_migrationhistory();
-    for (const auto& [version, duration] : migrationHistory) {
-        (*protoMigrationHistory)[version] = duration;
-    }
-
     // Get worker metrics like total queue time, queue num, exec time, etc. for
     // each instance. auto workerMetricsMap = scheduler.getWorkerMetrics();
     // serializeWorkerMetrics(workerMetricsMap, out.mutable_workermetrics());
-
-    auto versiontimestamp = scheduler.getVersionTimestamps();
-    auto* protoVersionHistory = out.mutable_versiontimestamp();
-    for (const auto& [timeKey, version] : versiontimestamp) {
-        (*protoVersionHistory)[timeKey] = version;
-    }
 
     return std::make_unique<faabric::WorkerStats>(std::move(out));
 }

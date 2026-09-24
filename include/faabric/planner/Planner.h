@@ -300,7 +300,8 @@ class Planner
     void updateRuntimeStats();
 
     std::map<std::string, std::unique_ptr<faabric::WorkerStats>>
-    fetchWorkerStatsAsync(const std::vector<std::string>& targetIps);
+    fetchWorkerStatsAsync(const std::vector<std::string>& targetIps,
+                          const faabric::WorkerRuntimeStatsRequest& req);
 };
 
 Planner& getPlanner();

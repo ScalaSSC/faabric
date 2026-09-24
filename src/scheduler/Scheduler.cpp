@@ -295,6 +295,7 @@ void Scheduler::reset()
         faabric::util::FullLock setResultMsgslock(setResultMsgsMx);
         setResultMsgs.clear();
     }
+    decentralScheduler.setClusterWorkerStats({});
 
     scheduledMsgsMap.clear();
     maxReplicasMap.clear();
@@ -318,7 +319,6 @@ void Scheduler::reset()
 
     currentMigrationVersion = 0;
     receivedMigrationSources.clear();
-    migrationHistory.clear();
 
     runtimeStats.reset();
 
@@ -982,20 +982,6 @@ void Scheduler::dispatchChainedMsgs()
             }
         }
 
-        // Worker-level chain recording: aggregate by dest host only (ignore
-        // which instance produced it). This feeds WorkerStats.workerChainHistory
-        // and is Scheduler-only, so it is not polluted by the Planner's
-        // initial dispatch recording.
-        std::map<std::string, int> workerChainByHost;
-        for (auto& [instancesName, hostCounter] : chainedCallsCounter) {
-            for (auto& [host, count] : hostCounter) {
-                workerChainByHost[host] += count;
-            }
-        }
-        for (auto& [host, count] : workerChainByHost) {
-            runtimeStats.recordWorkerOutgoingChain(host, count);
-        }
-
         faabric::util::FullLock lock(scheduledMsgsMapMx);
         if (scheduledMsgsMap.empty()) {
             lock.unlock();
@@ -1432,8 +1418,6 @@ void Scheduler::updateStatesInfo(
   std::map<std::string, std::set<std::string>>& transDestinationMap,
   std::map<std::string, std::set<std::string>>& transSourceMap)
 {
-    auto startTime = faabric::util::getGlobalClock().epochMillis();
-
     SPDLOG_DEBUG("State Update: Starting state update for migration version {}",
                 migrationVersion);
     isUpdateState.store(true, std::memory_order_release);
@@ -1452,8 +1436,6 @@ void Scheduler::updateStatesInfo(
     decentralScheduler.setScheuduledOperatorMap(scheduledOperatorMap);
     // update runtime summary and states info.
     decentralScheduler.syncStatesInfo(statesInfo);
-
-    runtimeStats.versionUpdate(migrationVersion);
 
     // If it's initialization, we don't need to migrate. Just return after
     // updating the states info.
@@ -1518,9 +1500,6 @@ void Scheduler::updateStatesInfo(
     }
 
     receivedMigrationSources.erase(migrationVersion);
-
-    auto endTime = faabric::util::getGlobalClock().epochMillis();
-    migrationHistory[migrationVersion] = endTime - startTime;
 }
 
 void Scheduler::calculateMaxReplicas(
@@ -1863,33 +1842,6 @@ std::map<std::string, int> Scheduler::getMaxReplicasMap()
     return maxReplicasMap;
 }
 
-std::map<int, int> Scheduler::getMigrationHistory()
-{
-    SPDLOG_DEBUG("Retrieving migration history with {} records",
-                 migrationHistory.size());
-    // if (migrationHistory.empty()) {
-    //     SPDLOG_DEBUG("No migration history records found.");
-    // } else {
-    //     std::stringstream ss;
-    //     ss << "Migration History: {";
-    //     for (auto it = migrationHistory.begin(); it !=
-    //     migrationHistory.end();
-    //          ++it) {
-    //         ss << it->first << ": " << it->second
-    //            << (std::next(it) != migrationHistory.end() ? ", " : "");
-    //     }
-    //     ss << "}";
-    //     SPDLOG_DEBUG(ss.str());
-    // }
-
-    return migrationHistory;
-}
-
-std::map<time_t, int> Scheduler::getVersionTimestamps()
-{
-    return runtimeStats.getVersionTimestamps();
-}
-
 std::map<std::string, InstanceMetricsResult> Scheduler::getWorkerMetrics(
   bool isRuntime)
 {
@@ -1908,6 +1860,12 @@ Scheduler::getStatsSnapshot()
     double lastCpu = getLastVmCpu();
 
     return { queueSizes, runningExecutorsCount, lastCpu };
+}
+
+void Scheduler::setClusterWorkerStats(
+  std::map<std::string, faabric::WorkerStats>&& stats)
+{
+    decentralScheduler.setClusterWorkerStats(std::move(stats));
 }
 
 void Scheduler::cpuMonitorLoop()

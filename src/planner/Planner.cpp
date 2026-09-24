@@ -1249,7 +1249,6 @@ std::string Planner::outputResult()
     auto& alloc = doc.GetAllocator();
     rapidjson::Value workerStatsObj(rapidjson::kObjectType);
     rapidjson::Value maxReplicaObj(rapidjson::kObjectType);
-    rapidjson::Value migrationHistoryObj(rapidjson::kObjectType);
     rapidjson::Value migrationDurationsObj(rapidjson::kObjectType);
     // rapidjson::Value allWorkerMetricsObj(rapidjson::kObjectType);
 
@@ -1272,21 +1271,6 @@ std::string Planner::outputResult()
         }
         maxReplicaObj.AddMember(
           rapidjson::Value(ip.c_str(), alloc).Move(), replicasArr, alloc);
-
-        SPDLOG_DEBUG("Planner parse migration history from host {}", ip);
-        // ===== migration history =====
-        rapidjson::Value migrationArr(rapidjson::kArrayType);
-        for (const auto& [version, count] : stats->migrationhistory()) {
-            SPDLOG_DEBUG(
-              "Migration version {} with duration {}", version, count);
-            rapidjson::Value migObj(rapidjson::kObjectType);
-            migObj.AddMember("version", version, alloc);
-            migObj.AddMember("duration", count, alloc);
-            migrationArr.PushBack(migObj, alloc);
-        }
-        // Add to migrationHistoryObj under the IP key
-        migrationHistoryObj.AddMember(
-          rapidjson::Value(ip.c_str(), alloc).Move(), migrationArr, alloc);
     }
 
     for (const auto& [version, record] : migrationDurations) {
@@ -1301,7 +1285,6 @@ std::string Planner::outputResult()
 
     doc.AddMember("workerStats", workerStatsObj, alloc);
     doc.AddMember("maxReplicaInfo", maxReplicaObj, alloc);
-    doc.AddMember("migrationHistory", migrationHistoryObj, alloc);
     doc.AddMember("migrationDurations", migrationDurationsObj, alloc);
     // doc.AddMember("allWorkerMetrics", allWorkerMetricsObj, alloc);
 
@@ -1314,20 +1297,21 @@ std::string Planner::outputResult()
 }
 
 std::map<std::string, std::unique_ptr<faabric::WorkerStats>>
-Planner::fetchWorkerStatsAsync(const std::vector<std::string>& targetIps)
+Planner::fetchWorkerStatsAsync(const std::vector<std::string>& targetIps,
+                               const faabric::WorkerRuntimeStatsRequest& req)
 {
     std::map<std::string, std::unique_ptr<faabric::WorkerStats>> results;
     std::mutex resultsMutex;
     std::vector<std::future<void>> futures;
     for (const auto& ip : targetIps) {
         try {
-            futures.emplace_back(
-              std::async(std::launch::async, [&results, &resultsMutex, ip]() {
+            futures.emplace_back(std::async(
+              std::launch::async, [&results, &resultsMutex, &req, ip]() {
                   try {
                       //   SPDLOG_DEBUG("Fetching runtime stats from host {}",
                       //   ip);
                       auto stats = faabric::scheduler::getFunctionCallClient(ip)
-                                     ->getWorkerRuntimeStats();
+                                     ->getWorkerRuntimeStats(req);
                       std::lock_guard<std::mutex> lock(resultsMutex);
                       results[ip] = std::move(stats);
                   } catch (const std::exception& e) {
@@ -1365,6 +1349,10 @@ Planner::fetchWorkerStatsAsync(const std::vector<std::string>& targetIps)
 // This is a function updating runtime statistics periodically.
 void Planner::updateRuntimeStats()
 {
+    // Stats fetched from all workers in the previous round, sent back to
+    // every worker with the next fetch. Only touched by this thread.
+    faabric::WorkerRuntimeStatsRequest lastRoundStats;
+
     while (!stopThreadTimer) {
         std::this_thread::sleep_for(
           std::chrono::milliseconds(runtimeReconfigPeriod));
@@ -1374,35 +1362,37 @@ void Planner::updateRuntimeStats()
         }
 
         SPDLOG_TRACE("Planner starts fetching runtime stats from workers");
-        // If no hosts or registered applications, skip fetching stats.
-        std::vector<std::string> targetIps;
-        int maxHostNum = 0;
-        {
-            faabric::util::SharedLock lock(plannerMx);
-            if (state.hostMap.empty()) {
-                continue;
-            }
-            maxHostNum = (int)state.hostMap.size();
-            for (const auto& [ip, hostInfo] : state.activeHosts) {
-                targetIps.push_back(ip);
-            }
-        }
-        if (targetIps.empty()) {
-            continue;
-        }
 
         // Scope reconfigMx to fetch + process only.
         // Must NOT hold reconfigMx when acquiring plannerMx (scaling decision),
         // because flushExecutors/flushSchedulingState acquire plannerMx →
         // reconfigMx in that order — the opposite would deadlock.
 
-        faabric::util::FullLock rflock(reconfigMx);
-        auto results = fetchWorkerStatsAsync(targetIps);
-
-        if (state.applicationMetrics) {
-            state.applicationMetrics->recordWorkerMetrics(results);
+        // Snapshot the registered workers before taking reconfigMx. This
+        // also prunes the hosts that have timed out, so we only issue RPCs to
+        // responsive workers.
+        std::vector<std::string> targetIps;
+        for (const auto& host : getAvailableHosts()) {
+            targetIps.push_back(host->ip());
         }
-        rflock.unlock();
+
+        if (targetIps.empty()) {
+            SPDLOG_TRACE("No registered workers to fetch runtime stats from");
+            lastRoundStats.Clear();
+        } else {
+            faabric::util::FullLock rflock(reconfigMx);
+            auto results = fetchWorkerStatsAsync(targetIps, lastRoundStats);
+
+            if (state.applicationMetrics) {
+                state.applicationMetrics->recordWorkerMetrics(results);
+            }
+
+            lastRoundStats.Clear();
+            auto& clusterStats = *lastRoundStats.mutable_clusterstats();
+            for (auto& [ip, stats] : results) {
+                clusterStats[ip] = std::move(*stats);
+            }
+        }
 
         // Capture planner-level waiting queue snapshot.
         if (state.applicationMetrics) {
@@ -1422,37 +1412,6 @@ void Planner::updateRuntimeStats()
             }
             state.applicationMetrics->recordQueueSnapshot(qSize, qAgeMicros);
         }
-
-        // SPDLOG_DEBUG("Planner finished updating runtime stats");
-
-        if (!state.applicationMetrics || isWarmup.load() ||
-            !autoScalingEnabled.load()) {
-            continue;
-        }
-
-        auto signals = state.applicationMetrics->getScalingSignals(
-          scalingDecisionPeriodMs / 1000);
-
-        // Compute chainedMultiplier from Application DAG:
-        // totalLoad = inputRate × (totalOperatorCount / inputOperatorCount)
-        if (stateAwareScheduler) {
-            const auto& inputNodeNames =
-              stateAwareScheduler->getInputNodeNames();
-            if (!inputNodeNames.empty()) {
-                auto workloads = state.applicationMetrics->getOptWorkloads();
-                long inputCount = 0, totalCount = 0;
-                for (const auto& [name, count] : workloads)
-                    totalCount += count;
-                for (const auto& inputName : inputNodeNames)
-                    if (workloads.count(inputName))
-                        inputCount += workloads.at(inputName);
-                if (inputCount > 0)
-                    signals.chainedMultiplier =
-                      static_cast<double>(totalCount - inputCount) / inputCount;
-            }
-        }
-
-        evaluateReschedule(signals, maxHostNum);
     }
 }
 

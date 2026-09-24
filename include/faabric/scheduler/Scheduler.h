@@ -166,19 +166,15 @@ class Scheduler
 
     std::map<std::string, int> getMaxReplicasMap();
 
-    std::map<int, int> getMigrationHistory();
-
-    std::map<time_t, int> getVersionTimestamps();
-
     std::map<std::string, InstanceMetricsResult> getWorkerMetrics(
       bool isRuntime = false);
 
-    std::map<std::string, int> getLastSecWorkerChain()
-    {
-        return runtimeStats.getLastSecWorkerChain();
-    }
-
     std::tuple<std::map<std::string, int>, double, double> getStatsSnapshot();
+
+    // Hands the planner's previous-round stats of all workers to
+    // decentralScheduler.
+    void setClusterWorkerStats(
+      std::map<std::string, faabric::WorkerStats>&& stats);
 
     void notifyExecutorFinished();
 
@@ -330,8 +326,6 @@ class Scheduler
     // MAP<migration version, set of updated states>
     std::map<int, std::set<std::string>> receivedMigrationSources;
     std::condition_variable migrationCv;
-    // MAP<migration version, migration time>
-    std::map<int, int> migrationHistory;
 
     using StateMigrationMap =
       std::map<std::string, std::map<std::string, std::vector<uint8_t>>>;

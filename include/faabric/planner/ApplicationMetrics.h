@@ -762,9 +762,6 @@ class ApplicationMetrics
         std::map<time_t, double> cpuLoadHistory;
         std::map<time_t, double> executorsHistory;
         std::map<time_t, bool> saturatedHistory;
-        // Worker-level outgoing chained calls: time -> (destHost -> count).
-        // Sourced from WorkerStats.workerChainHistory (Scheduler-only).
-        std::map<time_t, std::map<std::string, int>> chainHistory;
     };
 
     // Adds or updates the worker stats fetched from a specific host.
@@ -862,27 +859,9 @@ class ApplicationMetrics
                 }
             }
 
-            // Worker-level chain counts: read from
-            // WorkerStats.workerChainHistory (proto field 10), aggregated by
-            // dest host. dest == ip (or empty) is local, anything else is
-            // remote. Also persist into clusterWorkerMetrics for the snapshot
-            // block below.
-            auto& persistedChain =
-              clusterWorkerMetrics[ip].chainHistory[currentTime];
-            std::set<std::string> remoteDestHosts;
-            for (const auto& [ts, secProto] : statsPtr->workerchainhistory()) {
-                for (const auto& [dest, cnt] : secProto.hostcount()) {
-                    persistedChain[dest] += cnt;
-                    if (dest.empty() || dest == ip) {
-                        hostLocalChainedCalls += cnt;
-                    } else {
-                        hostRemoteChainedCalls += cnt;
-                        remoteDestHosts.insert(dest);
-                    }
-                }
-            }
-            double hostRemoteHostCount =
-              static_cast<double>(remoteDestHosts.size());
+            // Workers no longer report chained-call counts, so the RLS
+            // chained-call inputs (local, remote, remote host count) stay 0.
+            double hostRemoteHostCount = 0.0;
 
             // Host is saturated when the host-wide weighted average queue depth
             // and wait time both exceed their thresholds.
@@ -958,6 +937,7 @@ class ApplicationMetrics
         {
             long long execTimeSum = 0;
             long execTimeCount = 0;
+            // Chained-call totals stay 0: workers no longer report them.
             long long totalChained = 0;
             long long totalLocalChained = 0;
             long long totalRemoteChained = 0;
@@ -980,24 +960,6 @@ class ApplicationMetrics
                         execTimeCount += r.workerExecTime.count;
                     }
                     totalThroughput += r.throughput;
-                    workerHasData = true;
-                }
-
-                // Worker-level chained calls + distinct dest hosts come from
-                // chainHistory (Scheduler-recorded), not per-instance data.
-                auto chainIt = workerNode.chainHistory.find(currentTime);
-                if (chainIt != workerNode.chainHistory.end()) {
-                    std::set<std::string> destSet;
-                    for (const auto& [dest, cnt] : chainIt->second) {
-                        totalChained += cnt;
-                        if (dest.empty() || dest == workerIp) {
-                            totalLocalChained += cnt;
-                        } else {
-                            totalRemoteChained += cnt;
-                            destSet.insert(dest);
-                        }
-                    }
-                    totalDestHosts += (double)destSet.size();
                     workerHasData = true;
                 }
 
@@ -1066,11 +1028,6 @@ class ApplicationMetrics
                    workerNode.saturatedHistory.begin()->first < cutoffTime) {
                 workerNode.saturatedHistory.erase(
                   workerNode.saturatedHistory.begin());
-            }
-
-            while (!workerNode.chainHistory.empty() &&
-                   workerNode.chainHistory.begin()->first < cutoffTime) {
-                workerNode.chainHistory.erase(workerNode.chainHistory.begin());
             }
         }
 
