@@ -28,6 +28,7 @@ class RedisInstance
 
     std::string delifeqSha;
     std::string schedPublishSha;
+    std::string claimSha;
 
     std::string ip;
     std::string hostname;
@@ -63,6 +64,16 @@ redis.call('EXPIRE', key, result_expiry)
 redis.call('SET', status_key, result)
 redis.call('EXPIRE', status_key, status_expiry)
 return 0
+)---";
+
+    // Script to claim ownership of a key. Sets it to our proposed value if
+    // nobody holds it yet, and returns the current owner either way, so a
+    // caller that loses the race still learns where the thing lives.
+    const std::string_view claimCmd = R"---(
+if redis.call('SETNX', KEYS[1], ARGV[1]) == 1 then
+    return ARGV[1]
+end
+return redis.call('GET', KEYS[1])
 )---";
 };
 
@@ -173,6 +184,14 @@ class Redis
     void delIfEq(const std::string& key, uint32_t value);
 
     bool setnxex(const std::string& key, long value, int expirySeconds);
+
+    /**
+     * Atomically claims `key` for `proposedValue` if it is unset, and returns
+     * the value that ends up stored. A caller whose claim loses the race gets
+     * back the winner's value rather than an error.
+     */
+    std::string claimOrGet(const std::string& key,
+                           const std::string& proposedValue);
 
     std::vector<uint8_t> getAndLock(const std::string& key);
 

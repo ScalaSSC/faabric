@@ -165,6 +165,16 @@ class Planner
     std::thread updateRuntimeStatsThread;
 
     int scheduleMode = 0;
+
+    // The RLS coefficient estimator exists for the Binpack (mode 0) capacity
+    // model: ScalingSignals' coeffC/alpha/beta/gamma are read by
+    // computeTargetHostNum, groupNodesCapacity and computeChainedCostCoeff,
+    // all of which only run for mode 0. Every other mode -- ModeFlux included
+    // -- would be fitting it every stats round for nothing.
+    static bool coeffEstimatorUsedBy(int mode)
+    {
+        return mode == faabric::batch_scheduler::ModeBinpack;
+    }
     bool streamMode = faabric::util::getSystemConfig().streamMode;
     long lastParallelismUpdate;
     int parallelismUpdateInterval;
@@ -216,7 +226,7 @@ class Planner
 
     faabric::scheduler::InstancesRuntimeStats runtimeStats;
 
-    int runtimeReconfigPeriod = 5000; // ms
+    int runtimeReconfigPeriod = 1000; // ms
 
     // Auto-scaling: evaluate host count every scalingDecisionPeriodMs
     int scalingDecisionPeriodMs = 10000; // ms

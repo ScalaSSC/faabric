@@ -21,6 +21,16 @@ void DecentralizedScheduler::syncStatesInfo(
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
     statesInfo)
 {
+    // ModeFlux broadcasts no state: the planner registers none, so the
+    // request is always empty. The maps below are not a copy of the planner's
+    // view here but a cache this worker built while routing — claimed shard
+    // owners and the hash rings derived from the DAG — so clearing them would
+    // only force every key back through Redis for nothing.
+    if (scheduleMode == ModeFlux) {
+        SPDLOG_DEBUG("Flux keeps its locally resolved state info");
+        return;
+    }
+
     faabric::util::FullLock lock(scheduleMx);
 
     // Clean up the existing state info
@@ -53,6 +63,7 @@ void DecentralizedScheduler::syncStatesInfo(
             continue;
         }
         statePartitionBy[userFunc] = info.partitionBy;
+
         auto scheduledOpt =
           getScheduledOperatorOrThrow(scheduledOperatorsMap, userFunc);
         auto parallelismDist = scheduledOpt.parallelismDist;
@@ -77,17 +88,4 @@ void DecentralizedScheduler::syncStatesInfo(
     printScheduleInfomation();
 }
 
-void DecentralizedScheduler::setClusterWorkerStats(
-  std::map<std::string, faabric::WorkerStats>&& stats)
-{
-    faabric::util::FullLock lock(clusterWorkerStatsMx);
-    clusterWorkerStats = std::move(stats);
-}
-
-std::map<std::string, faabric::WorkerStats>
-DecentralizedScheduler::getClusterWorkerStats()
-{
-    faabric::util::SharedLock lock(clusterWorkerStatsMx);
-    return clusterWorkerStats;
-}
 }

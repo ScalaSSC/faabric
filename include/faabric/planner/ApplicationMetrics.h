@@ -881,8 +881,8 @@ class ApplicationMetrics
               hostSaturated;
 
             // One RLS update per host per second, only when saturated.
-            if (hostSaturated && hostThroughput > 0.0 &&
-                hostExecTimeCount > 0) {
+            if (coeffEstimatorEnabled && hostSaturated &&
+                hostThroughput > 0.0 && hostExecTimeCount > 0) {
                 double avgExecTime =
                   static_cast<double>(hostExecTimeSum) / hostExecTimeCount;
                 coeffEstimator.update(hostThroughput,
@@ -988,12 +988,14 @@ class ApplicationMetrics
               workerCount > 0 ? totalDestHosts / workerCount : 0.0;
 
             auto& snap = runtimeMetricsHistory[currentTime];
-            snap.coeffC = coeffEstimator.C();
-            snap.alpha = coeffEstimator.alpha();
-            snap.beta = coeffEstimator.beta();
-            snap.gamma = coeffEstimator.gamma();
-            snap.maxProcessed =
-              coeffEstimator.maxProcessed(avgExecTime, 0.0, 0.0, 0.0);
+            if (coeffEstimatorEnabled) {
+                snap.coeffC = coeffEstimator.C();
+                snap.alpha = coeffEstimator.alpha();
+                snap.beta = coeffEstimator.beta();
+                snap.gamma = coeffEstimator.gamma();
+                snap.maxProcessed =
+                  coeffEstimator.maxProcessed(avgExecTime, 0.0, 0.0, 0.0);
+            }
             snap.avgExecTime = avgExecTime;
             snap.avgChainedRatio = avgChainedRatio;
             snap.avgLocalChainedRatio = avgLocalChainedRatio;
@@ -1132,11 +1134,14 @@ class ApplicationMetrics
         }
 
         // CoeffEstimator physical coefficients (current estimates, not
-        // windowed)
-        sig.coeffC = coeffEstimator.C();
-        sig.alpha = coeffEstimator.alpha();
-        sig.beta = coeffEstimator.beta();
-        sig.gamma = coeffEstimator.gamma();
+        // windowed). Left at 0 when the estimator is off: a coeffC of 0 is
+        // what the capacity model already treats as "not warmed up yet".
+        if (coeffEstimatorEnabled) {
+            sig.coeffC = coeffEstimator.C();
+            sig.alpha = coeffEstimator.alpha();
+            sig.beta = coeffEstimator.beta();
+            sig.gamma = coeffEstimator.gamma();
+        }
 
         // Latest planner waiting queue snapshot
         if (!runtimeMetricsHistory.empty()) {
@@ -1234,6 +1239,23 @@ class ApplicationMetrics
         return true;
     }
 
+    // The RLS coefficient estimator only feeds the Binpack (mode 0) capacity
+    // model -- ScalingSignals' coeffC/alpha/beta/gamma have no other reader.
+    // Modes that do not use that model, ModeFlux among them, switch it off so
+    // the estimator is not fitted every stats round on data nothing consumes.
+    // The snapshot fields stay in place and read 0, which keeps the metrics
+    // output's column layout unchanged.
+    void setCoeffEstimatorEnabled(bool value)
+    {
+        faabric::util::FullLock lock(opMx);
+        if (coeffEstimatorEnabled == value) {
+            return;
+        }
+        coeffEstimatorEnabled = value;
+        SPDLOG_INFO("ApplicationMetrics: coefficient estimator {}",
+                    value ? "ON" : "OFF");
+    }
+
     bool setCoeff(const std::string& key, double value)
     {
         faabric::util::FullLock lock(opMx);
@@ -1324,6 +1346,8 @@ class ApplicationMetrics
 
     // Online RLS coefficient estimator (alpha, beta in CPU-budget model).
     CoeffEstimator coeffEstimator;
+    // Whether to fit and publish it at all; see setCoeffEstimatorEnabled.
+    bool coeffEstimatorEnabled = true;
 
     // thresholds for worker-side saturation detection
     int workerQueueNumThreshold = 500;

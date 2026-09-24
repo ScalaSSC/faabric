@@ -199,6 +199,8 @@ void Planner::flushSchedulingState()
     state.appStartTimes.clear();
     state.applicationMetrics =
       std::make_unique<ApplicationMetrics>("defaultApp", 1);
+    state.applicationMetrics->setCoeffEstimatorEnabled(
+      coeffEstimatorUsedBy(scheduleMode));
 
     state.activeHosts = convertToHostMap(state.hostMap);
     schedHostNum = 0;
@@ -206,7 +208,7 @@ void Planner::flushSchedulingState()
 
 std::vector<std::shared_ptr<Host>> Planner::getAvailableHosts(bool locked)
 {
-    SPDLOG_DEBUG("Planner received request to get available hosts");
+    // SPDLOG_DEBUG("Planner received request to get available hosts");
 
     // Acquire a full lock because we will also remove the hosts that have
     // timed out
@@ -698,11 +700,25 @@ bool Planner::registerApp(faabric::planner::RegisterApplicationRequest& rawReq,
     stateAwareScheduler->registerApp(std::move(app));
     distributeApp(rawReq);
 
+    // ModeFlux places nothing here: operators are not pinned and a shard's
+    // owner is claimed in Redis the first time a request is routed to it, so
+    // distributing the DAG is the whole of registration. It also runs on the
+    // full cluster rather than a `schedHostNum` prefix -- workers route over
+    // every registered host (Scheduler::routableHosts), and narrowing the
+    // planner's view would only make the two disagree on which host to
+    // propose as a shard's owner.
+    if (scheduleMode == batch_scheduler::ModeFlux) {
+        SPDLOG_INFO("Planner is in ModeFlux, skipping scheduling");
+        state.activeHosts = convertToHostMap(state.hostMap);
+        return true;
+    }
+
     if (schedHostNum != 0 && schedHostNum < state.hostMap.size()) {
         auto tempHostMap = convertToHostMap(state.hostMap);
         state.activeHosts =
           faabric::util::getFirstNElements(tempHostMap, schedHostNum);
     }
+
     stateAwareScheduler->initApp(state.activeHosts);
     stateAwareScheduler->scheduleApp(state.activeHosts);
     int curVersion = migrationVersion++;
@@ -1095,6 +1111,10 @@ bool Planner::resetParameter(
         // scheduler existed, and it only takes effect for modes 3 and 4.
         stateAwareScheduler->setClastPlacement(isClastPlacement);
         scheduleMode = value;
+        if (state.applicationMetrics) {
+            state.applicationMetrics->setCoeffEstimatorEnabled(
+              coeffEstimatorUsedBy(scheduleMode));
+        }
     }
     if (key == "dispatch_period") {
         dispatchPeriod = value;
@@ -1116,6 +1136,18 @@ bool Planner::resetParameter(
         double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
         stateAwareScheduler->setAlpha(newAlpha);
+    }
+    if (key == "flux_local_queue_limit") {
+        if (stateAwareScheduler) {
+            stateAwareScheduler->setFluxLocalQueueLimit(value);
+        }
+        SPDLOG_INFO("Flux local queue limit set to {}", value);
+    }
+    if (key == "flux_offload_margin") {
+        if (stateAwareScheduler) {
+            stateAwareScheduler->setFluxOffloadMargin(value);
+        }
+        SPDLOG_INFO("Flux offload margin set to {}", value);
     }
 
     // Forward to worker hosts
@@ -1142,7 +1174,10 @@ void Planner::rescheduleApp(int rescheduleMode, int hostNum)
 
     faabric::util::FullLock lock(plannerMx);
 
-    if (hostNum > 0 && hostNum <= (int)state.hostMap.size()) {
+    // ModeFlux always runs on the whole cluster; see registerApp.
+    if (scheduleMode == batch_scheduler::ModeFlux) {
+        state.activeHosts = convertToHostMap(state.hostMap);
+    } else if (hostNum > 0 && hostNum <= (int)state.hostMap.size()) {
         state.activeHosts = faabric::util::getFirstNElements(
           convertToHostMap(state.hostMap), hostNum);
         schedHostNum = hostNum;
@@ -1169,7 +1204,6 @@ void Planner::rescheduleApp(int rescheduleMode, int hostNum)
     stateAwareScheduler->updateApp(operatorWorkloadMap, edgeWeightMap);
     stateAwareScheduler->rescheduleApp(state.activeHosts,
                                        state.applicationMetrics.get());
-
 
     if (scheduleMode == 3 || scheduleMode == 0 ||
         (isClastPlacement && scheduleMode == 4)) {
@@ -1391,6 +1425,17 @@ void Planner::updateRuntimeStats()
             auto& clusterStats = *lastRoundStats.mutable_clusterstats();
             for (auto& [ip, stats] : results) {
                 clusterStats[ip] = std::move(*stats);
+            }
+
+            // The planner routes requests itself, so hand its scheduler the
+            // same cluster view the workers get piggybacked next round.
+            if (stateAwareScheduler) {
+                std::map<std::string, faabric::WorkerStats> schedStats;
+                for (const auto& [ip, stats] : clusterStats) {
+                    schedStats[ip] = stats;
+                }
+                stateAwareScheduler->setClusterWorkerStats(
+                  std::move(schedStats));
             }
         }
 

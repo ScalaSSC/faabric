@@ -23,6 +23,25 @@ namespace faabric::batch_scheduler {
 using NodeGroup = std::tuple<std::vector<std::shared_ptr<Node>>, std::string>;
 inline const std::string NONE_STRING = "None";
 
+// Values accepted by `scheduleMode`. Historically these were bare integers
+// spread across StateAwareScheduler, Scheduler, Planner and Application; the
+// names are here so the dispatch in scheduleApp/rescheduleApp can be read
+// without cross-referencing. `scheduleMode` stays an int because it arrives
+// from config and over HTTP.
+enum ScheduleMode : int
+{
+    ModeBinpack = 0,          // Capacity Binpack
+    ModeFaaSFlowAdaptive = 3,
+    ModeNonlinear = 4,
+    ModeApportion = 5,
+    ModeFaaSFlow = 7,
+    ModeStepConf = 11,
+    // Operators are not pinned to workers at all. Placement follows state
+    // ownership, which is claimed on demand in Redis by whichever scheduler
+    // routes the first request for it.
+    ModeFlux = 12,
+};
+
 struct HashAndParallelismInfo
 {
     int messageType;
@@ -84,6 +103,20 @@ class StateAwareScheduler : public BatchScheduler
     // rescheduleAppClastPlacement.
     void setClastPlacement(bool value) { isClastPlacement = value; }
 
+    // Cluster-wide view: the stats the planner fetched from every worker in
+    // its previous runtime-stats round, keyed by worker IP. Lives here rather
+    // than on DecentralizedScheduler because the planner routes requests too
+    // and needs the same view. Not cleared by resetScheduler(), as that also
+    // runs on every migration.
+    void setClusterWorkerStats(
+      std::map<std::string, faabric::WorkerStats>&& stats);
+
+    std::map<std::string, faabric::WorkerStats> getClusterWorkerStats();
+
+    void setFluxLocalQueueLimit(int value) { fluxLocalQueueLimit = value; }
+
+    void setFluxOffloadMargin(int value) { fluxOffloadMargin = value; }
+
     bool getClastPlacement() const { return isClastPlacement; }
 
     virtual void resetScheduler();
@@ -118,8 +151,54 @@ class StateAwareScheduler : public BatchScheduler
       const HostMap& hostMap,
       const std::unique_ptr<Message>& msg);
 
-    std::string scheduleStatefulMessage(std::string& userFunc,
+    /**
+     * ModeFlux stateless routing. Keeps the request on this worker while the
+     * operator's local backlog is tolerable, and offloads to a less congested
+     * host once it is not. The planner has no "local", so it always picks a
+     * host from the cluster view.
+     */
+    std::string scheduleStatelessMessageFlux(
+      std::string& userFunc,
+      const HostMap& hostMap,
+      const std::unique_ptr<Message>& msg);
+
+    /**
+     * Waiting-queue depth `ip` last reported for `queueKey`, or -1 if that
+     * host did not report at all in the last stats round.
+     */
+    static int hostQueueDepth(
+      const std::map<std::string, faabric::WorkerStats>& stats,
+      const std::string& ip,
+      const std::string& queueKey);
+
+    /**
+     * The registered DAG node for `userFunc`, or nullptr when no application
+     * is registered or the operator is not part of it. Public because the
+     * receiving side of a message needs the same view: under ModeFlux the
+     * DAG is the only description of an operator anyone has.
+     */
+    std::shared_ptr<Node> lookupNode(const std::string& userFunc);
+
+    std::string scheduleStatefulMessage(const HostMap& hostMap,
+                                        std::string& userFunc,
                                         const std::unique_ptr<Message>& msg);
+
+    /**
+     * ModeFlux routing. Nothing is registered at application registration
+     * time, so the operator's kind comes from the DAG every scheduler
+     * received in registerApp rather than from functionParallelism /
+     * statePartitionBy, which ModeFlux never populates:
+     *   - stateless            -> purely load-driven (queue depths)
+     *   - partitioned stateful -> the shard its partition key hashes to,
+     *                             whose owner is claimed on demand the first
+     *                             time any scheduler routes to it
+     *   - stateful             -> the owner of the shard it shuffles onto
+     * An operator missing from the DAG is routed by load: that is always
+     * safe, whereas inventing a shard for it is not.
+     */
+    std::string scheduleMessageFlux(const HostMap& hostMap,
+                                    std::string& userFunc,
+                                    const std::unique_ptr<Message>& msg);
 
     std::string scheduleMessage(const HostMap& hostMap,
                                 const faabric::Message& msg);
@@ -360,6 +439,18 @@ class StateAwareScheduler : public BatchScheduler
     // scheduler lock
     std::shared_mutex scheduleMx;
 
+    std::shared_mutex clusterWorkerStatsMx;
+    std::map<std::string, faabric::WorkerStats> clusterWorkerStats;
+
+    // ModeFlux stateless routing thresholds, both in queued messages.
+    // A worker keeps a request until the operator's local backlog exceeds
+    // fluxLocalQueueLimit, and even then only moves it to a host whose
+    // backlog is at least fluxOffloadMargin shorter. Without that margin a
+    // worker sitting just over the limit ships work to a host that is barely
+    // better, and the two trade places on every stats round.
+    int fluxLocalQueueLimit = 8;
+    int fluxOffloadMargin = 4;
+
     bool isplanner = true;
     int scheduleMode = 0;
 
@@ -552,6 +643,9 @@ class StateAwareScheduler : public BatchScheduler
     // Only partitioned stateful function will be registered here.
     // FunctionUser : Input Parition Key
     std::map<std::string, std::string> statePartitionBy;
+    // ModeFlux: operators whose shards have all been placed. Guards the
+    // per-message fast path from re-walking the whole shard set.
+    std::set<std::string> fluxInitialisedOps;
     // Function_User : Counter. It is used for shuffle grouping.
     std::shared_mutex counterMx;
     std::map<std::string, std::shared_ptr<std::atomic_uint>> counterTable;
@@ -606,6 +700,84 @@ class StateAwareScheduler : public BatchScheduler
     HashAndParallelismInfo getHashAndParallelismIndex(
       const std::string& userFunction,
       const faabric::Message& msg);
+
+    /**
+     * ModeFlux variant: the partition key and the shard count are read off
+     * the DAG node instead of statePartitionBy / functionParallelism.
+     */
+    HashAndParallelismInfo getHashAndParallelismIndexFlux(
+      const std::string& userFunction,
+      const Node& node,
+      const faabric::Message& msg);
+
+    /**
+     * ModeFlux: how many shards `node` starts with.
+     *
+     * A partitioned operator holds ONE logical state split by key, so it can
+     * start as a single shard and be split later as load appears -- which is
+     * how ModeFlux grows anything. Its declared parallelism is a target for
+     * that growth, not a starting point, so it is deliberately ignored here.
+     *
+     * A non-partitioned stateful operator is the opposite: its instances hold
+     * genuinely separate states and the shuffle picks between them with
+     * nothing mapping a key to one, so collapsing them would merge states
+     * that were never the same state. Its declared parallelism is honoured.
+     */
+    static int fluxShardCount(const Node& node);
+
+    /**
+     * ModeFlux: place every shard of `userFunc` the first time any of them is
+     * routed to, rather than one shard at a time, and place them all on one
+     * worker.
+     *
+     * ModeFlux does no static placement, so the initial layout only has to be
+     * deterministic, not good: the runtime spreads shards out from there as
+     * load appears. Starting every shard co-located is the honest expression
+     * of that -- it commits to nothing, and an operator that never gets hot
+     * never costs more than one worker. The whole set is placed at once
+     * because a half-placed operator would otherwise claim its remaining
+     * shards one at a time, whenever the input happened to first hash to
+     * them, making the layout depend on arrival order.
+     *
+     * Applies to both stateful kinds: partitioned operators get the shards
+     * their hash ring spans, non-partitioned ones the shards their shuffle
+     * rotates through. A no-op once the operator has been placed.
+     */
+    void initOperatorStateFlux(const std::string& userFunc,
+                               int parallelism,
+                               const HostMap& hostMap);
+
+    /**
+     * Hash ring over `parallelism` shards of `userFunction`, built on first
+     * use and cached. Every shard carries equal weight: ModeFlux pins no
+     * operator to a worker, so there are no per-worker weights to skew the
+     * ring with. Rebuilt if the DAG's shard count ever differs from the
+     * cached one.
+     */
+    std::shared_ptr<faabric::util::ConsistentHashRing> getFluxHashRing(
+      const std::string& userFunction,
+      int parallelism);
+
+    /**
+     * Returns the host owning `userFuncPar`, claiming it for a freshly picked
+     * candidate if nobody owns it yet (ModeFlux). Redis arbitrates, so
+     * concurrent callers on different schedulers agree on a single owner and
+     * the losers still get the winner's host back.
+     *
+     * Under the pinning modes the owner is always already in `stateHost`, so
+     * this never reaches Redis.
+     */
+    std::string resolveStateHost(const std::string& userFuncPar,
+                                 const HostMap& hostMap);
+
+    /**
+     * Deterministic first guess at who should own `userFuncPar`. Every
+     * scheduler derives the same candidate from the key, so the claim in
+     * resolveStateHost almost always succeeds on the first attempt instead of
+     * a herd of schedulers fighting over one key.
+     */
+    static std::string pickCandidateHost(const std::string& userFuncPar,
+                                         const HostMap& hostMap);
 
     void groupNodesHelper(const std::string& nodeName,
                           std::vector<NodeGroup>& groups,

@@ -299,6 +299,10 @@ void Scheduler::reset()
 
     scheduledMsgsMap.clear();
     maxReplicasMap.clear();
+    {
+        faabric::util::FullLock lock(fluxKnownShardsMx);
+        fluxKnownShards.clear();
+    }
 
     // This function is called when planner flush executors. In this case,
     // planner didn't flush the hostmap, the scheduler also should not flush it.
@@ -518,6 +522,13 @@ void Scheduler::enqueueMessageBatch(
         faabric::Message& msg = *msgPtr;
         std::string userFuncPar = msg.user() + "_" + msg.function() + "_" +
                                   std::to_string(msg.parallelismid());
+
+        // ModeFlux creates a shard's state here, on the message that first
+        // addresses it, because nothing has created it ahead of time.
+        if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
+            ensureLocalStateFlux(msg, userFuncPar);
+        }
+
         instancesCounter[userFuncPar]++;
         (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_TIME_KEY] = current;
         msg.set_starttimestamp(currentMillis);
@@ -668,7 +679,7 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
 
         for (auto& src : msgVec) {
             std::string host =
-              decentralScheduler.scheduleMessage(activeHosts, *src);
+              decentralScheduler.scheduleMessage(routableHosts(), *src);
             if (host != thisHost) {
                 faabric::util::FullLock lock(chainedCallMsgsMx);
                 chainedCallMsgs.push_back(std::move(src));
@@ -960,7 +971,7 @@ void Scheduler::dispatchChainedMsgs()
             // Schedule the chained calls
             // auto start = faabric::util::getCpuTimeNano();
             auto hosts = decentralScheduler.scheduleMessagesBatch(
-              activeHosts, localChainedCallMsgs);
+              routableHosts(), localChainedCallMsgs);
             // auto end = faabric::util::getCpuTimeNano();
             // if (start > 0 && end >= start) {
             //     cpuScheduleTime.fetch_add(end - start,
@@ -1056,6 +1067,12 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         }
     } else if (key == "runtime_reconfig") {
         decentralScheduler.setRuntimeReconfig(value == 1);
+    } else if (key == "flux_local_queue_limit") {
+        decentralScheduler.setFluxLocalQueueLimit(value);
+        SPDLOG_INFO("Reset flux_local_queue_limit parameter to : {}", value);
+    } else if (key == "flux_offload_margin") {
+        decentralScheduler.setFluxOffloadMargin(value);
+        SPDLOG_INFO("Reset flux_offload_margin parameter to : {}", value);
     } else if (key == "alpha") {
         double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
@@ -1092,19 +1109,40 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
 
     {
         faabric::util::SharedLock lock(mx);
-        auto& thisExecutors = executors[funcStr];
-        currentExecutorsSize = thisExecutors.size();
+        // NB - find() not operator[]: the latter default-inserts, which is a
+        // write to the map under a shared lock, racing every other reader and
+        // the push_back in claimExecutor.
+        auto it = executors.find(funcStr);
+        if (it != executors.end()) {
+            currentExecutorsSize = it->second.size();
 
-        for (auto& e : thisExecutors) {
-            if (e->availableClaim()) {
-                foundAvailable = true;
-                break;
+            for (auto& e : it->second) {
+                if (e->availableClaim()) {
+                    foundAvailable = true;
+                    break;
+                }
             }
         }
     }
 
     if (foundAvailable) {
         return true;
+    }
+
+    // ModeFlux has no planner-derived replica budget: nothing pins operators
+    // to workers, so there is no weight distribution to split one out of.
+    // maxExecutors is applied per shard instead -- funcStr is already
+    // user/func/parIdx -- so each shard scales on demand up to the same
+    // ceiling and no shard can hold another one's queue shut by filling a
+    // worker-wide budget. The reaper hands back whatever sits idle past
+    // BOUND_TIMEOUT.
+    if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
+        if (currentExecutorsSize < maxExecutors) {
+            return true;
+        }
+        // At the cap: this queue will not drain until an executor frees up.
+        logFluxExecutorCensus(funcStr);
+        return false;
     }
 
     int maxReplicas;
@@ -1507,6 +1545,14 @@ void Scheduler::calculateMaxReplicas(
     scheduledOperatorMap)
 {
     maxReplicasMap.clear();
+
+    // ModeFlux derives no per-function budgets. executorAvailable scales on
+    // demand against maxExecutors instead, so leaving the map empty is the
+    // intended state rather than a missing step.
+    if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
+        return;
+    }
+
     // Weight-derived budgets, renormalised below so they sum to maxExecutors.
     std::map<std::string, int> tempMaxReplicasMap;
     // Planner-supplied absolute budgets (Binpack mode 0), used verbatim.
@@ -1641,6 +1687,113 @@ void Scheduler::calculateMaxReplicas(
     }
 }
 
+void Scheduler::logFluxExecutorCensus(const std::string& blockedFunc)
+{
+    auto nowMs = faabric::util::getGlobalClock().epochMillis();
+    auto last = lastFluxExecutorLogMs.load(std::memory_order_relaxed);
+    if (nowMs - last < 1000) {
+        return;
+    }
+    if (!lastFluxExecutorLogMs.compare_exchange_strong(last, nowMs)) {
+        // Another thread is logging this second.
+        return;
+    }
+
+    // Ordered, so the same operator sits in the same place from one line to
+    // the next; `executors` itself is unordered.
+    std::map<std::string, std::pair<int, int>> census; // op -> {free, total}
+    int total = 0;
+    {
+        faabric::util::SharedLock lock(mx);
+        for (const auto& [funcStr, execs] : executors) {
+            int free = 0;
+            for (const auto& e : execs) {
+                if (e->availableClaim()) {
+                    free++;
+                }
+            }
+            census[funcStr] = { free, static_cast<int>(execs.size()) };
+            total += static_cast<int>(execs.size());
+        }
+    }
+
+    std::ostringstream oss;
+    bool first = true;
+    for (const auto& [funcStr, counts] : census) {
+        if (!first) {
+            oss << ", ";
+        }
+        first = false;
+        oss << funcStr << " " << counts.first << "/" << counts.second;
+    }
+
+    SPDLOG_DEBUG("Flux {} at its cap of {} on {}; worker holds {} executors "
+                 "[free/total]: {}",
+                 blockedFunc,
+                 maxExecutors,
+                 thisHost,
+                 total,
+                 oss.str());
+}
+
+void Scheduler::ensureLocalStateFlux(const faabric::Message& msg,
+                                     const std::string& userFuncPar)
+{
+    {
+        faabric::util::SharedLock lock(fluxKnownShardsMx);
+        if (fluxKnownShards.contains(userFuncPar)) {
+            return;
+        }
+    }
+
+    // The DAG is the only description of an operator under ModeFlux, and
+    // every worker holds one from registerApp.
+    std::string userFunc = msg.user() + "_" + msg.function();
+    auto node = decentralScheduler.lookupNode(userFunc);
+
+    bool needsState =
+      node != nullptr &&
+      node->type != faabric::batch_scheduler::NodeType::STATELESS;
+    bool isPartitioned =
+      needsState &&
+      node->type == faabric::batch_scheduler::NodeType::PARTITIONED_STATEFUL &&
+      !node->partitionBy.empty() && node->partitionBy != "None";
+
+    if (!needsState) {
+        // Stateless, or not an operator we know. Remember that so the lookup
+        // above short-circuits every later message for it.
+        faabric::util::FullLock lock(fluxKnownShardsMx);
+        fluxKnownShards.insert(userFuncPar);
+        return;
+    }
+
+    faabric::util::FullLock lock(fluxKnownShardsMx);
+    // Another thread may have created it while we were reading the DAG.
+    if (!fluxKnownShards.insert(userFuncPar).second) {
+        return;
+    }
+
+    try {
+        SPDLOG_INFO("Flux creates state {} on {} (partitioned {})",
+                    userFuncPar,
+                    thisHost,
+                    isPartitioned);
+        faabric::state::getGlobalState().createFS(
+          msg.user(), msg.function(), msg.parallelismid(), isPartitioned);
+    } catch (const std::exception& e) {
+        // The FunctionState constructor refuses to build state this host does
+        // not own, so landing here means the message was routed somewhere it
+        // should not have been. Drop the record rather than caching a shard
+        // we never created, and let the failure surface when the function
+        // actually reaches for its state.
+        fluxKnownShards.erase(userFuncPar);
+        SPDLOG_ERROR("Flux could not create state {} on {}: {}",
+                     userFuncPar,
+                     thisHost,
+                     e.what());
+    }
+}
+
 void Scheduler::createLocalState(
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
     statesInfo)
@@ -1703,7 +1856,7 @@ Scheduler::packMessage()
     lock.unlock();
 
     auto hosts =
-      decentralScheduler.scheduleMessagesBatch(activeHosts, localMsgs);
+      decentralScheduler.scheduleMessagesBatch(routableHosts(), localMsgs);
 
     for (size_t i = 0; i < localMsgs.size(); ++i) {
         const std::string& destinationHost = hosts[i];

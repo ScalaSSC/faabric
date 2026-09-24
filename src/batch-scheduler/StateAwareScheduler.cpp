@@ -3,6 +3,7 @@
 #include <faabric/state/FunctionStateClient.h>
 #include <faabric/util/batch.h>
 #include <faabric/util/logging.h>
+#include <faabric/util/random.h>
 // #include <faabric/util/map.h>
 #include <faabric/util/serialization.h>
 #include <faabric/util/string_tools.h>
@@ -180,6 +181,16 @@ bool StateAwareScheduler::registerApp(
 
 void StateAwareScheduler::initApp(const HostMap& hostMap)
 {
+    // ModeFlux places nothing at registration time. Distributing the DAG is
+    // the whole of registration: every operator's kind, partition key and
+    // shard count are read back off that DAG when a request is routed, and a
+    // shard's owner is claimed in Redis the first time one is. Registering
+    // states here would pre-place exactly what ModeFlux exists to place late.
+    if (scheduleMode == ModeFlux) {
+        SPDLOG_INFO("Flux skips state registration; state is placed on demand");
+        return;
+    }
+
     faabric::util::FullLock lock(scheduleMx);
 
     // 1. Register the states
@@ -238,11 +249,7 @@ void StateAwareScheduler::doRegisterState(const HostMap& hostMap,
     functionParallelism[userFunc] = 1;
     // The default parallelism is 1 and parallelism Idx is 0
     std::string funcParaId = userFunc + "_0";
-    // Assign state to a host.
-    int hostIdx =
-      stateRbCounter.fetch_add(1, std::memory_order_relaxed) % hostMap.size();
-    std::string host = faabric::util::getNthKey(hostMap, hostIdx);
-    stateHost[funcParaId] = host;
+
     // If it is partitioned state, register it.
     std::string partitionBy = std::get<0>(funcStateRegMap[userFunc]);
     std::string stateKey = std::get<1>(funcStateRegMap[userFunc]);
@@ -252,8 +259,145 @@ void StateAwareScheduler::doRegisterState(const HostMap& hostMap,
           std::make_shared<faabric::util::ConsistentHashRing>(
             functionParallelism[userFunc]);
     }
+
+    // ModeFlux does not place state up front. Leaving the owner unset is what
+    // makes the first scheduler to route a request for it claim a host in
+    // Redis, rather than everyone inheriting a choice made here.
+    if (scheduleMode == ModeFlux) {
+        return;
+    }
+
+    // Assign state to a host.
+    int hostIdx =
+      stateRbCounter.fetch_add(1, std::memory_order_relaxed) % hostMap.size();
+    std::string host = faabric::util::getNthKey(hostMap, hostIdx);
+    stateHost[funcParaId] = host;
     // Register the state to the host.
     registerStateToRedis(funcParaId, host);
+}
+
+std::string StateAwareScheduler::pickCandidateHost(
+  const std::string& userFuncPar,
+  const HostMap& hostMap)
+{
+    // HostMap is ordered, so every scheduler walks the same list and lands on
+    // the same candidate for a given key.
+    std::size_t hash =
+      faabric::util::hashVector(faabric::util::stringToBytes(userFuncPar));
+    return faabric::util::getNthKey(hostMap, hash % hostMap.size());
+}
+
+int StateAwareScheduler::fluxShardCount(const Node& node)
+{
+    if (node.type == NodeType::PARTITIONED_STATEFUL) {
+        return 1;
+    }
+    return node.parallelism > 0 ? node.parallelism : 1;
+}
+
+void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
+                                                int parallelism,
+                                                const HostMap& hostMap)
+{
+    {
+        faabric::util::SharedLock lock(scheduleMx);
+        if (fluxInitialisedOps.contains(userFunc)) {
+            return;
+        }
+    }
+
+    if (hostMap.empty()) {
+        SPDLOG_ERROR("Cannot place state for {} with no active hosts",
+                     userFunc);
+        throw std::runtime_error("No hosts available to own state");
+    }
+
+    // Every shard starts on one worker. Hashing the operator name rather than
+    // each shard key is what keeps the operator whole while still landing
+    // different operators on different workers.
+    std::string home = pickCandidateHost(userFunc, hostMap);
+
+    // Claim the whole set before taking the lock: each shard is a Redis round
+    // trip, and holding scheduleMx across them would serialise all routing on
+    // this host. Two schedulers initialising the same operator propose
+    // identical owners, so whoever wins each SETNX the result is the same.
+    redis::Redis& redis = redis::Redis::getState();
+    std::map<std::string, std::string> owners;
+    for (int idx = 0; idx < parallelism; idx++) {
+        std::string userFuncPar = userFunc + "_" + std::to_string(idx);
+        owners[userFuncPar] =
+          redis.claimOrGet(MAIN_KEY_PREFIX + userFuncPar, home);
+    }
+
+    std::ostringstream oss;
+    bool first = true;
+    for (const auto& [userFuncPar, owner] : owners) {
+        if (!first) {
+            oss << ", ";
+        }
+        first = false;
+        oss << userFuncPar << "->" << owner;
+    }
+    SPDLOG_INFO("Flux places {} ({} shards) on {}: {}",
+                userFunc,
+                parallelism,
+                home,
+                oss.str());
+
+    faabric::util::FullLock lock(scheduleMx);
+    for (const auto& [userFuncPar, owner] : owners) {
+        // Redis is authoritative. A thread that got here first wrote the same
+        // answer, so insert-if-absent and overwrite are equivalent.
+        stateHost.insert({ userFuncPar, owner });
+    }
+    functionParallelism[userFunc] = parallelism;
+    fluxInitialisedOps.insert(userFunc);
+}
+
+std::string StateAwareScheduler::resolveStateHost(
+  const std::string& userFuncPar,
+  const HostMap& hostMap)
+{
+    {
+        faabric::util::SharedLock lock(scheduleMx);
+        auto it = stateHost.find(userFuncPar);
+        if (it != stateHost.end()) {
+            return it->second;
+        }
+    }
+
+    // Every other mode pins state during scheduleApp, so not finding it here
+    // means something upstream failed rather than that it is ours to place.
+    if (scheduleMode != ModeFlux) {
+        SPDLOG_ERROR("StateHost for {} is not initialized", userFuncPar);
+        throw std::runtime_error("StateHost is not initialized");
+    }
+
+    if (hostMap.empty()) {
+        SPDLOG_ERROR("Cannot claim state {} with no active hosts",
+                     userFuncPar);
+        throw std::runtime_error("No hosts available to own state");
+    }
+
+    // Nobody here knows who owns this yet, so claim it. Redis decides, which
+    // keeps the planner and every worker scheduler agreeing on one owner.
+    // NB - deliberately outside the lock: this is a network round trip, and
+    // holding scheduleMx across it would serialise all routing on this host.
+    std::string candidate = pickCandidateHost(userFuncPar, hostMap);
+    redis::Redis& redis = redis::Redis::getState();
+    std::string owner =
+      redis.claimOrGet(MAIN_KEY_PREFIX + userFuncPar, candidate);
+
+    SPDLOG_INFO("Resolved state {} to host {} (proposed {})",
+                userFuncPar,
+                owner,
+                candidate);
+
+    faabric::util::FullLock lock(scheduleMx);
+    // Another thread may have resolved this while we were in Redis. Redis is
+    // authoritative and deterministic, so the answer is the same either way.
+    auto [it, inserted] = stateHost.emplace(userFuncPar, owner);
+    return it->second;
 }
 
 bool StateAwareScheduler::updateFuncStatePar(const std::string& userFunction,
@@ -393,10 +537,8 @@ std::string StateAwareScheduler::scheduleStatelessMessageApportion(
         auto parallelismInfo = getHashAndParallelismIndex(collocateFunc, *msg);
         std::string collocateUserFuncPar =
           collocateFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
-        if (stateHost.find(collocateUserFuncPar) == stateHost.end()) {
-            throw std::runtime_error("StateHost is not initialized");
-        }
-        std::string collocateHost = stateHost[collocateUserFuncPar];
+        std::string collocateHost =
+          resolveStateHost(collocateUserFuncPar, hostMap);
         host = runtimeSummary.getHost(userFuncPar, collocateHost);
     } else {
         // Otherwise the request by using round robin.
@@ -435,10 +577,236 @@ std::string StateAwareScheduler::scheduleStatelessMessageLocal(
     return host;
 }
 
+void StateAwareScheduler::setClusterWorkerStats(
+  std::map<std::string, faabric::WorkerStats>&& stats)
+{
+    faabric::util::FullLock lock(clusterWorkerStatsMx);
+    clusterWorkerStats = std::move(stats);
+}
+
+std::map<std::string, faabric::WorkerStats>
+StateAwareScheduler::getClusterWorkerStats()
+{
+    faabric::util::SharedLock lock(clusterWorkerStatsMx);
+    return clusterWorkerStats;
+}
+
+int StateAwareScheduler::hostQueueDepth(
+  const std::map<std::string, faabric::WorkerStats>& stats,
+  const std::string& ip,
+  const std::string& queueKey)
+{
+    auto hostIt = stats.find(ip);
+    if (hostIt == stats.end()) {
+        // That host did not report in the last round, so we know nothing
+        // about it. Distinguished from zero: an unknown host is not evidence
+        // of an idle one.
+        return -1;
+    }
+
+    const auto& queues = hostIt->second.instancequeuenum();
+    auto queueIt = queues.find(queueKey);
+    // A host that reported but has no queue for this operator genuinely has
+    // nothing waiting for it.
+    return queueIt == queues.end() ? 0 : queueIt->second;
+}
+
+std::string StateAwareScheduler::scheduleStatelessMessageFlux(
+  std::string& userFunc,
+  const HostMap& hostMap,
+  const std::unique_ptr<Message>& msg)
+{
+    msg->set_messagetype(0);
+
+    if (hostMap.empty()) {
+        SPDLOG_ERROR("Host map is empty, cannot schedule {}", userFunc);
+        throw std::runtime_error("Host map is empty");
+    }
+
+    // Stateless operators queue under parallelism index 0.
+    const std::string queueKey = userFunc + "_0";
+    auto stats = getClusterWorkerStats();
+
+    // No cluster view yet: at startup the planner has not finished a stats
+    // round. A worker keeps the request, the planner spreads round robin.
+    if (stats.empty()) {
+        if (!isplanner) {
+            return localHost;
+        }
+        auto counter = getNextCounter(userFunc);
+        return faabric::util::getNthKey(hostMap, counter % hostMap.size());
+    }
+
+    int localDepth = -1;
+    if (!isplanner) {
+        localDepth = hostQueueDepth(stats, localHost, queueKey);
+        // Stay put while the local backlog is tolerable. Routing elsewhere
+        // costs a hop and pulls the request away from whatever produced it.
+        if (localDepth >= 0 && localDepth <= fluxLocalQueueLimit) {
+            return localHost;
+        }
+    }
+
+    // Locally congested, or we are the planner and have no local. Sample two
+    // hosts and take the shorter queue rather than taking a strict argmin
+    // over the cluster: every scheduler reads the same periodically-refreshed
+    // snapshot, so a strict argmin sends all of them at whichever host
+    // happened to look idle when the planner last collected stats.
+    int lastIdx = static_cast<int>(hostMap.size()) - 1;
+    std::string candA =
+      faabric::util::getNthKey(hostMap, faabric::util::randomInt(0, lastIdx));
+    std::string candB =
+      faabric::util::getNthKey(hostMap, faabric::util::randomInt(0, lastIdx));
+
+    int depthA = hostQueueDepth(stats, candA, queueKey);
+    int depthB = hostQueueDepth(stats, candB, queueKey);
+
+    std::string best = candA;
+    int bestDepth = depthA;
+    // An unreported host loses to a reported one whatever its depth.
+    if (depthA < 0 || (depthB >= 0 && depthB < depthA)) {
+        best = candB;
+        bestDepth = depthB;
+    }
+
+    if (bestDepth < 0) {
+        // Neither sample reported. Keep the request here rather than sending
+        // it somewhere we have no information about.
+        return isplanner ? candA : localHost;
+    }
+
+    // Only actually move if the remote is meaningfully better, otherwise a
+    // worker just over the limit keeps shipping work to hosts that are barely
+    // shorter and the requests cross paths.
+    if (!isplanner && localDepth >= 0 &&
+        bestDepth + fluxOffloadMargin >= localDepth) {
+        return localHost;
+    }
+
+    SPDLOG_TRACE("Flux offloads {} to {} (local {}, remote {})",
+                 userFunc,
+                 best,
+                 localDepth,
+                 bestDepth);
+
+    return best;
+}
+
+std::shared_ptr<Node> StateAwareScheduler::lookupNode(
+  const std::string& userFunc)
+{
+    faabric::util::SharedLock lock(scheduleMx);
+    if (!application) {
+        return nullptr;
+    }
+    const auto& nodes = application->getNodes();
+    auto it = nodes.find(userFunc);
+    return it == nodes.end() ? nullptr : it->second;
+}
+
+std::shared_ptr<faabric::util::ConsistentHashRing>
+StateAwareScheduler::getFluxHashRing(const std::string& userFunction,
+                                     int parallelism)
+{
+    {
+        faabric::util::SharedLock lock(scheduleMx);
+        auto ringIt = stateHashRing.find(userFunction);
+        auto parIt = functionParallelism.find(userFunction);
+        if (ringIt != stateHashRing.end() &&
+            parIt != functionParallelism.end() &&
+            parIt->second == parallelism) {
+            return ringIt->second;
+        }
+    }
+
+    faabric::util::FullLock lock(scheduleMx);
+    // Another thread may have built it while we were unlocked. The ring is a
+    // pure function of the shard count, so either copy routes identically.
+    auto ringIt = stateHashRing.find(userFunction);
+    auto parIt = functionParallelism.find(userFunction);
+    if (ringIt != stateHashRing.end() && parIt != functionParallelism.end() &&
+        parIt->second == parallelism) {
+        return ringIt->second;
+    }
+
+    SPDLOG_INFO("Flux builds hash ring for {} over {} shards",
+                userFunction,
+                parallelism);
+    auto ring =
+      std::make_shared<faabric::util::ConsistentHashRing>(parallelism);
+    stateHashRing[userFunction] = ring;
+    functionParallelism[userFunction] = parallelism;
+    return ring;
+}
+
+HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndexFlux(
+  const std::string& userFunction,
+  const Node& node,
+  const faabric::Message& msg)
+{
+    int parallelism = fluxShardCount(node);
+
+    bool isPartitioned = node.type == NodeType::PARTITIONED_STATEFUL &&
+                         !node.partitionBy.empty() &&
+                         node.partitionBy != NONE_STRING;
+
+    // Non-partitioned stateful: no key to hash, so shuffle across the
+    // operator's shards and let the caller resolve that shard's owner.
+    if (!isPartitioned) {
+        auto localCounter = getNextCounter(userFunction);
+        return { 1, 0, static_cast<int>(localCounter % parallelism) };
+    }
+
+    auto ring = getFluxHashRing(userFunction, parallelism);
+
+    std::string inputString = msg.inputdata();
+    std::vector<uint8_t> inputVec(inputString.begin(), inputString.end());
+    size_t index = 0;
+    std::map<std::string, std::string> inputData =
+      faabric::util::deserializeMap(inputVec, index);
+
+    auto keyIt = inputData.find(node.partitionBy);
+    if (keyIt == inputData.end()) {
+        // Hash the empty key rather than shuffling: a shuffled message would
+        // land on a shard that does not hold its state. Keyless messages all
+        // converge on one shard, which is at least consistent.
+        SPDLOG_WARN("Flux: {} has no partition key {} in its input",
+                    userFunction,
+                    node.partitionBy);
+    }
+    std::string keyData =
+      keyIt == inputData.end() ? std::string() : keyIt->second;
+
+    std::vector<uint8_t> keyDataVec = faabric::util::stringToBytes(keyData);
+    auto [hash, parallelismIdx] = ring->getHashAndNode(keyDataVec);
+    getNextCounter(userFunction);
+
+    SPDLOG_TRACE("Flux routes {} key {} to shard {}",
+                 userFunction,
+                 keyData,
+                 parallelismIdx);
+
+    return { 2, hash, parallelismIdx };
+}
+
 HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
   const std::string& userFunction,
   const faabric::Message& msg)
 {
+    // ModeFlux registers no per-operator state, so the maps consulted below
+    // are empty: read the shard count and the partition key off the DAG
+    // instead. NB - `functionParallelism[userFunction]` in the shuffle branch
+    // below would otherwise default-construct to 0 and divide by zero.
+    if (scheduleMode == ModeFlux) {
+        auto node = lookupNode(userFunction);
+        if (node == nullptr) {
+            SPDLOG_ERROR("Flux: no DAG node for stateful operator {}",
+                         userFunction);
+            throw std::runtime_error("No DAG node for " + userFunction);
+        }
+        return getHashAndParallelismIndexFlux(userFunction, *node, msg);
+    }
+
     faabric::util::FullLock lock(scheduleMx);
 
     // For the partitioned stateful. Using key-partitioning.
@@ -478,21 +846,58 @@ HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
 }
 
 std::string StateAwareScheduler::scheduleStatefulMessage(
+  const HostMap& hostMap,
   std::string& userFunc,
   const std::unique_ptr<Message>& msg)
 {
     auto parallelismInfo = getHashAndParallelismIndex(userFunc, *msg);
     std::string userFuncPar =
       userFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
-    if (stateHost.find(userFuncPar) == stateHost.end()) {
-        throw std::runtime_error("StateHost is not initialized");
-    }
-    std::string host = stateHost[userFuncPar];
+    std::string host = resolveStateHost(userFuncPar, hostMap);
     // Register the parallelismIdx to it.
     // If Scheduling failed, the next scheduling will overwrite it.
     msg->set_messagetype(parallelismInfo.messageType);
     msg->set_hash(parallelismInfo.hash);
     msg->set_parallelismid(parallelismInfo.parallelismIdx);
+    return host;
+}
+
+std::string StateAwareScheduler::scheduleMessageFlux(
+  const HostMap& hostMap,
+  std::string& userFunc,
+  const std::unique_ptr<Message>& msg)
+{
+    // Check if the userFunc is in the DAG.
+    auto node = lookupNode(userFunc);
+
+    if (node == nullptr) {
+        // Not in the DAG at all. Load is the only signal we can trust here,
+        // and it is never wrong in the way a made-up shard would be.
+        SPDLOG_WARN("Flux: {} is not in the registered DAG, routing by load",
+                    userFunc);
+        return scheduleStatelessMessageFlux(userFunc, hostMap, msg);
+    }
+
+    if (node->type == NodeType::STATELESS) {
+        return scheduleStatelessMessageFlux(userFunc, hostMap, msg);
+    }
+
+    // Stateful of either kind: the placement is the state's placement. Place
+    // the operator's whole shard set the first time any of it is routed to,
+    // then pick this message's shard (hashed for partitioned, shuffled
+    // otherwise) and read back that shard's owner.
+    int parallelism = fluxShardCount(*node);
+    initOperatorStateFlux(userFunc, parallelism, hostMap);
+
+    auto parallelismInfo = getHashAndParallelismIndexFlux(userFunc, *node, *msg);
+    std::string userFuncPar =
+      userFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
+    std::string host = resolveStateHost(userFuncPar, hostMap);
+
+    msg->set_messagetype(parallelismInfo.messageType);
+    msg->set_hash(parallelismInfo.hash);
+    msg->set_parallelismid(parallelismInfo.parallelismIdx);
+
     return host;
 }
 
@@ -516,14 +921,22 @@ std::string StateAwareScheduler::scheduleMessage(
     }
     std::string userFunc = msg->user() + "_" + msg->function();
     std::string host = "unknown";
+
+    // ModeFlux registers nothing up front, so functionParallelism is empty and
+    // cannot be used to tell an operator's kind apart. It dispatches off the
+    // DAG instead.
+    if (scheduleMode == ModeFlux) {
+        host = scheduleMessageFlux(hostMap, userFunc, msg);
+    }
     // Stateful or partitioned stateful function
-    if (functionParallelism.contains(userFunc)) {
+    else if (functionParallelism.contains(userFunc)) {
         // TODO - get parallelism is not thread safe now
-        host = scheduleStatefulMessage(userFunc, msg);
+        host = scheduleStatefulMessage(hostMap, userFunc, msg);
     }
     // stateless operator
     else {
-        if (scheduleMode == 0 || scheduleMode == 5 ||  scheduleMode == 11) {
+        if (scheduleMode == ModeBinpack || scheduleMode == ModeApportion ||
+            scheduleMode == ModeStepConf) {
             host = scheduleStatelessMessageApportion(userFunc, hostMap, msg);
         } else {
             // when scheduleMode is 3, 4, 7, we use round robin
@@ -605,6 +1018,9 @@ const std::map<std::string, FunctionStateInfo>
 StateAwareScheduler::getStateInfo()
 {
     SPDLOG_DEBUG("Getting state information");
+    // stateHost is no longer written once at schedule time: under ModeFlux
+    // resolveStateHost inserts into it as requests are routed.
+    faabric::util::SharedLock lock(scheduleMx);
     std::map<std::string, FunctionStateInfo> stateInfo;
     for (const auto& [func, host] : funcStateRegMap) {
         FunctionStateInfo info;
@@ -1003,6 +1419,14 @@ StateAwareScheduler::buildScheduledOperatorsForGroup(
 
 void StateAwareScheduler::scheduleApp(const HostMap& hostMap)
 {
+    // ModeFlux does not pin operators to workers, so there is nothing to lay
+    // out here: placement follows state ownership, which is claimed on demand
+    // in resolveStateHost. Returning before the body also keeps ModeFlux away
+    // from the redis.flushAll() the pinning modes do, which would wipe the
+    // ownership keys those claims depend on.
+    if (scheduleMode == ModeFlux) {
+        return;
+    }
 
     //--------------------------------------------------------------------------
     // 1. Calculate the workload of each operator.
@@ -1332,6 +1756,14 @@ void StateAwareScheduler::rescheduleApp(
   const HostMap& hostMap,
   const faabric::planner::ApplicationMetrics* metrics)
 {
+    // ModeFlux does not pin operators to workers, so there is nothing to lay
+    // out here: placement follows state ownership, which is claimed on demand
+    // in resolveStateHost. Returning before the body also keeps ModeFlux away
+    // from the redis.flushAll() the pinning modes do, which would wipe the
+    // ownership keys those claims depend on.
+    if (scheduleMode == ModeFlux) {
+        return;
+    }
 
     //--------------------------------------------------------------------------
     // 1. Calculate the workload of each operator.
@@ -4783,6 +5215,7 @@ void StateAwareScheduler::resetScheduler()
     functionParallelism.clear();
     counterTable.clear();
     scheduledOperatorsMap.clear();
+    fluxInitialisedOps.clear();
     stateHost.clear();
     stateHashRing.clear();
     statePartitionBy.clear();

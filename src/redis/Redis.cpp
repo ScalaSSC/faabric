@@ -45,16 +45,18 @@ RedisInstance::RedisInstance(RedisRole roleIn)
     port = std::stoi(portStr);
 
     // Load scripts
-    if (delifeqSha.empty() || schedPublishSha.empty()) {
+    if (delifeqSha.empty() || schedPublishSha.empty() || claimSha.empty()) {
         std::unique_lock<std::mutex> lock(scriptsLock);
 
-        if (delifeqSha.empty() || schedPublishSha.empty()) {
+        if (delifeqSha.empty() || schedPublishSha.empty() ||
+            claimSha.empty()) {
             printf("Loading scripts for Redis instance at %s\n",
                    hostname.c_str());
             redisContext* context = redisConnect(ip.c_str(), port);
 
             delifeqSha = this->loadScript(context, delifeqCmd);
             schedPublishSha = this->loadScript(context, schedPublishCmd);
+            claimSha = this->loadScript(context, claimCmd);
 
             redisFree(context);
         }
@@ -556,6 +558,28 @@ bool Redis::setnxex(const std::string& key, long value, int expirySeconds)
     }
 
     return success;
+}
+
+std::string Redis::claimOrGet(const std::string& key,
+                              const std::string& proposedValue)
+{
+    auto reply = safeRedisCommand(context,
+                                  "EVALSHA %s 1 %s %s",
+                                  instance.claimSha.c_str(),
+                                  key.c_str(),
+                                  proposedValue.c_str());
+
+    if (reply->type == REDIS_REPLY_ERROR) {
+        SPDLOG_ERROR("Failed to claim {} - {}", key, reply->str);
+        throw std::runtime_error("Failed to claim key in Redis");
+    }
+
+    if (reply->type != REDIS_REPLY_STRING) {
+        SPDLOG_ERROR("Unexpected reply type {} claiming {}", reply->type, key);
+        throw std::runtime_error("Unexpected reply claiming key in Redis");
+    }
+
+    return std::string(reply->str, reply->len);
 }
 
 

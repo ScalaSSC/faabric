@@ -14,6 +14,7 @@
 #include <faabric/util/queue.h>
 #include <faabric/util/snapshot.h>
 
+#include <set>
 #include <shared_mutex>
 
 #define DEFAULT_THREAD_RESULT_TIMEOUT_MS 1000
@@ -294,6 +295,29 @@ class Scheduler
 
     faabric::batch_scheduler::HostMap activeHosts;
 
+    // ModeFlux: shards this worker has already settled -- either created, or
+    // found not to need state at all. Keeps ensureLocalStateFlux to one set
+    // lookup per message once an operator is running.
+    std::shared_mutex fluxKnownShardsMx;
+    std::set<std::string> fluxKnownShards;
+
+    // Throttle for logFluxExecutorCensus.
+    std::atomic<int64_t> lastFluxExecutorLogMs{ 0 };
+
+    /**
+     * The hosts this worker may route to. ModeFlux pins no operator to a
+     * worker and claims a shard's owner on demand, so every registered host
+     * is a candidate -- and nothing ever narrows activeHosts under ModeFlux
+     * anyway, since the planner sends no state-info broadcast. The other
+     * modes deliberately route only to the workers the planner placed the
+     * application on.
+     */
+    const faabric::batch_scheduler::HostMap& routableHosts() const
+    {
+        return scheduleMode == faabric::batch_scheduler::ModeFlux ? hostMap
+                                                                  : activeHosts;
+    }
+
     bool stopThreadTimer = false;
 
     std::thread dispatchChainedMsgsThread;
@@ -335,6 +359,41 @@ class Scheduler
     void calculateMaxReplicas(
       const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
         scheduledOperatorMap);
+
+    /**
+     * ModeFlux: bring `userFuncPar`'s function state into being on this
+     * worker, the first time a message for it arrives here.
+     *
+     * ModeFlux pre-creates nothing -- the planner places no state and sends
+     * no state-info broadcast -- so the arriving message is what creates the
+     * shard it addresses. Safe because only the worker holding a shard can
+     * migrate it away: a message for a shard we hold no record of means we
+     * are its owner and nobody has touched it yet. (Once migration exists,
+     * the third case -- a shard we handed off, whose router is stale -- is
+     * told apart by the handoff record we kept, not by anything on the wire.)
+     *
+     * Everything needed is already to hand: the message carries the shard
+     * index and the DAG carries the operator's kind. The FunctionState
+     * constructor re-checks ownership against Redis, so a misrouted message
+     * cannot create state on a host that does not own it.
+     *
+     * A no-op for stateless operators and after the shard is known.
+     */
+    void ensureLocalStateFlux(const faabric::Message& msg,
+                              const std::string& userFuncPar);
+
+    /**
+     * ModeFlux only: one line naming every shard's executors as free/total,
+     * plus the worker-wide total.
+     *
+     * Logged from the blocked path of executorAvailable, where one shard has
+     * hit its own cap. The whole worker is listed rather than just that shard
+     * because the cap is per shard and the worker has no ceiling of its own:
+     * what you want to see is how much the rest of the worker is already
+     * carrying. Throttled to one line a second -- the caller runs per queue
+     * every batchCheckPeriod.
+     */
+    void logFluxExecutorCensus(const std::string& blockedFunc);
 
     void createLocalState(
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
