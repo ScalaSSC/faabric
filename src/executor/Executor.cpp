@@ -400,7 +400,7 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                 }
                 stateLocks.clear();
             }
-            faabric::scheduler::getScheduler().notifyExecutorFinished();
+            faabric::scheduler::getScheduler().notifyExecutorFinished(firstMsg);
 
             continue;
         }

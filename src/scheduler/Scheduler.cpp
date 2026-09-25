@@ -318,6 +318,10 @@ void Scheduler::reset()
         fluxKnownUnits.clear();
     }
     clearFluxMigrationState();
+    {
+        std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+        fluxParidxRunning.clear();
+    }
 
     // This function is called when planner flush executors. In this case,
     // planner didn't flush the hostmap, the scheduler also should not flush it.
@@ -439,8 +443,40 @@ int Scheduler::reapStaleExecutors()
 long Scheduler::getFunctionExecutorCount(const faabric::Message& msg)
 {
     faabric::util::SharedLock lock(mx);
-    const std::string funcStr = faabric::util::funcParToString(msg, false);
-    return executors[funcStr].size();
+    auto it = executors.find(executorPoolKey(msg));
+    return it == executors.end() ? 0 : it->second.size();
+}
+
+std::string Scheduler::executorPoolKey(const faabric::Message& msg) const
+{
+    if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
+        return faabric::util::funcToString(msg, false);
+    }
+    return faabric::util::funcParToString(msg, false);
+}
+
+bool Scheduler::reserveParidxRunFlux(const std::string& funcParStr)
+{
+    {
+        std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+        int& running = fluxParidxRunning[funcParStr];
+        if (running < maxExecutors) {
+            running++;
+            return true;
+        }
+    }
+    // At the cap: this queue will not drain until one of its batches ends.
+    logFluxExecutorCensus(funcParStr);
+    return false;
+}
+
+void Scheduler::releaseParidxRunFlux(const std::string& funcParStr)
+{
+    std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+    auto it = fluxParidxRunning.find(funcParStr);
+    if (it != fluxParidxRunning.end() && it->second > 0) {
+        it->second--;
+    }
 }
 
 bool Scheduler::registerApp(std::unique_ptr<batch_scheduler::Application> app)
@@ -575,10 +611,13 @@ void Scheduler::enqueueMessageBatch(
         }
         if (targetQueue == nullptr) {
             faabric::util::FullLock writeLock(waitingQueuesMx);
-            auto [iterator, inserted] =
-              waitingQueues.emplace(userFuncPar,
-                                    std::make_unique<faabric::util::BatchQueue>(
-                                      userFuncPar, executeBatchsize));
+            // ModeFlux serves the oldest input first, wherever its work waits.
+            bool orderByInput =
+              scheduleMode == faabric::batch_scheduler::ModeFlux;
+            auto [iterator, inserted] = waitingQueues.emplace(
+              userFuncPar,
+              std::make_unique<faabric::util::BatchQueue>(
+                userFuncPar, executeBatchsize, orderByInput));
             targetQueue = iterator->second.get();
         }
 
@@ -641,6 +680,32 @@ void Scheduler::dispatchWorkerLoop()
                     waitingBatch->resetLastTime();
                 }
             }
+
+            // ModeFlux: the queue whose next request descends from the
+            // oldest input goes first.
+            if (scheduleMode == faabric::batch_scheduler::ModeFlux &&
+                readyQueues.size() > 1) {
+                using OrderKey = faabric::util::BatchQueue::OrderKey;
+                std::vector<std::pair<OrderKey, size_t>> order;
+                order.reserve(readyQueues.size());
+                for (size_t i = 0; i < readyQueues.size(); i++) {
+                    auto* queue = static_cast<faabric::util::BatchQueue*>(
+                      readyQueues[i].second);
+                    auto head = queue->headKey();
+                    // An emptied queue has nothing to be first with.
+                    order.emplace_back(
+                      head.value_or(OrderKey{ INT64_MAX, INT64_MAX }), i);
+                }
+                std::sort(order.begin(), order.end());
+                std::vector<
+                  std::pair<std::string, faabric::util::BatchQueueBase*>>
+                  sorted;
+                sorted.reserve(readyQueues.size());
+                for (const auto& [key, i] : order) {
+                    sorted.push_back(std::move(readyQueues[i]));
+                }
+                readyQueues = std::move(sorted);
+            }
         }
 
         for (auto& [funcStr, qPtr] : readyQueues) {
@@ -689,7 +754,29 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             break;
         }
 
-        if (!executorAvailable(funcStr)) {
+        // ModeFlux takes one of the paridx's run slots before it takes any
+        // requests, so that concurrent dispatchers cannot overshoot the cap
+        // between checking it and dispatching. The slot is handed back when
+        // the batch finishes (notifyExecutorFinished), or right here if no
+        // batch ends up running.
+        struct ParidxRunSlot
+        {
+            Scheduler* scheduler;
+            const std::string& funcParStr;
+            bool held = false;
+            ~ParidxRunSlot()
+            {
+                if (held) {
+                    scheduler->releaseParidxRunFlux(funcParStr);
+                }
+            }
+        } runSlot{ this, funcStr };
+        if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
+            if (!reserveParidxRunFlux(funcStr)) {
+                break;
+            }
+            runSlot.held = true;
+        } else if (!executorAvailable(funcStr)) {
             break;
         }
 
@@ -793,6 +880,8 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             for (auto& [unitKey, unitLock] : unitLocks) {
                 stateLocks.push_back(std::move(unitLock));
             }
+            // The running batch owns the run slot from here.
+            runSlot.held = false;
             e->executeBatchTasks(newReq, std::move(stateLocks));
             // if (!runningThreads.contains(threadClockId)) {
             //     faabric::util::FullLock cpuLock(cpuRecordMx);
@@ -1196,6 +1285,20 @@ std::vector<faabric::Message> Scheduler::getRecordedMessages()
 
 bool Scheduler::executorAvailable(const std::string& funcStr)
 {
+    // ModeFlux has no planner-derived replica budget: nothing pins operators
+    // to workers, so there is no weight distribution to split one out of.
+    // maxExecutors is applied per paridx instead -- funcStr is
+    // user/func/parIdx -- so each paridx scales on demand up to the same
+    // ceiling and no paridx can hold another one's queue shut by filling a
+    // worker-wide budget. The executors themselves come from the operator's
+    // shared pool, so the cap counts running batches, not pool size. The
+    // reaper hands back whatever sits idle past BOUND_TIMEOUT.
+    if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
+        std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+        auto it = fluxParidxRunning.find(funcStr);
+        return it == fluxParidxRunning.end() || it->second < maxExecutors;
+    }
+
     int currentExecutorsSize = 0;
     bool foundAvailable = false;
 
@@ -1219,22 +1322,6 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
 
     if (foundAvailable) {
         return true;
-    }
-
-    // ModeFlux has no planner-derived replica budget: nothing pins operators
-    // to workers, so there is no weight distribution to split one out of.
-    // maxExecutors is applied per paridx instead -- funcStr is already
-    // user/func/parIdx -- so each paridx scales on demand up to the same
-    // ceiling and no paridx can hold another one's queue shut by filling a
-    // worker-wide budget. The reaper hands back whatever sits idle past
-    // BOUND_TIMEOUT.
-    if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
-        if (currentExecutorsSize < maxExecutors) {
-            return true;
-        }
-        // At the cap: this queue will not drain until an executor frees up.
-        logFluxExecutorCensus(funcStr);
-        return false;
     }
 
     int maxReplicas;
@@ -1280,8 +1367,13 @@ void Scheduler::notifyExecutorStart()
     currentSecondCount.fetch_add(1, std::memory_order_relaxed);
 }
 
-void Scheduler::notifyExecutorFinished()
+void Scheduler::notifyExecutorFinished(const faabric::Message& msg)
 {
+    // The batch held one of its paridx's run slots since it was dispatched.
+    if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
+        releaseParidxRunFlux(faabric::util::funcParToString(msg, false));
+    }
+
     int current = runningExecutors.load(std::memory_order_relaxed);
 
     while (current > 0) {
@@ -1308,7 +1400,7 @@ double Scheduler::getAverageExecutors() const
 std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
   faabric::Message& msg)
 {
-    std::string funcStr = faabric::util::funcParToString(msg, false);
+    std::string funcStr = executorPoolKey(msg);
     auto factory = faabric::executor::getExecutorFactory();
     std::shared_ptr<faabric::executor::Executor> claimed = nullptr;
 
@@ -1792,7 +1884,8 @@ void Scheduler::logFluxExecutorCensus(const std::string& blockedFunc)
     }
 
     // Ordered, so the same operator sits in the same place from one line to
-    // the next; `executors` itself is unordered.
+    // the next; `executors` itself is unordered. Under ModeFlux each pool
+    // serves a whole operator.
     std::map<std::string, std::pair<int, int>> census; // op -> {free, total}
     int total = 0;
     {
@@ -1819,8 +1912,8 @@ void Scheduler::logFluxExecutorCensus(const std::string& blockedFunc)
         oss << funcStr << " " << counts.first << "/" << counts.second;
     }
 
-    SPDLOG_DEBUG("Flux {} at its cap of {} on {}; worker holds {} executors "
-                 "[free/total]: {}",
+    SPDLOG_DEBUG("Flux {} at its cap of {} running batches on {}; worker holds "
+                 "{} executors [free/total per operator]: {}",
                  blockedFunc,
                  maxExecutors,
                  thisHost,

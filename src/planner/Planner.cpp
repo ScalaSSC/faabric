@@ -482,10 +482,15 @@ bool Planner::enqueueBatchRequest(
     }
 
     int64_t enqueueTimeMicros = faabric::util::getGlobalClock().epochMicros();
+    int64_t firstSeq = nextInputSeq.fetch_add(msgCount);
     for (int i = 0; i < msgCount; i++) {
         auto msgPtr = std::make_shared<faabric::Message>(req->messages(i));
         (*msgPtr->mutable_metricrecorder())[PLANNER_ENQUEUE_TIME_KEY] =
           enqueueTimeMicros;
+        // Everything descending from this input carries these, and is ranked
+        // by them wherever it waits.
+        msgPtr->set_inputarrivaltime(enqueueTimeMicros);
+        msgPtr->set_inputseq(firstSeq + i);
         waitingMessageQueue.enqueue(msgPtr);
     }
 

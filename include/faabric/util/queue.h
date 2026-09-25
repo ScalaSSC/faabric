@@ -383,21 +383,54 @@ class BatchQueueBase
 
 /*
  * A queue stores the uninvoked requests.
+ *
+ * By default a plain FIFO. With `orderByInput`, it is ordered by the input
+ * request each message descends from instead -- (inputArrivalTime, inputSeq),
+ * earliest first -- so work that has been in the system longest leaves first,
+ * whatever order it happened to reach this worker in.
  */
 class BatchQueue : public BatchQueueBase
 {
+  public:
+    // Position in the queue: (inputArrivalTime, inputSeq) when ordered by
+    // input, (arrival order here, 0) otherwise. Smallest leaves first.
+    using OrderKey = std::pair<int64_t, int64_t>;
+
   protected:
     std::string userFuncPar;
     int batchSize;
-    std::queue<std::unique_ptr<faabric::Message>> batchQueue;
+    bool orderByInput;
+    int64_t fifoCounter = 0;
+    // Equal keys keep insertion order, so a FIFO falls out of the same
+    // container, as do input-ordered messages that share a key.
+    std::multimap<OrderKey, std::unique_ptr<faabric::Message>> batchQueue;
     int messagesCount = 0;
     std::mutex m_mutex;
     long lastTime;
 
+    OrderKey orderKeyOf(const faabric::Message& msg)
+    {
+        if (orderByInput) {
+            return { msg.inputarrivaltime(), msg.inputseq() };
+        }
+        return { fifoCounter++, 0 };
+    }
+
+    std::unique_ptr<faabric::Message> popFront()
+    {
+        auto it = batchQueue.begin();
+        auto msg = std::move(it->second);
+        batchQueue.erase(it);
+        return msg;
+    }
+
   public:
-    BatchQueue(const std::string& userFuncParIn, int batchSizein)
+    BatchQueue(const std::string& userFuncParIn,
+               int batchSizein,
+               bool orderByInputIn = false)
       : userFuncPar(userFuncParIn)
       , batchSize(batchSizein)
+      , orderByInput(orderByInputIn)
     {
         // Initialize lastTime with the current global clock time.
         lastTime = faabric::util::getGlobalClock().epochMillis();
@@ -408,13 +441,23 @@ class BatchQueue : public BatchQueueBase
         auto getFront = [&]() -> faabric::Message* {
             if (messagesCount == 0)
                 throw std::runtime_error("Queue is empty");
-            return batchQueue.front().get();
+            return batchQueue.begin()->second.get();
         };
 
         return locked ? getFront() : [&]() {
             std::lock_guard<std::mutex> lock(m_mutex);
             return getFront();
         }();
+    }
+
+    // The key of the message that would leave next, if any.
+    std::optional<OrderKey> headKey()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (batchQueue.empty()) {
+            return std::nullopt;
+        }
+        return batchQueue.begin()->first;
     }
 
     virtual void addMessage(std::unique_ptr<faabric::Message> msg)
@@ -425,7 +468,8 @@ class BatchQueue : public BatchQueueBase
         if (batchQueue.empty()) {
             resetLastTime(true);
         }
-        batchQueue.push(std::move(msg));
+        OrderKey key = orderKeyOf(*msg);
+        batchQueue.emplace(key, std::move(msg));
         messagesCount++;
     }
 
@@ -441,8 +485,7 @@ class BatchQueue : public BatchQueueBase
             if (batchQueue.empty()) {
                 break;
             }
-            returnMessages.push_back(std::move(batchQueue.front()));
-            batchQueue.pop();
+            returnMessages.push_back(popFront());
             messagesCount--;
         }
         return returnMessages;
@@ -453,22 +496,20 @@ class BatchQueue : public BatchQueueBase
         std::lock_guard<std::mutex> lock(m_mutex);
         std::vector<std::unique_ptr<faabric::Message>> drained;
         while (!batchQueue.empty()) {
-            drained.push_back(std::move(batchQueue.front()));
-            batchQueue.pop();
+            drained.push_back(popFront());
         }
         messagesCount = 0;
         return drained;
     }
 
-    // Up to `count` messages off the front, oldest first.
+    // Up to `count` messages off the front, first to leave first.
     virtual std::vector<std::unique_ptr<faabric::Message>> takeMessages(
       int count)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::vector<std::unique_ptr<faabric::Message>> taken;
         while (!batchQueue.empty() && static_cast<int>(taken.size()) < count) {
-            taken.push_back(std::move(batchQueue.front()));
-            batchQueue.pop();
+            taken.push_back(popFront());
             messagesCount--;
         }
         return taken;
@@ -481,17 +522,14 @@ class BatchQueue : public BatchQueueBase
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::vector<std::unique_ptr<faabric::Message>> taken;
-        std::queue<std::unique_ptr<faabric::Message>> kept;
-        while (!batchQueue.empty()) {
-            auto msg = std::move(batchQueue.front());
-            batchQueue.pop();
-            if (pred(*msg)) {
-                taken.push_back(std::move(msg));
+        for (auto it = batchQueue.begin(); it != batchQueue.end();) {
+            if (pred(*it->second)) {
+                taken.push_back(std::move(it->second));
+                it = batchQueue.erase(it);
             } else {
-                kept.push(std::move(msg));
+                ++it;
             }
         }
-        batchQueue.swap(kept);
         messagesCount = static_cast<int>(batchQueue.size());
         return taken;
     }
@@ -502,13 +540,8 @@ class BatchQueue : public BatchQueueBase
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::map<int, int> counts;
-        // std::queue cannot be iterated, so cycle it through once.
-        size_t n = batchQueue.size();
-        for (size_t i = 0; i < n; i++) {
-            auto msg = std::move(batchQueue.front());
-            batchQueue.pop();
+        for (const auto& [key, msg] : batchQueue) {
             counts[keyOf(*msg)]++;
-            batchQueue.push(std::move(msg));
         }
         return counts;
     }

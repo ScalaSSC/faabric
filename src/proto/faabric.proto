@@ -180,6 +180,13 @@ message Message {
     // whose keys are cut into shards; the shard, not the paridx, decides which
     // worker holds the key's state.
     int32 shardId = 100;
+    // The input request this message descends from: when the planner
+    // received it (us, planner clock) and its place in the planner's arrival
+    // order, which also orders the messages of one input batch. Chained calls
+    // inherit both, so every message of one input shares them. Together they
+    // rank work by how long it has been in the system, earliest first.
+    int64 inputArrivalTime = 101;
+    int64 inputSeq = 102;
 }
 
 // ---------------------------------------------

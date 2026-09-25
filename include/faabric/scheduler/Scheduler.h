@@ -195,7 +195,8 @@ class Scheduler
      */
     std::vector<faabric::ShardMove> getFluxShardMoves();
 
-    void notifyExecutorFinished();
+    // `msg` is the first message of the batch that finished.
+    void notifyExecutorFinished(const faabric::Message& msg);
 
     void notifyExecutorStart();
 
@@ -253,6 +254,25 @@ class Scheduler
     SchedulerReaperThread reaperThread;
 
     bool executorAvailable(const std::string& funcStr);
+
+    // Which pool of warm executors serves `msg`. ModeFlux keeps one pool per
+    // operator, shared by all its paridx: nothing in an executor is bound to
+    // a paridx -- state is reached through the paridx of the message being
+    // executed. Every other mode keeps one pool per paridx.
+    std::string executorPoolKey(const faabric::Message& msg) const;
+
+    // ModeFlux caps each paridx at maxExecutors batches running at once. The
+    // pool is shared, so the cap is counted here rather than by pool size.
+    // Keyed by user/func/parIdx.
+    std::mutex fluxParidxRunMx;
+    std::map<std::string, int> fluxParidxRunning;
+
+    // Takes one of the paridx's run slots for a batch about to be dispatched,
+    // or returns false if all are in use. Handed back by
+    // releaseParidxRunFlux, when the batch finishes or if none is dispatched.
+    bool reserveParidxRunFlux(const std::string& funcParStr);
+
+    void releaseParidxRunFlux(const std::string& funcParStr);
 
     std::shared_ptr<faabric::executor::Executor> claimExecutor(
       faabric::Message& msg

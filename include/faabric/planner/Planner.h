@@ -153,6 +153,9 @@ class Planner
     std::atomic<int> maxInflightApps{ 10000 };
     faabric::util::ThreadSafeQueue<std::shared_ptr<faabric::Message>>
       waitingMessageQueue;
+    // Next Message::inputSeq to hand out. Input batches take a contiguous
+    // block each, so a batch's messages keep their order.
+    std::atomic<int64_t> nextInputSeq{ 1 };
     std::thread processWaitingQueueThread;
     void processWaitingQueueLoop();
 
