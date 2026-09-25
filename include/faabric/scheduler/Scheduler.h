@@ -179,14 +179,17 @@ class Scheduler
 
     /**
      * ModeFlux: take over what another worker is handing to us. Installs
-     * every shard's state, marks the shards known so ensureLocalStateFlux
-     * leaves them alone, and enqueues the requests that travelled with them.
-     * Called synchronously by the sender before it flips the owners in Redis.
+     * every unit's state -- replacing a whole paridx, merging a shard's keys
+     * into the local copy of its paridx -- marks the units known so
+     * admitMessageFlux leaves them alone, and enqueues the requests that
+     * travelled with them. Called synchronously by the sender before it flips
+     * the owners in Redis.
      */
     void receiveShardFlux(faabric::FluxShardMigrationRequest& req);
 
     /**
-     * ModeFlux: every shard this worker has handed off and not taken back,
+     * ModeFlux: every unit of state this worker has handed off and not taken
+     * back,
      * reported in each stats round so the planner, and through it every
      * other worker, learns the new owners.
      */
@@ -310,11 +313,18 @@ class Scheduler
 
     faabric::batch_scheduler::HostMap activeHosts;
 
-    // ModeFlux: shards this worker has already settled -- either created, or
-    // found not to need state at all. Keeps ensureLocalStateFlux to one set
-    // lookup per message once an operator is running.
-    std::shared_mutex fluxKnownShardsMx;
-    std::set<std::string> fluxKnownShards;
+    // ---- ModeFlux units of state ----
+    // Ownership, locking and migration all work on units of state (see
+    // StateAwareScheduler::fluxUnitKey): the whole paridx of a stateful
+    // operator, or one shard of a partitioned operator's single paridx. Every
+    // map below is keyed by unit key.
+
+    // Units this worker has admitted requests for -- owned per Redis, or not
+    // needing state at all -- plus the paridx whose FunctionState exists here.
+    // Keeps admitMessageFlux to one set lookup per message once an operator is
+    // running.
+    std::shared_mutex fluxKnownUnitsMx;
+    std::set<std::string> fluxKnownUnits;
 
     // Throttle for logFluxExecutorCensus.
     std::atomic<int64_t> lastFluxExecutorLogMs{ 0 };
@@ -322,43 +332,45 @@ class Scheduler
     // ---- ModeFlux rebalancing ----
     // Guards the four maps below. Never held across a network call.
     std::mutex fluxMigrationMx;
-    // Shards being handed off right now. Requests for them are parked in
+    // Units being handed off right now. Requests for them are parked in
     // fluxPendingMsgs rather than queued, and nothing dispatches them.
-    std::set<std::string> fluxMigratingShards;
+    std::set<std::string> fluxMigratingUnits;
     std::map<std::string, std::vector<std::unique_ptr<faabric::Message>>>
       fluxPendingMsgs;
-    // Shards this worker handed off, keyed by userFuncPar. A request that
-    // still reaches us for one was routed on a stale owner and is forwarded.
-    // Dropped if the shard ever comes back.
-    std::map<std::string, faabric::ShardMove> fluxMovedShards;
-    // Earliest time (epoch ms) a shard may move again, so a shard does not
-    // bounce between workers on consecutive rounds of stale stats.
-    std::map<std::string, int64_t> fluxShardCooldownUntilMs;
-    // Size of fluxMigratingShards + fluxMovedShards, read lock-free by the
-    // enqueue path to skip the mutex until the first migration.
+    // Units this worker handed off. A request that still reaches us for one
+    // was routed on a stale owner and is forwarded. Dropped if the unit ever
+    // comes back.
+    std::map<std::string, faabric::ShardMove> fluxMovedUnits;
+    // Earliest time (epoch ms) a unit may move again, so it does not bounce
+    // between workers on consecutive rounds of stale stats.
+    std::map<std::string, int64_t> fluxUnitCooldownUntilMs;
+    // Size of fluxMigratingUnits + fluxMovedUnits, read lock-free by the
+    // enqueue and dispatch paths to skip the mutex until the first migration.
     std::atomic<int> fluxRouteRecords{ 0 };
 
-    // One lock per shard. A dispatched batch holds it shared until the batch
-    // has finished executing; a migration holds it exclusively, which is how
-    // it waits out every running access to the shard -- including one that
-    // has read and locked the state and has yet to write it back.
-    std::shared_mutex fluxShardLocksMx;
-    std::map<std::string, std::shared_ptr<std::shared_mutex>> fluxShardLocks;
-    std::shared_ptr<std::shared_mutex> getFluxShardLock(
-      const std::string& userFuncPar);
+    // One lock per unit. A dispatched batch holds the lock of every unit its
+    // requests address, shared, until the batch has finished executing; a
+    // migration holds it exclusively, which is how it waits out every running
+    // access to the unit -- including one that has read and locked the state
+    // and has yet to write it back. Batches of other shards of the same
+    // paridx are not held up.
+    std::shared_mutex fluxUnitLocksMx;
+    std::map<std::string, std::shared_ptr<std::shared_mutex>> fluxUnitLocks;
+    std::shared_ptr<std::shared_mutex> getFluxUnitLock(
+      const std::string& unitKey);
 
     std::thread fluxRebalanceThread;
     // ms between rebalancing rounds; 0 disables rebalancing.
     int fluxRebalancePeriod = 1000;
-    // ms a shard stays put after it moved.
+    // ms a unit stays put after it moved.
     int fluxMigrateCooldown = 5000;
     // Most requests one worker hands off per round, over all targets,
-    // stateless and stateful alike. A stateful shard goes whole or not at all,
-    // so one whose backlog exceeds what is left is skipped -- unless it is the
-    // first shard of the round, which may go over, or a shard bigger than
-    // the budget could never move.
+    // stateless and stateful alike. A unit goes whole or not at all, so one
+    // whose backlog exceeds what is left is skipped -- unless it is the first
+    // unit of the round, which may go over, or a unit bigger than the budget
+    // could never move.
     int fluxMigrateRequests = 10000;
-    // Executors a worker can run at once. Flux caps executors per shard, not
+    // Executors a worker can run at once. Flux caps executors per paridx, not
     // per worker, so free capacity is measured against this instead.
     int fluxWorkerSlots = 0;
 
@@ -368,44 +380,63 @@ class Scheduler
      * ModeFlux: one rebalancing round. Only acts when this worker is
      * saturated (every slot busy and requests waiting). Then, using the
      * cluster stats, it plans what goes where -- surplus stateless requests
-     * and whole stateful shards, hottest queues first, each to the worker
-     * with the most room left, within fluxMigrateRequests -- and hands each
-     * target its share in a single migration.
+     * and whole units of state with their requests, hottest first, each to
+     * the worker with the most room left, within fluxMigrateRequests -- and
+     * hands each target its share in a single migration.
      */
     void rebalanceFlux();
 
     /**
-     * ModeFlux: hand `shards` (userFuncPar of stateful shards, with their
-     * waiting requests) and up to the given count of requests from each
-     * stateless queue in `stateless` to `target`, in one request.
+     * ModeFlux: hand `units` (unit keys, each with the requests waiting for
+     * it) and up to the given count of requests from each stateless queue in
+     * `stateless` to `target`, in one request.
      *
-     * Blocks new dispatches of every shard, waits for running ones to finish,
+     * Blocks new dispatches of every unit, waits for running ones to finish,
      * ships the lot, flips all owners in Redis at once, then forwards
      * whatever arrived meanwhile. All or nothing: if the hand-over fails,
-     * every shard stays and every request goes back where it was. Returns
-     * {shards moved, stateless requests moved}.
+     * every unit stays and every request goes back where it was. Returns
+     * {units moved, stateless requests moved}.
      */
     std::pair<int, int> migrateToWorkerFlux(
       const std::string& target,
-      const std::vector<std::string>& shards,
+      const std::vector<std::string>& units,
       const std::vector<std::pair<std::string, int>>& stateless);
 
     /**
-     * ModeFlux enqueue hook. Parks a request for a shard being migrated, or
-     * collects one for a shard we handed off into `forwards` (by new owner).
+     * ModeFlux enqueue hook. Parks a request for a unit being migrated, or
+     * collects one for a unit we handed off into `forwards` (by new owner).
      * Returns true if the request was taken; false to queue it here.
      */
     bool divertMessageFlux(
       std::unique_ptr<faabric::Message>& msg,
-      const std::string& userFuncPar,
+      const std::string& unitKey,
       std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>&
         forwards);
+
+    /**
+     * ModeFlux dispatch hook. Takes the lock of unit `unitKey` for a batch
+     * about to run, adding it to `locks` unless the batch already holds it.
+     * Fails, and takes nothing, if the unit is being migrated or was handed
+     * off: the caller must then not run the request (see
+     * returnUndispatchableFlux).
+     */
+    bool lockUnitForDispatchFlux(
+      const std::string& unitKey,
+      std::map<std::string, std::unique_ptr<faabric::util::SharedLock>>& locks);
+
+    /**
+     * ModeFlux dispatch hook. A request pulled from a queue that must not run
+     * here after all: parked if its unit is mid-migration, forwarded if the
+     * unit was handed off, otherwise put back in its queue.
+     */
+    void returnUndispatchableFlux(std::unique_ptr<faabric::Message> msg,
+                                  const std::string& unitKey);
 
     void clearFluxMigrationState();
 
     /**
      * The hosts this worker may route to. ModeFlux pins no operator to a
-     * worker and claims a shard's owner on demand, so every registered host
+     * worker and claims a unit's owner on demand, so every registered host
      * is a candidate -- and nothing ever narrows activeHosts under ModeFlux
      * anyway, since the planner sends no state-info broadcast. The other
      * modes deliberately route only to the workers the planner placed the
@@ -460,34 +491,36 @@ class Scheduler
         scheduledOperatorMap);
 
     /**
-     * ModeFlux: bring `userFuncPar`'s function state into being on this
-     * worker, the first time a message for it arrives here.
+     * ModeFlux: decide whether a request for unit `unitKey` may run here, the
+     * first time a request for that unit arrives, and bring the unit's
+     * function state into being if so.
      *
      * ModeFlux pre-creates nothing -- the planner places no state and sends
-     * no state-info broadcast -- so the arriving message is what creates the
-     * shard it addresses. Safe because only the worker holding a shard can
-     * migrate it away: a message for a shard we hold no record of means we
-     * are its owner and nobody has touched it yet. (Once migration exists,
-     * the third case -- a shard we handed off, whose router is stale -- is
-     * told apart by the handoff record we kept, not by anything on the wire.)
+     * no state-info broadcast -- so the arriving request is what creates the
+     * state it addresses. Units handed off are caught earlier, by
+     * divertMessageFlux. What is left is checked against Redis, the
+     * authority on ownership: a request whose unit Redis gives to another
+     * worker was routed on a stale view and must not run here, or it would
+     * run against state this worker does not hold.
      *
-     * Everything needed is already to hand: the message carries the shard
-     * index and the DAG carries the operator's kind. The FunctionState
-     * constructor re-checks ownership against Redis, so a misrouted message
-     * cannot create state on a host that does not own it.
+     * A partitioned operator's paridx is split by shard across workers, so
+     * its FunctionState is created without the per-paridx ownership check and
+     * holds only the keys of the shards owned here.
      *
-     * A no-op for stateless operators and after the shard is known.
+     * Returns the owner to forward the request to, or an empty string to
+     * queue it here. Stateless operators and known units are always kept.
      */
-    void ensureLocalStateFlux(const faabric::Message& msg,
-                              const std::string& userFuncPar);
+    std::string admitMessageFlux(const faabric::Message& msg,
+                                 const std::string& userFuncPar,
+                                 const std::string& unitKey);
 
     /**
-     * ModeFlux only: one line naming every shard's executors as free/total,
+     * ModeFlux only: one line naming every paridx's executors as free/total,
      * plus the worker-wide total.
      *
-     * Logged from the blocked path of executorAvailable, where one shard has
-     * hit its own cap. The whole worker is listed rather than just that shard
-     * because the cap is per shard and the worker has no ceiling of its own:
+     * Logged from the blocked path of executorAvailable, where one paridx has
+     * hit its own cap. The whole worker is listed rather than just that paridx
+     * because the cap is per paridx and the worker has no ceiling of its own:
      * what you want to see is how much the rest of the worker is already
      * carrying. Throttled to one line a second -- the caller runs per queue
      * every batchCheckPeriod.

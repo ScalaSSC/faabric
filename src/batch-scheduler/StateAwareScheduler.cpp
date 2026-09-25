@@ -287,33 +287,74 @@ std::string StateAwareScheduler::pickCandidateHost(
     return faabric::util::getNthKey(hostMap, hash % hostMap.size());
 }
 
-int StateAwareScheduler::fluxShardCount(const Node& node) const
+bool StateAwareScheduler::fluxIsPartitioned(const Node& node)
+{
+    return node.type == NodeType::PARTITIONED_STATEFUL &&
+           !node.partitionBy.empty() && node.partitionBy != NONE_STRING;
+}
+
+int StateAwareScheduler::fluxParallelism(const Node& node) const
 {
     if (node.type == NodeType::PARTITIONED_STATEFUL) {
-        return fluxPartitionShards > 0 ? fluxPartitionShards : 1;
+        return 1;
     }
     return node.parallelism > 0 ? node.parallelism : 1;
 }
 
-bool StateAwareScheduler::updateStateHostFlux(const std::string& userFuncPar,
+std::string StateAwareScheduler::fluxUnitKey(const std::string& userFuncPar,
+                                             int shardId)
+{
+    if (shardId < 0) {
+        return userFuncPar;
+    }
+    return userFuncPar + "#" + std::to_string(shardId);
+}
+
+std::string StateAwareScheduler::fluxUnitKey(const faabric::Message& msg)
+{
+    std::string userFuncPar = msg.user() + "_" + msg.function() + "_" +
+                              std::to_string(msg.parallelismid());
+    return fluxUnitKey(userFuncPar,
+                       msg.messagetype() == 2 ? msg.shardid() : -1);
+}
+
+std::pair<std::string, int> StateAwareScheduler::splitFluxUnitKey(
+  const std::string& unitKey)
+{
+    auto hashPos = unitKey.rfind('#');
+    if (hashPos == std::string::npos) {
+        return { unitKey, -1 };
+    }
+    return { unitKey.substr(0, hashPos),
+             std::stoi(unitKey.substr(hashPos + 1)) };
+}
+
+int StateAwareScheduler::fluxShardOfKey(const std::string& userFunc,
+                                        const std::string& key)
+{
+    int shards = fluxPartitionShards > 0 ? fluxPartitionShards : 1;
+    auto ring = getFluxHashRing(userFunc, shards);
+    return ring->getHashAndNode(faabric::util::stringToBytes(key)).second;
+}
+
+bool StateAwareScheduler::updateStateHostFlux(const std::string& unitKey,
                                               const std::string& host,
                                               int64_t epoch)
 {
     faabric::util::FullLock lock(scheduleMx);
-    auto epochIt = stateHostEpoch.find(userFuncPar);
+    auto epochIt = stateHostEpoch.find(unitKey);
     int64_t known = epochIt == stateHostEpoch.end() ? 0 : epochIt->second;
     if (epoch <= known) {
         return false;
     }
-    stateHostEpoch[userFuncPar] = epoch;
-    stateHost.insert_or_assign(userFuncPar, host);
-    SPDLOG_DEBUG(
-      "Flux learns {} is on {} (epoch {})", userFuncPar, host, epoch);
+    stateHostEpoch[unitKey] = epoch;
+    stateHost.insert_or_assign(unitKey, host);
+    SPDLOG_DEBUG("Flux learns {} is on {} (epoch {})", unitKey, host, epoch);
     return true;
 }
 
 void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
-                                                int parallelism,
+                                                const Node& node,
                                                 const HostMap& hostMap)
 {
     {
@@ -329,43 +370,58 @@ void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
         throw std::runtime_error("No hosts available to own state");
     }
 
-    // Every shard starts on one worker. Hashing the operator name rather than
-    // each shard key is what keeps the operator whole while still landing
+    // Every unit starts on one worker. Hashing the operator name rather than
+    // each unit key is what keeps the operator whole while still landing
     // different operators on different workers.
     std::string home = pickCandidateHost(userFunc, hostMap);
 
-    // Claim the whole set before taking the lock: each shard is a Redis round
+    int parallelism = fluxParallelism(node);
+    std::vector<std::string> units;
+    if (fluxIsPartitioned(node)) {
+        int shards = fluxPartitionShards > 0 ? fluxPartitionShards : 1;
+        for (int shard = 0; shard < shards; shard++) {
+            units.push_back(fluxUnitKey(userFunc + "_0", shard));
+        }
+    } else {
+        for (int idx = 0; idx < parallelism; idx++) {
+            units.push_back(userFunc + "_" + std::to_string(idx));
+        }
+    }
+
+    // Claim the whole set before taking the lock: each unit is a Redis round
     // trip, and holding scheduleMx across them would serialise all routing on
     // this host. Two schedulers initialising the same operator propose
     // identical owners, so whoever wins each SETNX the result is the same.
     redis::Redis& redis = redis::Redis::getState();
     std::map<std::string, std::string> owners;
-    for (int idx = 0; idx < parallelism; idx++) {
-        std::string userFuncPar = userFunc + "_" + std::to_string(idx);
-        owners[userFuncPar] =
-          redis.claimOrGet(MAIN_KEY_PREFIX + userFuncPar, home);
+    std::map<std::string, int> unitsPerOwner;
+    for (const auto& unit : units) {
+        std::string owner = redis.claimOrGet(MAIN_KEY_PREFIX + unit, home);
+        owners[unit] = owner;
+        unitsPerOwner[owner]++;
     }
 
     std::ostringstream oss;
     bool first = true;
-    for (const auto& [userFuncPar, owner] : owners) {
+    for (const auto& [owner, count] : unitsPerOwner) {
         if (!first) {
             oss << ", ";
         }
         first = false;
-        oss << userFuncPar << "->" << owner;
+        oss << owner << ":" << count;
     }
-    SPDLOG_INFO("Flux places {} ({} shards) on {}: {}",
+    SPDLOG_INFO("Flux places {} ({} units) on {}: {}",
                 userFunc,
-                parallelism,
+                units.size(),
                 home,
                 oss.str());
 
     faabric::util::FullLock lock(scheduleMx);
-    for (const auto& [userFuncPar, owner] : owners) {
+    for (const auto& [unit, owner] : owners) {
         // Redis is authoritative. A thread that got here first wrote the same
-        // answer, so insert-if-absent and overwrite are equivalent.
-        stateHost.insert({ userFuncPar, owner });
+        // answer, and an owner learnt from a later move must not be undone,
+        // so only fill in what is missing.
+        stateHost.insert({ unit, owner });
     }
     functionParallelism[userFunc] = parallelism;
     fluxInitialisedOps.insert(userFunc);
@@ -604,7 +660,9 @@ void StateAwareScheduler::setClusterWorkerStats(
         for (const auto& [ip, workerStats] : stats) {
             for (const auto& move : workerStats.shardmoves()) {
                 updateStateHostFlux(
-                  move.userfuncpar(), move.host(), move.epoch());
+                  fluxUnitKey(move.userfuncpar(), move.shardid()),
+                  move.host(),
+                  move.epoch());
             }
         }
     }
@@ -735,15 +793,14 @@ std::shared_ptr<Node> StateAwareScheduler::lookupNode(
 
 std::shared_ptr<faabric::util::ConsistentHashRing>
 StateAwareScheduler::getFluxHashRing(const std::string& userFunction,
-                                     int parallelism)
+                                     int shards)
 {
     {
         faabric::util::SharedLock lock(scheduleMx);
         auto ringIt = stateHashRing.find(userFunction);
-        auto parIt = functionParallelism.find(userFunction);
-        if (ringIt != stateHashRing.end() &&
-            parIt != functionParallelism.end() &&
-            parIt->second == parallelism) {
+        auto shardsIt = fluxRingShards.find(userFunction);
+        if (ringIt != stateHashRing.end() && shardsIt != fluxRingShards.end() &&
+            shardsIt->second == shards) {
             return ringIt->second;
         }
     }
@@ -752,19 +809,17 @@ StateAwareScheduler::getFluxHashRing(const std::string& userFunction,
     // Another thread may have built it while we were unlocked. The ring is a
     // pure function of the shard count, so either copy routes identically.
     auto ringIt = stateHashRing.find(userFunction);
-    auto parIt = functionParallelism.find(userFunction);
-    if (ringIt != stateHashRing.end() && parIt != functionParallelism.end() &&
-        parIt->second == parallelism) {
+    auto shardsIt = fluxRingShards.find(userFunction);
+    if (ringIt != stateHashRing.end() && shardsIt != fluxRingShards.end() &&
+        shardsIt->second == shards) {
         return ringIt->second;
     }
 
-    SPDLOG_INFO("Flux builds hash ring for {} over {} shards",
-                userFunction,
-                parallelism);
-    auto ring =
-      std::make_shared<faabric::util::ConsistentHashRing>(parallelism);
+    SPDLOG_INFO(
+      "Flux builds hash ring for {} over {} shards", userFunction, shards);
+    auto ring = std::make_shared<faabric::util::ConsistentHashRing>(shards);
     stateHashRing[userFunction] = ring;
-    functionParallelism[userFunction] = parallelism;
+    fluxRingShards[userFunction] = shards;
     return ring;
 }
 
@@ -773,20 +828,18 @@ HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndexFlux(
   const Node& node,
   const faabric::Message& msg)
 {
-    int parallelism = fluxShardCount(node);
-
-    bool isPartitioned = node.type == NodeType::PARTITIONED_STATEFUL &&
-                         !node.partitionBy.empty() &&
-                         node.partitionBy != NONE_STRING;
-
     // Non-partitioned stateful: no key to hash, so shuffle across the
-    // operator's shards and let the caller resolve that shard's owner.
-    if (!isPartitioned) {
+    // operator's paridx and let the caller resolve that paridx's owner.
+    if (!fluxIsPartitioned(node)) {
+        int parallelism = fluxParallelism(node);
         auto localCounter = getNextCounter(userFunction);
         return { 1, 0, static_cast<int>(localCounter % parallelism) };
     }
 
-    auto ring = getFluxHashRing(userFunction, parallelism);
+    // Partitioned: always paridx 0. The key picks the shard within it, and
+    // the caller resolves that shard's owner.
+    int shards = fluxPartitionShards > 0 ? fluxPartitionShards : 1;
+    auto ring = getFluxHashRing(userFunction, shards);
 
     std::string inputString = msg.inputdata();
     std::vector<uint8_t> inputVec(inputString.begin(), inputString.end());
@@ -807,15 +860,13 @@ HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndexFlux(
       keyIt == inputData.end() ? std::string() : keyIt->second;
 
     std::vector<uint8_t> keyDataVec = faabric::util::stringToBytes(keyData);
-    auto [hash, parallelismIdx] = ring->getHashAndNode(keyDataVec);
+    auto [hash, shardIdx] = ring->getHashAndNode(keyDataVec);
     getNextCounter(userFunction);
 
-    SPDLOG_TRACE("Flux routes {} key {} to shard {}",
-                 userFunction,
-                 keyData,
-                 parallelismIdx);
+    SPDLOG_TRACE(
+      "Flux routes {} key {} to shard {}", userFunction, keyData, shardIdx);
 
-    return { 2, hash, parallelismIdx };
+    return { 2, hash, 0, shardIdx };
 }
 
 HashAndParallelismInfo StateAwareScheduler::getHashAndParallelismIndex(
@@ -912,20 +963,22 @@ std::string StateAwareScheduler::scheduleMessageFlux(
     }
 
     // Stateful of either kind: the placement is the state's placement. Place
-    // the operator's whole shard set the first time any of it is routed to,
-    // then pick this message's shard (hashed for partitioned, shuffled
-    // otherwise) and read back that shard's owner.
-    int parallelism = fluxShardCount(*node);
-    initOperatorStateFlux(userFunc, parallelism, hostMap);
+    // the operator's whole unit set the first time any of it is routed to,
+    // then pick this message's unit -- the shard its key hashes to within
+    // paridx 0 for partitioned, a shuffled paridx otherwise -- and read back
+    // that unit's owner.
+    initOperatorStateFlux(userFunc, *node, hostMap);
 
     auto parallelismInfo = getHashAndParallelismIndexFlux(userFunc, *node, *msg);
     std::string userFuncPar =
       userFunc + "_" + std::to_string(parallelismInfo.parallelismIdx);
-    std::string host = resolveStateHost(userFuncPar, hostMap);
+    std::string host = resolveStateHost(
+      fluxUnitKey(userFuncPar, parallelismInfo.shardIdx), hostMap);
 
     msg->set_messagetype(parallelismInfo.messageType);
     msg->set_hash(parallelismInfo.hash);
     msg->set_parallelismid(parallelismInfo.parallelismIdx);
+    msg->set_shardid(std::max(parallelismInfo.shardIdx, 0));
 
     return host;
 }
@@ -5247,6 +5300,7 @@ void StateAwareScheduler::resetScheduler()
     fluxInitialisedOps.clear();
     stateHost.clear();
     stateHostEpoch.clear();
+    fluxRingShards.clear();
     stateHashRing.clear();
     statePartitionBy.clear();
     funcStateRegMap.clear();

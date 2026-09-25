@@ -314,8 +314,8 @@ void Scheduler::reset()
     scheduledMsgsMap.clear();
     maxReplicasMap.clear();
     {
-        faabric::util::FullLock lock(fluxKnownShardsMx);
-        fluxKnownShards.clear();
+        faabric::util::FullLock lock(fluxKnownUnitsMx);
+        fluxKnownUnits.clear();
     }
     clearFluxMigrationState();
 
@@ -532,7 +532,7 @@ void Scheduler::enqueueMessageBatch(
     // Statistics the message enqueue count
     std::map<std::string, int> instancesCounter;
 
-    // ModeFlux: requests for shards we handed off, by their new owner.
+    // ModeFlux: requests for units we do not hold, by their owner.
     std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>
       fluxForwards;
 
@@ -544,14 +544,18 @@ void Scheduler::enqueueMessageBatch(
                                   std::to_string(msg.parallelismid());
 
         if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
-            // Before ensureLocalStateFlux: a shard mid-migration or already
-            // gone must not be recreated here.
-            if (divertMessageFlux(msgPtr, userFuncPar, fluxForwards)) {
+            std::string unitKey =
+              faabric::batch_scheduler::StateAwareScheduler::fluxUnitKey(msg);
+            // Before admitMessageFlux: a unit mid-migration or already gone
+            // must not be recreated here.
+            if (divertMessageFlux(msgPtr, unitKey, fluxForwards)) {
                 continue;
             }
-            // ModeFlux creates a shard's state here, on the message that
-            // first addresses it, if nobody has created it yet.
-            ensureLocalStateFlux(msg, userFuncPar);
+            std::string owner = admitMessageFlux(msg, userFuncPar, unitKey);
+            if (!owner.empty()) {
+                fluxForwards[owner].push_back(std::move(msgPtr));
+                continue;
+            }
         }
 
         instancesCounter[userFuncPar]++;
@@ -591,9 +595,10 @@ void Scheduler::enqueueMessageBatch(
     }
 
     for (auto& [host, forwardMsgs] : fluxForwards) {
-        SPDLOG_DEBUG("Flux forwards {} requests for moved shards to {}",
-                     forwardMsgs.size(),
-                     host);
+        SPDLOG_DEBUG(
+          "Flux forwards {} requests for units it does not hold to {}",
+          forwardMsgs.size(),
+          host);
         faabric::scheduler::getFunctionCallClient(host)->executeFunctionsBatch(
           std::move(forwardMsgs));
     }
@@ -665,11 +670,11 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
     auto loopDeadlineMs =
       faabric::util::getGlobalClock().epochMillis() + batchCheckPeriod;
 
-    // ModeFlux: a stateful queue holds one shard's requests, and they must run
-    // against that shard -- it is the one whose lock the batch holds, so it
-    // is the one a migration waits for. Re-scheduling would re-shuffle a
-    // non-partitioned request onto some other shard, so only ask who owns
-    // this one now.
+    // ModeFlux: every request in a stateful queue already carries its unit --
+    // its paridx, plus its shard if partitioned -- and must run against that
+    // unit: it is the one whose lock the batch holds, so it is the one a
+    // migration waits for. Re-scheduling would re-shuffle a non-partitioned
+    // request onto some other paridx, so only ask who owns its unit now.
     bool fluxStatefulQueue = false;
     if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
         auto node = decentralScheduler.lookupNode(user + "_" + func);
@@ -692,34 +697,22 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             break;
         }
 
-        std::unique_ptr<faabric::util::SharedLock> stateLock;
-        if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
-            // ModeFlux never takes stateUpdateMx exclusively; what can pull
-            // state from under a batch is a migration of its shard. Hold the
-            // shard's own lock shared for as long as the batch runs, and back
-            // off rather than wait if a migration holds or wants it.
-            if (fluxRouteRecords.load(std::memory_order_acquire) > 0) {
-                std::lock_guard<std::mutex> lock(fluxMigrationMx);
-                if (fluxMigratingShards.contains(userFuncPar)) {
-                    break;
-                }
-            }
-            stateLock = std::make_unique<faabric::util::SharedLock>(
-              *getFluxShardLock(userFuncPar), std::try_to_lock);
-            if (!stateLock->owns_lock()) {
+        // Held until the batch has finished executing. The other modes hold
+        // stateUpdateMx, which their central state update takes exclusively.
+        // ModeFlux never does; what can pull state from under a batch there
+        // is a migration of a unit it addresses, so it holds those units'
+        // locks instead, taken per request below.
+        faabric::util::SharedLockSet stateLocks;
+        if (scheduleMode != faabric::batch_scheduler::ModeFlux) {
+            stateLocks.push_back(
+              std::make_unique<faabric::util::SharedLock>(stateUpdateMx));
+            if (isUpdateState.load(std::memory_order_acquire)) {
                 break;
             }
-        } else {
-            stateLock =
-              std::make_unique<faabric::util::SharedLock>(stateUpdateMx);
         }
 
-        if (isUpdateState.load(std::memory_order_acquire)) {
-            break;
-        }
         // Double check
         if (waitingQueue.getMessagesCount() == 0) {
-            stateLock->unlock();
             break;
         }
 
@@ -727,12 +720,10 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
         try {
             msgVec = waitingQueue.getMessages();
         } catch (...) {
-            stateLock->unlock();
             break;
         }
 
         if (msgVec.empty()) {
-            stateLock->unlock();
             break;
         }
 
@@ -742,15 +733,32 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
 
         auto now = faabric::util::getGlobalClock().epochMicros();
 
+        std::map<std::string, std::unique_ptr<faabric::util::SharedLock>>
+          unitLocks;
         for (auto& src : msgVec) {
-            std::string host =
-              fluxStatefulQueue
-                ? decentralScheduler.shardOwnerFlux(userFuncPar,
-                                                    routableHosts())
-                : decentralScheduler.scheduleMessage(routableHosts(), *src);
+            std::string unitKey;
+            std::string host;
+            if (fluxStatefulQueue) {
+                unitKey =
+                  faabric::batch_scheduler::StateAwareScheduler::fluxUnitKey(
+                    *src);
+                host =
+                  decentralScheduler.unitOwnerFlux(unitKey, routableHosts());
+            } else {
+                host =
+                  decentralScheduler.scheduleMessage(routableHosts(), *src);
+            }
             if (host != thisHost) {
                 faabric::util::FullLock lock(chainedCallMsgsMx);
                 chainedCallMsgs.push_back(std::move(src));
+                continue;
+            }
+
+            // A unit being migrated must not run: leave the request to the
+            // migration instead of executing it against state that is leaving.
+            if (fluxStatefulQueue &&
+                !lockUnitForDispatchFlux(unitKey, unitLocks)) {
+                returnUndispatchableFlux(std::move(src), unitKey);
                 continue;
             }
 
@@ -782,15 +790,16 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                          userFuncPar,
                          newReq->messages_size());
 
-            e->executeBatchTasks(newReq, std::move(stateLock));
+            for (auto& [unitKey, unitLock] : unitLocks) {
+                stateLocks.push_back(std::move(unitLock));
+            }
+            e->executeBatchTasks(newReq, std::move(stateLocks));
             // if (!runningThreads.contains(threadClockId)) {
             //     faabric::util::FullLock cpuLock(cpuRecordMx);
             //     runningThreads.emplace(threadClockId);
             // }
-        } else {
-            if (stateLock)
-                stateLock->unlock();
         }
+        // Otherwise nothing runs, and the locks go with this iteration.
     }
 
     try {
@@ -1214,9 +1223,9 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
 
     // ModeFlux has no planner-derived replica budget: nothing pins operators
     // to workers, so there is no weight distribution to split one out of.
-    // maxExecutors is applied per shard instead -- funcStr is already
-    // user/func/parIdx -- so each shard scales on demand up to the same
-    // ceiling and no shard can hold another one's queue shut by filling a
+    // maxExecutors is applied per paridx instead -- funcStr is already
+    // user/func/parIdx -- so each paridx scales on demand up to the same
+    // ceiling and no paridx can hold another one's queue shut by filling a
     // worker-wide budget. The reaper hands back whatever sits idle past
     // BOUND_TIMEOUT.
     if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
@@ -1819,13 +1828,32 @@ void Scheduler::logFluxExecutorCensus(const std::string& blockedFunc)
                  oss.str());
 }
 
-void Scheduler::ensureLocalStateFlux(const faabric::Message& msg,
-                                     const std::string& userFuncPar)
+namespace {
+using faabric::batch_scheduler::StateAwareScheduler;
+
+// Ownership of a unit of state lives in Redis under "main_" + unit key -- for
+// a whole paridx the very key the state registry reads (see
+// FunctionStateRegistry::getMasterIP). Its epoch sits next to it and only
+// ever grows.
+std::string fluxOwnerKey(const std::string& unitKey)
+{
+    return "main_" + unitKey;
+}
+
+std::string fluxEpochKey(const std::string& unitKey)
+{
+    return "flux_epoch_" + unitKey;
+}
+}
+
+std::string Scheduler::admitMessageFlux(const faabric::Message& msg,
+                                        const std::string& userFuncPar,
+                                        const std::string& unitKey)
 {
     {
-        faabric::util::SharedLock lock(fluxKnownShardsMx);
-        if (fluxKnownShards.contains(userFuncPar)) {
-            return;
+        faabric::util::SharedLock lock(fluxKnownUnitsMx);
+        if (fluxKnownUnits.contains(unitKey)) {
+            return "";
         }
     }
 
@@ -1833,91 +1861,89 @@ void Scheduler::ensureLocalStateFlux(const faabric::Message& msg,
     // every worker holds one from registerApp.
     std::string userFunc = msg.user() + "_" + msg.function();
     auto node = decentralScheduler.lookupNode(userFunc);
-
-    bool needsState =
-      node != nullptr &&
-      node->type != faabric::batch_scheduler::NodeType::STATELESS;
-    bool isPartitioned =
-      needsState &&
-      node->type == faabric::batch_scheduler::NodeType::PARTITIONED_STATEFUL &&
-      !node->partitionBy.empty() && node->partitionBy != "None";
-
-    if (!needsState) {
+    if (node == nullptr ||
+        node->type == faabric::batch_scheduler::NodeType::STATELESS) {
         // Stateless, or not an operator we know. Remember that so the lookup
         // above short-circuits every later message for it.
-        faabric::util::FullLock lock(fluxKnownShardsMx);
-        fluxKnownShards.insert(userFuncPar);
-        return;
+        faabric::util::FullLock lock(fluxKnownUnitsMx);
+        fluxKnownUnits.insert(unitKey);
+        return "";
     }
+    bool isPartitioned = StateAwareScheduler::fluxIsPartitioned(*node);
 
-    faabric::util::FullLock lock(fluxKnownShardsMx);
-    // Another thread may have created it while we were reading the DAG.
-    if (!fluxKnownShards.insert(userFuncPar).second) {
-        return;
-    }
-
+    // Redis decides who holds the unit. Routers claim every unit of an
+    // operator before routing to any of it, so claiming here only ever wins
+    // for a unit nobody has claimed -- and then the request is already here.
+    std::string owner;
     try {
-        SPDLOG_INFO("Flux creates state {} on {} (partitioned {})",
-                    userFuncPar,
-                    thisHost,
-                    isPartitioned);
-        faabric::state::getGlobalState().createFS(
-          msg.user(), msg.function(), msg.parallelismid(), isPartitioned);
+        owner =
+          redis::Redis::getState().claimOrGet(fluxOwnerKey(unitKey), thisHost);
     } catch (const std::exception& e) {
-        // The FunctionState constructor refuses to build state this host does
-        // not own, so landing here means the message was routed somewhere it
-        // should not have been. Drop the record rather than caching a shard
-        // we never created, and let the failure surface when the function
-        // actually reaches for its state.
-        fluxKnownShards.erase(userFuncPar);
-        SPDLOG_ERROR("Flux could not create state {} on {}: {}",
-                     userFuncPar,
+        SPDLOG_ERROR(
+          "Flux could not read the owner of {}: {}", unitKey, e.what());
+        return "";
+    }
+    if (owner != thisHost) {
+        SPDLOG_DEBUG("Flux {} does not hold {}, forwarding to its owner {}",
+                     thisHost,
+                     unitKey,
+                     owner);
+        return owner;
+    }
+
+    faabric::util::FullLock lock(fluxKnownUnitsMx);
+    // Another thread may have admitted it while we were in Redis.
+    if (fluxKnownUnits.contains(unitKey)) {
+        return "";
+    }
+    try {
+        // A partitioned paridx is split by shard across workers, so nobody
+        // owns it as a whole and the per-paridx ownership check cannot apply.
+        // Keep any copy already here either way: for a partitioned paridx it
+        // may hold other shards' keys, some of which arrived by migration.
+        faabric::state::getGlobalState().getOrCreateFS(msg.user(),
+                                                       msg.function(),
+                                                       msg.parallelismid(),
+                                                       isPartitioned,
+                                                       !isPartitioned);
+    } catch (const std::exception& e) {
+        SPDLOG_ERROR("Flux could not create state for {} on {}: {}",
+                     unitKey,
                      thisHost,
                      e.what());
+        return "";
     }
+    fluxKnownUnits.insert(unitKey);
+    SPDLOG_DEBUG("Flux admits {} on {}", unitKey, thisHost);
+    return "";
 }
 
 // ----------------------------------
 // ModeFlux rebalancing
 // ----------------------------------
 
-namespace {
-// Ownership of shard `userFuncPar` lives in Redis under the same key the
-// state registry reads (see FunctionStateRegistry::getMasterIP); its epoch
-// sits next to it and only ever grows.
-std::string fluxOwnerKey(const std::string& userFuncPar)
-{
-    return "main_" + userFuncPar;
-}
-
-std::string fluxEpochKey(const std::string& userFuncPar)
-{
-    return "flux_epoch_" + userFuncPar;
-}
-}
-
-std::shared_ptr<std::shared_mutex> Scheduler::getFluxShardLock(
-  const std::string& userFuncPar)
+std::shared_ptr<std::shared_mutex> Scheduler::getFluxUnitLock(
+  const std::string& unitKey)
 {
     {
-        faabric::util::SharedLock lock(fluxShardLocksMx);
-        auto it = fluxShardLocks.find(userFuncPar);
-        if (it != fluxShardLocks.end()) {
+        faabric::util::SharedLock lock(fluxUnitLocksMx);
+        auto it = fluxUnitLocks.find(unitKey);
+        if (it != fluxUnitLocks.end()) {
             return it->second;
         }
     }
 
     // Entries are never erased: a running batch holds its lock through the
-    // shared_ptr, and the map is bounded by the number of shards anyway.
-    faabric::util::FullLock lock(fluxShardLocksMx);
-    auto [it, inserted] = fluxShardLocks.try_emplace(
-      userFuncPar, std::make_shared<std::shared_mutex>());
+    // shared_ptr, and the map is bounded by the number of units anyway.
+    faabric::util::FullLock lock(fluxUnitLocksMx);
+    auto [it, inserted] =
+      fluxUnitLocks.try_emplace(unitKey, std::make_shared<std::shared_mutex>());
     return it->second;
 }
 
 bool Scheduler::divertMessageFlux(
   std::unique_ptr<faabric::Message>& msg,
-  const std::string& userFuncPar,
+  const std::string& unitKey,
   std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>& forwards)
 {
     if (fluxRouteRecords.load(std::memory_order_acquire) == 0) {
@@ -1925,13 +1951,13 @@ bool Scheduler::divertMessageFlux(
     }
 
     std::lock_guard<std::mutex> lock(fluxMigrationMx);
-    if (fluxMigratingShards.contains(userFuncPar)) {
-        fluxPendingMsgs[userFuncPar].push_back(std::move(msg));
+    if (fluxMigratingUnits.contains(unitKey)) {
+        fluxPendingMsgs[unitKey].push_back(std::move(msg));
         return true;
     }
 
-    auto movedIt = fluxMovedShards.find(userFuncPar);
-    if (movedIt != fluxMovedShards.end()) {
+    auto movedIt = fluxMovedUnits.find(unitKey);
+    if (movedIt != fluxMovedUnits.end()) {
         forwards[movedIt->second.host()].push_back(std::move(msg));
         return true;
     }
@@ -1939,12 +1965,73 @@ bool Scheduler::divertMessageFlux(
     return false;
 }
 
+bool Scheduler::lockUnitForDispatchFlux(
+  const std::string& unitKey,
+  std::map<std::string, std::unique_ptr<faabric::util::SharedLock>>& locks)
+{
+    if (locks.contains(unitKey)) {
+        return true;
+    }
+
+    // Lock first, then check: a migration marks the unit before it takes the
+    // lock exclusively, so either we see the mark here, or we hold the lock
+    // before the migration does and it waits for this batch to finish.
+    auto unitLock = std::make_unique<faabric::util::SharedLock>(
+      *getFluxUnitLock(unitKey), std::try_to_lock);
+    if (!unitLock->owns_lock()) {
+        return false;
+    }
+    if (fluxRouteRecords.load(std::memory_order_acquire) > 0) {
+        std::lock_guard<std::mutex> lock(fluxMigrationMx);
+        if (fluxMigratingUnits.contains(unitKey) ||
+            fluxMovedUnits.contains(unitKey)) {
+            return false;
+        }
+    }
+
+    locks.emplace(unitKey, std::move(unitLock));
+    return true;
+}
+
+void Scheduler::returnUndispatchableFlux(std::unique_ptr<faabric::Message> msg,
+                                         const std::string& unitKey)
+{
+    std::string forwardTo;
+    {
+        std::lock_guard<std::mutex> lock(fluxMigrationMx);
+        if (fluxMigratingUnits.contains(unitKey)) {
+            // The migration forwards it with the unit, or puts it back.
+            fluxPendingMsgs[unitKey].push_back(std::move(msg));
+            return;
+        }
+        auto movedIt = fluxMovedUnits.find(unitKey);
+        if (movedIt != fluxMovedUnits.end()) {
+            forwardTo = movedIt->second.host();
+        }
+    }
+
+    if (!forwardTo.empty()) {
+        std::list<std::unique_ptr<faabric::Message>> forward;
+        forward.push_back(std::move(msg));
+        faabric::scheduler::getFunctionCallClient(forwardTo)
+          ->executeFunctionsBatch(std::move(forward));
+        return;
+    }
+
+    // Neither: the lock was busy for a moment. Try again next round.
+    faabric::util::SharedLock lock(waitingQueuesMx);
+    auto it = waitingQueues.find(faabric::util::getUserFuncPar(*msg));
+    if (it != waitingQueues.end()) {
+        it->second->addMessage(std::move(msg));
+    }
+}
+
 std::vector<faabric::ShardMove> Scheduler::getFluxShardMoves()
 {
     std::lock_guard<std::mutex> lock(fluxMigrationMx);
     std::vector<faabric::ShardMove> moves;
-    moves.reserve(fluxMovedShards.size());
-    for (const auto& [userFuncPar, move] : fluxMovedShards) {
+    moves.reserve(fluxMovedUnits.size());
+    for (const auto& [unitKey, move] : fluxMovedUnits) {
         moves.push_back(move);
     }
     return moves;
@@ -1953,10 +2040,10 @@ std::vector<faabric::ShardMove> Scheduler::getFluxShardMoves()
 void Scheduler::clearFluxMigrationState()
 {
     std::lock_guard<std::mutex> lock(fluxMigrationMx);
-    fluxMigratingShards.clear();
+    fluxMigratingUnits.clear();
     fluxPendingMsgs.clear();
-    fluxMovedShards.clear();
-    fluxShardCooldownUntilMs.clear();
+    fluxMovedUnits.clear();
+    fluxUnitCooldownUntilMs.clear();
     fluxRouteRecords.store(0, std::memory_order_release);
 }
 
@@ -2001,14 +2088,14 @@ void Scheduler::rebalanceFlux()
 
     // 1. Only a saturated worker sheds load: every slot busy and requests
     // still waiting. Our own numbers are live; the stats are a round old.
-    std::vector<std::pair<std::string, int>> backlog;
+    std::vector<std::pair<std::string, int>> queueDepths;
     int totalWaiting = 0;
     {
         faabric::util::SharedLock lock(waitingQueuesMx);
         for (const auto& [userFuncPar, queue] : waitingQueues) {
             int depth = queue->getMessagesCount();
             if (depth > 0) {
-                backlog.emplace_back(userFuncPar, depth);
+                queueDepths.emplace_back(userFuncPar, depth);
                 totalWaiting += depth;
             }
         }
@@ -2034,7 +2121,7 @@ void Scheduler::rebalanceFlux()
     {
         std::string ip;
         int room;
-        std::vector<std::string> shards;
+        std::vector<std::string> units;
         std::vector<std::pair<std::string, int>> stateless;
     };
     std::vector<FluxTarget> targets;
@@ -2062,12 +2149,52 @@ void Scheduler::rebalanceFlux()
         return;
     }
 
-    // 3. Plan: hottest queues first, each to whichever worker has the most
-    // room left, until the round's request budget is spent. Room is reserved
-    // as we go so one idle worker does not take everything.
-    std::sort(backlog.begin(), backlog.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
+    // 3. What could move: stateless queues, and units of state with the
+    // requests waiting for them. A partitioned paridx's queue mixes the
+    // requests of all its shards, and each shard is a unit of its own.
+    struct FluxCandidate
+    {
+        std::string key;
+        int depth;
+        bool isStateless;
+    };
+    std::vector<FluxCandidate> candidates;
+    for (const auto& [userFuncPar, depth] : queueDepths) {
+        auto [user, func, parStr] =
+          faabric::util::splitUserFuncPar(userFuncPar);
+        auto node = decentralScheduler.lookupNode(user + "_" + func);
+        if (node == nullptr ||
+            node->type == faabric::batch_scheduler::NodeType::STATELESS) {
+            candidates.push_back({ userFuncPar, depth, true });
+            continue;
+        }
+        if (!StateAwareScheduler::fluxIsPartitioned(*node)) {
+            candidates.push_back({ userFuncPar, depth, false });
+            continue;
+        }
+        std::map<int, int> perShard;
+        {
+            faabric::util::SharedLock lock(waitingQueuesMx);
+            auto it = waitingQueues.find(userFuncPar);
+            if (it != waitingQueues.end()) {
+                perShard = it->second->countBy(
+                  [](const faabric::Message& m) { return m.shardid(); });
+            }
+        }
+        for (const auto& [shard, n] : perShard) {
+            candidates.push_back(
+              { StateAwareScheduler::fluxUnitKey(userFuncPar, shard),
+                n,
+                false });
+        }
+    }
+
+    // 4. Plan: hottest first, each to whichever worker has the most room
+    // left, until the round's request budget is spent. Room is reserved as
+    // we go so one idle worker does not take everything.
+    std::sort(candidates.begin(),
+              candidates.end(),
+              [](const auto& a, const auto& b) { return a.depth > b.depth; });
 
     auto roomiest = [&targets]() -> FluxTarget* {
         FluxTarget* best = nullptr;
@@ -2080,9 +2207,9 @@ void Scheduler::rebalanceFlux()
     };
 
     int budget = fluxMigrateRequests;
-    bool firstShard = true;
+    bool firstUnit = true;
     int64_t nowMs = faabric::util::getGlobalClock().epochMillis();
-    for (const auto& [userFuncPar, depth] : backlog) {
+    for (const auto& candidate : candidates) {
         if (budget <= 0) {
             break;
         }
@@ -2091,21 +2218,15 @@ void Scheduler::rebalanceFlux()
             break;
         }
 
-        auto [user, func, parStr] =
-          faabric::util::splitUserFuncPar(userFuncPar);
-        auto node = decentralScheduler.lookupNode(user + "_" + func);
-        bool isStateless =
-          node == nullptr ||
-          node->type == faabric::batch_scheduler::NodeType::STATELESS;
-
-        if (isStateless) {
+        if (candidate.isStateless) {
             // Keep one batch to run here; ship the rest, as much as the
             // target and the budget allow.
-            int n = std::min({ depth - batchSize, target->room, budget });
+            int n =
+              std::min({ candidate.depth - batchSize, target->room, budget });
             if (n <= 0) {
                 continue;
             }
-            target->stateless.emplace_back(userFuncPar, n);
+            target->stateless.emplace_back(candidate.key, n);
             target->room -= n;
             budget -= n;
             continue;
@@ -2113,54 +2234,56 @@ void Scheduler::rebalanceFlux()
 
         {
             std::lock_guard<std::mutex> lock(fluxMigrationMx);
-            if (fluxMigratingShards.contains(userFuncPar) ||
-                fluxMovedShards.contains(userFuncPar)) {
+            if (fluxMigratingUnits.contains(candidate.key) ||
+                fluxMovedUnits.contains(candidate.key)) {
                 continue;
             }
-            auto coolIt = fluxShardCooldownUntilMs.find(userFuncPar);
-            if (coolIt != fluxShardCooldownUntilMs.end() &&
+            auto coolIt = fluxUnitCooldownUntilMs.find(candidate.key);
+            if (coolIt != fluxUnitCooldownUntilMs.end() &&
                 nowMs < coolIt->second) {
                 continue;
             }
         }
 
-        // A shard goes whole, with every request waiting for it. One that
+        // A unit goes whole, with every request waiting for it. One that
         // does not fit waits for a later round -- unless it is the round's
-        // first shard, or a shard bigger than the budget could never move.
-        if (!firstShard && (depth > budget || depth > target->room)) {
+        // first unit, or a unit bigger than the budget could never move.
+        if (!firstUnit &&
+            (candidate.depth > budget || candidate.depth > target->room)) {
             continue;
         }
-        target->shards.push_back(userFuncPar);
-        target->room -= depth;
-        budget -= depth;
-        firstShard = false;
+        target->units.push_back(candidate.key);
+        target->room -= candidate.depth;
+        budget -= candidate.depth;
+        firstUnit = false;
     }
 
-    // 4. One hand-over per target.
-    int shardsMoved = 0;
+    // 5. One hand-over per target.
+    int unitsMoved = 0;
     int statelessMoved = 0;
     int targetsUsed = 0;
     for (const auto& target : targets) {
-        if (target.shards.empty() && target.stateless.empty()) {
+        if (target.units.empty() && target.stateless.empty()) {
             continue;
         }
-        auto [nShards, nStateless] =
-          migrateToWorkerFlux(target.ip, target.shards, target.stateless);
-        shardsMoved += nShards;
+        auto [nUnits, nStateless] =
+          migrateToWorkerFlux(target.ip, target.units, target.stateless);
+        unitsMoved += nUnits;
         statelessMoved += nStateless;
-        if (nShards > 0 || nStateless > 0) {
+        if (nUnits > 0 || nStateless > 0) {
             targetsUsed++;
         }
     }
 
-    if (shardsMoved > 0 || statelessMoved > 0) {
+    if (unitsMoved > 0 || statelessMoved > 0) {
         SPDLOG_INFO("Flux {} rebalanced ({} busy / {} slots, {} waiting): "
-                    "moved {} shards and {} stateless requests to {} workers",
+                    "moved {} units of state and {} stateless requests to {} "
+                    "workers",
                     thisHost,
                     busy,
                     slots,
                     totalWaiting,
-                    shardsMoved,
+                    unitsMoved,
                     statelessMoved,
                     targetsUsed);
     }
@@ -2168,88 +2291,90 @@ void Scheduler::rebalanceFlux()
 
 std::pair<int, int> Scheduler::migrateToWorkerFlux(
   const std::string& target,
-  const std::vector<std::string>& shards,
+  const std::vector<std::string>& units,
   const std::vector<std::pair<std::string, int>>& stateless)
 {
-    struct FluxShardMove
+    struct FluxUnitMove
     {
+        std::string unitKey;
         std::string userFuncPar;
+        // -1 for a whole paridx.
+        int shardId;
         std::string user;
         std::string func;
         int parIdx;
-        bool isPartitioned;
         int64_t epoch;
-        bool isLocal = false;
         std::unique_ptr<faabric::util::FullLock> lock;
     };
 
-    // 1. Keep only the shards Redis says we own, and read their epochs: the
+    // 1. Keep only the units Redis says we own, and read their epochs: the
     // move publishes epoch + 1, and the receiver needs it before the flip.
     redis::Redis& redis = redis::Redis::getState();
-    std::vector<FluxShardMove> moves;
-    for (const auto& userFuncPar : shards) {
+    std::vector<FluxUnitMove> moves;
+    for (const auto& unitKey : units) {
+        auto [userFuncPar, shardId] =
+          StateAwareScheduler::splitFluxUnitKey(unitKey);
         auto [user, func, parStr] =
           faabric::util::splitUserFuncPar(userFuncPar);
         auto node = decentralScheduler.lookupNode(user + "_" + func);
         if (node == nullptr ||
-            node->type == faabric::batch_scheduler::NodeType::STATELESS) {
+            node->type == faabric::batch_scheduler::NodeType::STATELESS ||
+            StateAwareScheduler::fluxIsPartitioned(*node) != (shardId >= 0)) {
             continue;
         }
 
         std::string owner =
-          faabric::util::bytesToString(redis.get(fluxOwnerKey(userFuncPar)));
+          faabric::util::bytesToString(redis.get(fluxOwnerKey(unitKey)));
         if (owner != thisHost) {
             SPDLOG_WARN("Flux {} does not own {} (owner {}), not moving it",
                         thisHost,
-                        userFuncPar,
+                        unitKey,
                         owner);
             continue;
         }
         int64_t epoch = 0;
-        auto epochBytes = redis.get(fluxEpochKey(userFuncPar));
+        auto epochBytes = redis.get(fluxEpochKey(unitKey));
         if (!epochBytes.empty()) {
             epoch = std::stoll(faabric::util::bytesToString(epochBytes));
         }
 
-        FluxShardMove move;
+        FluxUnitMove move;
+        move.unitKey = unitKey;
         move.userFuncPar = userFuncPar;
+        move.shardId = shardId;
         move.user = user;
         move.func = func;
         move.parIdx = std::stoi(parStr);
-        move.isPartitioned =
-          node->type ==
-            faabric::batch_scheduler::NodeType::PARTITIONED_STATEFUL &&
-          !node->partitionBy.empty() && node->partitionBy != "None";
         move.epoch = epoch;
         moves.push_back(std::move(move));
     }
 
     // 2. Freeze them all first: from here their requests are parked, not
-    // queued, and no new batch of them is dispatched.
+    // queued, and no new batch touching them is dispatched.
     {
         std::lock_guard<std::mutex> lock(fluxMigrationMx);
-        std::erase_if(moves, [this](const FluxShardMove& m) {
-            if (fluxMigratingShards.contains(m.userFuncPar) ||
-                fluxMovedShards.contains(m.userFuncPar)) {
+        std::erase_if(moves, [this](const FluxUnitMove& m) {
+            if (fluxMigratingUnits.contains(m.unitKey) ||
+                fluxMovedUnits.contains(m.unitKey)) {
                 return true;
             }
-            fluxMigratingShards.insert(m.userFuncPar);
+            fluxMigratingUnits.insert(m.unitKey);
             fluxRouteRecords.fetch_add(1, std::memory_order_release);
             return false;
         });
     }
 
-    // 3. Wait out every batch already running against each shard. Each holds
-    // its shard's lock shared until it has finished, so a function that has
+    // 3. Wait out every batch already running against each unit. Each holds
+    // its units' locks shared until it has finished, so a function that has
     // read-and-locked its state gets to write it back before we snapshot.
-    // Dispatchers only ever try-lock, so holding one shard while waiting for
+    // Dispatchers only ever try-lock, so holding one unit while waiting for
     // the next cannot deadlock.
     for (auto& move : moves) {
         move.lock = std::make_unique<faabric::util::FullLock>(
-          *getFluxShardLock(move.userFuncPar));
+          *getFluxUnitLock(move.unitKey));
     }
 
-    // 4. Pack: every shard's state and waiting requests, then the stateless
+    // 4. Pack every unit's state and waiting requests, then the stateless
     // requests.
     auto& state = faabric::state::getGlobalState();
     faabric::FluxShardMigrationRequest req;
@@ -2257,8 +2382,11 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
     auto* batch = req.mutable_messagebatch();
     batch->set_invokehost(thisHost);
 
-    auto takeFromQueue = [this, batch](const std::string& userFuncPar,
-                                       int count) -> int {
+    auto takeFromQueue =
+      [this, batch](
+        const std::string& userFuncPar,
+        const std::function<std::vector<std::unique_ptr<faabric::Message>>(
+          faabric::util::BatchQueue&)>& take) -> int {
         std::vector<std::unique_ptr<faabric::Message>> taken;
         {
             faabric::util::SharedLock lock(waitingQueuesMx);
@@ -2266,8 +2394,7 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
             if (it == waitingQueues.end()) {
                 return 0;
             }
-            taken = count < 0 ? it->second->drainMessages()
-                              : it->second->takeMessages(count);
+            taken = take(*it->second);
         }
         for (auto& msg : taken) {
             batch->add_messages()->Swap(msg.get());
@@ -2275,43 +2402,96 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
         return static_cast<int>(taken.size());
     };
 
-    int shardRequests = 0;
+    int unitRequests = 0;
     size_t stateBytes = 0;
-    for (auto& move : moves) {
-        {
-            faabric::util::SharedLock lock(fluxKnownShardsMx);
-            move.isLocal = fluxKnownShards.contains(move.userFuncPar);
-        }
+    // With access_state_remote the state already lives in Redis, and state
+    // never materialised here has nothing to carry.
+    bool carryState = !state.accessRemote;
 
-        auto* shard = req.add_shards();
-        shard->set_user(move.user);
-        shard->set_function(move.func);
-        shard->set_parallelismid(move.parIdx);
-        shard->set_ispartitioned(move.isPartitioned);
-        shard->set_epoch(move.epoch + 1);
-        // With access_state_remote the state already lives in Redis, and a
-        // shard never materialised here has nothing to carry.
-        if (!state.accessRemote && move.isLocal) {
-            try {
-                auto bytes =
-                  state.snapshotFS(move.user, move.func, move.parIdx);
-                shard->set_hasstate(true);
-                shard->set_serializedstate(bytes.data(), bytes.size());
-                stateBytes += bytes.size();
-            } catch (const std::exception& e) {
-                SPDLOG_DEBUG("Flux found no local state for {}: {}",
-                             move.userFuncPar,
-                             e.what());
+    // Whole paridx: the state and the queue go as they are.
+    for (auto& move : moves) {
+        if (move.shardId >= 0) {
+            continue;
+        }
+        auto* unitState = req.add_shards();
+        unitState->set_user(move.user);
+        unitState->set_function(move.func);
+        unitState->set_parallelismid(move.parIdx);
+        unitState->set_shardid(-1);
+        unitState->set_ispartitioned(false);
+        unitState->set_epoch(move.epoch + 1);
+        if (carryState && state.hasFS(move.user, move.func, move.parIdx)) {
+            auto bytes = state.snapshotFS(move.user, move.func, move.parIdx);
+            unitState->set_hasstate(true);
+            unitState->set_serializedstate(bytes.data(), bytes.size());
+            stateBytes += bytes.size();
+        }
+        unitRequests +=
+          takeFromQueue(move.userFuncPar, [](faabric::util::BatchQueue& q) {
+              return q.drainMessages();
+          });
+    }
+
+    // Shards: cut out of their paridx, one pass per paridx for the keys and
+    // one for the requests.
+    std::map<std::string, std::set<int>> shardsByParidx;
+    std::map<std::string, const FluxUnitMove*> paridxOf;
+    for (const auto& move : moves) {
+        if (move.shardId >= 0) {
+            shardsByParidx[move.userFuncPar].insert(move.shardId);
+            paridxOf[move.userFuncPar] = &move;
+        }
+    }
+    for (const auto& [userFuncPar, shards] : shardsByParidx) {
+        const FluxUnitMove& any = *paridxOf.at(userFuncPar);
+        std::string userFunc = any.user + "_" + any.func;
+
+        std::map<int, std::vector<uint8_t>> snapshots;
+        if (carryState && state.hasFS(any.user, any.func, any.parIdx)) {
+            snapshots = state.snapshotShards(
+              any.user,
+              any.func,
+              any.parIdx,
+              [this, &userFunc](const std::string& key) {
+                  return decentralScheduler.fluxShardOfKey(userFunc, key);
+              },
+              shards);
+        }
+        for (const auto& move : moves) {
+            if (move.userFuncPar != userFuncPar || move.shardId < 0) {
+                continue;
+            }
+            auto* unitState = req.add_shards();
+            unitState->set_user(move.user);
+            unitState->set_function(move.func);
+            unitState->set_parallelismid(move.parIdx);
+            unitState->set_shardid(move.shardId);
+            unitState->set_ispartitioned(true);
+            unitState->set_epoch(move.epoch + 1);
+            auto snapIt = snapshots.find(move.shardId);
+            if (snapIt != snapshots.end()) {
+                unitState->set_hasstate(true);
+                unitState->set_serializedstate(snapIt->second.data(),
+                                               snapIt->second.size());
+                stateBytes += snapIt->second.size();
             }
         }
 
-        shardRequests += takeFromQueue(move.userFuncPar, -1);
+        unitRequests +=
+          takeFromQueue(userFuncPar, [&shards](faabric::util::BatchQueue& q) {
+              return q.takeIf([&shards](const faabric::Message& m) {
+                  return m.messagetype() == 2 && shards.contains(m.shardid());
+              });
+          });
     }
 
     int statelessRequests = 0;
     std::map<std::string, int> statelessTaken;
     for (const auto& [userFuncPar, count] : stateless) {
-        int n = takeFromQueue(userFuncPar, count);
+        int n =
+          takeFromQueue(userFuncPar, [count](faabric::util::BatchQueue& q) {
+              return q.takeMessages(count);
+          });
         if (n > 0) {
             statelessTaken[userFuncPar] = n;
             statelessRequests += n;
@@ -2323,7 +2503,7 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
     }
 
     // 5. Hand it all over. Until the flip below, Redis still names us for
-    // every shard, so nothing new is routed to the target before the state
+    // every unit, so nothing new is routed to the target before the state
     // has arrived.
     bool installed = false;
     try {
@@ -2331,7 +2511,7 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
           req);
         installed = true;
     } catch (const std::exception& e) {
-        SPDLOG_ERROR("Flux could not hand {} shards and {} stateless requests "
+        SPDLOG_ERROR("Flux could not hand {} units and {} stateless requests "
                      "to {}: {}",
                      moves.size(),
                      statelessRequests,
@@ -2344,7 +2524,7 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
     auto collectParked = [this, &moves]() {
         std::list<std::unique_ptr<faabric::Message>> parked;
         for (const auto& move : moves) {
-            auto pendingIt = fluxPendingMsgs.find(move.userFuncPar);
+            auto pendingIt = fluxPendingMsgs.find(move.unitKey);
             if (pendingIt == fluxPendingMsgs.end()) {
                 continue;
             }
@@ -2357,15 +2537,15 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
     };
 
     if (!installed) {
-        // Nothing changed hands. Unfreeze every shard and put every request
+        // Nothing changed hands. Unfreeze every unit and put every request
         // back in the queue it came from.
         std::list<std::unique_ptr<faabric::Message>> parked;
         {
             std::lock_guard<std::mutex> lock(fluxMigrationMx);
             for (const auto& move : moves) {
-                fluxMigratingShards.erase(move.userFuncPar);
+                fluxMigratingUnits.erase(move.unitKey);
                 fluxRouteRecords.fetch_sub(1, std::memory_order_release);
-                fluxShardCooldownUntilMs[move.userFuncPar] =
+                fluxUnitCooldownUntilMs[move.unitKey] =
                   nowMs + fluxMigrateCooldown;
             }
             parked = collectParked();
@@ -2394,63 +2574,82 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
         return { 0, 0 };
     }
 
-    // 6. Flip every owner at once. Only the owner moves a shard, so the
-    // checks in the script can only fail if something outside Flux rewrote a
-    // key.
+    // 6. Flip every owner at once. Only the owner moves a unit, so the checks
+    // in the script can only fail if something outside Flux rewrote a key.
     std::vector<redis::Redis::OwnerTransfer> transfers;
     for (const auto& move : moves) {
-        transfers.push_back({ fluxOwnerKey(move.userFuncPar),
-                              fluxEpochKey(move.userFuncPar),
+        transfers.push_back({ fluxOwnerKey(move.unitKey),
+                              fluxEpochKey(move.unitKey),
                               move.epoch });
     }
     bool flipped = false;
     try {
         flipped = redis.transferOwners(transfers, thisHost, target);
     } catch (const std::exception& e) {
-        SPDLOG_ERROR("Flux could not flip owners of {} shards: {}",
-                     moves.size(),
-                     e.what());
+        SPDLOG_ERROR(
+          "Flux could not flip owners of {} units: {}", moves.size(), e.what());
     }
     if (!flipped && !moves.empty()) {
         // The target holds the state and the requests now, so it is the owner
         // in every way but the Redis record. Keep going rather than end up
-        // with the shards in two places.
-        SPDLOG_ERROR("Flux owner flip of {} shards ({} -> {}) was refused; "
+        // with the units in two places.
+        SPDLOG_ERROR("Flux owner flip of {} units ({} -> {}) was refused; "
                      "Redis no longer matches their location",
                      moves.size(),
                      thisHost,
                      target);
     }
 
-    // 7. Leave a forwarding record for every shard, and hand over whatever
+    // 7. Leave a forwarding record for every unit, and hand over whatever
     // was parked while we were busy. From here their requests are forwarded.
     std::list<std::unique_ptr<faabric::Message>> parked;
     {
         std::lock_guard<std::mutex> lock(fluxMigrationMx);
         for (const auto& move : moves) {
-            fluxMigratingShards.erase(move.userFuncPar);
+            fluxMigratingUnits.erase(move.unitKey);
             faabric::ShardMove record;
             record.set_userfuncpar(move.userFuncPar);
+            record.set_shardid(move.shardId);
             record.set_host(target);
             record.set_epoch(move.epoch + 1);
             // One record swapped for another: fluxRouteRecords is unchanged.
-            fluxMovedShards[move.userFuncPar] = std::move(record);
-            fluxShardCooldownUntilMs[move.userFuncPar] =
-              nowMs + fluxMigrateCooldown;
+            fluxMovedUnits[move.unitKey] = std::move(record);
+            fluxUnitCooldownUntilMs[move.unitKey] = nowMs + fluxMigrateCooldown;
         }
         parked = collectParked();
     }
 
-    for (auto& move : moves) {
+    // Drop the state that left: a whole paridx goes, a shard's keys are cut
+    // out of the paridx, which stays for the shards still here.
+    for (const auto& move : moves) {
         decentralScheduler.updateStateHostFlux(
-          move.userFuncPar, target, move.epoch + 1);
-        if (!state.accessRemote && move.isLocal) {
+          move.unitKey, target, move.epoch + 1);
+        if (move.shardId < 0 && carryState &&
+            state.hasFS(move.user, move.func, move.parIdx)) {
             state.deleteFS(move.user, move.func, move.parIdx);
         }
-        {
-            faabric::util::FullLock lock(fluxKnownShardsMx);
-            fluxKnownShards.erase(move.userFuncPar);
+    }
+    for (const auto& [userFuncPar, shards] : shardsByParidx) {
+        const FluxUnitMove& any = *paridxOf.at(userFuncPar);
+        std::string userFunc = any.user + "_" + any.func;
+        if (carryState && state.hasFS(any.user, any.func, any.parIdx)) {
+            state.eraseShards(
+              any.user,
+              any.func,
+              any.parIdx,
+              [this, &userFunc](const std::string& key) {
+                  return decentralScheduler.fluxShardOfKey(userFunc, key);
+              },
+              shards);
         }
+    }
+    {
+        faabric::util::FullLock lock(fluxKnownUnitsMx);
+        for (const auto& move : moves) {
+            fluxKnownUnits.erase(move.unitKey);
+        }
+    }
+    for (auto& move : moves) {
         move.lock.reset();
     }
 
@@ -2464,11 +2663,11 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
         runtimeStats.instanceGenerate(userFuncPar, target, n);
     }
 
-    SPDLOG_INFO("Flux moved {} shards ({} state bytes, {} queued + {} parked "
+    SPDLOG_INFO("Flux moved {} units ({} state bytes, {} queued + {} parked "
                 "requests) and {} stateless requests {} -> {}",
                 moves.size(),
                 stateBytes,
-                shardRequests,
+                unitRequests,
                 nParked,
                 statelessRequests,
                 thisHost,
@@ -2482,45 +2681,55 @@ void Scheduler::receiveShardFlux(faabric::FluxShardMigrationRequest& req)
     int64_t cooldownUntilMs =
       faabric::util::getGlobalClock().epochMillis() + fluxMigrateCooldown;
 
-    for (const auto& shard : req.shards()) {
-        std::string userFuncPar = shard.user() + "_" + shard.function() + "_" +
-                                  std::to_string(shard.parallelismid());
+    for (const auto& unitState : req.shards()) {
+        std::string userFuncPar = unitState.user() + "_" +
+                                  unitState.function() + "_" +
+                                  std::to_string(unitState.parallelismid());
+        std::string unitKey =
+          StateAwareScheduler::fluxUnitKey(userFuncPar, unitState.shardid());
 
-        // Install even an empty shard: requests may already be on their way,
-        // and ensureLocalStateFlux cannot create it for them because Redis
-        // still names the sender until it flips the owner.
+        // Install even an empty unit: requests may already be on their way,
+        // and admitMessageFlux will not take them because Redis still names
+        // the sender until it flips the owner.
         if (!state.accessRemote) {
-            const std::string& data = shard.serializedstate();
+            const std::string& data = unitState.serializedstate();
             std::vector<uint8_t> bytes(data.begin(), data.end());
-            state.installMigratedFS(shard.user(),
-                                    shard.function(),
-                                    shard.parallelismid(),
-                                    shard.ispartitioned(),
-                                    bytes);
+            if (unitState.shardid() < 0) {
+                state.installMigratedFS(unitState.user(),
+                                        unitState.function(),
+                                        unitState.parallelismid(),
+                                        unitState.ispartitioned(),
+                                        bytes);
+            } else {
+                state.mergeMigratedShard(unitState.user(),
+                                         unitState.function(),
+                                         unitState.parallelismid(),
+                                         bytes);
+            }
         }
         {
-            faabric::util::FullLock lock(fluxKnownShardsMx);
-            fluxKnownShards.insert(userFuncPar);
+            faabric::util::FullLock lock(fluxKnownUnitsMx);
+            fluxKnownUnits.insert(unitKey);
         }
         {
             std::lock_guard<std::mutex> lock(fluxMigrationMx);
-            // The shard may be coming back to a worker that once handed it
+            // The unit may be coming back to a worker that once handed it
             // off.
-            if (fluxMovedShards.erase(userFuncPar) > 0) {
+            if (fluxMovedUnits.erase(unitKey) > 0) {
                 fluxRouteRecords.fetch_sub(1, std::memory_order_release);
             }
-            fluxShardCooldownUntilMs[userFuncPar] = cooldownUntilMs;
+            fluxUnitCooldownUntilMs[unitKey] = cooldownUntilMs;
         }
         decentralScheduler.updateStateHostFlux(
-          userFuncPar, thisHost, shard.epoch());
+          unitKey, thisHost, unitState.epoch());
     }
 
-    SPDLOG_INFO("Flux took over {} shards and {} requests from {}",
+    SPDLOG_INFO("Flux took over {} units and {} requests from {}",
                 req.shards_size(),
                 req.messagebatch().messages_size(),
                 req.sourcehost());
 
-    // Only after every shard is installed: the requests may address any of
+    // Only after every unit is installed: the requests may address any of
     // them.
     if (req.messagebatch().messages_size() > 0) {
         auto batch = std::make_unique<faabric::MessageBatch>();

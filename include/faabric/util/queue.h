@@ -8,6 +8,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -471,6 +472,45 @@ class BatchQueue : public BatchQueueBase
             messagesCount--;
         }
         return taken;
+    }
+
+    // Every message for which `pred` holds, in queue order. The rest keep
+    // their order.
+    virtual std::vector<std::unique_ptr<faabric::Message>> takeIf(
+      const std::function<bool(const faabric::Message&)>& pred)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::unique_ptr<faabric::Message>> taken;
+        std::queue<std::unique_ptr<faabric::Message>> kept;
+        while (!batchQueue.empty()) {
+            auto msg = std::move(batchQueue.front());
+            batchQueue.pop();
+            if (pred(*msg)) {
+                taken.push_back(std::move(msg));
+            } else {
+                kept.push(std::move(msg));
+            }
+        }
+        batchQueue.swap(kept);
+        messagesCount = static_cast<int>(batchQueue.size());
+        return taken;
+    }
+
+    // How many messages fall under each value of `keyOf`.
+    std::map<int, int> countBy(
+      const std::function<int(const faabric::Message&)>& keyOf)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::map<int, int> counts;
+        // std::queue cannot be iterated, so cycle it through once.
+        size_t n = batchQueue.size();
+        for (size_t i = 0; i < n; i++) {
+            auto msg = std::move(batchQueue.front());
+            batchQueue.pop();
+            counts[keyOf(*msg)]++;
+            batchQueue.push(std::move(msg));
+        }
+        return counts;
     }
 
     int getMessagesCount()

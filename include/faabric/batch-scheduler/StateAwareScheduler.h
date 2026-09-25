@@ -47,6 +47,8 @@ struct HashAndParallelismInfo
     int messageType;
     size_t hash;
     int parallelismIdx;
+    // ModeFlux partitioned stateful only: the shard the key hashes to.
+    int shardIdx = -1;
 };
 
 struct FunctionStateInfo
@@ -117,31 +119,61 @@ class StateAwareScheduler : public BatchScheduler
 
     void setFluxOffloadMargin(int value) { fluxOffloadMargin = value; }
 
-    // Shard count of every partitioned stateful operator under ModeFlux. Must
+    // Shard count of every partitioned stateful operator under ModeFlux. A
+    // partitioned operator has a single paridx (0); its keys are hashed onto
+    // this many shards, and each shard is placed and moved on its own. Must
     // be set before the application is registered and left alone afterwards:
     // every router hashes keys onto this many shards, so changing it mid-run
     // would send the same key to different shards on different routers.
     void setFluxPartitionShards(int value) { fluxPartitionShards = value; }
 
+    int getFluxPartitionShards() const { return fluxPartitionShards; }
+
     /**
-     * ModeFlux: record that `userFuncPar` is now owned by `host`, as of
+     * ModeFlux names every unit of state that is owned, locked and moved as
+     * a whole: a stateful operator's paridx ("user_func_par"), or one shard
+     * of a partitioned operator's paridx ("user_func_par#shard"). A negative
+     * shard means the whole paridx.
+     */
+    static std::string fluxUnitKey(const std::string& userFuncPar, int shardId);
+
+    // The unit a routed message addresses: its shard for a partitioned
+    // message (messageType 2), its paridx otherwise.
+    static std::string fluxUnitKey(const faabric::Message& msg);
+
+    // Inverse of fluxUnitKey: {userFuncPar, shardId}, shardId -1 for a whole
+    // paridx.
+    static std::pair<std::string, int> splitFluxUnitKey(
+      const std::string& unitKey);
+
+    // Whether ModeFlux treats `node` as partitioned: keyed state, one paridx
+    // split into shards.
+    static bool fluxIsPartitioned(const Node& node);
+
+    // The shard `key` of partitioned operator `userFunc` hashes to -- the
+    // same hash routing uses, so a state key and the requests for it always
+    // agree on their shard.
+    int fluxShardOfKey(const std::string& userFunc, const std::string& key);
+
+    /**
+     * ModeFlux: record that unit `unitKey` is now owned by `host`, as of
      * ownership epoch `epoch`. Ignored unless `epoch` is newer than the one
      * already known, so stale and duplicate reports are harmless. Returns
      * whether the record changed anything.
      */
-    bool updateStateHostFlux(const std::string& userFuncPar,
+    bool updateStateHostFlux(const std::string& unitKey,
                              const std::string& host,
                              int64_t epoch);
 
     /**
-     * ModeFlux: current owner of shard `userFuncPar`, as far as this
-     * scheduler knows. For a request that already carries its shard, which
+     * ModeFlux: current owner of unit `unitKey`, as far as this scheduler
+     * knows. For a request that already carries its paridx and shard, which
      * must not be re-hashed or re-shuffled onto another one.
      */
-    std::string shardOwnerFlux(const std::string& userFuncPar,
-                               const HostMap& hostMap)
+    std::string unitOwnerFlux(const std::string& unitKey,
+                              const HostMap& hostMap)
     {
-        return resolveStateHost(userFuncPar, hostMap);
+        return resolveStateHost(unitKey, hostMap);
     }
 
     bool getClastPlacement() const { return isClastPlacement; }
@@ -673,13 +705,16 @@ class StateAwareScheduler : public BatchScheduler
     // Only partitioned stateful function will be registered here.
     // FunctionUser : Input Parition Key
     std::map<std::string, std::string> statePartitionBy;
-    // ModeFlux: operators whose shards have all been placed. Guards the
-    // per-message fast path from re-walking the whole shard set.
+    // ModeFlux: operators whose units have all been placed. Guards the
+    // per-message fast path from re-walking the whole unit set.
     std::set<std::string> fluxInitialisedOps;
-    // ModeFlux: Function_User_ParallelismIndex : ownership epoch of the owner
+    // ModeFlux: unit key (see fluxUnitKey) : ownership epoch of the owner
     // held in stateHost. Absent means epoch 0, i.e. the initial placement.
-    // Guarded by scheduleMx, like stateHost.
+    // Guarded by scheduleMx, like stateHost, which ModeFlux also keys by unit.
     std::map<std::string, int64_t> stateHostEpoch;
+    // ModeFlux: Function_User : shard count its cached hash ring was built
+    // over.
+    std::map<std::string, int> fluxRingShards;
     // Function_User : Counter. It is used for shuffle grouping.
     std::shared_mutex counterMx;
     std::map<std::string, std::shared_ptr<std::atomic_uint>> counterTable;
@@ -745,55 +780,43 @@ class StateAwareScheduler : public BatchScheduler
       const faabric::Message& msg);
 
     /**
-     * ModeFlux: how many shards `node` has, for its whole lifetime.
-     *
-     * A partitioned operator holds ONE logical state split by key, so its
-     * shard count is a unit of movement, not of parallelism: it is cut into
-     * fluxPartitionShards shards, all placed on one worker when the operator
-     * is first routed to (initOperatorStateFlux), and load is spread by
-     * migrating whole shards to other workers. The count never changes
-     * afterwards, so no key ever changes shard. Its declared parallelism
-     * plays no part.
-     *
-     * A non-partitioned stateful operator is the opposite: its instances hold
+     * ModeFlux: how many paridx `node` has. A partitioned operator has one:
+     * its keys are spread by shard (fluxPartitionShards) within that paridx,
+     * not across paridx. A non-partitioned stateful operator's instances hold
      * genuinely separate states and the shuffle picks between them with
-     * nothing mapping a key to one, so collapsing them would merge states
-     * that were never the same state. Its declared parallelism is honoured.
+     * nothing mapping a key to one, so its declared parallelism is honoured.
      */
-    int fluxShardCount(const Node& node) const;
+    int fluxParallelism(const Node& node) const;
 
     /**
-     * ModeFlux: place every shard of `userFunc` the first time any of them is
-     * routed to, rather than one shard at a time, and place them all on one
-     * worker.
+     * ModeFlux: place every unit of `node` the first time any of them is
+     * routed to, rather than one unit at a time, and place them all on one
+     * worker. The units are the shards of paridx 0 for a partitioned
+     * operator, and its paridx for a non-partitioned one.
      *
      * ModeFlux does no static placement, so the initial layout only has to be
-     * deterministic, not good: the runtime spreads shards out from there as
-     * load appears. Starting every shard co-located is the honest expression
+     * deterministic, not good: the runtime spreads units out from there as
+     * load appears. Starting every unit co-located is the honest expression
      * of that -- it commits to nothing, and an operator that never gets hot
      * never costs more than one worker. The whole set is placed at once
      * because a half-placed operator would otherwise claim its remaining
-     * shards one at a time, whenever the input happened to first hash to
-     * them, making the layout depend on arrival order.
-     *
-     * Applies to both stateful kinds: partitioned operators get the shards
-     * their hash ring spans, non-partitioned ones the shards their shuffle
-     * rotates through. A no-op once the operator has been placed.
+     * units one at a time, whenever the input happened to first hash to
+     * them, making the layout depend on arrival order. A no-op once the
+     * operator has been placed.
      */
     void initOperatorStateFlux(const std::string& userFunc,
-                               int parallelism,
+                               const Node& node,
                                const HostMap& hostMap);
 
     /**
-     * Hash ring over `parallelism` shards of `userFunction`, built on first
-     * use and cached. Every shard carries equal weight: ModeFlux pins no
-     * operator to a worker, so there are no per-worker weights to skew the
-     * ring with. Rebuilt if the DAG's shard count ever differs from the
-     * cached one.
+     * Hash ring over `shards` shards of `userFunction`, built on first use
+     * and cached. Every shard carries equal weight: ModeFlux pins no operator
+     * to a worker, so there are no per-worker weights to skew the ring with.
+     * Rebuilt if the shard count ever differs from the cached one.
      */
     std::shared_ptr<faabric::util::ConsistentHashRing> getFluxHashRing(
       const std::string& userFunction,
-      int parallelism);
+      int shards);
 
     /**
      * Returns the host owning `userFuncPar`, claiming it for a freshly picked

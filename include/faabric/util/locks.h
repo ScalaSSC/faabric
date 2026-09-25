@@ -21,6 +21,9 @@ namespace faabric::util {
 typedef std::unique_lock<std::mutex> UniqueLock;
 typedef std::unique_lock<std::shared_mutex> FullLock;
 typedef std::shared_lock<std::shared_mutex> SharedLock;
+// Shared locks held and released together, e.g. the state a batch executes
+// against when that spans several locks.
+typedef std::vector<std::unique_ptr<SharedLock>> SharedLockSet;
 
 class FlagWaiter : public std::enable_shared_from_this<FlagWaiter>
 {

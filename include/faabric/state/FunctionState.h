@@ -6,6 +6,7 @@
 #include <faabric/util/hash.h>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <semaphore>
 #include <set>
@@ -71,10 +72,22 @@ class FunctionState
       const HashRingPtr& hashRing);
     void addMigrateState(const std::vector<uint8_t>& serializedState);
 
-    // The whole shard in the format addMigrateState reads back: the raw
-    // bytes, or every key of a partitioned shard. The caller must make sure
-    // nothing is executing against the shard, since held locks do not travel.
+    // The whole state in the format addMigrateState reads back: the raw
+    // bytes, or every key of a partitioned state. The caller must make sure
+    // nothing is executing against it, since held locks do not travel.
     std::vector<uint8_t> snapshotForMigration();
+
+    // Partitioned state only. The keys whose shard (as `shardOf` computes it)
+    // is in `shards`, serialised per shard in the format addMigrateState
+    // merges back. The caller must make sure nothing is executing against
+    // those shards.
+    std::map<int, std::vector<uint8_t>> snapshotShards(
+      const std::function<int(const std::string&)>& shardOf,
+      const std::set<int>& shards);
+
+    // Partitioned state only. Drops the keys whose shard is in `shards`.
+    void eraseShards(const std::function<int(const std::string&)>& shardOf,
+                     const std::set<int>& shards);
 
     bool getIsPartitioned() { return partition; }
     std::string getUserFunc() { return user + "_" + function; };

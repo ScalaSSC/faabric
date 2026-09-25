@@ -137,10 +137,14 @@ class State
 
     std::string getThisIP();
 
+    // `verifyOwner` false skips the check that Redis names this host as the
+    // paridx's owner. ModeFlux partitioned operators need that: their paridx
+    // is split by shard across workers, so no single host owns it.
     std::shared_ptr<FunctionState> createFS(const std::string& user,
                                             const std::string& func,
                                             int32_t parallelismId,
-                                            const bool partitionable);
+                                            const bool partitionable,
+                                            bool verifyOwner = true);
 
     std::shared_ptr<FunctionState> getFS(const std::string& user,
                                          const std::string& func,
@@ -150,11 +154,24 @@ class State
                   const std::string& func,
                   int32_t parallelismId);
 
+    bool hasFS(const std::string& user,
+               const std::string& func,
+               int32_t parallelismId);
+
+    // Like createFS, but keeps an existing copy instead of replacing it. For
+    // a paridx whose state may already have arrived by migration.
+    std::shared_ptr<FunctionState> getOrCreateFS(const std::string& user,
+                                                 const std::string& func,
+                                                 int32_t parallelismId,
+                                                 bool partitionable,
+                                                 bool verifyOwner);
+
     /**
-     * ModeFlux shard migration. snapshotFS serialises a local shard for the
-     * move; installMigratedFS builds it on the receiver from that snapshot,
-     * replacing any local copy. The receiver is not yet the owner in Redis
-     * when it installs, so the ownership check is skipped there.
+     * ModeFlux migration of a stateful operator's whole paridx. snapshotFS
+     * serialises the local copy for the move; installMigratedFS builds it on
+     * the receiver from that snapshot, replacing any local copy. The receiver
+     * is not yet the owner in Redis when it installs, so the ownership check
+     * is skipped there.
      */
     std::vector<uint8_t> snapshotFS(const std::string& user,
                                     const std::string& func,
@@ -165,6 +182,30 @@ class State
                            int32_t parallelismId,
                            bool partitionable,
                            const std::vector<uint8_t>& serializedState);
+
+    /**
+     * ModeFlux migration of shards of a partitioned operator's paridx. The
+     * paridx is split across workers by shard, so shards are cut out of the
+     * sender's copy and merged into the receiver's, never replacing it.
+     * mergeMigratedShard creates the receiver's copy if it has none yet.
+     */
+    std::map<int, std::vector<uint8_t>> snapshotShards(
+      const std::string& user,
+      const std::string& func,
+      int32_t parallelismId,
+      const std::function<int(const std::string&)>& shardOf,
+      const std::set<int>& shards);
+
+    void eraseShards(const std::string& user,
+                     const std::string& func,
+                     int32_t parallelismId,
+                     const std::function<int(const std::string&)>& shardOf,
+                     const std::set<int>& shards);
+
+    void mergeMigratedShard(const std::string& user,
+                            const std::string& func,
+                            int32_t parallelismId,
+                            const std::vector<uint8_t>& serializedState);
 
     void clearFS();
 

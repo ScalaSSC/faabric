@@ -364,6 +364,42 @@ std::vector<uint8_t> FunctionState::snapshotForMigration()
     return faabric::util::serializeParStateMap(allKeys);
 }
 
+std::map<int, std::vector<uint8_t>> FunctionState::snapshotShards(
+  const std::function<int(const std::string&)>& shardOf,
+  const std::set<int>& shards)
+{
+    faabric::util::FullLock lock(funcStateMutex);
+
+    std::map<int, std::map<std::string, std::vector<uint8_t>>> byShard;
+    // Every requested shard gets an entry, even one holding no keys yet.
+    for (int shard : shards) {
+        byShard[shard];
+    }
+    for (const auto& [key, state] : indivStateMap) {
+        int shard = shardOf(key);
+        auto it = byShard.find(shard);
+        if (it != byShard.end()) {
+            it->second.emplace(key, state.getState());
+        }
+    }
+
+    std::map<int, std::vector<uint8_t>> result;
+    for (const auto& [shard, keys] : byShard) {
+        result[shard] = faabric::util::serializeParStateMap(keys);
+    }
+    return result;
+}
+
+void FunctionState::eraseShards(
+  const std::function<int(const std::string&)>& shardOf,
+  const std::set<int>& shards)
+{
+    faabric::util::FullLock lock(funcStateMutex);
+    std::erase_if(indivStateMap, [&](const auto& entry) {
+        return shards.contains(shardOf(entry.first));
+    });
+}
+
 void FunctionState::addMigrateState(const std::vector<uint8_t>& serializedState)
 {
     faabric::util::FullLock lock(funcStateMutex);

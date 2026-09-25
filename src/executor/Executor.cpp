@@ -88,7 +88,7 @@ void Executor::shutdown()
         SPDLOG_TRACE("Executor {} killing thread pool {}", id, i);
         threadTaskQueues[i].enqueue(
           std::make_tuple(ExecutorTask(POOL_SHUTDOWN, nullptr),
-                          std::unique_ptr<faabric::util::SharedLock>()));
+                          faabric::util::SharedLockSet()));
 
         // Wait for thread to terminate
         if (threadPoolThreads[i]->joinable()) {
@@ -112,7 +112,7 @@ Executor::~Executor()
 
 clockid_t Executor::executeBatchTasks(
   std::shared_ptr<faabric::BatchExecuteRequest> req,
-  std::unique_ptr<std::shared_lock<std::shared_mutex>> stateLock)
+  faabric::util::SharedLockSet stateLocks)
 {
     const std::string funcStr = faabric::util::funcToString(req);
     auto& firstMsg = req->mutable_messages()->at(0);
@@ -174,8 +174,8 @@ clockid_t Executor::executeBatchTasks(
                  threadPoolIdx);
 
     auto task = ExecutorTask(STREAM_BATCH, req);
-    std::tuple<ExecutorTask, std::unique_ptr<faabric::util::SharedLock>>
-      queueItem(std::move(task), std::move(stateLock));
+    std::tuple<ExecutorTask, faabric::util::SharedLockSet> queueItem(
+      std::move(task), std::move(stateLocks));
     // Enqueue the task
     threadTaskQueues[threadPoolIdx].enqueue(std::move(queueItem));
 
@@ -298,13 +298,13 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
         SPDLOG_TRACE("Thread starting loop {}:{}", id, threadPoolIdx);
 
         ExecutorTask task;
-        std::unique_ptr<faabric::util::SharedLock> stateLock;
+        faabric::util::SharedLockSet stateLocks;
 
         try {
             auto dequeuedItem =
               threadTaskQueues[threadPoolIdx].dequeue(conf.boundTimeout);
             task = std::move(std::get<0>(dequeuedItem));
-            stateLock = std::move(std::get<1>(dequeuedItem));
+            stateLocks = std::move(std::get<1>(dequeuedItem));
         } catch (faabric::util::QueueTimeoutException& ex) {
             SPDLOG_TRACE(
               "Thread {}:{} got no messages in timeout {}ms, looping",
@@ -390,10 +390,15 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             faabric::scheduler::getScheduler().enqueueSetResults(
               std::move(task.req));
 
-            if (stateLock) {
+            if (!stateLocks.empty()) {
                 SPDLOG_DEBUG(
                   "statelock unlocked by thread {}:{}", id, threadPoolIdx);
-                stateLock->unlock();
+                for (auto& stateLock : stateLocks) {
+                    if (stateLock && stateLock->owns_lock()) {
+                        stateLock->unlock();
+                    }
+                }
+                stateLocks.clear();
             }
             faabric::scheduler::getScheduler().notifyExecutorFinished();
 

@@ -455,7 +455,8 @@ std::shared_ptr<FunctionState> State::doGetFS(const std::string& user,
 std::shared_ptr<FunctionState> State::createFS(const std::string& user,
                                                const std::string& func,
                                                int32_t parallelismId,
-                                               const bool partitionable)
+                                               const bool partitionable,
+                                               bool verifyOwner)
 {
     CHECK_USER_FUNC(user, func);
 
@@ -470,7 +471,8 @@ std::shared_ptr<FunctionState> State::createFS(const std::string& user,
         fsMap.erase(lookupKey);
     }
 
-    auto fs = std::make_shared<FunctionState>(user, func, parallelismId);
+    auto fs = std::make_shared<FunctionState>(
+      user, func, parallelismId, 0, verifyOwner);
     if (partitionable) {
         SPDLOG_INFO(
           "State::createFS: Setting partition key {} is partitionable",
@@ -479,6 +481,94 @@ std::shared_ptr<FunctionState> State::createFS(const std::string& user,
     }
     fsMap.emplace(lookupKey, std::move(fs));
     return fsMap[lookupKey];
+}
+
+bool State::hasFS(const std::string& user,
+                  const std::string& func,
+                  int32_t parallelismId)
+{
+    std::string lookupKey =
+      faabric::util::keyForFunction(user, func, parallelismId);
+    SharedLock sharedLock(fsmapMutex);
+    auto it = fsMap.find(lookupKey);
+    return it != fsMap.end() && it->second != nullptr;
+}
+
+std::shared_ptr<FunctionState> State::getOrCreateFS(const std::string& user,
+                                                    const std::string& func,
+                                                    int32_t parallelismId,
+                                                    bool partitionable,
+                                                    bool verifyOwner)
+{
+    CHECK_USER_FUNC(user, func);
+
+    std::string lookupKey =
+      faabric::util::keyForFunction(user, func, parallelismId);
+
+    FullLock fullLock(fsmapMutex);
+    auto it = fsMap.find(lookupKey);
+    if (it != fsMap.end() && it->second != nullptr) {
+        return it->second;
+    }
+
+    SPDLOG_INFO("State::getOrCreateFS: Creating function state {} for {}",
+                lookupKey,
+                thisIP);
+    auto fs = std::make_shared<FunctionState>(
+      user, func, parallelismId, 0, verifyOwner);
+    if (partitionable) {
+        fs->isPartitioned();
+    }
+    fsMap[lookupKey] = fs;
+    return fs;
+}
+
+std::map<int, std::vector<uint8_t>> State::snapshotShards(
+  const std::string& user,
+  const std::string& func,
+  int32_t parallelismId,
+  const std::function<int(const std::string&)>& shardOf,
+  const std::set<int>& shards)
+{
+    return doGetFS(user, func, parallelismId)->snapshotShards(shardOf, shards);
+}
+
+void State::eraseShards(const std::string& user,
+                        const std::string& func,
+                        int32_t parallelismId,
+                        const std::function<int(const std::string&)>& shardOf,
+                        const std::set<int>& shards)
+{
+    doGetFS(user, func, parallelismId)->eraseShards(shardOf, shards);
+}
+
+void State::mergeMigratedShard(const std::string& user,
+                               const std::string& func,
+                               int32_t parallelismId,
+                               const std::vector<uint8_t>& serializedState)
+{
+    CHECK_USER_FUNC(user, func);
+
+    std::string lookupKey =
+      faabric::util::keyForFunction(user, func, parallelismId);
+
+    std::shared_ptr<FunctionState> fs;
+    {
+        FullLock fullLock(fsmapMutex);
+        auto it = fsMap.find(lookupKey);
+        if (it == fsMap.end() || it->second == nullptr) {
+            fs = std::make_shared<FunctionState>(
+              user, func, parallelismId, 0, /* verifyOwner */ false);
+            fs->isPartitioned();
+            fsMap[lookupKey] = fs;
+        } else {
+            fs = it->second;
+        }
+    }
+
+    if (!serializedState.empty()) {
+        fs->addMigrateState(serializedState);
+    }
 }
 
 std::vector<uint8_t> State::snapshotFS(const std::string& user,
