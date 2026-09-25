@@ -19,5 +19,6 @@ enum FunctionCalls
     Custom = 13,
     GetWorkerStats = 14,
     GetWorkerRuntimeStats = 15,
+    MigrateShardFlux = 16,
 };
 }

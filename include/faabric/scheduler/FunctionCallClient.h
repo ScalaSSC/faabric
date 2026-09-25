@@ -70,6 +70,10 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
 
     void migrateStates(std::shared_ptr<faabric::StateMigrationRequest> req);
 
+    // ModeFlux: synchronous, so the sender knows the shard is installed on
+    // the receiver before it flips the owner in Redis.
+    void migrateShardFlux(const faabric::FluxShardMigrationRequest& req);
+
     std::string getPersistentState(
       std::shared_ptr<faabric::planner::MapMessage> req);
 

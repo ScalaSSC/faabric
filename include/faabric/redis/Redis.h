@@ -29,6 +29,7 @@ class RedisInstance
     std::string delifeqSha;
     std::string schedPublishSha;
     std::string claimSha;
+    std::string transferOwnersSha;
 
     std::string ip;
     std::string hostname;
@@ -74,6 +75,29 @@ if redis.call('SETNX', KEYS[1], ARGV[1]) == 1 then
     return ARGV[1]
 end
 return redis.call('GET', KEYS[1])
+)---";
+
+    // Script to hand ownership of several keys from one holder to another,
+    // all or nothing. KEYS come in (owner, epoch) pairs; ARGV[1] is the
+    // current holder, ARGV[2] the new one, and ARGV[2 + i] the epoch pair i
+    // must still be at. Moves every owner and bumps every epoch only if all
+    // pairs pass both checks. Returns 1 if it moved them, 0 otherwise.
+    const std::string_view transferOwnersCmd = R"---(
+local n = #KEYS / 2
+for i = 1, n do
+    if redis.call('GET', KEYS[2 * i - 1]) ~= ARGV[1] then
+        return 0
+    end
+    local epoch = tonumber(redis.call('GET', KEYS[2 * i]) or '0')
+    if epoch ~= tonumber(ARGV[2 + i]) then
+        return 0
+    end
+end
+for i = 1, n do
+    redis.call('SET', KEYS[2 * i - 1], ARGV[2])
+    redis.call('SET', KEYS[2 * i], tonumber(ARGV[2 + i]) + 1)
+end
+return 1
 )---";
 };
 
@@ -192,6 +216,24 @@ class Redis
      */
     std::string claimOrGet(const std::string& key,
                            const std::string& proposedValue);
+
+    struct OwnerTransfer
+    {
+        std::string ownerKey;
+        std::string epochKey;
+        // A missing epoch key reads as 0.
+        int64_t expectedEpoch;
+    };
+
+    /**
+     * Atomically moves every `ownerKey` in `transfers` from `fromValue` to
+     * `toValue` and bumps each epoch by one -- provided `fromValue` still
+     * holds all of them and every epoch still reads its expected value. All
+     * or nothing: returns false and changes nothing if any check fails.
+     */
+    bool transferOwners(const std::vector<OwnerTransfer>& transfers,
+                        const std::string& fromValue,
+                        const std::string& toValue);
 
     std::vector<uint8_t> getAndLock(const std::string& key);
 

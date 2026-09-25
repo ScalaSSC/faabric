@@ -215,6 +215,17 @@ void FunctionCallClient::migrateStates(
       faabric::scheduler::FunctionCalls::MigrateStates, req.get(), &resp);
 }
 
+void FunctionCallClient::migrateShardFlux(
+  const faabric::FluxShardMigrationRequest& req)
+{
+    std::string buffer = req.SerializeAsString();
+    faabric::EmptyResponse resp;
+    syncSend(faabric::scheduler::FunctionCalls::MigrateShardFlux,
+             reinterpret_cast<const uint8_t*>(buffer.data()),
+             buffer.size(),
+             &resp);
+}
+
 // -----------------------------------
 // Static setter/getters
 // -----------------------------------

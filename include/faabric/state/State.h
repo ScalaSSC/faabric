@@ -150,6 +150,22 @@ class State
                   const std::string& func,
                   int32_t parallelismId);
 
+    /**
+     * ModeFlux shard migration. snapshotFS serialises a local shard for the
+     * move; installMigratedFS builds it on the receiver from that snapshot,
+     * replacing any local copy. The receiver is not yet the owner in Redis
+     * when it installs, so the ownership check is skipped there.
+     */
+    std::vector<uint8_t> snapshotFS(const std::string& user,
+                                    const std::string& func,
+                                    int32_t parallelismId);
+
+    void installMigratedFS(const std::string& user,
+                           const std::string& func,
+                           int32_t parallelismId,
+                           bool partitionable,
+                           const std::vector<uint8_t>& serializedState);
+
     void clearFS();
 
     void flushState();

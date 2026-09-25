@@ -1149,6 +1149,12 @@ bool Planner::resetParameter(
         }
         SPDLOG_INFO("Flux offload margin set to {}", value);
     }
+    if (key == "flux_partition_shards") {
+        if (stateAwareScheduler) {
+            stateAwareScheduler->setFluxPartitionShards(value);
+        }
+        SPDLOG_INFO("Flux partitioned shard count set to {}", value);
+    }
 
     // Forward to worker hosts
     auto reqPtr =

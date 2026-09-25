@@ -32,10 +32,13 @@ class IndivState
 class FunctionState
 {
   public:
+    // `verifyOwner` is false only for a shard arriving by migration: it is
+    // installed before its owner is flipped in Redis, so the check would fail.
     FunctionState(const std::string& userIn,
                   const std::string& functionIn,
                   int parallelismIdIn,
-                  size_t stateSizeIn);
+                  size_t stateSizeIn,
+                  bool verifyOwner = true);
 
     FunctionState(const std::string& userIn,
                   const std::string& functionIn,
@@ -67,6 +70,11 @@ class FunctionState
     std::map<int, std::vector<uint8_t>> redirectLocalParState(
       const HashRingPtr& hashRing);
     void addMigrateState(const std::vector<uint8_t>& serializedState);
+
+    // The whole shard in the format addMigrateState reads back: the raw
+    // bytes, or every key of a partitioned shard. The caller must make sure
+    // nothing is executing against the shard, since held locks do not travel.
+    std::vector<uint8_t> snapshotForMigration();
 
     bool getIsPartitioned() { return partition; }
     std::string getUserFunc() { return user + "_" + function; };

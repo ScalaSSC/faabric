@@ -117,6 +117,33 @@ class StateAwareScheduler : public BatchScheduler
 
     void setFluxOffloadMargin(int value) { fluxOffloadMargin = value; }
 
+    // Shard count of every partitioned stateful operator under ModeFlux. Must
+    // be set before the application is registered and left alone afterwards:
+    // every router hashes keys onto this many shards, so changing it mid-run
+    // would send the same key to different shards on different routers.
+    void setFluxPartitionShards(int value) { fluxPartitionShards = value; }
+
+    /**
+     * ModeFlux: record that `userFuncPar` is now owned by `host`, as of
+     * ownership epoch `epoch`. Ignored unless `epoch` is newer than the one
+     * already known, so stale and duplicate reports are harmless. Returns
+     * whether the record changed anything.
+     */
+    bool updateStateHostFlux(const std::string& userFuncPar,
+                             const std::string& host,
+                             int64_t epoch);
+
+    /**
+     * ModeFlux: current owner of shard `userFuncPar`, as far as this
+     * scheduler knows. For a request that already carries its shard, which
+     * must not be re-hashed or re-shuffled onto another one.
+     */
+    std::string shardOwnerFlux(const std::string& userFuncPar,
+                               const HostMap& hostMap)
+    {
+        return resolveStateHost(userFuncPar, hostMap);
+    }
+
     bool getClastPlacement() const { return isClastPlacement; }
 
     virtual void resetScheduler();
@@ -451,6 +478,9 @@ class StateAwareScheduler : public BatchScheduler
     int fluxLocalQueueLimit = 8;
     int fluxOffloadMargin = 4;
 
+    // See setFluxPartitionShards.
+    int fluxPartitionShards = 200;
+
     bool isplanner = true;
     int scheduleMode = 0;
 
@@ -646,6 +676,10 @@ class StateAwareScheduler : public BatchScheduler
     // ModeFlux: operators whose shards have all been placed. Guards the
     // per-message fast path from re-walking the whole shard set.
     std::set<std::string> fluxInitialisedOps;
+    // ModeFlux: Function_User_ParallelismIndex : ownership epoch of the owner
+    // held in stateHost. Absent means epoch 0, i.e. the initial placement.
+    // Guarded by scheduleMx, like stateHost.
+    std::map<std::string, int64_t> stateHostEpoch;
     // Function_User : Counter. It is used for shuffle grouping.
     std::shared_mutex counterMx;
     std::map<std::string, std::shared_ptr<std::atomic_uint>> counterTable;
@@ -711,19 +745,22 @@ class StateAwareScheduler : public BatchScheduler
       const faabric::Message& msg);
 
     /**
-     * ModeFlux: how many shards `node` starts with.
+     * ModeFlux: how many shards `node` has, for its whole lifetime.
      *
-     * A partitioned operator holds ONE logical state split by key, so it can
-     * start as a single shard and be split later as load appears -- which is
-     * how ModeFlux grows anything. Its declared parallelism is a target for
-     * that growth, not a starting point, so it is deliberately ignored here.
+     * A partitioned operator holds ONE logical state split by key, so its
+     * shard count is a unit of movement, not of parallelism: it is cut into
+     * fluxPartitionShards shards, all placed on one worker when the operator
+     * is first routed to (initOperatorStateFlux), and load is spread by
+     * migrating whole shards to other workers. The count never changes
+     * afterwards, so no key ever changes shard. Its declared parallelism
+     * plays no part.
      *
      * A non-partitioned stateful operator is the opposite: its instances hold
      * genuinely separate states and the shuffle picks between them with
      * nothing mapping a key to one, so collapsing them would merge states
      * that were never the same state. Its declared parallelism is honoured.
      */
-    static int fluxShardCount(const Node& node);
+    int fluxShardCount(const Node& node) const;
 
     /**
      * ModeFlux: place every shard of `userFunc` the first time any of them is

@@ -481,6 +481,44 @@ std::shared_ptr<FunctionState> State::createFS(const std::string& user,
     return fsMap[lookupKey];
 }
 
+std::vector<uint8_t> State::snapshotFS(const std::string& user,
+                                       const std::string& func,
+                                       int32_t parallelismId)
+{
+    return doGetFS(user, func, parallelismId)->snapshotForMigration();
+}
+
+void State::installMigratedFS(const std::string& user,
+                              const std::string& func,
+                              int32_t parallelismId,
+                              bool partitionable,
+                              const std::vector<uint8_t>& serializedState)
+{
+    CHECK_USER_FUNC(user, func);
+
+    std::string lookupKey =
+      faabric::util::keyForFunction(user, func, parallelismId);
+
+    auto fs = std::make_shared<FunctionState>(
+      user, func, parallelismId, 0, /* verifyOwner */ false);
+    if (partitionable) {
+        fs->isPartitioned();
+    }
+    // An empty snapshot is a shard that never held anything. Loading it would
+    // map a zero-length region for a non-partitioned shard.
+    if (!serializedState.empty()) {
+        fs->addMigrateState(serializedState);
+    }
+
+    FullLock fullLock(fsmapMutex);
+    fsMap.erase(lookupKey);
+    fsMap.emplace(lookupKey, std::move(fs));
+    SPDLOG_INFO("State::installMigratedFS: installed {} ({} bytes) on {}",
+                lookupKey,
+                serializedState.size(),
+                thisIP);
+}
+
 void State::deleteFS(const std::string& user,
                      const std::string& func,
                      int32_t parallelismId)

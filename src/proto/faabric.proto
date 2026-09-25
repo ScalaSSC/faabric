@@ -427,6 +427,43 @@ message WorkerStats{
     map<string, InstanceMetricsResultProto> workerMetrics = 6;
     map<string, int32> instanceQueueNum = 7;
     double executorsNum = 8;
+    // ModeFlux: every shard this worker has handed off, and to whom. See
+    // ShardMove.
+    repeated ShardMove shardMoves = 9;
+}
+
+// ModeFlux: a shard left `userFuncPar`'s previous owner for `host`. `epoch`
+// is the shard's ownership epoch in Redis after the move; it only ever grows,
+// so of two records for one shard the higher epoch is the newer.
+message ShardMove {
+    string userFuncPar = 1;
+    string host = 2;
+    int64 epoch = 3;
+}
+
+// ModeFlux: one shard handed over inside a FluxShardMigrationRequest.
+message FluxShardState {
+    string user = 1;
+    string function = 2;
+    int32 parallelismId = 3;
+    bool isPartitioned = 4;
+    // False when the source never materialised the shard, or state lives in
+    // Redis (access_state_remote): the receiver then starts it empty.
+    bool hasState = 5;
+    bytes serializedState = 6;
+    // Ownership epoch the move will publish in Redis.
+    int64 epoch = 7;
+}
+
+// ModeFlux: everything one rebalancing round hands from sourceHost to one
+// receiving worker -- any number of shards with their state, plus the
+// requests travelling with them: those waiting for the shards, and surplus
+// stateless requests. Sent before the owners are flipped in Redis, so the
+// receiver installs the shards without the usual ownership check.
+message FluxShardMigrationRequest {
+    string sourceHost = 1;
+    repeated FluxShardState shards = 2;
+    MessageBatch messageBatch = 3;
 }
 
 // Request for GetWorkerRuntimeStats. The planner piggybacks the stats it

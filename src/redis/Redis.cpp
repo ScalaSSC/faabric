@@ -45,11 +45,12 @@ RedisInstance::RedisInstance(RedisRole roleIn)
     port = std::stoi(portStr);
 
     // Load scripts
-    if (delifeqSha.empty() || schedPublishSha.empty() || claimSha.empty()) {
+    if (delifeqSha.empty() || schedPublishSha.empty() || claimSha.empty() ||
+        transferOwnersSha.empty()) {
         std::unique_lock<std::mutex> lock(scriptsLock);
 
-        if (delifeqSha.empty() || schedPublishSha.empty() ||
-            claimSha.empty()) {
+        if (delifeqSha.empty() || schedPublishSha.empty() || claimSha.empty() ||
+            transferOwnersSha.empty()) {
             printf("Loading scripts for Redis instance at %s\n",
                    hostname.c_str());
             redisContext* context = redisConnect(ip.c_str(), port);
@@ -57,6 +58,7 @@ RedisInstance::RedisInstance(RedisRole roleIn)
             delifeqSha = this->loadScript(context, delifeqCmd);
             schedPublishSha = this->loadScript(context, schedPublishCmd);
             claimSha = this->loadScript(context, claimCmd);
+            transferOwnersSha = this->loadScript(context, transferOwnersCmd);
 
             redisFree(context);
         }
@@ -582,6 +584,62 @@ std::string Redis::claimOrGet(const std::string& key,
     return std::string(reply->str, reply->len);
 }
 
+bool Redis::transferOwners(const std::vector<OwnerTransfer>& transfers,
+                           const std::string& fromValue,
+                           const std::string& toValue)
+{
+    if (transfers.empty()) {
+        return true;
+    }
+
+    // EVALSHA sha numkeys key... arg...
+    std::vector<std::string> args;
+    args.reserve(3 + 3 * transfers.size() + 2);
+    args.emplace_back("EVALSHA");
+    args.emplace_back(instance.transferOwnersSha);
+    args.emplace_back(std::to_string(2 * transfers.size()));
+    for (const auto& t : transfers) {
+        args.push_back(t.ownerKey);
+        args.push_back(t.epochKey);
+    }
+    args.push_back(fromValue);
+    args.push_back(toValue);
+    for (const auto& t : transfers) {
+        args.push_back(std::to_string(t.expectedEpoch));
+    }
+
+    std::vector<const char*> argv;
+    std::vector<size_t> argvLen;
+    argv.reserve(args.size());
+    argvLen.reserve(args.size());
+    for (const auto& a : args) {
+        argv.push_back(a.c_str());
+        argvLen.push_back(a.size());
+    }
+
+    auto reply = wrapReply((redisReply*)redisCommandArgv(
+      context, static_cast<int>(argv.size()), argv.data(), argvLen.data()));
+
+    if (reply == nullptr) {
+        SPDLOG_ERROR("No reply transferring {} keys", transfers.size());
+        throw std::runtime_error("No reply transferring keys in Redis");
+    }
+
+    if (reply->type == REDIS_REPLY_ERROR) {
+        SPDLOG_ERROR(
+          "Failed to transfer {} keys - {}", transfers.size(), reply->str);
+        throw std::runtime_error("Failed to transfer keys in Redis");
+    }
+
+    if (reply->type != REDIS_REPLY_INTEGER) {
+        SPDLOG_ERROR("Unexpected reply type {} transferring {} keys",
+                     reply->type,
+                     transfers.size());
+        throw std::runtime_error("Unexpected reply transferring keys in Redis");
+    }
+
+    return reply->integer == 1;
+}
 
 static constexpr int STATE_LOCK_TIMEOUT_SECS = 1;
 

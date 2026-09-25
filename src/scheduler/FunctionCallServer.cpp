@@ -64,6 +64,9 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::MigrateStates: {
             return recvMigrateStates(message.udata());
         }
+        case faabric::scheduler::FunctionCalls::MigrateShardFlux: {
+            return recvMigrateShardFlux(message.udata());
+        }
         case faabric::scheduler::FunctionCalls::GetPersistentState: {
             return recvGetPersistentState(message.udata());
         }
@@ -190,6 +193,16 @@ FunctionCallServer::recvMigrateStates(std::span<const uint8_t> buffer)
                  oss.str());
 
     scheduler.processMigrationData(parsedMsg);
+
+    return std::make_unique<faabric::EmptyResponse>();
+}
+
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvMigrateShardFlux(std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::FluxShardMigrationRequest, buffer.data(), buffer.size())
+
+    scheduler.receiveShardFlux(parsedMsg);
 
     return std::make_unique<faabric::EmptyResponse>();
 }
@@ -386,6 +399,10 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
 
     out.set_executorsnum(executorsCount);
     out.set_cpuload(cpuLoadVal);
+
+    for (auto& move : scheduler.getFluxShardMoves()) {
+        *out.add_shardmoves() = std::move(move);
+    }
 
     return std::make_unique<faabric::WorkerStats>(std::move(out));
 }

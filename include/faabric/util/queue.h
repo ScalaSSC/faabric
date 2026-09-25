@@ -459,6 +459,20 @@ class BatchQueue : public BatchQueueBase
         return drained;
     }
 
+    // Up to `count` messages off the front, oldest first.
+    virtual std::vector<std::unique_ptr<faabric::Message>> takeMessages(
+      int count)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::unique_ptr<faabric::Message>> taken;
+        while (!batchQueue.empty() && static_cast<int>(taken.size()) < count) {
+            taken.push_back(std::move(batchQueue.front()));
+            batchQueue.pop();
+            messagesCount--;
+        }
+        return taken;
+    }
+
     int getMessagesCount()
     {
         std::lock_guard<std::mutex> lock(m_mutex);

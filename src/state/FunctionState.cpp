@@ -29,7 +29,8 @@ void IndivState::setState(const std::vector<uint8_t>& newState)
 FunctionState::FunctionState(const std::string& userIn,
                              const std::string& functionIn,
                              int parallelismIdIn,
-                             size_t stateSizeIn)
+                             size_t stateSizeIn,
+                             bool verifyOwner)
   : user(userIn)
   , function(functionIn)
   , parallelismId(parallelismIdIn)
@@ -44,14 +45,18 @@ FunctionState::FunctionState(const std::string& userIn,
                  stateSize,
                  parallelismId);
 
-    std::string mainIP =
-      stateRegistry.getMasterIP(user, function, parallelismId);
-    if (mainIP != faabric::util::getSystemConfig().endpointHost) {
-        SPDLOG_ERROR("Function state for {}/{}-{} is not allocated this host",
-                     user,
-                     function,
-                     parallelismId);
-        throw std::runtime_error("Function state is not allocated this host");
+    if (verifyOwner) {
+        std::string mainIP =
+          stateRegistry.getMasterIP(user, function, parallelismId);
+        if (mainIP != faabric::util::getSystemConfig().endpointHost) {
+            SPDLOG_ERROR(
+              "Function state for {}/{}-{} is not allocated this host",
+              user,
+              function,
+              parallelismId);
+            throw std::runtime_error(
+              "Function state is not allocated this host");
+        }
     }
 
     // If stateSizeIn is not set, the configure has to be called later.
@@ -338,6 +343,25 @@ std::map<int, std::vector<uint8_t>> FunctionState::redirectLocalParState(
         returnMap[paraIdx] = faabric::util::serializeParStateMap(state);
     }
     return returnMap;
+}
+
+std::vector<uint8_t> FunctionState::snapshotForMigration()
+{
+    faabric::util::FullLock lock(funcStateMutex);
+
+    if (!partition) {
+        if (sharedMemory == nullptr || stateSize == 0) {
+            return {};
+        }
+        auto bytePtr = BYTES(sharedMemory);
+        return std::vector<uint8_t>(bytePtr, bytePtr + stateSize);
+    }
+
+    std::map<std::string, std::vector<uint8_t>> allKeys;
+    for (const auto& [key, state] : indivStateMap) {
+        allKeys.emplace(key, state.getState());
+    }
+    return faabric::util::serializeParStateMap(allKeys);
 }
 
 void FunctionState::addMigrateState(const std::vector<uint8_t>& serializedState)

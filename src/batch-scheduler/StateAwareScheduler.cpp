@@ -287,12 +287,29 @@ std::string StateAwareScheduler::pickCandidateHost(
     return faabric::util::getNthKey(hostMap, hash % hostMap.size());
 }
 
-int StateAwareScheduler::fluxShardCount(const Node& node)
+int StateAwareScheduler::fluxShardCount(const Node& node) const
 {
     if (node.type == NodeType::PARTITIONED_STATEFUL) {
-        return 1;
+        return fluxPartitionShards > 0 ? fluxPartitionShards : 1;
     }
     return node.parallelism > 0 ? node.parallelism : 1;
+}
+
+bool StateAwareScheduler::updateStateHostFlux(const std::string& userFuncPar,
+                                              const std::string& host,
+                                              int64_t epoch)
+{
+    faabric::util::FullLock lock(scheduleMx);
+    auto epochIt = stateHostEpoch.find(userFuncPar);
+    int64_t known = epochIt == stateHostEpoch.end() ? 0 : epochIt->second;
+    if (epoch <= known) {
+        return false;
+    }
+    stateHostEpoch[userFuncPar] = epoch;
+    stateHost.insert_or_assign(userFuncPar, host);
+    SPDLOG_DEBUG(
+      "Flux learns {} is on {} (epoch {})", userFuncPar, host, epoch);
+    return true;
 }
 
 void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
@@ -580,6 +597,18 @@ std::string StateAwareScheduler::scheduleStatelessMessageLocal(
 void StateAwareScheduler::setClusterWorkerStats(
   std::map<std::string, faabric::WorkerStats>&& stats)
 {
+    // Every worker reports the shards it has handed off. Folding all of them
+    // in, newest epoch winning, is how the planner and every other worker
+    // learn where a moved shard lives now.
+    if (scheduleMode == ModeFlux) {
+        for (const auto& [ip, workerStats] : stats) {
+            for (const auto& move : workerStats.shardmoves()) {
+                updateStateHostFlux(
+                  move.userfuncpar(), move.host(), move.epoch());
+            }
+        }
+    }
+
     faabric::util::FullLock lock(clusterWorkerStatsMx);
     clusterWorkerStats = std::move(stats);
 }
@@ -5217,6 +5246,7 @@ void StateAwareScheduler::resetScheduler()
     scheduledOperatorsMap.clear();
     fluxInitialisedOps.clear();
     stateHost.clear();
+    stateHostEpoch.clear();
     stateHashRing.clear();
     statePartitionBy.clear();
     funcStateRegMap.clear();
