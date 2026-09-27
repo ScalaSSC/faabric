@@ -46,11 +46,11 @@ RedisInstance::RedisInstance(RedisRole roleIn)
 
     // Load scripts
     if (delifeqSha.empty() || schedPublishSha.empty() || claimSha.empty() ||
-        transferOwnersSha.empty()) {
+        transferOwnersSha.empty() || claimWithEpochSha.empty()) {
         std::unique_lock<std::mutex> lock(scriptsLock);
 
         if (delifeqSha.empty() || schedPublishSha.empty() || claimSha.empty() ||
-            transferOwnersSha.empty()) {
+            transferOwnersSha.empty() || claimWithEpochSha.empty()) {
             printf("Loading scripts for Redis instance at %s\n",
                    hostname.c_str());
             redisContext* context = redisConnect(ip.c_str(), port);
@@ -59,6 +59,7 @@ RedisInstance::RedisInstance(RedisRole roleIn)
             schedPublishSha = this->loadScript(context, schedPublishCmd);
             claimSha = this->loadScript(context, claimCmd);
             transferOwnersSha = this->loadScript(context, transferOwnersCmd);
+            claimWithEpochSha = this->loadScript(context, claimWithEpochCmd);
 
             redisFree(context);
         }
@@ -582,6 +583,36 @@ std::string Redis::claimOrGet(const std::string& key,
     }
 
     return std::string(reply->str, reply->len);
+}
+
+std::pair<std::string, int64_t> Redis::claimOrGetWithEpoch(
+  const std::string& ownerKey,
+  const std::string& epochKey,
+  const std::string& proposedValue)
+{
+    auto reply = safeRedisCommand(context,
+                                  "EVALSHA %s 2 %s %s %s",
+                                  instance.claimWithEpochSha.c_str(),
+                                  ownerKey.c_str(),
+                                  epochKey.c_str(),
+                                  proposedValue.c_str());
+
+    if (reply->type == REDIS_REPLY_ERROR) {
+        SPDLOG_ERROR("Failed to claim {} - {}", ownerKey, reply->str);
+        throw std::runtime_error("Failed to claim key in Redis");
+    }
+
+    if (reply->type != REDIS_REPLY_ARRAY || reply->elements != 2 ||
+        reply->element[0]->type != REDIS_REPLY_STRING ||
+        reply->element[1]->type != REDIS_REPLY_STRING) {
+        SPDLOG_ERROR(
+          "Unexpected reply type {} claiming {}", reply->type, ownerKey);
+        throw std::runtime_error("Unexpected reply claiming key in Redis");
+    }
+
+    std::string owner(reply->element[0]->str, reply->element[0]->len);
+    std::string epochStr(reply->element[1]->str, reply->element[1]->len);
+    return { owner, std::stoll(epochStr) };
 }
 
 bool Redis::transferOwners(const std::vector<OwnerTransfer>& transfers,

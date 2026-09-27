@@ -177,6 +177,13 @@ class StateAwareScheduler : public BatchScheduler
     static std::pair<std::string, int> splitFluxUnitKey(
       const std::string& unitKey);
 
+    // Where Redis keeps the owner of a unit of state, and that owner's epoch.
+    // The owner key of a whole paridx is also the one the state registry
+    // reads (see FunctionStateRegistry::getMasterIP).
+    static std::string fluxOwnerKey(const std::string& unitKey);
+
+    static std::string fluxEpochKey(const std::string& unitKey);
+
     // Whether ModeFlux treats `node` as partitioned: keyed state, one paridx
     // split into shards.
     static bool fluxIsPartitioned(const Node& node);
@@ -884,6 +891,15 @@ class StateAwareScheduler : public BatchScheduler
     std::shared_ptr<faabric::util::ConsistentHashRing> getFluxHashRing(
       const std::string& userFunction,
       int shards);
+
+    /**
+     * ModeFlux: records in the routing cache an owner read from Redis
+     * together with its epoch. Fills a missing entry, and replaces an
+     * existing one only if this epoch is newer. Caller holds scheduleMx.
+     */
+    void recordOwnerFromRedisFlux(const std::string& unitKey,
+                                  const std::string& owner,
+                                  int64_t epoch);
 
     /**
      * Returns the host owning `userFuncPar`, claiming it for a freshly picked

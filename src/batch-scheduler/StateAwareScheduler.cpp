@@ -318,6 +318,31 @@ std::string StateAwareScheduler::fluxUnitKey(const faabric::Message& msg)
                        msg.messagetype() == 2 ? msg.shardid() : -1);
 }
 
+std::string StateAwareScheduler::fluxOwnerKey(const std::string& unitKey)
+{
+    return MAIN_KEY_PREFIX + unitKey;
+}
+
+std::string StateAwareScheduler::fluxEpochKey(const std::string& unitKey)
+{
+    return "flux_epoch_" + unitKey;
+}
+
+void StateAwareScheduler::recordOwnerFromRedisFlux(const std::string& unitKey,
+                                                   const std::string& owner,
+                                                   int64_t epoch)
+{
+    auto epochIt = stateHostEpoch.find(unitKey);
+    int64_t known = epochIt == stateHostEpoch.end() ? 0 : epochIt->second;
+    if (stateHost.contains(unitKey) && epoch <= known) {
+        // What we have is as new or newer -- learnt from a move report that
+        // got here before this read.
+        return;
+    }
+    stateHost[unitKey] = owner;
+    stateHostEpoch[unitKey] = epoch;
+}
+
 std::pair<std::string, int> StateAwareScheduler::splitFluxUnitKey(
   const std::string& unitKey)
 {
@@ -392,13 +417,18 @@ void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
     // trip, and holding scheduleMx across them would serialise all routing on
     // this host. Two schedulers initialising the same operator propose
     // identical owners, so whoever wins each SETNX the result is the same.
+    //
+    // Each claim also reads back the unit's epoch: a unit claimed long ago may
+    // have moved since, and recording the owner with its real epoch keeps an
+    // older move report arriving later from winning over it.
     redis::Redis& redis = redis::Redis::getState();
-    std::map<std::string, std::string> owners;
+    std::map<std::string, std::pair<std::string, int64_t>> owners;
     std::map<std::string, int> unitsPerOwner;
     for (const auto& unit : units) {
-        std::string owner = redis.claimOrGet(MAIN_KEY_PREFIX + unit, home);
-        owners[unit] = owner;
-        unitsPerOwner[owner]++;
+        auto ownerAndEpoch = redis.claimOrGetWithEpoch(
+          fluxOwnerKey(unit), fluxEpochKey(unit), home);
+        unitsPerOwner[ownerAndEpoch.first]++;
+        owners[unit] = std::move(ownerAndEpoch);
     }
 
     std::ostringstream oss;
@@ -417,11 +447,9 @@ void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
                 oss.str());
 
     faabric::util::FullLock lock(scheduleMx);
-    for (const auto& [unit, owner] : owners) {
-        // Redis is authoritative. A thread that got here first wrote the same
-        // answer, and an owner learnt from a later move must not be undone,
-        // so only fill in what is missing.
-        stateHost.insert({ unit, owner });
+    for (const auto& [unit, ownerAndEpoch] : owners) {
+        recordOwnerFromRedisFlux(
+          unit, ownerAndEpoch.first, ownerAndEpoch.second);
     }
     functionParallelism[userFunc] = parallelism;
     fluxInitialisedOps.insert(userFunc);
@@ -458,19 +486,20 @@ std::string StateAwareScheduler::resolveStateHost(
     // holding scheduleMx across it would serialise all routing on this host.
     std::string candidate = pickCandidateHost(userFuncPar, hostMap);
     redis::Redis& redis = redis::Redis::getState();
-    std::string owner =
-      redis.claimOrGet(MAIN_KEY_PREFIX + userFuncPar, candidate);
+    auto [owner, epoch] = redis.claimOrGetWithEpoch(
+      fluxOwnerKey(userFuncPar), fluxEpochKey(userFuncPar), candidate);
 
-    SPDLOG_INFO("Resolved state {} to host {} (proposed {})",
+    SPDLOG_INFO("Resolved state {} to host {} (proposed {}, epoch {})",
                 userFuncPar,
                 owner,
-                candidate);
+                candidate,
+                epoch);
 
     faabric::util::FullLock lock(scheduleMx);
-    // Another thread may have resolved this while we were in Redis. Redis is
-    // authoritative and deterministic, so the answer is the same either way.
-    auto [it, inserted] = stateHost.emplace(userFuncPar, owner);
-    return it->second;
+    // Another thread, or a move report, may have filled this in while we were
+    // in Redis. The newer epoch wins either way.
+    recordOwnerFromRedisFlux(userFuncPar, owner, epoch);
+    return stateHost.at(userFuncPar);
 }
 
 bool StateAwareScheduler::updateFuncStatePar(const std::string& userFunction,

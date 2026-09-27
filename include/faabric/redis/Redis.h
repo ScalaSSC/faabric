@@ -30,6 +30,7 @@ class RedisInstance
     std::string schedPublishSha;
     std::string claimSha;
     std::string transferOwnersSha;
+    std::string claimWithEpochSha;
 
     std::string ip;
     std::string hostname;
@@ -75,6 +76,20 @@ if redis.call('SETNX', KEYS[1], ARGV[1]) == 1 then
     return ARGV[1]
 end
 return redis.call('GET', KEYS[1])
+)---";
+
+    // Script to claim ownership of a key like claimCmd, and read back, in the
+    // same step, the owner together with the epoch stored in KEYS[2] (0 if
+    // unset). transferOwnersCmd moves owner and epoch together, so the pair
+    // read here always belongs together.
+    const std::string_view claimWithEpochCmd = R"---(
+redis.call('SETNX', KEYS[1], ARGV[1])
+local owner = redis.call('GET', KEYS[1])
+local epoch = redis.call('GET', KEYS[2])
+if not epoch then
+    epoch = '0'
+end
+return { owner, epoch }
 )---";
 
     // Script to hand ownership of several keys from one holder to another,
@@ -216,6 +231,15 @@ class Redis
      */
     std::string claimOrGet(const std::string& key,
                            const std::string& proposedValue);
+
+    /**
+     * Like claimOrGet, and also returns the epoch stored under `epochKey`
+     * (0 if unset), read atomically with the owner.
+     */
+    std::pair<std::string, int64_t> claimOrGetWithEpoch(
+      const std::string& ownerKey,
+      const std::string& epochKey,
+      const std::string& proposedValue);
 
     struct OwnerTransfer
     {

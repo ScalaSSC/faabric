@@ -2080,18 +2080,16 @@ void Scheduler::logFluxExecutorCensus(const std::string& blockedFunc)
 namespace {
 using faabric::batch_scheduler::StateAwareScheduler;
 
-// Ownership of a unit of state lives in Redis under "main_" + unit key -- for
-// a whole paridx the very key the state registry reads (see
-// FunctionStateRegistry::getMasterIP). Its epoch sits next to it and only
-// ever grows.
+// Ownership of a unit of state lives in Redis; its epoch sits next to it and
+// only ever grows. See StateAwareScheduler::fluxOwnerKey.
 std::string fluxOwnerKey(const std::string& unitKey)
 {
-    return "main_" + unitKey;
+    return StateAwareScheduler::fluxOwnerKey(unitKey);
 }
 
 std::string fluxEpochKey(const std::string& unitKey)
 {
-    return "flux_epoch_" + unitKey;
+    return StateAwareScheduler::fluxEpochKey(unitKey);
 }
 }
 
