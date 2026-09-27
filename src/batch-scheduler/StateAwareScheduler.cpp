@@ -653,6 +653,12 @@ std::string StateAwareScheduler::scheduleStatelessMessageLocal(
 void StateAwareScheduler::setClusterWorkerStats(
   std::map<std::string, faabric::WorkerStats>&& stats)
 {
+    // What was routed since the last round is in these stats now.
+    {
+        std::lock_guard<std::mutex> lock(fluxAssignedMx);
+        fluxAssignedSinceStats.clear();
+    }
+
     // Every worker reports the shards it has handed off. Folding all of them
     // in, newest epoch winning, is how the planner and every other worker
     // learn where a moved shard lives now.
@@ -678,24 +684,130 @@ StateAwareScheduler::getClusterWorkerStats()
     return clusterWorkerStats;
 }
 
-int StateAwareScheduler::hostQueueDepth(
+double StateAwareScheduler::clusterSlotTimeUs(
+  const std::map<std::string, faabric::WorkerStats>& stats,
+  const std::string& queueKey)
+{
+    double sum = 0;
+    int n = 0;
+    for (const auto& [ip, workerStats] : stats) {
+        const auto& slotTimes = workerStats.paridxslottimeus();
+        auto it = slotTimes.find(queueKey);
+        if (it != slotTimes.end() && it->second > 0) {
+            sum += it->second;
+            n++;
+        }
+    }
+    return n == 0 ? 0 : sum / n;
+}
+
+double StateAwareScheduler::remoteWaitUsFlux(
   const std::map<std::string, faabric::WorkerStats>& stats,
   const std::string& ip,
-  const std::string& queueKey)
+  const std::string& queueKey,
+  double slotTimeUs)
 {
     auto hostIt = stats.find(ip);
     if (hostIt == stats.end()) {
         // That host did not report in the last round, so we know nothing
-        // about it. Distinguished from zero: an unknown host is not evidence
-        // of an idle one.
-        return -1;
+        // about it. An unknown host is not evidence of an idle one.
+        return std::numeric_limits<double>::infinity();
+    }
+    const auto& workerStats = hostIt->second;
+
+    auto countIn = [&queueKey](const auto& counts) -> int {
+        auto it = counts.find(queueKey);
+        return it == counts.end() ? 0 : static_cast<int>(it->second);
+    };
+    int queued = countIn(workerStats.instancequeuenum());
+    int running = countIn(workerStats.paridxrunning());
+    {
+        std::lock_guard<std::mutex> lock(fluxAssignedMx);
+        auto assignedIt = fluxAssignedSinceStats.find(ip);
+        if (assignedIt != fluxAssignedSinceStats.end()) {
+            auto it = assignedIt->second.find(queueKey);
+            if (it != assignedIt->second.end()) {
+                queued += it->second;
+            }
+        }
     }
 
-    const auto& queues = hostIt->second.instancequeuenum();
-    auto queueIt = queues.find(queueKey);
-    // A host that reported but has no queue for this operator genuinely has
-    // nothing waiting for it.
-    return queueIt == queues.end() ? 0 : queueIt->second;
+    // As many batches of the paridx as can run there at once: its cap, or
+    // fewer if the worker has fewer executor slots free (plus those it
+    // already runs).
+    int slots = workerStats.workerslots();
+    int cap = workerStats.paridxcap();
+    int freeSlots =
+      slots > 0
+        ? slots - static_cast<int>(std::ceil(workerStats.executorsnum()))
+        : 0;
+    int parallel = running + std::max(0, freeSlots);
+    if (cap > 0) {
+        parallel = std::min(parallel, cap);
+    }
+    parallel = std::max(parallel, 1);
+
+    return queued * slotTimeUs / parallel;
+}
+
+std::map<std::string, int> StateAwareScheduler::fluxUnitsPerHost(
+  const std::string& userFunc)
+{
+    std::string prefix = userFunc + "_";
+    std::map<std::string, int> perHost;
+    faabric::util::SharedLock lock(scheduleMx);
+    for (const auto& [unitKey, host] : stateHost) {
+        if (unitKey.starts_with(prefix)) {
+            perHost[host]++;
+        }
+    }
+    return perHost;
+}
+
+double StateAwareScheduler::fluxAffinity(
+  const std::string& userFunc,
+  const std::string& ip,
+  const std::map<std::string, faabric::WorkerStats>& stats)
+{
+    // The operator itself and the operators it chains to: requests routed to
+    // where their state is make their chained calls local.
+    std::vector<std::string> ops = { userFunc };
+    {
+        faabric::util::SharedLock lock(scheduleMx);
+        if (application) {
+            const auto& connections = application->getConnections();
+            auto it = connections.find(userFunc);
+            if (it != connections.end()) {
+                ops.insert(ops.end(), it->second.begin(), it->second.end());
+            }
+        }
+    }
+
+    int held = 0;
+    int total = 0;
+    for (const auto& op : ops) {
+        for (const auto& [host, units] : fluxUnitsPerHost(op)) {
+            total += units;
+            if (host == ip) {
+                held += units;
+            }
+        }
+    }
+    double affinity = total == 0 ? 0 : static_cast<double>(held) / total;
+
+    // Already running the operator: its executors are warm there.
+    auto hostIt = stats.find(ip);
+    if (hostIt != stats.end()) {
+        std::string prefix = userFunc + "_";
+        for (const auto& [queueKey, depth] :
+             hostIt->second.instancequeuenum()) {
+            if (queueKey.starts_with(prefix)) {
+                affinity += 1;
+                break;
+            }
+        }
+    }
+    return affinity;
 }
 
 std::string StateAwareScheduler::scheduleStatelessMessageFlux(
@@ -714,69 +826,122 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     const std::string queueKey = userFunc + "_0";
     auto stats = getClusterWorkerStats();
 
-    // No cluster view yet: at startup the planner has not finished a stats
-    // round. A worker keeps the request, the planner spreads round robin.
-    if (stats.empty()) {
-        if (!isplanner) {
+    auto recordAssigned = [this, &queueKey](const std::string& ip) {
+        std::lock_guard<std::mutex> lock(fluxAssignedMx);
+        fluxAssignedSinceStats[ip][queueKey]++;
+    };
+
+    // ---- Worker: keep it, unless elsewhere is sooner even after the hop ----
+    if (!isplanner) {
+        if (!fluxLocalLoad) {
             return localHost;
         }
+        FluxLocalLoad local = fluxLocalLoad(queueKey);
+        int ahead = local.queued;
+        {
+            std::lock_guard<std::mutex> lock(fluxAssignedMx);
+            ahead += fluxKeptThisPass[queueKey];
+        }
+
+        auto keepLocal = [this, &queueKey]() {
+            std::lock_guard<std::mutex> lock(fluxAssignedMx);
+            fluxKeptThisPass[queueKey]++;
+            return localHost;
+        };
+
+        // A run slot is free: it starts here at the next dispatch round.
+        if (ahead < local.freeRequests || stats.empty()) {
+            return keepLocal();
+        }
+
+        double slotTimeUs = local.slotTimeUs > 0
+                              ? local.slotTimeUs
+                              : clusterSlotTimeUs(stats, queueKey);
+        // Behind `ahead` others, drained at the rate the paridx achieves here.
+        double localWaitUs = 0;
+        if (local.ratePerSec > 0) {
+            localWaitUs = ahead * 1e6 / local.ratePerSec;
+        } else if (slotTimeUs > 0) {
+            localWaitUs = ahead * slotTimeUs;
+        }
+        if (slotTimeUs <= 0 || localWaitUs <= local.remoteCostUs) {
+            // Nothing measured to compare with, or no remote could win.
+            return keepLocal();
+        }
+
+        std::string best;
+        double bestWaitUs = localWaitUs;
+        for (const auto& [ip, host] : hostMap) {
+            if (ip == localHost) {
+                continue;
+            }
+            double waitUs = remoteWaitUsFlux(stats, ip, queueKey, slotTimeUs) +
+                            local.remoteCostUs;
+            if (waitUs < bestWaitUs) {
+                best = ip;
+                bestWaitUs = waitUs;
+            }
+        }
+        if (best.empty()) {
+            return keepLocal();
+        }
+
+        SPDLOG_TRACE("Flux offloads {} to {} (wait here {:.0f}us, there "
+                     "{:.0f}us)",
+                     userFunc,
+                     best,
+                     localWaitUs,
+                     bestWaitUs);
+        recordAssigned(best);
+        return best;
+    }
+
+    // ---- Planner: balance first, operators together second ----
+    // No cluster view yet: at startup the planner has not finished a stats
+    // round, so spread round robin.
+    if (stats.empty()) {
         auto counter = getNextCounter(userFunc);
         return faabric::util::getNthKey(hostMap, counter % hostMap.size());
     }
 
-    int localDepth = -1;
-    if (!isplanner) {
-        localDepth = hostQueueDepth(stats, localHost, queueKey);
-        // Stay put while the local backlog is tolerable. Routing elsewhere
-        // costs a hop and pulls the request away from whatever produced it.
-        if (localDepth >= 0 && localDepth <= fluxLocalQueueLimit) {
-            return localHost;
+    double slotTimeUs = clusterSlotTimeUs(stats, queueKey);
+    // Nothing measured yet: compare queue lengths instead.
+    double unitUs = slotTimeUs > 0 ? slotTimeUs : 1;
+
+    std::vector<std::pair<std::string, double>> waits;
+    double bestWaitUs = std::numeric_limits<double>::infinity();
+    for (const auto& [ip, host] : hostMap) {
+        double waitUs = remoteWaitUsFlux(stats, ip, queueKey, unitUs);
+        waits.emplace_back(ip, waitUs);
+        bestWaitUs = std::min(bestWaitUs, waitUs);
+    }
+
+    if (std::isinf(bestWaitUs)) {
+        // Nobody reported: spread round robin.
+        auto counter = getNextCounter(userFunc);
+        return faabric::util::getNthKey(hostMap, counter % hostMap.size());
+    }
+
+    // Hosts within one request's service time of the best are equally good
+    // for balance; among those, the one most tied to the operator wins.
+    std::string chosen;
+    double chosenAffinity = -1;
+    double chosenWaitUs = 0;
+    for (const auto& [ip, waitUs] : waits) {
+        if (waitUs > bestWaitUs + unitUs) {
+            continue;
+        }
+        double affinity = fluxAffinity(userFunc, ip, stats);
+        if (affinity > chosenAffinity ||
+            (affinity == chosenAffinity && waitUs < chosenWaitUs)) {
+            chosen = ip;
+            chosenAffinity = affinity;
+            chosenWaitUs = waitUs;
         }
     }
 
-    // Locally congested, or we are the planner and have no local. Sample two
-    // hosts and take the shorter queue rather than taking a strict argmin
-    // over the cluster: every scheduler reads the same periodically-refreshed
-    // snapshot, so a strict argmin sends all of them at whichever host
-    // happened to look idle when the planner last collected stats.
-    int lastIdx = static_cast<int>(hostMap.size()) - 1;
-    std::string candA =
-      faabric::util::getNthKey(hostMap, faabric::util::randomInt(0, lastIdx));
-    std::string candB =
-      faabric::util::getNthKey(hostMap, faabric::util::randomInt(0, lastIdx));
-
-    int depthA = hostQueueDepth(stats, candA, queueKey);
-    int depthB = hostQueueDepth(stats, candB, queueKey);
-
-    std::string best = candA;
-    int bestDepth = depthA;
-    // An unreported host loses to a reported one whatever its depth.
-    if (depthA < 0 || (depthB >= 0 && depthB < depthA)) {
-        best = candB;
-        bestDepth = depthB;
-    }
-
-    if (bestDepth < 0) {
-        // Neither sample reported. Keep the request here rather than sending
-        // it somewhere we have no information about.
-        return isplanner ? candA : localHost;
-    }
-
-    // Only actually move if the remote is meaningfully better, otherwise a
-    // worker just over the limit keeps shipping work to hosts that are barely
-    // shorter and the requests cross paths.
-    if (!isplanner && localDepth >= 0 &&
-        bestDepth + fluxOffloadMargin >= localDepth) {
-        return localHost;
-    }
-
-    SPDLOG_TRACE("Flux offloads {} to {} (local {}, remote {})",
-                 userFunc,
-                 best,
-                 localDepth,
-                 bestDepth);
-
-    return best;
+    recordAssigned(chosen);
+    return chosen;
 }
 
 std::shared_ptr<Node> StateAwareScheduler::lookupNode(
@@ -1044,6 +1209,13 @@ std::vector<std::string> StateAwareScheduler::scheduleMessagesBatch(
         SPDLOG_ERROR("Host map is empty, cannot schedule messages");
         throw std::runtime_error("Host map is empty");
     }
+    // A new routing pass: what the last one kept here is in the live queues
+    // by now.
+    if (!isplanner) {
+        std::lock_guard<std::mutex> lock(fluxAssignedMx);
+        fluxKeptThisPass.clear();
+    }
+
     std::vector<std::string> hosts;
     hosts.resize(msgs.size());
     for (int i = 0; i < msgs.size(); i++) {
@@ -5301,6 +5473,11 @@ void StateAwareScheduler::resetScheduler()
     stateHost.clear();
     stateHostEpoch.clear();
     fluxRingShards.clear();
+    {
+        std::lock_guard<std::mutex> lock(fluxAssignedMx);
+        fluxAssignedSinceStats.clear();
+        fluxKeptThisPass.clear();
+    }
     stateHashRing.clear();
     statePartitionBy.clear();
     funcStateRegMap.clear();

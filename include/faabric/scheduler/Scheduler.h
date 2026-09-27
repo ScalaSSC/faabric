@@ -195,6 +195,10 @@ class Scheduler
      */
     std::vector<faabric::ShardMove> getFluxShardMoves();
 
+    // ModeFlux: adds this worker's per-paridx load and capacity to the stats
+    // it reports every round.
+    void fillFluxWorkerStats(faabric::WorkerStats& out);
+
     // `msg` is the first message of the batch that finished.
     void notifyExecutorFinished(const faabric::Message& msg);
 
@@ -261,18 +265,67 @@ class Scheduler
     // executed. Every other mode keeps one pool per paridx.
     std::string executorPoolKey(const faabric::Message& msg) const;
 
-    // ModeFlux caps each paridx at maxExecutors batches running at once. The
-    // pool is shared, so the cap is counted here rather than by pool size.
+    // ModeFlux, per paridx: the run-slot count behind the maxExecutors cap,
+    // and what the paridx actually achieves here, measured over rebalancing
+    // windows. Measured rather than modelled on purpose: it takes in the
+    // dispatch cadence, executor preparation and CPU contention, none of
+    // which the execution time alone shows.
+    struct FluxParidxLoad
+    {
+        // Batches running right now. The executor pool is shared by the
+        // operator, so the cap is counted here rather than by pool size.
+        int running = 0;
+        // The current window: when it started, when `running` last changed,
+        // running batches integrated over time so far, requests finished.
+        int64_t windowStartUs = 0;
+        int64_t lastChangeUs = 0;
+        double runningIntegralUs = 0;
+        int64_t finished = 0;
+        // The last complete window: requests finished per second, and the
+        // executor time one request took (average running batches over that
+        // rate). The latter keeps its last measured value through idle
+        // windows.
+        double ratePerSec = 0;
+        double slotTimeUs = 0;
+    };
     // Keyed by user/func/parIdx.
     std::mutex fluxParidxRunMx;
-    std::map<std::string, int> fluxParidxRunning;
+    std::map<std::string, FluxParidxLoad> fluxParidxLoad;
+
+    // Accounts the time since `running` last changed, and opens the first
+    // window of a paridx seen for the first time.
+    static void advanceFluxLoad(FluxParidxLoad& load, int64_t nowUs);
 
     // Takes one of the paridx's run slots for a batch about to be dispatched,
     // or returns false if all are in use. Handed back by
-    // releaseParidxRunFlux, when the batch finishes or if none is dispatched.
+    // releaseParidxRunFlux if no batch ends up dispatched, or by
+    // finishParidxRunFlux when the batch finishes.
     bool reserveParidxRunFlux(const std::string& funcParStr);
 
     void releaseParidxRunFlux(const std::string& funcParStr);
+
+    void finishParidxRunFlux(const std::string& funcParStr, int requests);
+
+    // Closes the current measurement window of every paridx and opens the
+    // next. Once per rebalancing period.
+    void rollFluxParidxWindows();
+
+    std::map<std::string, FluxParidxLoad> snapshotFluxParidxLoads();
+
+    // What the StateAwareScheduler reads about one of this worker's queues
+    // when routing chained requests (keyed like the queue: user_func_par).
+    faabric::batch_scheduler::StateAwareScheduler::FluxLocalLoad
+    fluxLocalLoadOf(const std::string& userFuncPar);
+
+    // Time (us) handing work over to another worker has taken, averaged over
+    // recent migrations: from freezing the units to flipping their owners.
+    // What a moved request loses before it can start on the other side.
+    double fluxMigrationCostUs = 0;
+
+    // Queue depths the last rebalancing round saw, by queue key: tells a
+    // paridx that has had work waiting all along from one hit by a fresh
+    // burst. Only touched by the rebalancing thread.
+    std::map<std::string, int> fluxPreviousDepths;
 
     std::shared_ptr<faabric::executor::Executor> claimExecutor(
       faabric::Message& msg
@@ -380,7 +433,9 @@ class Scheduler
       const std::string& unitKey);
 
     std::thread fluxRebalanceThread;
-    // ms between rebalancing rounds; 0 disables rebalancing.
+    // ms between rebalancing rounds; 0 disables rebalancing. Also the horizon
+    // a round plans for: what a paridx will not get through here before the
+    // next round is what is worth moving.
     int fluxRebalancePeriod = 1000;
     // ms a unit stays put after it moved.
     int fluxMigrateCooldown = 5000;
@@ -391,18 +446,34 @@ class Scheduler
     // could never move.
     int fluxMigrateRequests = 10000;
     // Executors a worker can run at once. Flux caps executors per paridx, not
-    // per worker, so free capacity is measured against this instead.
+    // per worker; this is what bounds a worker as a whole.
     int fluxWorkerSlots = 0;
 
     void fluxRebalanceLoop();
 
     /**
-     * ModeFlux: one rebalancing round. Only acts when this worker is
-     * saturated (every slot busy and requests waiting). Then, using the
-     * cluster stats, it plans what goes where -- surplus stateless requests
-     * and whole units of state with their requests, hottest first, each to
-     * the worker with the most room left, within fluxMigrateRequests -- and
-     * hands each target its share in a single migration.
+     * ModeFlux: one rebalancing round.
+     *
+     * When: a paridx is behind here -- more is waiting than it will finish
+     * before the next round, judged by the rate it actually achieved over
+     * the last window (or, for a fresh burst on a paridx that was idle, by
+     * all of its run slots).
+     *
+     * How much: only that excess. What it will get through here stays.
+     *
+     * Which: the oldest input first. Stateless requests one by one, units of
+     * state whole with every request waiting for them, ranked by their
+     * oldest request. A partitioned paridx sheds shards; a stateful paridx
+     * only moves if the target would drain it sooner than it drains here.
+     *
+     * Where: to the worker that can get through the most of it before the
+     * next round, after paying the measured migration cost -- free run slots
+     * of the paridx and free executor slots, less its own backlog. Between
+     * workers offering the same number of batches, one already running the
+     * operator or holding its state wins.
+     *
+     * Each target gets its share in a single migration, and a round moves at
+     * most fluxMigrateRequests requests.
      */
     void rebalanceFlux();
 

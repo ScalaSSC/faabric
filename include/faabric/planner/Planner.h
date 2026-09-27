@@ -156,6 +156,13 @@ class Planner
     // Next Message::inputSeq to hand out. Input batches take a contiguous
     // block each, so a batch's messages keep their order.
     std::atomic<int64_t> nextInputSeq{ 1 };
+
+    // Bumped by every flush. The runtime-stats thread keeps the stats of the
+    // previous round to hand back to the workers with the next one; when this
+    // has moved on, those stats belong to a flushed run and are dropped
+    // instead -- otherwise the first round of the new run would hand the
+    // workers the old run's state moves and loads.
+    std::atomic<uint64_t> flushGeneration{ 0 };
     std::thread processWaitingQueueThread;
     void processWaitingQueueLoop();
 

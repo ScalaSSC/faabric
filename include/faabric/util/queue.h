@@ -7,6 +7,7 @@
 #include <faabric/util/logging.h>
 
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <iostream>
@@ -534,16 +535,29 @@ class BatchQueue : public BatchQueueBase
         return taken;
     }
 
-    // How many messages fall under each value of `keyOf`.
-    std::map<int, int> countBy(
+    struct GroupSummary
+    {
+        int count = 0;
+        // Key of the group's message that would leave first.
+        OrderKey first{ INT64_MAX, INT64_MAX };
+    };
+
+    // How many messages fall under each value of `keyOf`, and which of them
+    // is first in line.
+    std::map<int, GroupSummary> summaryBy(
       const std::function<int(const faabric::Message&)>& keyOf)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        std::map<int, int> counts;
+        std::map<int, GroupSummary> groups;
         for (const auto& [key, msg] : batchQueue) {
-            counts[keyOf(*msg)]++;
+            auto& group = groups[keyOf(*msg)];
+            if (group.count == 0) {
+                // Iterating in queue order: the first seen is first in line.
+                group.first = key;
+            }
+            group.count++;
         }
-        return counts;
+        return groups;
     }
 
     int getMessagesCount()

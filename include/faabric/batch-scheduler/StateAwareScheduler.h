@@ -9,6 +9,7 @@
 #include <faabric/util/hash.h>
 #include <faabric/util/locks.h>
 
+#include <functional>
 #include <map>
 #include <set>
 #include <shared_mutex>
@@ -115,9 +116,39 @@ class StateAwareScheduler : public BatchScheduler
 
     std::map<std::string, faabric::WorkerStats> getClusterWorkerStats();
 
-    void setFluxLocalQueueLimit(int value) { fluxLocalQueueLimit = value; }
+    /**
+     * ModeFlux: what a worker knows about one of its own queues right now.
+     * The cluster stats are a round old, and a worker routing its own chained
+     * requests can do better for its own queues.
+     */
+    struct FluxLocalLoad
+    {
+        // Requests waiting in the queue.
+        int queued = 0;
+        // How many more requests could start right now: free run slots of the
+        // paridx, in requests, or 0 if the worker has no executor slot free.
+        int freeRequests = 0;
+        // Requests the paridx finished per second over the last rebalancing
+        // window, and the executor time one request took; 0 when unmeasured.
+        double ratePerSec = 0;
+        double slotTimeUs = 0;
+        // Time a request sent to another worker loses before it can start
+        // there, on top of that worker's queue.
+        double remoteCostUs = 0;
+    };
 
-    void setFluxOffloadMargin(int value) { fluxOffloadMargin = value; }
+    // Workers only: how the scheduler reads its host's own queues.
+    void setFluxLocalLoadProvider(
+      std::function<FluxLocalLoad(const std::string& queueKey)> provider)
+    {
+        fluxLocalLoad = std::move(provider);
+    }
+
+    /**
+     * ModeFlux: how many units of `userFunc`'s state each host holds, as far
+     * as this scheduler knows (the routing cache).
+     */
+    std::map<std::string, int> fluxUnitsPerHost(const std::string& userFunc);
 
     // Shard count of every partitioned stateful operator under ModeFlux. A
     // partitioned operator has a single paridx (0); its keys are hashed onto
@@ -211,10 +242,18 @@ class StateAwareScheduler : public BatchScheduler
       const std::unique_ptr<Message>& msg);
 
     /**
-     * ModeFlux stateless routing. Keeps the request on this worker while the
-     * operator's local backlog is tolerable, and offloads to a less congested
-     * host once it is not. The planner has no "local", so it always picks a
-     * host from the cluster view.
+     * ModeFlux stateless routing, by expected wait: the request goes where it
+     * can start soonest.
+     *
+     * A worker keeps its own chained requests unless another worker would
+     * start one sooner even after paying for the hop -- which keeps an
+     * application's operators together on the worker already running them,
+     * and moves only what that worker cannot keep up with.
+     *
+     * The planner has no local. Among the hosts whose expected wait is within
+     * one request's service time of the best, it picks the one most tied to
+     * the operator (see fluxAffinity): workload balance first, operators
+     * together second.
      */
     std::string scheduleStatelessMessageFlux(
       std::string& userFunc,
@@ -222,13 +261,35 @@ class StateAwareScheduler : public BatchScheduler
       const std::unique_ptr<Message>& msg);
 
     /**
-     * Waiting-queue depth `ip` last reported for `queueKey`, or -1 if that
-     * host did not report at all in the last stats round.
+     * ModeFlux: executor time one request of `queueKey` takes, averaged over
+     * the workers that measured it in their last window; 0 if none did.
      */
-    static int hostQueueDepth(
+    static double clusterSlotTimeUs(
+      const std::map<std::string, faabric::WorkerStats>& stats,
+      const std::string& queueKey);
+
+    /**
+     * ModeFlux: expected wait (us) before one more request of `queueKey` could
+     * start on `ip` -- its queue as last reported plus whatever was routed
+     * there since, drained by as many batches as the paridx may run there.
+     * Infinite if `ip` did not report.
+     */
+    double remoteWaitUsFlux(
       const std::map<std::string, faabric::WorkerStats>& stats,
       const std::string& ip,
-      const std::string& queueKey);
+      const std::string& queueKey,
+      double slotTimeUs);
+
+    /**
+     * ModeFlux: how tied `ip` is to operator `userFunc` -- the share of the
+     * state units of the operator and of its downstream operators that `ip`
+     * holds, plus one if `ip` already runs the operator. Only ever used to
+     * choose between hosts that are otherwise as good.
+     */
+    double fluxAffinity(
+      const std::string& userFunc,
+      const std::string& ip,
+      const std::map<std::string, faabric::WorkerStats>& stats);
 
     /**
      * The registered DAG node for `userFunc`, or nullptr when no application
@@ -501,14 +562,20 @@ class StateAwareScheduler : public BatchScheduler
     std::shared_mutex clusterWorkerStatsMx;
     std::map<std::string, faabric::WorkerStats> clusterWorkerStats;
 
-    // ModeFlux stateless routing thresholds, both in queued messages.
-    // A worker keeps a request until the operator's local backlog exceeds
-    // fluxLocalQueueLimit, and even then only moves it to a host whose
-    // backlog is at least fluxOffloadMargin shorter. Without that margin a
-    // worker sitting just over the limit ships work to a host that is barely
-    // better, and the two trade places on every stats round.
-    int fluxLocalQueueLimit = 8;
-    int fluxOffloadMargin = 4;
+    // Workers only; see setFluxLocalLoadProvider.
+    std::function<FluxLocalLoad(const std::string& queueKey)> fluxLocalLoad;
+
+    // ModeFlux: requests routed to each host since the last stats round, per
+    // queue. The stats cannot show them yet, so without these every decision
+    // until the next round would see the same stale picture and send
+    // everything to whichever host looked least loaded. Cleared when new
+    // stats arrive.
+    std::mutex fluxAssignedMx;
+    std::map<std::string, std::map<std::string, int>> fluxAssignedSinceStats;
+    // Workers only: requests the current routing pass kept here, per queue.
+    // The live queue does not show them until the pass is over and they are
+    // enqueued. Cleared at the start of every scheduleMessagesBatch.
+    std::map<std::string, int> fluxKeptThisPass;
 
     // See setFluxPartitionShards.
     int fluxPartitionShards = 200;

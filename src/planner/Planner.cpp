@@ -174,7 +174,12 @@ void Planner::flushExecutors()
 
     if (stateAwareScheduler) {
         stateAwareScheduler->resetScheduler();
+        // resetScheduler keeps the cluster view (the other modes also run it
+        // on every migration). A flush starts over, so drop it too: it holds
+        // the old run's loads and state moves.
+        stateAwareScheduler->setClusterWorkerStats({});
     }
+    flushGeneration++;
 
     migrationVersion = 0;
     migrationDurations.clear();
@@ -204,6 +209,16 @@ void Planner::flushSchedulingState()
 
     state.activeHosts = convertToHostMap(state.hostMap);
     schedHostNum = 0;
+
+    // Requests of the old run still waiting to be scheduled or dispatched
+    // must not leak into the next one.
+    std::shared_ptr<faabric::Message> dropped;
+    while (waitingMessageQueue.try_dequeue(dropped)) {
+    }
+    state.scheduledMsgsMap.clear();
+    runtimeStats.reset();
+    nextInputSeq = 1;
+    flushGeneration++;
 }
 
 std::vector<std::shared_ptr<Host>> Planner::getAvailableHosts(bool locked)
@@ -1142,17 +1157,11 @@ bool Planner::resetParameter(
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
         stateAwareScheduler->setAlpha(newAlpha);
     }
-    if (key == "flux_local_queue_limit") {
-        if (stateAwareScheduler) {
-            stateAwareScheduler->setFluxLocalQueueLimit(value);
-        }
-        SPDLOG_INFO("Flux local queue limit set to {}", value);
-    }
-    if (key == "flux_offload_margin") {
-        if (stateAwareScheduler) {
-            stateAwareScheduler->setFluxOffloadMargin(value);
-        }
-        SPDLOG_INFO("Flux offload margin set to {}", value);
+    if (key == "flux_local_queue_limit" || key == "flux_offload_margin") {
+        // ModeFlux routes stateless requests by expected wait now; these
+        // queue-length thresholds are gone. Still accepted so existing
+        // experiment scripts keep working.
+        SPDLOG_WARN("{} is no longer used by ModeFlux; ignored", key);
     }
     if (key == "flux_partition_shards") {
         if (stateAwareScheduler) {
@@ -1397,6 +1406,7 @@ void Planner::updateRuntimeStats()
     // Stats fetched from all workers in the previous round, sent back to
     // every worker with the next fetch. Only touched by this thread.
     faabric::WorkerRuntimeStatsRequest lastRoundStats;
+    uint64_t statsGeneration = flushGeneration.load();
 
     while (!stopThreadTimer) {
         std::this_thread::sleep_for(
@@ -1404,6 +1414,15 @@ void Planner::updateRuntimeStats()
 
         if (stopThreadTimer) {
             break;
+        }
+
+        // A flush since the last round: what that round fetched belongs to
+        // the old run. Flushes take reconfigMx, which a fetch holds
+        // throughout, so no flush can land in the middle of one.
+        uint64_t currentGeneration = flushGeneration.load();
+        if (currentGeneration != statsGeneration) {
+            lastRoundStats.Clear();
+            statsGeneration = currentGeneration;
         }
 
         SPDLOG_TRACE("Planner starts fetching runtime stats from workers");

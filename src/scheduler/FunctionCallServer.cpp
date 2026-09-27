@@ -403,6 +403,7 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
     for (auto& move : scheduler.getFluxShardMoves()) {
         *out.add_shardmoves() = std::move(move);
     }
+    scheduler.fillFluxWorkerStats(out);
 
     return std::make_unique<faabric::WorkerStats>(std::move(out));
 }

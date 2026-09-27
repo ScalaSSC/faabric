@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <unordered_set>
 
@@ -111,6 +112,10 @@ Scheduler::Scheduler()
 
     fluxWorkerSlots =
       std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    decentralScheduler.setFluxLocalLoadProvider(
+      [this](const std::string& userFuncPar) {
+          return fluxLocalLoadOf(userFuncPar);
+      });
     fluxRebalanceThread = std::thread(&Scheduler::fluxRebalanceLoop, this);
 
     // Initialize the dispatch worker pool
@@ -320,8 +325,15 @@ void Scheduler::reset()
     clearFluxMigrationState();
     {
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
-        fluxParidxRunning.clear();
+        fluxParidxLoad.clear();
     }
+    {
+        // The executors are shut down by now, so no batch holds any of these.
+        faabric::util::FullLock lock(fluxUnitLocksMx);
+        fluxUnitLocks.clear();
+    }
+    fluxMigrationCostUs = 0;
+    fluxPreviousDepths.clear();
 
     // This function is called when planner flush executors. In this case,
     // planner didn't flush the hostmap, the scheduler also should not flush it.
@@ -455,13 +467,44 @@ std::string Scheduler::executorPoolKey(const faabric::Message& msg) const
     return faabric::util::funcParToString(msg, false);
 }
 
+void Scheduler::advanceFluxLoad(FluxParidxLoad& load, int64_t nowUs)
+{
+    if (load.windowStartUs == 0) {
+        load.windowStartUs = nowUs;
+    }
+    if (load.lastChangeUs > 0 && nowUs > load.lastChangeUs) {
+        load.runningIntegralUs +=
+          static_cast<double>(load.running) * (nowUs - load.lastChangeUs);
+    }
+    load.lastChangeUs = nowUs;
+}
+
+namespace {
+// user/func/par (executor and run-slot keys) to user_func_par (queue keys,
+// and the keys of the stats). User and function names contain no '/'.
+std::string fluxQueueKeyOf(const std::string& funcParStr)
+{
+    std::string key = funcParStr;
+    std::replace(key.begin(), key.end(), '/', '_');
+    return key;
+}
+
+std::string fluxFuncParStrOf(const std::string& userFuncPar)
+{
+    auto [user, func, par] = faabric::util::splitUserFuncPar(userFuncPar);
+    return user + "/" + func + "/" + par;
+}
+}
+
 bool Scheduler::reserveParidxRunFlux(const std::string& funcParStr)
 {
     {
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
-        int& running = fluxParidxRunning[funcParStr];
-        if (running < maxExecutors) {
-            running++;
+        auto& load = fluxParidxLoad[funcParStr];
+        if (load.running < maxExecutors) {
+            advanceFluxLoad(load,
+                            faabric::util::getGlobalClock().epochMicros());
+            load.running++;
             return true;
         }
     }
@@ -473,10 +516,106 @@ bool Scheduler::reserveParidxRunFlux(const std::string& funcParStr)
 void Scheduler::releaseParidxRunFlux(const std::string& funcParStr)
 {
     std::lock_guard<std::mutex> lock(fluxParidxRunMx);
-    auto it = fluxParidxRunning.find(funcParStr);
-    if (it != fluxParidxRunning.end() && it->second > 0) {
-        it->second--;
+    auto it = fluxParidxLoad.find(funcParStr);
+    if (it != fluxParidxLoad.end() && it->second.running > 0) {
+        advanceFluxLoad(it->second,
+                        faabric::util::getGlobalClock().epochMicros());
+        it->second.running--;
     }
+}
+
+void Scheduler::finishParidxRunFlux(const std::string& funcParStr, int requests)
+{
+    std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+    auto it = fluxParidxLoad.find(funcParStr);
+    if (it == fluxParidxLoad.end()) {
+        return;
+    }
+    advanceFluxLoad(it->second, faabric::util::getGlobalClock().epochMicros());
+    if (it->second.running > 0) {
+        it->second.running--;
+    }
+    it->second.finished += std::max(1, requests);
+}
+
+void Scheduler::rollFluxParidxWindows()
+{
+    int64_t nowUs = faabric::util::getGlobalClock().epochMicros();
+    std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+    for (auto& [funcParStr, load] : fluxParidxLoad) {
+        advanceFluxLoad(load, nowUs);
+        int64_t windowUs = nowUs - load.windowStartUs;
+        if (windowUs <= 0) {
+            continue;
+        }
+        load.ratePerSec = load.finished * 1e6 / windowUs;
+        if (load.finished > 0) {
+            // Little's law: batches in flight over requests per second is
+            // the time each request holds a run slot.
+            double avgRunning = load.runningIntegralUs / windowUs;
+            load.slotTimeUs = avgRunning * 1e6 / load.ratePerSec;
+        }
+        load.windowStartUs = nowUs;
+        load.runningIntegralUs = 0;
+        load.finished = 0;
+    }
+}
+
+std::map<std::string, Scheduler::FluxParidxLoad>
+Scheduler::snapshotFluxParidxLoads()
+{
+    std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+    return fluxParidxLoad;
+}
+
+faabric::batch_scheduler::StateAwareScheduler::FluxLocalLoad
+Scheduler::fluxLocalLoadOf(const std::string& userFuncPar)
+{
+    faabric::batch_scheduler::StateAwareScheduler::FluxLocalLoad local;
+    {
+        faabric::util::SharedLock lock(waitingQueuesMx);
+        auto it = waitingQueues.find(userFuncPar);
+        if (it != waitingQueues.end()) {
+            local.queued = it->second->getMessagesCount();
+        }
+    }
+
+    int running = 0;
+    {
+        std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+        auto it = fluxParidxLoad.find(fluxFuncParStrOf(userFuncPar));
+        if (it != fluxParidxLoad.end()) {
+            running = it->second.running;
+            local.ratePerSec = it->second.ratePerSec;
+            local.slotTimeUs = it->second.slotTimeUs;
+        }
+    }
+
+    bool workerSlotFree =
+      runningExecutors.load(std::memory_order_relaxed) < fluxWorkerSlots;
+    local.freeRequests = workerSlotFree ? std::max(0, maxExecutors - running) *
+                                            std::max(1, executeBatchsize)
+                                        : 0;
+    // A request sent elsewhere leaves with the next chained-call dispatch and
+    // is only picked up by the other worker's next one.
+    local.remoteCostUs = dispatchPeriod * 1000.0;
+    return local;
+}
+
+void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
+{
+    {
+        std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+        for (const auto& [funcParStr, load] : fluxParidxLoad) {
+            std::string queueKey = fluxQueueKeyOf(funcParStr);
+            (*out.mutable_paridxrunning())[queueKey] = load.running;
+            if (load.slotTimeUs > 0) {
+                (*out.mutable_paridxslottimeus())[queueKey] = load.slotTimeUs;
+            }
+        }
+    }
+    out.set_workerslots(fluxWorkerSlots);
+    out.set_paridxcap(maxExecutors);
 }
 
 bool Scheduler::registerApp(std::unique_ptr<batch_scheduler::Application> app)
@@ -829,8 +968,26 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                 unitKey =
                   faabric::batch_scheduler::StateAwareScheduler::fluxUnitKey(
                     *src);
-                host =
-                  decentralScheduler.unitOwnerFlux(unitKey, routableHosts());
+                // A unit held here runs here. It was admitted against Redis,
+                // the authority on ownership; the routing cache is only a
+                // cache, and a stale entry pointing elsewhere would bounce
+                // the request between two workers that each think the other
+                // holds it. Only a request whose unit is not held here --
+                // left behind by a migration -- is routed on.
+                bool heldHere = false;
+                {
+                    faabric::util::SharedLock lock(fluxKnownUnitsMx);
+                    heldHere = fluxKnownUnits.contains(unitKey);
+                }
+                host = heldHere ? thisHost
+                                : decentralScheduler.unitOwnerFlux(
+                                    unitKey, routableHosts());
+            } else if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
+                // A stateless request is only dispatched once it has a run
+                // slot here, so nowhere could start it sooner: sending it on
+                // would only add a hop. Where stateless work runs is decided
+                // when it is routed, and by rebalancing.
+                host = thisHost;
             } else {
                 host =
                   decentralScheduler.scheduleMessage(routableHosts(), *src);
@@ -1233,12 +1390,10 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         }
     } else if (key == "runtime_reconfig") {
         decentralScheduler.setRuntimeReconfig(value == 1);
-    } else if (key == "flux_local_queue_limit") {
-        decentralScheduler.setFluxLocalQueueLimit(value);
-        SPDLOG_INFO("Reset flux_local_queue_limit parameter to : {}", value);
-    } else if (key == "flux_offload_margin") {
-        decentralScheduler.setFluxOffloadMargin(value);
-        SPDLOG_INFO("Reset flux_offload_margin parameter to : {}", value);
+    } else if (key == "flux_local_queue_limit" ||
+               key == "flux_offload_margin") {
+        // Stateless routing is by expected wait now; see Planner.
+        SPDLOG_WARN("{} is no longer used by ModeFlux; ignored", key);
     } else if (key == "flux_partition_shards") {
         decentralScheduler.setFluxPartitionShards(value);
         SPDLOG_INFO("Reset flux_partition_shards parameter to : {}", value);
@@ -1295,8 +1450,8 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
     // reaper hands back whatever sits idle past BOUND_TIMEOUT.
     if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
-        auto it = fluxParidxRunning.find(funcStr);
-        return it == fluxParidxRunning.end() || it->second < maxExecutors;
+        auto it = fluxParidxLoad.find(funcStr);
+        return it == fluxParidxLoad.end() || it->second.running < maxExecutors;
     }
 
     int currentExecutorsSize = 0;
@@ -1371,7 +1526,8 @@ void Scheduler::notifyExecutorFinished(const faabric::Message& msg)
 {
     // The batch held one of its paridx's run slots since it was dispatched.
     if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
-        releaseParidxRunFlux(faabric::util::funcParToString(msg, false));
+        finishParidxRunFlux(faabric::util::funcParToString(msg, false),
+                            msg.executebatchsize());
     }
 
     int current = runningExecutors.load(std::memory_order_relaxed);
@@ -2155,6 +2311,10 @@ void Scheduler::fluxRebalanceLoop()
             break;
         }
 
+        // Close the measurement window whether or not we rebalance: the stats
+        // report what it measured.
+        rollFluxParidxWindows();
+
         if (scheduleMode != faabric::batch_scheduler::ModeFlux ||
             fluxRebalancePeriod <= 0) {
             continue;
@@ -2176,32 +2336,125 @@ void Scheduler::rebalanceFlux()
         return;
     }
 
-    int slots = fluxWorkerSlots > 0 ? fluxWorkerSlots : 1;
-    int batchSize = std::max(1, executeBatchsize);
+    using OrderKey = faabric::util::BatchQueue::OrderKey;
 
-    // 1. Only a saturated worker sheds load: every slot busy and requests
-    // still waiting. Our own numbers are live; the stats are a round old.
-    std::vector<std::pair<std::string, int>> queueDepths;
-    int totalWaiting = 0;
-    {
-        faabric::util::SharedLock lock(waitingQueuesMx);
-        for (const auto& [userFuncPar, queue] : waitingQueues) {
-            int depth = queue->getMessagesCount();
-            if (depth > 0) {
-                queueDepths.emplace_back(userFuncPar, depth);
-                totalWaiting += depth;
-            }
-        }
-    }
-    int busy = runningExecutors.load(std::memory_order_relaxed);
-    if (totalWaiting == 0 || busy < slots) {
+    // The round plans for the time until the next one. A moved request loses
+    // the migration cost before it can start on the other side, so only the
+    // rest of the horizon is of use there; if the cost is the whole horizon,
+    // nothing moved now would be done any sooner.
+    double horizonUs =
+      (fluxRebalancePeriod > 0 ? fluxRebalancePeriod : 1000) * 1000.0;
+    double usableUs = horizonUs - fluxMigrationCostUs;
+    if (usableUs <= 0) {
+        SPDLOG_DEBUG("Flux {} does not rebalance: migrating takes {:.0f}us, "
+                     "longer than a round",
+                     thisHost,
+                     fluxMigrationCostUs);
         return;
     }
 
-    // 2. Workers with free slots, as of the last stats round, and how many
-    // requests each can take: a batch per free slot. A worker's own backlog
-    // eats into its free slots at one slot per batch. Slots are assumed the
-    // same on every worker.
+    int slots = std::max(1, fluxWorkerSlots);
+    int batchSize = std::max(1, executeBatchsize);
+    bool workerFull = runningExecutors.load(std::memory_order_relaxed) >= slots;
+    auto loads = snapshotFluxParidxLoads();
+
+    // 1. Paridx that are behind here: more is waiting than they will finish
+    // before the next round. Only that excess is worth moving.
+    //
+    // What a paridx finishes is judged by what it did finish in the last
+    // window -- measured, so it reflects the dispatch cadence and CPU
+    // contention, which a model of free run slots does not. That only holds
+    // for a paridx that had work waiting all along, though: one that was
+    // idle a round ago finished only what little it was given. For those, a
+    // fresh burst, assume it gets all of its run slots.
+    struct FluxBacklog
+    {
+        std::string userFuncPar;
+        std::string userFunc;
+        // 0 stateless, 1 stateful (moves as a whole paridx), 2 partitioned
+        // (moves by shard).
+        int kind;
+        int depth;
+        double excess;
+        double slotTimeUs;
+        double ratePerSec;
+        OrderKey first;
+    };
+    std::vector<std::pair<std::string, faabric::util::BatchQueue*>> queues;
+    {
+        // Queues are only ever erased by reset(), which stops this thread
+        // first, so the pointers outlive the lock.
+        faabric::util::SharedLock lock(waitingQueuesMx);
+        for (const auto& [userFuncPar, queue] : waitingQueues) {
+            queues.emplace_back(userFuncPar, queue.get());
+        }
+    }
+
+    std::map<std::string, int> previousDepths = std::move(fluxPreviousDepths);
+    fluxPreviousDepths.clear();
+
+    std::vector<FluxBacklog> backlogs;
+    for (const auto& [userFuncPar, queue] : queues) {
+        int depth = queue->getMessagesCount();
+        if (depth == 0) {
+            continue;
+        }
+        fluxPreviousDepths[userFuncPar] = depth;
+
+        FluxParidxLoad load;
+        auto loadIt = loads.find(fluxFuncParStrOf(userFuncPar));
+        if (loadIt != loads.end()) {
+            load = loadIt->second;
+        }
+        double slotTimeUs =
+          load.slotTimeUs > 0
+            ? load.slotTimeUs
+            : StateAwareScheduler::clusterSlotTimeUs(stats, userFuncPar);
+        if (slotTimeUs <= 0) {
+            // Nothing measured, here or anywhere: no basis for a plan.
+            continue;
+        }
+        bool waitingAllAlong = previousDepths.contains(userFuncPar);
+        // All its run slots, unless the worker has no executor slot to spare
+        // for more than it already runs.
+        int runSlots = workerFull ? std::max(1, load.running) : maxExecutors;
+        double ratePerSec = waitingAllAlong && load.ratePerSec > 0
+                              ? load.ratePerSec
+                              : runSlots * 1e6 / slotTimeUs;
+        double excess = depth - ratePerSec * horizonUs / 1e6;
+        if (excess < 1) {
+            continue;
+        }
+        auto first = queue->headKey();
+        if (!first) {
+            continue;
+        }
+
+        auto [user, func, parStr] =
+          faabric::util::splitUserFuncPar(userFuncPar);
+        std::string userFunc = user + "_" + func;
+        auto node = decentralScheduler.lookupNode(userFunc);
+        int kind = 0;
+        if (node != nullptr &&
+            node->type != faabric::batch_scheduler::NodeType::STATELESS) {
+            kind = StateAwareScheduler::fluxIsPartitioned(*node) ? 2 : 1;
+        }
+        backlogs.push_back({ userFuncPar,
+                             userFunc,
+                             kind,
+                             depth,
+                             excess,
+                             slotTimeUs,
+                             ratePerSec,
+                             *first });
+    }
+    if (backlogs.empty()) {
+        return;
+    }
+
+    // 2. Workers that can take work, as of the last stats round, with the
+    // executor time each has free before the next round. Budgets are drawn
+    // down as work is assigned, so one idle worker does not take everything.
     std::set<std::string> routable;
     {
         faabric::util::SharedLock lock(mx);
@@ -2213,172 +2466,300 @@ void Scheduler::rebalanceFlux()
     struct FluxTarget
     {
         std::string ip;
-        int room;
+        int freeSlots;
+        int cap;
+        double workerBudgetUs;
+        // Per queue key, filled on first use.
+        std::map<std::string, double> paridxBudgetUs;
         std::vector<std::string> units;
-        std::vector<std::pair<std::string, int>> stateless;
+        std::map<std::string, int> stateless;
     };
     std::vector<FluxTarget> targets;
     for (const auto& [ip, workerStats] : stats) {
         if (ip == thisHost || !routable.contains(ip)) {
             continue;
         }
-        int queued = 0;
-        for (const auto& [queueKey, depth] : workerStats.instancequeuenum()) {
-            queued += depth;
-        }
+        int targetSlots =
+          workerStats.workerslots() > 0 ? workerStats.workerslots() : slots;
+        int targetCap =
+          workerStats.paridxcap() > 0 ? workerStats.paridxcap() : maxExecutors;
         int freeSlots =
-          slots - static_cast<int>(std::ceil(workerStats.executorsnum())) -
-          (queued + batchSize - 1) / batchSize;
-        if (freeSlots > 0) {
-            targets.push_back({ ip, freeSlots * batchSize, {}, {} });
+          targetSlots - static_cast<int>(std::ceil(workerStats.executorsnum()));
+        if (freeSlots <= 0) {
+            continue;
         }
+        targets.push_back(
+          { ip, freeSlots, targetCap, freeSlots * usableUs, {}, {}, {} });
     }
     if (targets.empty()) {
-        SPDLOG_DEBUG("Flux {} is saturated ({} busy, {} waiting) but no "
-                     "worker has a free slot",
+        SPDLOG_DEBUG("Flux {} has {} paridx behind but no worker has a free "
+                     "executor slot",
                      thisHost,
-                     busy,
-                     totalWaiting);
+                     backlogs.size());
         return;
     }
 
-    // 3. What could move: stateless queues, and units of state with the
-    // requests waiting for them. A partitioned paridx's queue mixes the
-    // requests of all its shards, and each shard is a unit of its own.
-    struct FluxCandidate
-    {
-        std::string key;
-        int depth;
-        bool isStateless;
+    auto countIn = [](const auto& counts, const std::string& key) -> int {
+        auto it = counts.find(key);
+        return it == counts.end() ? 0 : static_cast<int>(it->second);
     };
-    std::vector<FluxCandidate> candidates;
-    for (const auto& [userFuncPar, depth] : queueDepths) {
-        auto [user, func, parStr] =
-          faabric::util::splitUserFuncPar(userFuncPar);
-        auto node = decentralScheduler.lookupNode(user + "_" + func);
-        if (node == nullptr ||
-            node->type == faabric::batch_scheduler::NodeType::STATELESS) {
-            candidates.push_back({ userFuncPar, depth, true });
-            continue;
+
+    // What a target can do for a paridx before the next round: its free run
+    // slots there (all of them if it does not run the paridx), bounded by its
+    // free executor slots, less its own backlog of the paridx.
+    auto paridxBudget = [&](FluxTarget& target,
+                            const FluxBacklog& backlog) -> double& {
+        auto it = target.paridxBudgetUs.find(backlog.userFuncPar);
+        if (it != target.paridxBudgetUs.end()) {
+            return it->second;
         }
-        if (!StateAwareScheduler::fluxIsPartitioned(*node)) {
-            candidates.push_back({ userFuncPar, depth, false });
-            continue;
+        const auto& workerStats = stats.at(target.ip);
+        int running = countIn(workerStats.paridxrunning(), backlog.userFuncPar);
+        int queued =
+          countIn(workerStats.instancequeuenum(), backlog.userFuncPar);
+        int runSlots = std::min(target.cap - running, target.freeSlots);
+        double budgetUs =
+          std::max(0.0, runSlots * usableUs - queued * backlog.slotTimeUs);
+        return target.paridxBudgetUs.emplace(backlog.userFuncPar, budgetUs)
+          .first->second;
+    };
+    auto available = [&](FluxTarget& target, const FluxBacklog& backlog) {
+        return std::min(target.workerBudgetUs, paridxBudget(target, backlog));
+    };
+    auto consume =
+      [&](FluxTarget& target, const FluxBacklog& backlog, double executorUs) {
+          target.workerBudgetUs -= executorUs;
+          paridxBudget(target, backlog) -= executorUs;
+      };
+
+    // Tied to the operator: already running it, or holding its state.
+    std::map<std::string, std::map<std::string, int>> unitsPerHost;
+    auto affine = [&](const FluxTarget& target, const std::string& userFunc) {
+        auto it = unitsPerHost.find(userFunc);
+        if (it == unitsPerHost.end()) {
+            it = unitsPerHost
+                   .emplace(userFunc,
+                            decentralScheduler.fluxUnitsPerHost(userFunc))
+                   .first;
         }
-        std::map<int, int> perShard;
-        {
-            faabric::util::SharedLock lock(waitingQueuesMx);
-            auto it = waitingQueues.find(userFuncPar);
-            if (it != waitingQueues.end()) {
-                perShard = it->second->countBy(
-                  [](const faabric::Message& m) { return m.shardid(); });
+        if (countIn(it->second, target.ip) > 0) {
+            return true;
+        }
+        std::string prefix = userFunc + "_";
+        for (const auto& [queueKey, depth] :
+             stats.at(target.ip).instancequeuenum()) {
+            if (queueKey.starts_with(prefix)) {
+                return true;
             }
         }
-        for (const auto& [shard, n] : perShard) {
-            candidates.push_back(
-              { StateAwareScheduler::fluxUnitKey(userFuncPar, shard),
-                n,
-                false });
-        }
-    }
+        return false;
+    };
 
-    // 4. Plan: hottest first, each to whichever worker has the most room
-    // left, until the round's request budget is spent. Room is reserved as
-    // we go so one idle worker does not take everything.
-    std::sort(candidates.begin(),
-              candidates.end(),
-              [](const auto& a, const auto& b) { return a.depth > b.depth; });
-
-    auto roomiest = [&targets]() -> FluxTarget* {
+    // The target with room for at least `needUs` that can take the most
+    // batches of the paridx. Between targets offering as many batches, one
+    // tied to the operator wins: resources first, operators together second.
+    auto bestTarget = [&](const FluxBacklog& backlog,
+                          double needUs) -> FluxTarget* {
         FluxTarget* best = nullptr;
-        for (auto& t : targets) {
-            if (t.room > 0 && (best == nullptr || t.room > best->room)) {
-                best = &t;
+        long bestBatches = -1;
+        bool bestAffine = false;
+        double bestAvailableUs = 0;
+        for (auto& target : targets) {
+            double availableUs = available(target, backlog);
+            if (availableUs <= 0 || availableUs < needUs) {
+                continue;
+            }
+            long batches =
+              static_cast<long>(availableUs / (backlog.slotTimeUs * batchSize));
+            bool isAffine = affine(target, backlog.userFunc);
+            bool better = best == nullptr || batches > bestBatches ||
+                          (batches == bestBatches && isAffine && !bestAffine) ||
+                          (batches == bestBatches && isAffine == bestAffine &&
+                           availableUs > bestAvailableUs);
+            if (better) {
+                best = &target;
+                bestBatches = batches;
+                bestAffine = isAffine;
+                bestAvailableUs = availableUs;
             }
         }
         return best;
     };
 
-    int budget = fluxMigrateRequests;
-    bool firstUnit = true;
+    // 3. What could move, oldest input first. Stateless requests go one by
+    // one; a unit of state goes whole with every request waiting for it, and
+    // ranks by its oldest request.
+    struct FluxItem
+    {
+        OrderKey first;
+        size_t backlog;
+        // Empty for stateless requests.
+        std::string unitKey;
+        int count;
+    };
     int64_t nowMs = faabric::util::getGlobalClock().epochMillis();
-    for (const auto& candidate : candidates) {
-        if (budget <= 0) {
-            break;
+    auto unitMovable = [&](const std::string& unitKey) {
+        std::lock_guard<std::mutex> lock(fluxMigrationMx);
+        if (fluxMigratingUnits.contains(unitKey) ||
+            fluxMovedUnits.contains(unitKey)) {
+            return false;
         }
-        FluxTarget* target = roomiest();
-        if (target == nullptr) {
-            break;
-        }
+        auto coolIt = fluxUnitCooldownUntilMs.find(unitKey);
+        return coolIt == fluxUnitCooldownUntilMs.end() ||
+               nowMs >= coolIt->second;
+    };
 
-        if (candidate.isStateless) {
-            // Keep one batch to run here; ship the rest, as much as the
-            // target and the budget allow.
-            int n =
-              std::min({ candidate.depth - batchSize, target->room, budget });
-            if (n <= 0) {
-                continue;
+    std::vector<FluxItem> items;
+    for (size_t i = 0; i < backlogs.size(); i++) {
+        const auto& backlog = backlogs[i];
+        if (backlog.kind == 0) {
+            items.push_back({ backlog.first,
+                              i,
+                              "",
+                              static_cast<int>(std::ceil(backlog.excess)) });
+            continue;
+        }
+        if (backlog.kind == 1) {
+            if (unitMovable(backlog.userFuncPar)) {
+                items.push_back(
+                  { backlog.first, i, backlog.userFuncPar, backlog.depth });
             }
-            target->stateless.emplace_back(candidate.key, n);
-            target->room -= n;
-            budget -= n;
             continue;
         }
 
+        // Partitioned: shed the shards holding the oldest requests, until
+        // they carry the excess.
+        std::map<int, faabric::util::BatchQueue::GroupSummary> shards;
         {
-            std::lock_guard<std::mutex> lock(fluxMigrationMx);
-            if (fluxMigratingUnits.contains(candidate.key) ||
-                fluxMovedUnits.contains(candidate.key)) {
-                continue;
-            }
-            auto coolIt = fluxUnitCooldownUntilMs.find(candidate.key);
-            if (coolIt != fluxUnitCooldownUntilMs.end() &&
-                nowMs < coolIt->second) {
-                continue;
+            faabric::util::SharedLock lock(waitingQueuesMx);
+            auto it = waitingQueues.find(backlog.userFuncPar);
+            if (it != waitingQueues.end()) {
+                shards = it->second->summaryBy(
+                  [](const faabric::Message& m) { return m.shardid(); });
             }
         }
+        std::vector<std::pair<int, faabric::util::BatchQueue::GroupSummary>>
+          ordered(shards.begin(), shards.end());
+        std::sort(
+          ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+              return a.second.first < b.second.first;
+          });
+        double carried = 0;
+        for (const auto& [shard, summary] : ordered) {
+            if (carried >= backlog.excess) {
+                break;
+            }
+            std::string unitKey =
+              StateAwareScheduler::fluxUnitKey(backlog.userFuncPar, shard);
+            if (!unitMovable(unitKey)) {
+                continue;
+            }
+            items.push_back({ summary.first, i, unitKey, summary.count });
+            carried += summary.count;
+        }
+    }
+    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
 
-        // A unit goes whole, with every request waiting for it. One that
-        // does not fit waits for a later round -- unless it is the round's
-        // first unit, or a unit bigger than the budget could never move.
-        if (!firstUnit &&
-            (candidate.depth > budget || candidate.depth > target->room)) {
+    // 4. Assign, within the round's request budget.
+    int budgetRequests = fluxMigrateRequests;
+    bool firstUnit = true;
+    for (const auto& item : items) {
+        if (budgetRequests <= 0) {
+            break;
+        }
+        const auto& backlog = backlogs[item.backlog];
+
+        if (item.unitKey.empty()) {
+            // Stateless: as many as fit, spread over targets if need be.
+            int remaining = std::min(item.count, budgetRequests);
+            while (remaining > 0) {
+                FluxTarget* target = bestTarget(backlog, backlog.slotTimeUs);
+                if (target == nullptr) {
+                    break;
+                }
+                int n = std::min(remaining,
+                                 static_cast<int>(available(*target, backlog) /
+                                                  backlog.slotTimeUs));
+                if (n <= 0) {
+                    break;
+                }
+                target->stateless[backlog.userFuncPar] += n;
+                consume(*target, backlog, n * backlog.slotTimeUs);
+                remaining -= n;
+                budgetRequests -= n;
+            }
             continue;
         }
-        target->units.push_back(candidate.key);
-        target->room -= candidate.depth;
-        budget -= candidate.depth;
+
+        double needUs = item.count * backlog.slotTimeUs;
+        FluxTarget* target = bestTarget(backlog, needUs);
+        // A unit goes whole or not at all. One that fits nowhere waits for a
+        // later round -- unless it is the round's first unit, or a unit
+        // bigger than any target's room could never move.
+        if (target == nullptr && firstUnit) {
+            target = bestTarget(backlog, 0);
+        }
+        if (target == nullptr || (!firstUnit && item.count > budgetRequests)) {
+            continue;
+        }
+        if (backlog.kind == 1) {
+            // A stateful paridx keeps its cap wherever it runs, so moving it
+            // only pays if the target drains it sooner than it drains here.
+            double hereUs = backlog.ratePerSec > 0
+                              ? backlog.depth * 1e6 / backlog.ratePerSec
+                              : std::numeric_limits<double>::infinity();
+            int runSlots =
+              std::max(1, std::min(target->cap, target->freeSlots));
+            double thereUs = fluxMigrationCostUs +
+                             backlog.depth * backlog.slotTimeUs / runSlots;
+            if (thereUs >= hereUs) {
+                continue;
+            }
+        }
+        target->units.push_back(item.unitKey);
+        consume(*target, backlog, needUs);
+        budgetRequests -= item.count;
         firstUnit = false;
     }
 
-    // 5. One hand-over per target.
+    // 5. One hand-over per target. Each measures what migrating costs.
     int unitsMoved = 0;
     int statelessMoved = 0;
     int targetsUsed = 0;
-    for (const auto& target : targets) {
+    for (auto& target : targets) {
         if (target.units.empty() && target.stateless.empty()) {
             continue;
         }
+        std::vector<std::pair<std::string, int>> stateless(
+          target.stateless.begin(), target.stateless.end());
+        int64_t startUs = faabric::util::getGlobalClock().epochMicros();
         auto [nUnits, nStateless] =
-          migrateToWorkerFlux(target.ip, target.units, target.stateless);
+          migrateToWorkerFlux(target.ip, target.units, stateless);
+        if (nUnits == 0 && nStateless == 0) {
+            continue;
+        }
+        double tookUs = static_cast<double>(
+          faabric::util::getGlobalClock().epochMicros() - startUs);
+        fluxMigrationCostUs = fluxMigrationCostUs <= 0
+                                ? tookUs
+                                : 0.7 * fluxMigrationCostUs + 0.3 * tookUs;
         unitsMoved += nUnits;
         statelessMoved += nStateless;
-        if (nUnits > 0 || nStateless > 0) {
-            targetsUsed++;
-        }
+        targetsUsed++;
     }
 
     if (unitsMoved > 0 || statelessMoved > 0) {
-        SPDLOG_INFO("Flux {} rebalanced ({} busy / {} slots, {} waiting): "
-                    "moved {} units of state and {} stateless requests to {} "
-                    "workers",
+        SPDLOG_INFO("Flux {} rebalanced {} paridx behind: moved {} units of "
+                    "state and {} stateless requests to {} workers "
+                    "(migration cost now {:.0f}us)",
                     thisHost,
-                    busy,
-                    slots,
-                    totalWaiting,
+                    backlogs.size(),
                     unitsMoved,
                     statelessMoved,
-                    targetsUsed);
+                    targetsUsed,
+                    fluxMigrationCostUs);
     }
 }
 
