@@ -187,6 +187,11 @@ message Message {
     // rank work by how long it has been in the system, earliest first.
     int64 inputArrivalTime = 101;
     int64 inputSeq = 102;
+    // ModeFlux: how many times this request went from one worker on to
+    // another after first reaching a worker -- migrated, forwarded to a new
+    // or the real owner of its state, or rerouted at dispatch. Statistics
+    // only; nothing decides on it.
+    int32 forwardCount = 103;
 }
 
 // ---------------------------------------------
@@ -454,6 +459,38 @@ message WorkerStats{
     // the most batches one paridx may run at once here (max_executors).
     int32 workerSlots = 12;
     int32 paridxCap = 13;
+    FluxMigrationStats fluxMigration = 14;
+}
+
+// ModeFlux: what one worker's migrations and forwarding have cost. Counters
+// are cumulative since the last flush, so a lost stats round loses nothing:
+// the planner takes differences between rounds. heldUnits and costUs are
+// taken at the time of the report.
+message FluxMigrationStats
+{
+  // As the sender: hand-overs completed and rolled back, units of state
+  // moved, the requests that went with them, stateless requests moved,
+  // state bytes, and time spent from freezing to flipping owners.
+  int64 handovers = 1;
+  int64 failed = 2;
+  int64 outUnits = 3;
+  int64 outStateReqs = 4;
+  int64 outStateless = 5;
+  int64 outStateBytes = 6;
+  int64 migrateUs = 7;
+  // As the receiver.
+  int64 inUnits = 8;
+  int64 inStateReqs = 9;
+  int64 inStateless = 10;
+  int64 inStateBytes = 11;
+  // Requests sent on because routing was off: to a unit handed off earlier
+  // (tombstone), to the owner Redis names, or rerouted at dispatch.
+  int64 fwdTombstone = 12;
+  int64 fwdOwner = 13;
+  int64 rerouted = 14;
+  // Units of state held here now, and the current migration cost estimate.
+  int32 heldUnits = 15;
+  double costUs = 16;
 }
 
 // ModeFlux: a unit of state left its previous owner for `host`. The unit is

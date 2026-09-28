@@ -60,7 +60,11 @@ class Scheduler
 
     void enqueueSetResults(std::shared_ptr<faabric::BatchExecuteRequest> req);
 
-    void executeBatchForQueue(const std::string& userFuncPar,
+    // Dispatches batches from one queue for up to batchCheckPeriod. Returns
+    // whether it stopped only because that time ran out, with requests still
+    // waiting that could run now -- as opposed to running out of requests, or
+    // of run slots or executors, which a later event will signal.
+    bool executeBatchForQueue(const std::string& userFuncPar,
                               util::BatchQueueBase& waitingQueue);
 
     void resetParameter(std::string key, int32_t value);
@@ -242,8 +246,38 @@ class Scheduler
 
     faabric::util::ThreadSafeQueue<std::string> readyDispatchQueue;
     std::vector<std::thread> dispatchThreads;
-    bool stopDispatcher = false;
     void dispatchWorkerLoop();
+
+    // ---- Event-driven dispatch ----
+    // Dispatchers sleep until a queue has something that could run: requests
+    // arrived, a batch finished and freed its run slot, or requests came back
+    // to a queue. The event marks the queue pending and wakes a dispatcher,
+    // so requests start as soon as they can instead of at the next tick.
+    //
+    // Queues with something to dispatch (queue key -> when marked), and the
+    // ones a dispatcher is working on: each queue is worked on by one
+    // dispatcher at a time.
+    std::mutex dispatchMx;
+    std::condition_variable dispatchCv;
+    std::map<std::string, int64_t> dispatchPending;
+    std::set<std::string> dispatchActive;
+    // Guarded by dispatchMx.
+    bool stopDispatcher = false;
+
+    void markDispatchPending(const std::string& userFuncPar);
+
+    // Marks every non-empty queue. After a pause in dispatching (a central
+    // state update), and as a safety net against a missed event.
+    void markAllDispatchPending();
+
+    // Picks the pending queue to work on next and marks it active: the one
+    // whose next request descends from the oldest input under ModeFlux, the
+    // one pending longest otherwise. Caller holds dispatchMx.
+    std::string pickDispatchQueue();
+
+    // Wakes the chained-call dispatcher and the result reporter.
+    faabric::util::WakeSignal chainedWake;
+    faabric::util::WakeSignal resultsWake;
 
     // ---- Threads ----
     faabric::snapshot::SnapshotRegistry& reg;
@@ -320,7 +354,55 @@ class Scheduler
     // Time (us) handing work over to another worker has taken, averaged over
     // recent migrations: from freezing the units to flipping their owners.
     // What a moved request loses before it can start on the other side.
-    double fluxMigrationCostUs = 0;
+    // Written by the rebalancing thread, read by the stats report.
+    std::atomic<double> fluxMigrationCostUs{ 0 };
+
+    // Cumulative counters behind WorkerStats.fluxMigration, since the last
+    // flush. See FluxMigrationStats.
+    struct FluxMigrationCounters
+    {
+        std::atomic<int64_t> handovers{ 0 };
+        std::atomic<int64_t> failed{ 0 };
+        std::atomic<int64_t> outUnits{ 0 };
+        std::atomic<int64_t> outStateReqs{ 0 };
+        std::atomic<int64_t> outStateless{ 0 };
+        std::atomic<int64_t> outStateBytes{ 0 };
+        std::atomic<int64_t> migrateUs{ 0 };
+        std::atomic<int64_t> inUnits{ 0 };
+        std::atomic<int64_t> inStateReqs{ 0 };
+        std::atomic<int64_t> inStateless{ 0 };
+        std::atomic<int64_t> inStateBytes{ 0 };
+        std::atomic<int64_t> fwdTombstone{ 0 };
+        std::atomic<int64_t> fwdOwner{ 0 };
+        std::atomic<int64_t> rerouted{ 0 };
+
+        void reset()
+        {
+            for (auto* counter : { &handovers,
+                                   &failed,
+                                   &outUnits,
+                                   &outStateReqs,
+                                   &outStateless,
+                                   &outStateBytes,
+                                   &migrateUs,
+                                   &inUnits,
+                                   &inStateReqs,
+                                   &inStateless,
+                                   &inStateBytes,
+                                   &fwdTombstone,
+                                   &fwdOwner,
+                                   &rerouted }) {
+                counter->store(0, std::memory_order_relaxed);
+            }
+        }
+    };
+    FluxMigrationCounters fluxCounters;
+
+    // Marks `msg` as having gone on to another worker once more.
+    static void countForward(faabric::Message& msg)
+    {
+        msg.set_forwardcount(msg.forwardcount() + 1);
+    }
 
     // Queue depths the last rebalancing round saw, by queue key: tells a
     // paridx that has had work waiting all along from one hit by a fresh

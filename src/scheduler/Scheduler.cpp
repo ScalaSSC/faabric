@@ -74,6 +74,11 @@ static VmCpuData readVmCpuData()
 
 namespace faabric::scheduler {
 
+// How long an event-driven loop sleeps at most without being woken. Only a
+// safety net against a missed wake-up: work is picked up when it arrives, not
+// on this timer.
+static constexpr auto SAFETY_WAKE = std::chrono::milliseconds(100);
+
 static faabric::batch_scheduler::HostMap convertHostMap(
   const std::map<std::string, std::string>& registeredHostsMap)
 {
@@ -132,6 +137,7 @@ Scheduler::~Scheduler()
     }
     // Stop the batch timer thread
     stopBatchTimer = true;
+    resultsWake.notify();
     // if (batchTimerThread.joinable()) {
     //     batchTimerThread.join();
     // }
@@ -143,6 +149,7 @@ Scheduler::~Scheduler()
         cpuMonitorThread.join();
     }
     stopThreadTimer = true;
+    chainedWake.notify();
     if (dispatchChainedMsgsThread.joinable()) {
         dispatchChainedMsgsThread.join();
     }
@@ -151,7 +158,11 @@ Scheduler::~Scheduler()
     }
 
     // Safely shutdown dispatch threads
-    stopDispatcher = true;
+    {
+        std::lock_guard<std::mutex> lock(dispatchMx);
+        stopDispatcher = true;
+    }
+    dispatchCv.notify_all();
     // for (size_t i = 0; i < dispatchThreads.size(); ++i) {
     //     readyDispatchQueue.enqueue("");
     // }
@@ -246,6 +257,7 @@ void Scheduler::reset()
     reaperThread.stop();
 
     stopBatchTimer = true;
+    resultsWake.notify();
     // if (batchTimerThread.joinable()) {
     //     batchTimerThread.join();
     // }
@@ -254,6 +266,7 @@ void Scheduler::reset()
     }
 
     stopThreadTimer = true;
+    chainedWake.notify();
     if (dispatchChainedMsgsThread.joinable()) {
         dispatchChainedMsgsThread.join();
     }
@@ -328,12 +341,19 @@ void Scheduler::reset()
         fluxParidxLoad.clear();
     }
     {
+        // The queues are gone. A dispatcher still working on one finds it
+        // missing and moves on.
+        std::lock_guard<std::mutex> lock(dispatchMx);
+        dispatchPending.clear();
+    }
+    {
         // The executors are shut down by now, so no batch holds any of these.
         faabric::util::FullLock lock(fluxUnitLocksMx);
         fluxUnitLocks.clear();
     }
     fluxMigrationCostUs = 0;
     fluxPreviousDepths.clear();
+    fluxCounters.reset();
 
     // This function is called when planner flush executors. In this case,
     // planner didn't flush the hostmap, the scheduler also should not flush it.
@@ -616,6 +636,51 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
     }
     out.set_workerslots(fluxWorkerSlots);
     out.set_paridxcap(maxExecutors);
+
+    auto* migration = out.mutable_fluxmigration();
+    auto load = [](const std::atomic<int64_t>& counter) {
+        return counter.load(std::memory_order_relaxed);
+    };
+    migration->set_handovers(load(fluxCounters.handovers));
+    migration->set_failed(load(fluxCounters.failed));
+    migration->set_outunits(load(fluxCounters.outUnits));
+    migration->set_outstatereqs(load(fluxCounters.outStateReqs));
+    migration->set_outstateless(load(fluxCounters.outStateless));
+    migration->set_outstatebytes(load(fluxCounters.outStateBytes));
+    migration->set_migrateus(load(fluxCounters.migrateUs));
+    migration->set_inunits(load(fluxCounters.inUnits));
+    migration->set_instatereqs(load(fluxCounters.inStateReqs));
+    migration->set_instateless(load(fluxCounters.inStateless));
+    migration->set_instatebytes(load(fluxCounters.inStateBytes));
+    migration->set_fwdtombstone(load(fluxCounters.fwdTombstone));
+    migration->set_fwdowner(load(fluxCounters.fwdOwner));
+    migration->set_rerouted(load(fluxCounters.rerouted));
+    migration->set_costus(fluxMigrationCostUs.load());
+
+    // Units of state held here: every shard, and every paridx of a stateful
+    // operator. Stateless operators are in the known set too, without state.
+    std::vector<std::string> known;
+    {
+        faabric::util::SharedLock lock(fluxKnownUnitsMx);
+        known.assign(fluxKnownUnits.begin(), fluxKnownUnits.end());
+    }
+    int held = 0;
+    for (const auto& unitKey : known) {
+        auto [userFuncPar, shardId] =
+          faabric::batch_scheduler::StateAwareScheduler::splitFluxUnitKey(
+            unitKey);
+        if (shardId >= 0) {
+            held++;
+            continue;
+        }
+        auto [user, func, par] = faabric::util::splitUserFuncPar(userFuncPar);
+        auto node = decentralScheduler.lookupNode(user + "_" + func);
+        if (node != nullptr &&
+            node->type != faabric::batch_scheduler::NodeType::STATELESS) {
+            held++;
+        }
+    }
+    migration->set_heldunits(held);
 }
 
 bool Scheduler::registerApp(std::unique_ptr<batch_scheduler::Application> app)
@@ -689,6 +754,8 @@ void Scheduler::enqueueMessageBatch(
             chainedCallMsgs.push_back(
               std::make_unique<faabric::Message>(std::move(*msgPtr)));
         }
+        lock.unlock();
+        chainedWake.notify();
         return;
     }
 
@@ -728,6 +795,8 @@ void Scheduler::enqueueMessageBatch(
             }
             std::string owner = admitMessageFlux(msg, userFuncPar, unitKey);
             if (!owner.empty()) {
+                countForward(msg);
+                fluxCounters.fwdOwner.fetch_add(1, std::memory_order_relaxed);
                 fluxForwards[owner].push_back(std::move(msgPtr));
                 continue;
             }
@@ -772,6 +841,11 @@ void Scheduler::enqueueMessageBatch(
         runtimeStats.instanceAdd(instancesName, invokeHost, count);
     }
 
+    // Something to dispatch in every queue that received requests.
+    for (const auto& [userFuncPar, count] : instancesCounter) {
+        markDispatchPending(userFuncPar);
+    }
+
     for (auto& [host, forwardMsgs] : fluxForwards) {
         SPDLOG_DEBUG(
           "Flux forwards {} requests for units it does not hold to {}",
@@ -784,83 +858,143 @@ void Scheduler::enqueueMessageBatch(
     SPDLOG_DEBUG("Enqueued {} messages completed", nMessages);
 }
 
+void Scheduler::markDispatchPending(const std::string& userFuncPar)
+{
+    {
+        std::lock_guard<std::mutex> lock(dispatchMx);
+        dispatchPending.try_emplace(
+          userFuncPar, faabric::util::getGlobalClock().epochMicros());
+    }
+    dispatchCv.notify_one();
+}
+
+void Scheduler::markAllDispatchPending()
+{
+    std::vector<std::string> nonEmpty;
+    {
+        faabric::util::SharedLock lock(waitingQueuesMx);
+        for (const auto& [userFuncPar, queue] : waitingQueues) {
+            if (queue->getMessagesCount() > 0) {
+                nonEmpty.push_back(userFuncPar);
+            }
+        }
+    }
+    if (nonEmpty.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(dispatchMx);
+        int64_t nowUs = faabric::util::getGlobalClock().epochMicros();
+        for (const auto& userFuncPar : nonEmpty) {
+            dispatchPending.try_emplace(userFuncPar, nowUs);
+        }
+    }
+    dispatchCv.notify_all();
+}
+
+std::string Scheduler::pickDispatchQueue()
+{
+    using OrderKey = faabric::util::BatchQueue::OrderKey;
+    bool byInput = scheduleMode == faabric::batch_scheduler::ModeFlux;
+
+    std::string picked;
+    OrderKey pickedHead{ INT64_MAX, INT64_MAX };
+    int64_t pickedSince = INT64_MAX;
+    faabric::util::SharedLock queuesLock(waitingQueuesMx);
+    for (const auto& [userFuncPar, since] : dispatchPending) {
+        if (dispatchActive.contains(userFuncPar)) {
+            continue;
+        }
+        if (byInput) {
+            // ModeFlux: the queue whose next request descends from the
+            // oldest input goes first.
+            auto it = waitingQueues.find(userFuncPar);
+            OrderKey head = OrderKey{ INT64_MAX, INT64_MAX };
+            if (it != waitingQueues.end()) {
+                head = it->second->headKey().value_or(head);
+            }
+            if (picked.empty() || head < pickedHead) {
+                picked = userFuncPar;
+                pickedHead = head;
+            }
+        } else if (picked.empty() || since < pickedSince) {
+            picked = userFuncPar;
+            pickedSince = since;
+        }
+    }
+
+    if (!picked.empty()) {
+        dispatchPending.erase(picked);
+        dispatchActive.insert(picked);
+    }
+    return picked;
+}
+
 void Scheduler::dispatchWorkerLoop()
 {
-    while (!stopDispatcher) {
-        std::this_thread::sleep_for(
-          std::chrono::milliseconds(batchCheckPeriod));
-
-        if (stopDispatcher)
-            break;
-
-        if (isUpdateState.load(std::memory_order_acquire)) {
+    while (true) {
+        std::string userFuncPar;
+        {
+            std::unique_lock<std::mutex> lock(dispatchMx);
+            auto hasWork = [this]() {
+                if (isUpdateState.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                for (const auto& [key, since] : dispatchPending) {
+                    if (!dispatchActive.contains(key)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            bool woken = dispatchCv.wait_for(
+              lock, SAFETY_WAKE, [&] { return stopDispatcher || hasWork(); });
+            if (stopDispatcher) {
+                break;
+            }
+            if (!woken) {
+                // Nothing for a while. In case an event was missed, look at
+                // every queue once.
+                lock.unlock();
+                markAllDispatchPending();
+                continue;
+            }
+            userFuncPar = pickDispatchQueue();
+        }
+        if (userFuncPar.empty()) {
             continue;
         }
 
-        std::vector<std::pair<std::string, faabric::util::BatchQueueBase*>>
-          readyQueues;
+        faabric::util::BatchQueue* queue = nullptr;
+        {
+            faabric::util::SharedLock lock(waitingQueuesMx);
+            auto it = waitingQueues.find(userFuncPar);
+            if (it != waitingQueues.end()) {
+                queue = it->second.get();
+            }
+        }
+        bool moreNow =
+          queue != nullptr && executeBatchForQueue(userFuncPar, *queue);
 
         {
-            faabric::util::SharedLock readlock(waitingQueuesMx);
-
-            if (isUpdateState.load(std::memory_order_acquire)) {
-                continue;
-            }
-
-            for (auto& [userFuncPar, waitingBatch] : waitingQueues) {
-                if (waitingBatch->getMessagesCount() == 0) {
-                    continue;
-                }
-
-                if (waitingBatch->getMessagesCount() >= executeBatchsize ||
-                    waitingBatch->getTimeInterval() >= batchInterval) {
-
-                    readyQueues.push_back({ userFuncPar, waitingBatch.get() });
-                    waitingBatch->resetLastTime();
-                }
-            }
-
-            // ModeFlux: the queue whose next request descends from the
-            // oldest input goes first.
-            if (scheduleMode == faabric::batch_scheduler::ModeFlux &&
-                readyQueues.size() > 1) {
-                using OrderKey = faabric::util::BatchQueue::OrderKey;
-                std::vector<std::pair<OrderKey, size_t>> order;
-                order.reserve(readyQueues.size());
-                for (size_t i = 0; i < readyQueues.size(); i++) {
-                    auto* queue = static_cast<faabric::util::BatchQueue*>(
-                      readyQueues[i].second);
-                    auto head = queue->headKey();
-                    // An emptied queue has nothing to be first with.
-                    order.emplace_back(
-                      head.value_or(OrderKey{ INT64_MAX, INT64_MAX }), i);
-                }
-                std::sort(order.begin(), order.end());
-                std::vector<
-                  std::pair<std::string, faabric::util::BatchQueueBase*>>
-                  sorted;
-                sorted.reserve(readyQueues.size());
-                for (const auto& [key, i] : order) {
-                    sorted.push_back(std::move(readyQueues[i]));
-                }
-                readyQueues = std::move(sorted);
+            std::lock_guard<std::mutex> lock(dispatchMx);
+            dispatchActive.erase(userFuncPar);
+            if (moreNow) {
+                dispatchPending.try_emplace(
+                  userFuncPar, faabric::util::getGlobalClock().epochMicros());
             }
         }
-
-        for (auto& [funcStr, qPtr] : readyQueues) {
-            if (isUpdateState.load(std::memory_order_acquire)) {
-                break;
-            }
-            executeBatchForQueue(funcStr, *qPtr);
-        }
+        // It may have been marked again while we worked on it, and only now
+        // can another dispatcher take it.
+        dispatchCv.notify_one();
     }
 }
 
-void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
+bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                                      util::BatchQueueBase& waitingQueue)
 {
     if (isUpdateState.load(std::memory_order_acquire)) {
-        return;
+        return false;
     }
 
     auto userFuncParTuple = util::splitUserFuncPar(userFuncPar);
@@ -887,9 +1021,13 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
           node->type != faabric::batch_scheduler::NodeType::STATELESS;
     }
 
+    // Out of time with requests left: hand the queue back so the others get
+    // a turn, and pick it up again straight after.
+    bool outOfTime = false;
     while (waitingQueue.getMessagesCount() != 0) {
 
         if (faabric::util::getGlobalClock().epochMillis() >= loopDeadlineMs) {
+            outOfTime = true;
             break;
         }
 
@@ -993,8 +1131,16 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                   decentralScheduler.scheduleMessage(routableHosts(), *src);
             }
             if (host != thisHost) {
-                faabric::util::FullLock lock(chainedCallMsgsMx);
-                chainedCallMsgs.push_back(std::move(src));
+                if (fluxStatefulQueue) {
+                    countForward(*src);
+                    fluxCounters.rerouted.fetch_add(1,
+                                                    std::memory_order_relaxed);
+                }
+                {
+                    faabric::util::FullLock lock(chainedCallMsgsMx);
+                    chainedCallMsgs.push_back(std::move(src));
+                }
+                chainedWake.notify();
                 continue;
             }
 
@@ -1054,6 +1200,8 @@ void Scheduler::executeBatchForQueue(const std::string& userFuncPar,
         }
     } catch (...) {
     }
+
+    return outOfTime && waitingQueue.getMessagesCount() > 0;
 }
 
 void Scheduler::enqueueChainedCalls(
@@ -1070,14 +1218,17 @@ void Scheduler::enqueueChainedCalls(
         }
     }
     msgs.clear();
+    lock.unlock();
+    chainedWake.notify();
     SPDLOG_DEBUG("Enqueueing chained calls finished");
 }
 
 void Scheduler::setMessageResults()
 {
     while (!stopBatchTimer) {
-        std::this_thread::sleep_for(
-          std::chrono::milliseconds(plannerCallInterval));
+        // Report results as soon as there are some; whatever finishes while
+        // a report is in flight goes with the next one.
+        resultsWake.wait(SAFETY_WAKE);
 
         if (stopBatchTimer) {
             break;
@@ -1133,6 +1284,8 @@ void Scheduler::enqueueSetResults(
 
         setResultMsgs.emplace_back(std::make_unique<faabric::Message>(msg));
     }
+    lock.unlock();
+    resultsWake.notify();
     SPDLOG_DEBUG("Enqueueing set results finished");
 }
 
@@ -1187,8 +1340,9 @@ void Scheduler::enqueueSchedMsgs(
 void Scheduler::dispatchChainedMsgs()
 {
     while (!stopThreadTimer) {
-        // Sleep for a while to batch the scheduled requests
-        std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
+        // Route chained calls as soon as there are some; whatever arrives
+        // while a round is being routed and sent goes with the next one.
+        chainedWake.wait(SAFETY_WAKE);
 
         if (stopThreadTimer) {
             break;
@@ -1538,6 +1692,11 @@ void Scheduler::notifyExecutorFinished(const faabric::Message& msg)
             break;
         }
     }
+
+    // Its run slot and executor are free again, so its queue may dispatch.
+    // Only now: a dispatcher woken any earlier would find neither free, and
+    // nothing would wake it again.
+    markDispatchPending(faabric::util::getUserFuncPar(msg));
 }
 
 double Scheduler::getAverageExecutors() const
@@ -1820,6 +1979,9 @@ void Scheduler::updateStatesInfo(
     if (isInitialization) {
         createLocalState(statesInfo);
         isUpdateState = false;
+        // Dispatching was paused for the update: resume it.
+        markAllDispatchPending();
+        chainedWake.notify();
         SPDLOG_DEBUG(
           "State Update: initialization complete, no migration needed");
         return;
@@ -1871,6 +2033,9 @@ void Scheduler::updateStatesInfo(
       "State Update: states reallocation complete, reschedule requests now");
 
     isUpdateState = false;
+    // Dispatching was paused for the update: resume it.
+    markAllDispatchPending();
+    chainedWake.notify();
 
     while (!migratedMsgs.empty()) {
         auto msgBatch = migratedMsgs.dequeue();
@@ -2205,6 +2370,8 @@ bool Scheduler::divertMessageFlux(
 
     auto movedIt = fluxMovedUnits.find(unitKey);
     if (movedIt != fluxMovedUnits.end()) {
+        countForward(*msg);
+        fluxCounters.fwdTombstone.fetch_add(1, std::memory_order_relaxed);
         forwards[movedIt->second.host()].push_back(std::move(msg));
         return true;
     }
@@ -2258,6 +2425,8 @@ void Scheduler::returnUndispatchableFlux(std::unique_ptr<faabric::Message> msg,
     }
 
     if (!forwardTo.empty()) {
+        countForward(*msg);
+        fluxCounters.fwdTombstone.fetch_add(1, std::memory_order_relaxed);
         std::list<std::unique_ptr<faabric::Message>> forward;
         forward.push_back(std::move(msg));
         faabric::scheduler::getFunctionCallClient(forwardTo)
@@ -2265,12 +2434,17 @@ void Scheduler::returnUndispatchableFlux(std::unique_ptr<faabric::Message> msg,
         return;
     }
 
-    // Neither: the lock was busy for a moment. Try again next round.
-    faabric::util::SharedLock lock(waitingQueuesMx);
-    auto it = waitingQueues.find(faabric::util::getUserFuncPar(*msg));
-    if (it != waitingQueues.end()) {
-        it->second->addMessage(std::move(msg));
+    // Neither: the lock was busy for a moment. Back in its queue, and try
+    // again.
+    std::string userFuncPar = faabric::util::getUserFuncPar(*msg);
+    {
+        faabric::util::SharedLock lock(waitingQueuesMx);
+        auto it = waitingQueues.find(userFuncPar);
+        if (it != waitingQueues.end()) {
+            it->second->addMessage(std::move(msg));
+        }
     }
+    markDispatchPending(userFuncPar);
 }
 
 std::vector<faabric::ShardMove> Scheduler::getFluxShardMoves()
@@ -2342,12 +2516,13 @@ void Scheduler::rebalanceFlux()
     // nothing moved now would be done any sooner.
     double horizonUs =
       (fluxRebalancePeriod > 0 ? fluxRebalancePeriod : 1000) * 1000.0;
-    double usableUs = horizonUs - fluxMigrationCostUs;
+    double costUs = fluxMigrationCostUs.load();
+    double usableUs = horizonUs - costUs;
     if (usableUs <= 0) {
         SPDLOG_DEBUG("Flux {} does not rebalance: migrating takes {:.0f}us, "
                      "longer than a round",
                      thisHost,
-                     fluxMigrationCostUs);
+                     fluxMigrationCostUs.load());
         return;
     }
 
@@ -2710,8 +2885,8 @@ void Scheduler::rebalanceFlux()
                               : std::numeric_limits<double>::infinity();
             int runSlots =
               std::max(1, std::min(target->cap, target->freeSlots));
-            double thereUs = fluxMigrationCostUs +
-                             backlog.depth * backlog.slotTimeUs / runSlots;
+            double thereUs =
+              costUs + backlog.depth * backlog.slotTimeUs / runSlots;
             if (thereUs >= hereUs) {
                 continue;
             }
@@ -2740,9 +2915,11 @@ void Scheduler::rebalanceFlux()
         }
         double tookUs = static_cast<double>(
           faabric::util::getGlobalClock().epochMicros() - startUs);
-        fluxMigrationCostUs = fluxMigrationCostUs <= 0
-                                ? tookUs
-                                : 0.7 * fluxMigrationCostUs + 0.3 * tookUs;
+        fluxCounters.migrateUs.fetch_add(static_cast<int64_t>(tookUs),
+                                         std::memory_order_relaxed);
+        double previousCostUs = fluxMigrationCostUs.load();
+        fluxMigrationCostUs =
+          previousCostUs <= 0 ? tookUs : 0.7 * previousCostUs + 0.3 * tookUs;
         unitsMoved += nUnits;
         statelessMoved += nStateless;
         targetsUsed++;
@@ -2757,7 +2934,7 @@ void Scheduler::rebalanceFlux()
                     unitsMoved,
                     statelessMoved,
                     targetsUsed,
-                    fluxMigrationCostUs);
+                    fluxMigrationCostUs.load());
     }
 }
 
@@ -2974,6 +3151,11 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
         return { 0, 0 };
     }
 
+    // Every request in the hand-over goes on to another worker once more.
+    for (auto& msg : *batch->mutable_messages()) {
+        countForward(msg);
+    }
+
     // 5. Hand it all over. Until the flip below, Redis still names us for
     // every unit, so nothing new is routed to the target before the state
     // has arrived.
@@ -3022,6 +3204,7 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
             }
             parked = collectParked();
         }
+        std::set<std::string> requeued;
         {
             // These were accounted for when they were first queued, so they
             // go straight back into their queues.
@@ -3032,6 +3215,9 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
                 if (it == waitingQueues.end()) {
                     continue;
                 }
+                requeued.insert(it->first);
+                // It never left.
+                msg.set_forwardcount(msg.forwardcount() - 1);
                 auto msgPtr = std::make_unique<faabric::Message>();
                 msgPtr->Swap(&msg);
                 it->second->addMessage(std::move(msgPtr));
@@ -3040,9 +3226,17 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
         for (auto& move : moves) {
             move.lock.reset();
         }
+        // The units are unfrozen and their requests are back: dispatch them.
+        for (const auto& userFuncPar : requeued) {
+            markDispatchPending(userFuncPar);
+        }
+        for (const auto& move : moves) {
+            markDispatchPending(move.userFuncPar);
+        }
         if (!parked.empty()) {
             enqueueMessageBatch(std::move(parked), thisHost);
         }
+        fluxCounters.failed.fetch_add(1, std::memory_order_relaxed);
         return { 0, 0 };
     }
 
@@ -3127,9 +3321,22 @@ std::pair<int, int> Scheduler::migrateToWorkerFlux(
 
     size_t nParked = parked.size();
     if (!parked.empty()) {
+        for (auto& msg : parked) {
+            countForward(*msg);
+        }
         faabric::scheduler::getFunctionCallClient(target)
           ->executeFunctionsBatch(std::move(parked));
     }
+
+    fluxCounters.handovers.fetch_add(1, std::memory_order_relaxed);
+    fluxCounters.outUnits.fetch_add(static_cast<int64_t>(moves.size()),
+                                    std::memory_order_relaxed);
+    fluxCounters.outStateReqs.fetch_add(
+      unitRequests + static_cast<int64_t>(nParked), std::memory_order_relaxed);
+    fluxCounters.outStateless.fetch_add(statelessRequests,
+                                        std::memory_order_relaxed);
+    fluxCounters.outStateBytes.fetch_add(static_cast<int64_t>(stateBytes),
+                                         std::memory_order_relaxed);
 
     for (const auto& [userFuncPar, n] : statelessTaken) {
         runtimeStats.instanceGenerate(userFuncPar, target, n);
@@ -3194,6 +3401,19 @@ void Scheduler::receiveShardFlux(faabric::FluxShardMigrationRequest& req)
         }
         decentralScheduler.updateStateHostFlux(
           unitKey, thisHost, unitState.epoch());
+    }
+
+    fluxCounters.inUnits.fetch_add(req.shards_size(),
+                                   std::memory_order_relaxed);
+    for (const auto& unitState : req.shards()) {
+        fluxCounters.inStateBytes.fetch_add(
+          static_cast<int64_t>(unitState.serializedstate().size()),
+          std::memory_order_relaxed);
+    }
+    for (const auto& msg : req.messagebatch().messages()) {
+        auto& counter = msg.messagetype() == 0 ? fluxCounters.inStateless
+                                               : fluxCounters.inStateReqs;
+        counter.fetch_add(1, std::memory_order_relaxed);
     }
 
     SPDLOG_INFO("Flux took over {} units and {} requests from {}",

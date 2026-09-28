@@ -229,6 +229,152 @@ class ApplicationMetrics
         std::vector<RlsUpdateEntry> rlsUpdates;
     };
 
+    // ModeFlux: per worker and per second, what migration and forwarding
+    // cost (fluxMigrations), and totals per worker and for the cluster
+    // (fluxMigrationSummary), also logged. The shares put them next to the
+    // work done: requests moved, and requests sent on because routing was
+    // off, per request processed. Caller holds opMx.
+    void addFluxMigrationMetrics(rapidjson::Document& doc) const
+    {
+        auto& alloc = doc.GetAllocator();
+        if (runtimeMetricsHistory.empty()) {
+            return;
+        }
+        int64_t startSec = runtimeMetricsHistory.begin()->first;
+        int64_t endSec = runtimeMetricsHistory.rbegin()->first;
+
+        rapidjson::Value perSecondObj(rapidjson::kObjectType);
+        rapidjson::Value summaryObj(rapidjson::kObjectType);
+        faabric::FluxMigrationStats clusterTotal;
+        long long clusterProcessed = 0;
+        bool anyWorker = false;
+
+        auto summarise = [&alloc](const faabric::FluxMigrationStats& total,
+                                  long long processed) {
+            rapidjson::Value obj(rapidjson::kObjectType);
+            for (const auto& field : fluxCounterFields()) {
+                obj.AddMember(rapidjson::StringRef(field.name),
+                              static_cast<int64_t>((total.*field.get)()),
+                              alloc);
+            }
+            obj.AddMember("held_units", total.heldunits(), alloc);
+            obj.AddMember("cost_us", total.costus(), alloc);
+            obj.AddMember("processed", static_cast<int64_t>(processed), alloc);
+            double moved =
+              static_cast<double>(total.outstatereqs() + total.outstateless());
+            double extra = static_cast<double>(
+              total.fwdtombstone() + total.fwdowner() + total.rerouted());
+            obj.AddMember(
+              "moved_share", processed > 0 ? moved / processed : 0.0, alloc);
+            obj.AddMember("extra_forward_share",
+                          processed > 0 ? extra / processed : 0.0,
+                          alloc);
+            return obj;
+        };
+
+        for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+            if (workerNode.fluxMigrationHistory.empty()) {
+                continue;
+            }
+            anyWorker = true;
+
+            rapidjson::Value workerArr(rapidjson::kArrayType);
+            faabric::FluxMigrationStats previous;
+            faabric::FluxMigrationStats total;
+            long long processed = 0;
+            for (int64_t s = startSec; s <= endSec; ++s) {
+                for (const auto& [instanceName, timeSeries] :
+                     workerNode.instances) {
+                    auto recIt = timeSeries.history.find(s);
+                    if (recIt != timeSeries.history.end()) {
+                        processed += recIt->second.throughput;
+                    }
+                }
+
+                faabric::FluxMigrationStats delta;
+                auto it = workerNode.fluxMigrationHistory.find(s);
+                if (it != workerNode.fluxMigrationHistory.end()) {
+                    delta = fluxMigrationDelta(it->second, previous);
+                    addFluxMigration(total, delta);
+                    previous = it->second;
+                } else {
+                    // No report this second: nothing changed that we know of.
+                    delta.set_heldunits(previous.heldunits());
+                }
+
+                std::string entry;
+                for (const auto& field : fluxCounterFields()) {
+                    int64_t value = (delta.*field.get)();
+                    // Milliseconds read better per second than microseconds.
+                    if (field.get == &faabric::FluxMigrationStats::migrateus) {
+                        value /= 1000;
+                    }
+                    entry += std::to_string(value) + " / ";
+                }
+                entry += std::to_string(delta.heldunits());
+                workerArr.PushBack(
+                  rapidjson::Value(entry.c_str(), alloc).Move(), alloc);
+            }
+
+            perSecondObj.AddMember(
+              rapidjson::Value(ip.c_str(), alloc).Move(), workerArr, alloc);
+            summaryObj.AddMember(rapidjson::Value(ip.c_str(), alloc).Move(),
+                                 summarise(total, processed),
+                                 alloc);
+
+            SPDLOG_INFO("Flux migration on {}: {} hand-overs ({} failed), "
+                        "{} units / {} state requests / {} stateless / {} "
+                        "bytes out in {} ms, {} units / {} requests in, "
+                        "{} requests sent on by stale routing, {} units held; "
+                        "{} of {} processed requests moved",
+                        ip,
+                        total.handovers(),
+                        total.failed(),
+                        total.outunits(),
+                        total.outstatereqs(),
+                        total.outstateless(),
+                        total.outstatebytes(),
+                        total.migrateus() / 1000,
+                        total.inunits(),
+                        total.instatereqs() + total.instateless(),
+                        total.fwdtombstone() + total.fwdowner() +
+                          total.rerouted(),
+                        total.heldunits(),
+                        total.outstatereqs() + total.outstateless(),
+                        processed);
+
+            addFluxMigration(clusterTotal, total);
+            clusterTotal.set_heldunits(0);
+            clusterProcessed += processed;
+        }
+
+        if (!anyWorker) {
+            return;
+        }
+
+        // Cluster-wide: held units add up across workers.
+        int clusterHeld = 0;
+        for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+            if (!workerNode.fluxMigrationHistory.empty()) {
+                clusterHeld +=
+                  workerNode.fluxMigrationHistory.rbegin()->second.heldunits();
+            }
+        }
+        clusterTotal.set_heldunits(clusterHeld);
+        clusterTotal.set_costus(0);
+        summaryObj.AddMember(
+          "cluster", summarise(clusterTotal, clusterProcessed), alloc);
+
+        doc.AddMember("fluxMigrations: handovers / failed / out_units / "
+                      "out_state_reqs / out_stateless / out_state_bytes / "
+                      "migrate_ms / in_units / in_state_reqs / in_stateless / "
+                      "in_state_bytes / fwd_tombstone / fwd_owner / rerouted "
+                      "/ held_units",
+                      perSecondObj,
+                      alloc);
+        doc.AddMember("fluxMigrationSummary", summaryObj, alloc);
+    }
+
     rapidjson::Document getMetrics() const
     {
         faabric::util::FullLock lock(opMx);
@@ -671,6 +817,8 @@ class ApplicationMetrics
           workerMetricDetailsObj,
           alloc);
 
+        addFluxMigrationMetrics(doc);
+
         // Per-second RLS update inputs: one entry per saturated host per
         // second. Format: throughput / execTime(us) / localChained /
         // remoteChained
@@ -762,7 +910,67 @@ class ApplicationMetrics
         std::map<time_t, double> cpuLoadHistory;
         std::map<time_t, double> executorsHistory;
         std::map<time_t, bool> saturatedHistory;
+        // ModeFlux: the worker's migration counters as reported each second
+        // (cumulative since the last flush).
+        std::map<time_t, faabric::FluxMigrationStats> fluxMigrationHistory;
     };
+
+    // The cumulative counters of FluxMigrationStats, in output order.
+    struct FluxCounterField
+    {
+        const char* name;
+        int64_t (faabric::FluxMigrationStats::*get)() const;
+        void (faabric::FluxMigrationStats::*set)(int64_t);
+    };
+
+    static const std::vector<FluxCounterField>& fluxCounterFields()
+    {
+        using S = faabric::FluxMigrationStats;
+        static const std::vector<FluxCounterField> fields = {
+            { "handovers", &S::handovers, &S::set_handovers },
+            { "failed", &S::failed, &S::set_failed },
+            { "out_units", &S::outunits, &S::set_outunits },
+            { "out_state_reqs", &S::outstatereqs, &S::set_outstatereqs },
+            { "out_stateless", &S::outstateless, &S::set_outstateless },
+            { "out_state_bytes", &S::outstatebytes, &S::set_outstatebytes },
+            { "migrate_us", &S::migrateus, &S::set_migrateus },
+            { "in_units", &S::inunits, &S::set_inunits },
+            { "in_state_reqs", &S::instatereqs, &S::set_instatereqs },
+            { "in_stateless", &S::instateless, &S::set_instateless },
+            { "in_state_bytes", &S::instatebytes, &S::set_instatebytes },
+            { "fwd_tombstone", &S::fwdtombstone, &S::set_fwdtombstone },
+            { "fwd_owner", &S::fwdowner, &S::set_fwdowner },
+            { "rerouted", &S::rerouted, &S::set_rerouted },
+        };
+        return fields;
+    }
+
+    // What the counters grew by between two reports. A counter that went
+    // down was reset by a flush in between, so all of it is new.
+    static faabric::FluxMigrationStats fluxMigrationDelta(
+      const faabric::FluxMigrationStats& current,
+      const faabric::FluxMigrationStats& previous)
+    {
+        faabric::FluxMigrationStats delta;
+        for (const auto& field : fluxCounterFields()) {
+            int64_t now = (current.*field.get)();
+            int64_t before = (previous.*field.get)();
+            (delta.*field.set)(now >= before ? now - before : now);
+        }
+        delta.set_heldunits(current.heldunits());
+        delta.set_costus(current.costus());
+        return delta;
+    }
+
+    static void addFluxMigration(faabric::FluxMigrationStats& total,
+                                 const faabric::FluxMigrationStats& delta)
+    {
+        for (const auto& field : fluxCounterFields()) {
+            (total.*field.set)((total.*field.get)() + (delta.*field.get)());
+        }
+        total.set_heldunits(delta.heldunits());
+        total.set_costus(delta.costus());
+    }
 
     // Adds or updates the worker stats fetched from a specific host.
     // Deserialise one InstanceMetricsResultProto into an InstanceRecord.
@@ -819,6 +1027,10 @@ class ApplicationMetrics
               statsPtr->cpuload();
             clusterWorkerMetrics[ip].executorsHistory[currentTime] =
               statsPtr->executorsnum();
+            if (statsPtr->has_fluxmigration()) {
+                clusterWorkerMetrics[ip].fluxMigrationHistory[currentTime] =
+                  statsPtr->fluxmigration();
+            }
 
             // Aggregate across all instances on this host before RLS update.
             double hostThroughput = 0.0;

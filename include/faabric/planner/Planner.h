@@ -166,6 +166,12 @@ class Planner
     std::thread processWaitingQueueThread;
     void processWaitingQueueLoop();
 
+    // Wake the input scheduler (inputs arrived, or an app finished and freed
+    // an in-flight slot) and the dispatcher (requests scheduled), instead of
+    // them polling on a timer.
+    faabric::util::WakeSignal inputWake;
+    faabric::util::WakeSignal scheduledWake;
+
     // ---- Batch Execution ----
     bool stopThreadTimer = false;
 

@@ -3,6 +3,7 @@
 #include <faabric/util/logging.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <iostream>
 #include <list>
@@ -24,6 +25,44 @@ typedef std::shared_lock<std::shared_mutex> SharedLock;
 // Shared locks held and released together, e.g. the state a batch executes
 // against when that spans several locks.
 typedef std::vector<std::unique_ptr<SharedLock>> SharedLockSet;
+
+/**
+ * Wakes a thread that works through whatever has piled up, as soon as there
+ * is something for it, rather than on a timer.
+ *
+ * Any number of notify() calls before the thread next waits collapse into one
+ * wake-up: the thread then takes everything that piled up in the meantime.
+ * That keeps the batching a timer gave, without its delay -- when idle, work
+ * is picked up at once; when busy, it accumulates while the thread handles
+ * the previous lot, so batches grow with load on their own.
+ */
+class WakeSignal
+{
+  public:
+    void notify()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mx);
+            pending = true;
+        }
+        cv.notify_one();
+    }
+
+    // Waits until notified or `timeout` has passed, and consumes the
+    // notification. Returns whether it was notified.
+    bool wait(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(mx);
+        bool notified = cv.wait_for(lock, timeout, [this] { return pending; });
+        pending = false;
+        return notified;
+    }
+
+  private:
+    std::mutex mx;
+    std::condition_variable cv;
+    bool pending = false;
+};
 
 class FlagWaiter : public std::enable_shared_from_this<FlagWaiter>
 {

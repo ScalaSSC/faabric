@@ -35,6 +35,11 @@ namespace faabric::planner {
 
 const std::string PLANNER_ENQUEUE_TIME_KEY = "planner_queue_time_key";
 
+// How long an event-driven loop sleeps at most without being woken. Only a
+// safety net against a missed wake-up: work is picked up when it arrives, not
+// on this timer.
+static constexpr auto SAFETY_WAKE = std::chrono::milliseconds(100);
+
 #define CONTINUE_IF_OUTPUTTING                                                 \
     if (isOutputting) {                                                        \
         continue;                                                              \
@@ -99,6 +104,8 @@ Planner::~Planner()
 {
     // Stop the batch timer thread
     stopThreadTimer = true;
+    inputWake.notify();
+    scheduledWake.notify();
     if (dequeueScheduledMsgsThread.joinable()) {
         dequeueScheduledMsgsThread.join();
     }
@@ -421,6 +428,8 @@ void Planner::setMessageResultBatch(
             state.appResults.erase(appId);
             state.inFlightApps.erase(appId);
             state.appStartTimes.erase(appId);
+            // An in-flight slot is free: inputs held back may go now.
+            inputWake.notify();
         }
     }
     SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
@@ -508,6 +517,7 @@ bool Planner::enqueueBatchRequest(
         msgPtr->set_inputseq(firstSeq + i);
         waitingMessageQueue.enqueue(msgPtr);
     }
+    inputWake.notify();
 
     SPDLOG_DEBUG("Enqueued {} messages. Current waiting queue size: {}",
                  msgCount,
@@ -518,7 +528,12 @@ bool Planner::enqueueBatchRequest(
 void Planner::processWaitingQueueLoop()
 {
     while (!stopThreadTimer) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
+        // Schedule inputs as soon as there are some; whatever arrives while a
+        // round is scheduled goes with the next one.
+        inputWake.wait(SAFETY_WAKE);
+        if (stopThreadTimer) {
+            break;
+        }
 
         CONTINUE_IF_OUTPUTTING
 
@@ -546,6 +561,8 @@ void Planner::processWaitingQueueLoop()
                              tempBatchReq->messages_size());
                 scheduleMessages(tempBatchReq, false);
             }
+            // Any the in-flight limit held back go when the next app finishes,
+            // which wakes us.
         }
     }
 }
@@ -626,6 +643,7 @@ void Planner::doEnqueueSchedMessages(
 
         state.scheduledMsgsMap[host].push_back(std::move(msg));
     }
+    scheduledWake.notify();
 
     for (auto& [instancesName, hostCounter] : msgCallsCounter) {
         for (auto& [host, count] : hostCounter) {
@@ -637,8 +655,12 @@ void Planner::doEnqueueSchedMessages(
 void Planner::dequeueScheduledMsgs()
 {
     while (!stopThreadTimer) {
-        // Sleep for a while to batch the scheduled requests
-        std::this_thread::sleep_for(std::chrono::milliseconds(dispatchPeriod));
+        // Send scheduled requests as soon as there are some; whatever is
+        // scheduled while a round is being sent goes with the next one.
+        scheduledWake.wait(SAFETY_WAKE);
+        if (stopThreadTimer) {
+            break;
+        }
         // Lock only for copying and clearing `scheduledMsgsMap`
         CONTINUE_IF_OUTPUTTING
         faabric::util::FullLock lock(plannerMx);
@@ -667,6 +689,8 @@ void Planner::dequeueScheduledMsgs()
             msgsCallMap[hostIp] = std::move(msgsList); // Move ownership
         }
         state.scheduledMsgsMap.clear();
+        // Sending takes a while; scheduling must not wait on it.
+        lock.unlock();
 
         // Parallel execution of function calls for each host
         std::vector<std::thread> threads;
@@ -1343,6 +1367,9 @@ std::string Planner::outputResult()
     // doc.AddMember("allWorkerMetrics", allWorkerMetricsObj, alloc);
 
     isOutputting = false;
+    // Scheduling and dispatching paused while outputting: resume them.
+    inputWake.notify();
+    scheduledWake.notify();
     // Write out the JSON document to a string.
     rapidjson::StringBuffer buffer;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);

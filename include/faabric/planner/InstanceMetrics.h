@@ -4,6 +4,7 @@
 #include <faabric/util/locks.h>
 #include <faabric/util/logging.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <rapidjson/document.h>
@@ -111,6 +112,12 @@ class InstanceMetrics
         }
         std::string host = msg->executedhost();
         hostStats[host]++;
+
+        // How many times the request went on to another worker (ModeFlux).
+        int forwards = std::max(0, msg->forwardcount());
+        totalForwards += forwards;
+        maxForwardCount = std::max(maxForwardCount, forwards);
+        forwardCountHist[std::min(forwards, 3)]++;
     }
 
     std::string getMetrics() const
@@ -149,6 +156,24 @@ class InstanceMetrics
         }
         doc.AddMember("hostStats", hostStatsObj, alloc);
 
+        // Times each request went on to another worker after first reaching
+        // one: the average, the most, and how many requests went 0, 1, 2, and
+        // 3 or more times.
+        double avgForwardCount =
+          count > 0 ? static_cast<double>(totalForwards) / count : 0.0;
+        doc.AddMember("avgForwardCount", avgForwardCount, alloc);
+        doc.AddMember("maxForwardCount", maxForwardCount, alloc);
+        rapidjson::Value forwardHistObj(rapidjson::kObjectType);
+        for (int forwards = 0; forwards <= 3; forwards++) {
+            std::string key =
+              forwards < 3 ? std::to_string(forwards) : std::string("3+");
+            auto it = forwardCountHist.find(forwards);
+            long n = it == forwardCountHist.end() ? 0 : it->second;
+            forwardHistObj.AddMember(
+              rapidjson::Value(key.c_str(), alloc).Move(), n, alloc);
+        }
+        doc.AddMember("forwardCountHist", forwardHistObj, alloc);
+
         rapidjson::StringBuffer buffer;
         rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
         doc.Accept(writer);
@@ -175,6 +200,10 @@ class InstanceMetrics
 
         batchCounter.clear();
         hostStats.clear();
+
+        totalForwards = 0;
+        maxForwardCount = 0;
+        forwardCountHist.clear();
     }
 
   private:
@@ -195,6 +224,11 @@ class InstanceMetrics
     double avgExecuteBatchSize = 0.0;
     std::map<int, int> batchCounter;
     std::map<std::string, int> hostStats;
+
+    long totalForwards = 0;
+    int maxForwardCount = 0;
+    // Forward count (capped at 3, meaning "3 or more") : requests.
+    std::map<int, long> forwardCountHist;
 };
 
 }
