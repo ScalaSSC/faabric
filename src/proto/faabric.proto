@@ -541,4 +541,19 @@ message FluxShardMigrationRequest {
 message WorkerRuntimeStatsRequest {
     // Worker IP -> stats returned by that worker in the previous round
     map<string, WorkerStats> clusterStats = 1;
+    // ModeFlux: worker IP -> where that worker should send what it cannot get
+    // through itself, as the planner saw it in the previous round.
+    map<string, FluxOffloadPlan> fluxOffloadPlans = 2;
+}
+
+// ModeFlux: the planner's advice to one worker it saw falling behind. Each
+// worker with spare capacity is advised to at most one or a few such workers,
+// never all of them, so they do not all send to the same worker. Advice only:
+// the worker still judges from its own live queues whether it needs to shed
+// anything, and when.
+message FluxOffloadPlan
+{
+  // Target worker -> executor time (us) this worker may send it until the
+  // next plan arrives.
+  map<string, double> quotaUs = 1;
 }

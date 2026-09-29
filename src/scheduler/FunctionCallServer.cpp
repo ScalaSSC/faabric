@@ -382,6 +382,17 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
     }
     scheduler.setClusterWorkerStats(std::move(clusterStats));
 
+    // ModeFlux: the planner's advice for this worker, if it is behind.
+    std::map<std::string, double> offloadQuotaUs;
+    auto planIt = parsedMsg.fluxoffloadplans().find(
+      faabric::util::getSystemConfig().endpointHost);
+    if (planIt != parsedMsg.fluxoffloadplans().end()) {
+        for (const auto& [target, quotaUs] : planIt->second.quotaus()) {
+            offloadQuotaUs[target] = quotaUs;
+        }
+    }
+    scheduler.setFluxOffloadQuota(std::move(offloadQuotaUs));
+
     faabric::WorkerStats out;
 
     out.set_ip(faabric::util::getSystemConfig().endpointHost);

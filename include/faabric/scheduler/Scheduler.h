@@ -203,6 +203,13 @@ class Scheduler
     // it reports every round.
     void fillFluxWorkerStats(faabric::WorkerStats& out);
 
+    // ModeFlux: the planner's advice for this worker (see FluxOffloadPlan).
+    // Empty when the planner saw no need, or nowhere to send.
+    void setFluxOffloadQuota(std::map<std::string, double> quotaUs)
+    {
+        decentralScheduler.setFluxOffloadQuota(std::move(quotaUs));
+    }
+
     // `msg` is the first message of the batch that finished.
     void notifyExecutorFinished(const faabric::Message& msg);
 
@@ -566,16 +573,17 @@ class Scheduler
      *
      * How much: only that excess. What it will get through here stays.
      *
-     * Which: the oldest input first. Stateless requests one by one, units of
-     * state whole with every request waiting for them, ranked by their
-     * oldest request. A partitioned paridx sheds shards; a stateful paridx
-     * only moves if the target would drain it sooner than it drains here.
+     * Which: stateless requests one by one, units of state whole with every
+     * request waiting for them; the oldest input first within each. A
+     * partitioned paridx sheds shards, a stateful one moves as a whole.
      *
-     * Where: to the worker that can get through the most of it before the
-     * next round, after paying the measured migration cost -- free run slots
-     * of the paridx and free executor slots, less its own backlog. Between
-     * workers offering the same number of batches, one already running the
-     * operator or holding its state wins.
+     * Where: only to the workers the planner advised (FluxOffloadPlan), each
+     * item to the one with the most quota left, within the quota. Without
+     * advice, nothing moves: the planner sees every worker, and makes sure
+     * workers behind do not all descend on the same idle one.
+     *
+     * Stateless requests go first because their chained calls go with them
+     * and run on the other side as local calls.
      *
      * Each target gets its share in a single migration, and a round moves at
      * most fluxMigrateRequests requests.

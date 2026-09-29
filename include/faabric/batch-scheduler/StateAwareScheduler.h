@@ -114,7 +114,9 @@ class StateAwareScheduler : public BatchScheduler
     void setClusterWorkerStats(
       std::map<std::string, faabric::WorkerStats>&& stats);
 
-    std::map<std::string, faabric::WorkerStats> getClusterWorkerStats();
+    // Shared, not copied: routing reads it for every request.
+    std::shared_ptr<const std::map<std::string, faabric::WorkerStats>>
+    getClusterWorkerStats();
 
     /**
      * ModeFlux: what a worker knows about one of its own queues right now.
@@ -128,13 +130,9 @@ class StateAwareScheduler : public BatchScheduler
         // How many more requests could start right now: free run slots of the
         // paridx, in requests, or 0 if the worker has no executor slot free.
         int freeRequests = 0;
-        // Requests the paridx finished per second over the last rebalancing
-        // window, and the executor time one request took; 0 when unmeasured.
-        double ratePerSec = 0;
+        // Executor time one request took over the last rebalancing window; 0
+        // when unmeasured.
         double slotTimeUs = 0;
-        // Time a request sent to another worker loses before it can start
-        // there, on top of that worker's queue.
-        double remoteCostUs = 0;
     };
 
     // Workers only: how the scheduler reads its host's own queues.
@@ -145,10 +143,36 @@ class StateAwareScheduler : public BatchScheduler
     }
 
     /**
-     * ModeFlux: how many units of `userFunc`'s state each host holds, as far
-     * as this scheduler knows (the routing cache).
+     * ModeFlux, planner: from the workers' last stats, advise every worker
+     * that is falling behind where to send what it cannot get through before
+     * the next round (`horizonUs`) -- see FluxOffloadPlan.
+     *
+     * Kept deliberately cheap: one pass over the stats and a greedy match.
+     * A worker is behind when its queued work (requests x executor time per
+     * request) exceeds what it can run in the horizon, and has room when it is
+     * the other way round. Those behind, most first, are matched with those
+     * with room, most first -- a worker already running one of the operators
+     * backed up there going first, for its warm executors -- and each worker's
+     * room is handed out once, so no two workers are sent to the same room.
      */
-    std::map<std::string, int> fluxUnitsPerHost(const std::string& userFunc);
+    std::map<std::string, faabric::FluxOffloadPlan> planFluxOffload(
+      const std::map<std::string, faabric::WorkerStats>& stats,
+      double horizonUs);
+
+    /**
+     * ModeFlux, workers: the planner's latest advice for this worker. The
+     * quotas are drawn down as work is sent, by chained-call routing and by
+     * rebalancing alike, and start afresh with every new plan.
+     */
+    void setFluxOffloadQuota(std::map<std::string, double> quotaUs);
+
+    std::map<std::string, double> getFluxOffloadQuota();
+
+    // Draws `us` from the quota for `target`. Fails, drawing nothing, if the
+    // quota is short -- unless `allowOver`, which lets it go to zero.
+    bool drawFluxOffloadQuota(const std::string& target,
+                              double us,
+                              bool allowOver = false);
 
     // Shard count of every partitioned stateful operator under ModeFlux. A
     // partitioned operator has a single paridx (0); its keys are hashed onto
@@ -249,18 +273,16 @@ class StateAwareScheduler : public BatchScheduler
       const std::unique_ptr<Message>& msg);
 
     /**
-     * ModeFlux stateless routing, by expected wait: the request goes where it
-     * can start soonest.
+     * ModeFlux stateless routing.
      *
-     * A worker keeps its own chained requests unless another worker would
-     * start one sooner even after paying for the hop -- which keeps an
-     * application's operators together on the worker already running them,
-     * and moves only what that worker cannot keep up with.
+     * A worker keeps its own chained requests -- which keeps an application's
+     * operators together on the worker already running them -- unless it has
+     * no run slot free for one and the planner has advised it where to send
+     * work; then it goes to the advised worker with the most quota left.
      *
-     * The planner has no local. Among the hosts whose expected wait is within
-     * one request's service time of the best, it picks the one most tied to
-     * the operator (see fluxAffinity): workload balance first, operators
-     * together second.
+     * The planner has no local. It sends each input where it can start
+     * soonest; among hosts within one request's service time of the best, one
+     * already running the operator goes first, for its warm executors.
      */
     std::string scheduleStatelessMessageFlux(
       std::string& userFunc,
@@ -287,16 +309,12 @@ class StateAwareScheduler : public BatchScheduler
       const std::string& queueKey,
       double slotTimeUs);
 
-    /**
-     * ModeFlux: how tied `ip` is to operator `userFunc` -- the share of the
-     * state units of the operator and of its downstream operators that `ip`
-     * holds, plus one if `ip` already runs the operator. Only ever used to
-     * choose between hosts that are otherwise as good.
-     */
-    double fluxAffinity(
-      const std::string& userFunc,
+    // ModeFlux: whether `ip` reported a queue of any paridx of operator
+    // `userFunc`, i.e. has run it and has warm executors for it.
+    static bool runsOperatorFlux(
+      const std::map<std::string, faabric::WorkerStats>& stats,
       const std::string& ip,
-      const std::map<std::string, faabric::WorkerStats>& stats);
+      const std::string& userFunc);
 
     /**
      * The registered DAG node for `userFunc`, or nullptr when no application
@@ -567,7 +585,10 @@ class StateAwareScheduler : public BatchScheduler
     std::shared_mutex scheduleMx;
 
     std::shared_mutex clusterWorkerStatsMx;
-    std::map<std::string, faabric::WorkerStats> clusterWorkerStats;
+    // Replaced whole by each stats round, never modified in place.
+    std::shared_ptr<const std::map<std::string, faabric::WorkerStats>>
+      clusterWorkerStats =
+        std::make_shared<std::map<std::string, faabric::WorkerStats>>();
 
     // Workers only; see setFluxLocalLoadProvider.
     std::function<FluxLocalLoad(const std::string& queueKey)> fluxLocalLoad;
@@ -579,6 +600,9 @@ class StateAwareScheduler : public BatchScheduler
     // stats arrive.
     std::mutex fluxAssignedMx;
     std::map<std::string, std::map<std::string, int>> fluxAssignedSinceStats;
+    // Workers only: the planner's latest advice, drawn down as work is sent.
+    std::mutex fluxOffloadMx;
+    std::map<std::string, double> fluxOffloadQuotaUs;
     // Workers only: requests the current routing pass kept here, per queue.
     // The live queue does not show them until the pass is over and they are
     // enqueued. Cleared at the start of every scheduleMessagesBatch.
@@ -914,13 +938,19 @@ class StateAwareScheduler : public BatchScheduler
                                  const HostMap& hostMap);
 
     /**
-     * Deterministic first guess at who should own `userFuncPar`. Every
-     * scheduler derives the same candidate from the key, so the claim in
-     * resolveStateHost almost always succeeds on the first attempt instead of
-     * a herd of schedulers fighting over one key.
+     * ModeFlux: the worker every unit of stateful operator `userFunc` starts
+     * on, fixed by whoever first routes to it. A worker proposes itself: it is
+     * running the operator upstream, so state and caller start together. The
+     * planner proposes the host with the least queued work. One Redis claim on
+     * the operator settles it, so the units are never split between workers
+     * routing to the operator at the same time.
      */
-    static std::string pickCandidateHost(const std::string& userFuncPar,
-                                         const HostMap& hostMap);
+    std::string fluxHomeOf(const std::string& userFunc, const HostMap& hostMap);
+
+    static std::string fluxHomeKey(const std::string& userFunc)
+    {
+        return "flux_home_" + userFunc;
+    }
 
     void groupNodesHelper(const std::string& nodeName,
                           std::vector<NodeGroup>& groups,
