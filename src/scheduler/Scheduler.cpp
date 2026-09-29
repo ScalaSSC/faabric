@@ -274,13 +274,27 @@ void Scheduler::reset()
         fluxRebalanceThread.join();
     }
 
-    // Shut down, then clear executors
-    for (auto& ep : executors) {
-        for (auto& e : ep.second) {
+    // Drop the pools, then shut their executors down outside any lock: an
+    // executor finishing meanwhile finds its pool gone and is not taken back.
+    std::unordered_map<std::string, std::shared_ptr<ExecutorPool>> pools;
+    {
+        faabric::util::FullLock lock(executorPoolsMx);
+        pools.swap(executorPools);
+    }
+    for (auto& [key, pool] : pools) {
+        std::vector<std::shared_ptr<faabric::executor::Executor>> execs;
+        {
+            std::lock_guard<std::mutex> lock(pool->mx);
+            for (auto& [ptr, exec] : pool->all) {
+                execs.push_back(exec);
+            }
+            pool->all.clear();
+            pool->idle.clear();
+        }
+        for (auto& e : execs) {
             e->shutdown();
         }
     }
-    executors.clear();
 
     runningExecutors.store(0);
 
@@ -397,86 +411,95 @@ void SchedulerReaperThread::doWork()
 
 int Scheduler::reapStaleExecutors()
 {
-    faabric::util::FullLock lock(mx);
-
-    if (executors.empty()) {
-        SPDLOG_DEBUG("No executors to check for reaping");
-        return 0;
+    std::vector<std::shared_ptr<ExecutorPool>> pools;
+    {
+        faabric::util::SharedLock lock(executorPoolsMx);
+        for (const auto& [key, pool] : executorPools) {
+            pools.push_back(pool);
+        }
     }
 
-    std::vector<std::string> keysToRemove;
-    int nReaped = 0;
-
-    for (auto& execPair : executors) {
-        std::string key = execPair.first;
-        std::vector<std::shared_ptr<faabric::executor::Executor>>& execs =
-          execPair.second;
-        std::vector<std::shared_ptr<faabric::executor::Executor>> toRemove;
-
-        if (execs.empty()) {
-            continue;
-        }
-
-        SPDLOG_TRACE(
-          "Checking {} executors for {} for reaping", execs.size(), key);
-
-        faabric::Message& firstMsg = execs.back()->getBoundMessage();
-        std::string user = firstMsg.user();
-        std::string function = firstMsg.function();
-        std::string mainHost = firstMsg.mainhost();
-
-        for (auto exec : execs) {
+    // Only idle executors are candidates, so nothing running is ever reaped,
+    // and taking them out of the pool first means nothing hands them out
+    // while they shut down -- which happens outside every lock, as it waits
+    // for the executor's threads and tears down its module.
+    std::vector<std::shared_ptr<faabric::executor::Executor>> toShutdown;
+    for (auto& pool : pools) {
+        std::lock_guard<std::mutex> lock(pool->mx);
+        std::erase_if(pool->idle, [&](faabric::executor::Executor* exec) {
             long millisSinceLastExec = exec->getMillisSinceLastExec();
             if (millisSinceLastExec < conf.boundTimeout) {
-                // This executor has had an execution too recently
                 SPDLOG_TRACE("Not reaping {}, last exec {}ms ago (limit {}ms)",
                              exec->id,
                              millisSinceLastExec,
                              conf.boundTimeout);
-                continue;
+                return false;
             }
-
-            // Check if executor is currently executing
-            if (exec->isExecuting()) {
-                SPDLOG_TRACE("Not reaping {}, currently executing", exec->id);
-                continue;
-            }
-
             SPDLOG_TRACE("Reaping {}, last exec {}ms ago (limit {}ms)",
                          exec->id,
                          millisSinceLastExec,
                          conf.boundTimeout);
-
-            toRemove.emplace_back(exec);
-            nReaped++;
-        }
-
-        // Remove those that need to be removed
-        for (auto exec : toRemove) {
-            // Shut down the executor
-            exec->shutdown();
-
-            // Remove and erase
-            auto removed = std::remove(execs.begin(), execs.end(), exec);
-            execs.erase(removed, execs.end());
-        }
+            auto it = pool->all.find(exec);
+            if (it != pool->all.end()) {
+                toShutdown.push_back(it->second);
+                pool->all.erase(it);
+            }
+            return true;
+        });
     }
 
-    // Remove and erase
-    for (auto& key : keysToRemove) {
-        SPDLOG_TRACE("Removing scheduler record for {}, no more executors",
-                     key);
-        executors.erase(key);
+    for (auto& exec : toShutdown) {
+        exec->shutdown();
     }
 
-    return nReaped;
+    if (toShutdown.empty()) {
+        SPDLOG_DEBUG("No executors to reap");
+    }
+    return static_cast<int>(toShutdown.size());
 }
 
 long Scheduler::getFunctionExecutorCount(const faabric::Message& msg)
 {
-    faabric::util::SharedLock lock(mx);
-    auto it = executors.find(executorPoolKey(msg));
-    return it == executors.end() ? 0 : it->second.size();
+    auto pool = getExecutorPool(executorPoolKey(msg), false);
+    if (pool == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(pool->mx);
+    return static_cast<long>(pool->all.size());
+}
+
+std::shared_ptr<Scheduler::ExecutorPool> Scheduler::getExecutorPool(
+  const std::string& key,
+  bool create)
+{
+    {
+        faabric::util::SharedLock lock(executorPoolsMx);
+        auto it = executorPools.find(key);
+        if (it != executorPools.end()) {
+            return it->second;
+        }
+    }
+    if (!create) {
+        return nullptr;
+    }
+    faabric::util::FullLock lock(executorPoolsMx);
+    auto [it, inserted] =
+      executorPools.try_emplace(key, std::make_shared<ExecutorPool>());
+    return it->second;
+}
+
+void Scheduler::returnExecutor(faabric::executor::Executor* executor)
+{
+    auto pool =
+      getExecutorPool(executorPoolKey(executor->getBoundMessage()), false);
+    if (pool == nullptr) {
+        // Its pool was dropped by a reset: the executor is being shut down.
+        return;
+    }
+    std::lock_guard<std::mutex> lock(pool->mx);
+    if (pool->all.contains(executor)) {
+        pool->idle.push_back(executor);
+    }
 }
 
 std::string Scheduler::executorPoolKey(const faabric::Message& msg) const
@@ -1608,25 +1631,14 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
         return it == fluxParidxLoad.end() || it->second.running < maxExecutors;
     }
 
+    // Other modes keep a pool per paridx, and funcStr is its key.
     int currentExecutorsSize = 0;
     bool foundAvailable = false;
-
-    {
-        faabric::util::SharedLock lock(mx);
-        // NB - find() not operator[]: the latter default-inserts, which is a
-        // write to the map under a shared lock, racing every other reader and
-        // the push_back in claimExecutor.
-        auto it = executors.find(funcStr);
-        if (it != executors.end()) {
-            currentExecutorsSize = it->second.size();
-
-            for (auto& e : it->second) {
-                if (e->availableClaim()) {
-                    foundAvailable = true;
-                    break;
-                }
-            }
-        }
+    auto pool = getExecutorPool(funcStr, false);
+    if (pool != nullptr) {
+        std::lock_guard<std::mutex> lock(pool->mx);
+        currentExecutorsSize = static_cast<int>(pool->all.size());
+        foundAvailable = !pool->idle.empty();
     }
 
     if (foundAvailable) {
@@ -1716,42 +1728,37 @@ std::shared_ptr<faabric::executor::Executor> Scheduler::claimExecutor(
   faabric::Message& msg)
 {
     std::string funcStr = executorPoolKey(msg);
-    auto factory = faabric::executor::getExecutorFactory();
-    std::shared_ptr<faabric::executor::Executor> claimed = nullptr;
+    auto pool = getExecutorPool(funcStr, true);
 
+    // An idle executor, if there is one. No reset here: an executor resets
+    // itself when its batch is done, before it comes back to the pool, so an
+    // idle one is already clean. Resetting again re-instantiated the module
+    // for nothing.
     {
-        faabric::util::FullLock lock(mx);
-        auto& thisExecutors = executors[funcStr];
-
-        for (auto& e : thisExecutors) {
-            if (e->tryClaim()) {
-                claimed = e;
-                claimed->reset(msg);
+        std::lock_guard<std::mutex> lock(pool->mx);
+        while (!pool->idle.empty()) {
+            faabric::executor::Executor* exec = pool->idle.back();
+            pool->idle.pop_back();
+            auto it = pool->all.find(exec);
+            if (it != pool->all.end() && exec->tryClaim()) {
                 SPDLOG_DEBUG(
-                  "Reusing warm executor {} for {}", claimed->id, funcStr);
-                break;
+                  "Reusing warm executor {} for {}", exec->id, funcStr);
+                return it->second;
             }
         }
     }
 
-    if (claimed != nullptr) {
-        return claimed;
-    }
-
+    // None idle: a new one. Creating it instantiates the module, which is
+    // slow, so the pool is not held meanwhile.
     SPDLOG_DEBUG("Scaling {} -> creating new executor", funcStr);
-    auto executor = factory->createExecutor(msg);
-
+    auto executor =
+      faabric::executor::getExecutorFactory()->createExecutor(msg);
+    executor->tryClaim();
     {
-        faabric::util::FullLock lock(mx);
-        auto& thisExecutors = executors[funcStr];
-
-        thisExecutors.push_back(std::move(executor));
-        claimed = thisExecutors.back();
-        claimed->tryClaim();
+        std::lock_guard<std::mutex> lock(pool->mx);
+        pool->all.emplace(executor.get(), executor);
     }
-
-    assert(claimed != nullptr);
-    return claimed;
+    return executor;
 }
 
 void Scheduler::setThreadResultLocally(uint32_t appId,
@@ -2209,18 +2216,16 @@ void Scheduler::logFluxExecutorCensus(const std::string& blockedFunc)
     // serves a whole operator.
     std::map<std::string, std::pair<int, int>> census; // op -> {free, total}
     int total = 0;
+    std::vector<std::pair<std::string, std::shared_ptr<ExecutorPool>>> pools;
     {
-        faabric::util::SharedLock lock(mx);
-        for (const auto& [funcStr, execs] : executors) {
-            int free = 0;
-            for (const auto& e : execs) {
-                if (e->availableClaim()) {
-                    free++;
-                }
-            }
-            census[funcStr] = { free, static_cast<int>(execs.size()) };
-            total += static_cast<int>(execs.size());
-        }
+        faabric::util::SharedLock lock(executorPoolsMx);
+        pools.assign(executorPools.begin(), executorPools.end());
+    }
+    for (const auto& [funcStr, pool] : pools) {
+        std::lock_guard<std::mutex> lock(pool->mx);
+        census[funcStr] = { static_cast<int>(pool->idle.size()),
+                            static_cast<int>(pool->all.size()) };
+        total += static_cast<int>(pool->all.size());
     }
 
     std::ostringstream oss;

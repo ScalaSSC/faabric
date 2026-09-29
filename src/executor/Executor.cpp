@@ -386,6 +386,12 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                 availablePoolThreads.insert(threadPoolIdx);
             }
 
+            // Only now back to the scheduler's pool: handed out any earlier,
+            // the next batch could find no thread free to run on.
+            if (isLastThreadInExecutor) {
+                faabric::scheduler::getScheduler().returnExecutor(this);
+            }
+
             // Enqueue the message result
             faabric::scheduler::getScheduler().enqueueSetResults(
               std::move(task.req));

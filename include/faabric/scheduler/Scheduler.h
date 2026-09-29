@@ -206,6 +206,11 @@ class Scheduler
     // `msg` is the first message of the batch that finished.
     void notifyExecutorFinished(const faabric::Message& msg);
 
+    // An executor done with its batch -- reset and with its thread free again
+    // -- going back to its pool to be handed out anew. Called from the
+    // executor's own thread.
+    void returnExecutor(faabric::executor::Executor* executor);
+
     void notifyExecutorStart();
 
     double getAverageExecutors() const;
@@ -233,10 +238,28 @@ class Scheduler
     int executeBatchsize;
 
     // ---- Executors ----
-    std::unordered_map<
-      std::string,
-      std::vector<std::shared_ptr<faabric::executor::Executor>>>
-      executors;
+    // One pool of warm executors per executorPoolKey, each with its own lock,
+    // so handing out and taking back executors neither scans a pool nor
+    // contends with anything outside it.
+    struct ExecutorPool
+    {
+        std::mutex mx;
+        // Every executor of the pool, by address, owning it.
+        std::unordered_map<faabric::executor::Executor*,
+                           std::shared_ptr<faabric::executor::Executor>>
+          all;
+        // The idle ones, the most recently returned last: it is the one
+        // handed out next, its caches the warmest.
+        std::vector<faabric::executor::Executor*> idle;
+    };
+    // Only written when a pool is added or all are dropped.
+    std::shared_mutex executorPoolsMx;
+    std::unordered_map<std::string, std::shared_ptr<ExecutorPool>>
+      executorPools;
+
+    // The pool for `key`, created if missing and `create` is set.
+    std::shared_ptr<ExecutorPool> getExecutorPool(const std::string& key,
+                                                  bool create);
 
     std::atomic<int> runningExecutors{ 0 };
     std::atomic<int64_t> currentWindowSec{ 0 };
