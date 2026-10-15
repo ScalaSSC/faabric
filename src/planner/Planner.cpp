@@ -507,8 +507,10 @@ bool Planner::enqueueBatchRequest(
 
     int64_t enqueueTimeMicros = faabric::util::getGlobalClock().epochMicros();
     int64_t firstSeq = nextInputSeq.fetch_add(msgCount);
+    // Moved out, not copied: the caller only reads the app id back.
     for (int i = 0; i < msgCount; i++) {
-        auto msgPtr = std::make_shared<faabric::Message>(req->messages(i));
+        auto msgPtr = std::make_shared<faabric::Message>();
+        msgPtr->Swap(req->mutable_messages(i));
         (*msgPtr->mutable_metricrecorder())[PLANNER_ENQUEUE_TIME_KEY] =
           enqueueTimeMicros;
         // Everything descending from this input carries these, and is ranked
@@ -551,7 +553,8 @@ void Planner::processWaitingQueueLoop()
             for (int i = 0; i < msgsToSchedule; ++i) {
                 std::shared_ptr<faabric::Message> msg;
                 if (waitingMessageQueue.try_dequeue(msg)) {
-                    *tempBatchReq->add_messages() = *msg;
+                    // The queue held the only reference.
+                    tempBatchReq->add_messages()->Swap(msg.get());
                 } else {
                     break;
                 }
@@ -612,12 +615,13 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
         i++; // Only increment i if a message was not removed
     }
 
-    // Second loop: prepare messages and transfer ownership
+    // Second loop: move the messages out of the request, which nothing reads
+    // after this
     std::vector<std::unique_ptr<faabric::Message>> messages;
     messages.reserve(req->messages_size());
     for (int i = 0; i < req->messages_size(); i++) {
-        auto message =
-          std::make_unique<faabric::Message>(*req->mutable_messages(i));
+        auto message = std::make_unique<faabric::Message>();
+        message->Swap(req->mutable_messages(i));
         messages.push_back(std::move(message));
     }
     auto hosts =
@@ -691,18 +695,26 @@ void Planner::dequeueScheduledMsgs()
         state.scheduledMsgsMap.clear();
         // Sending takes a while; scheduling must not wait on it.
         lock.unlock();
+        if (msgsCallMap.empty()) {
+            continue;
+        }
 
-        // Parallel execution of function calls for each host
+        // Parallel execution of function calls for each host. A send waits
+        // until the socket takes it, so the hosts go side by side -- the last
+        // one on this thread, which would only be waiting otherwise.
         std::vector<std::thread> threads;
-        for (auto& [hostIp, msgs] : msgsCallMap) {
+        auto lastHost = std::prev(msgsCallMap.end());
+        for (auto it = msgsCallMap.begin(); it != lastHost; ++it) {
             threads.emplace_back(
-              [hostIp](
+              [hostIp = it->first](
                 std::list<std::unique_ptr<faabric::Message>> msgsIn) mutable {
                   faabric::scheduler::getFunctionCallClient(hostIp)
                     ->executeFunctionsBatch(std::move(msgsIn));
               },
-              std::move(msgs));
+              std::move(it->second));
         }
+        faabric::scheduler::getFunctionCallClient(lastHost->first)
+          ->executeFunctionsBatch(std::move(lastHost->second));
         // Join all threads to ensure they complete before next iteration
         for (auto& t : threads) {
             if (t.joinable()) {

@@ -188,9 +188,11 @@ void FunctionCallClient::executeFunctionsBatch(
     batchMsgsList->set_invokehost(
       faabric::util::getSystemConfig().endpointHost);
 
+    // Ours to consume: handed to the batch rather than copied into it.
     for (auto& msg : msgs) {
-        batchMsgsList->add_messages()->CopyFrom(*msg);
+        batchMsgsList->mutable_messages()->AddAllocated(msg.release());
     }
+    msgs.clear();
     asyncSend(faabric::scheduler::FunctionCalls::ExecuteFunctionsBatch,
               batchMsgsList.get());
 }

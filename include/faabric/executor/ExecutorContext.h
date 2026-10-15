@@ -28,7 +28,8 @@ class ExecutorContext
 
     std::vector<std::string> chainedFunctionName;
     std::vector<int> chainedMsgId;
-    std::vector<std::vector<uint8_t>> chainedInput;
+    // Held as the message's input field is, so it moves straight in.
+    std::vector<std::string> chainedInput;
 
     static bool isSet();
 

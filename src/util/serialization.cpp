@@ -69,6 +69,12 @@ std::size_t hashVector(const std::vector<uint8_t>& vec)
     return murmurhash(vec.data(), vec.size(), 0);
 }
 
+std::size_t hashBytes(std::string_view bytes)
+{
+    return murmurhash(
+      reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), 0);
+}
+
 // Transforms a uint8_t vector of bytes into a uint32_t
 uint32_t uint8VToUint32(const std::vector<uint8_t>& bytes)
 {
@@ -320,6 +326,50 @@ std::map<std::string, std::string> deserializeMap(
         map[std::move(key)] = std::move(value);
     }
     return map;
+}
+
+std::optional<std::string_view> findInSerializedMap(std::string_view buffer,
+                                                    std::string_view key)
+{
+    if (buffer.size() < 4) {
+        return std::nullopt;
+    }
+
+    size_t index = 0;
+    auto readString = [&buffer, &index]() {
+        uint32_t length;
+        if (buffer.size() < index + sizeof(length)) {
+            throw std::runtime_error("Buffer too small for a string length");
+        }
+        std::memcpy(&length, buffer.data() + index, sizeof(length));
+        index += sizeof(length);
+        if (buffer.size() < index + length) {
+            throw std::runtime_error("Buffer too small for a string");
+        }
+        std::string_view str = buffer.substr(index, length);
+        index += length;
+        return str;
+    };
+
+    uint32_t numPairs;
+    std::memcpy(&numPairs, buffer.data(), sizeof(numPairs));
+    index += sizeof(numPairs);
+
+    // Every pair is read, not only up to the first match: deserializeMap keeps
+    // the last value of a repeated key.
+    std::optional<std::string_view> found;
+    for (uint32_t i = 0; i < numPairs; ++i) {
+        if (buffer.size() < index + 1) {
+            throw std::runtime_error(
+              "Buffer too small for expected number of pairs");
+        }
+        std::string_view pairKey = readString();
+        std::string_view value = readString();
+        if (pairKey == key) {
+            found = value;
+        }
+    }
+    return found;
 }
 
 // Serialize a nested map

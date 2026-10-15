@@ -2,7 +2,9 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // THERE MUST BE SAME AS CPP LIMFAASM UTIL SERIALIZATION
@@ -12,6 +14,9 @@
 namespace faabric::util {
 
 std::size_t hashVector(const std::vector<uint8_t>& vec);
+
+// hashVector of the same bytes, without putting them in a vector first.
+std::size_t hashBytes(std::string_view bytes);
 
 // Serialiazion and Deserialization from uint8_t vetors to uint32_t
 uint32_t uint8VToUint32(const std::vector<uint8_t>& bytes);
@@ -55,6 +60,12 @@ void serializeMap(std::vector<uint8_t>& buffer,
 std::map<std::string, std::string> deserializeMap(
   const std::vector<uint8_t>& buffer,
   size_t& index);
+
+// The value deserializeMap would hold under `key` for a map serialised at the
+// start of `buffer`, read in place instead of building the map; nullopt if the
+// key is not there.
+std::optional<std::string_view> findInSerializedMap(std::string_view buffer,
+                                                    std::string_view key);
 
 // Serialize a nested map
 void serializeNestedMap(

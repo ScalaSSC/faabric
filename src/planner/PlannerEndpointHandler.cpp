@@ -197,7 +197,8 @@ void PlannerEndpointHandler::onRequest(
                 response.body() = std::string("Bad JSON in body's payload");
                 return ctx.sendFunction(std::move(response));
             }
-            auto ber = std::make_shared<faabric::BatchExecuteRequest>(rawBer);
+            auto ber =
+              std::make_shared<faabric::BatchExecuteRequest>(std::move(rawBer));
 
             // For the request from the user, we will return false if the
             // waiting queue is too large.

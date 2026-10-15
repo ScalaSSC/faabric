@@ -15,6 +15,8 @@
 #include <shared_mutex>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace faabric::batch_scheduler {
 
@@ -148,8 +150,9 @@ class StateAwareScheduler : public BatchScheduler
      * the next round (`horizonUs`) -- see FluxOffloadPlan.
      *
      * Kept deliberately cheap: one pass over the stats and a greedy match.
-     * A worker is behind when its queued work (requests x executor time per
-     * request) exceeds what it can run in the horizon, and has room when it is
+     * A worker is behind when what it has to get through in the horizon --
+     * its queued work (requests x executor time per request) and the work
+     * arriving meanwhile -- exceeds what it can run, and has room when it is
      * the other way round. Those behind, most first, are matched with those
      * with room, most first -- a worker already running one of the operators
      * backed up there going first, for its warm executors -- and each worker's
@@ -216,6 +219,11 @@ class StateAwareScheduler : public BatchScheduler
     // same hash routing uses, so a state key and the requests for it always
     // agree on their shard.
     int fluxShardOfKey(const std::string& userFunc, const std::string& key);
+
+    // fluxShardOfKey for many keys of one operator: the ring is looked up
+    // once, not once per key.
+    std::function<int(const std::string&)> fluxShardOfKeyFn(
+      const std::string& userFunc);
 
     /**
      * ModeFlux: record that unit `unitKey` is now owned by `host`, as of
@@ -290,6 +298,15 @@ class StateAwareScheduler : public BatchScheduler
       const std::unique_ptr<Message>& msg);
 
     /**
+     * ModeFlux: executor time queued on `ip` as it last reported -- each
+     * queue's requests times the time one takes there, or the cluster's
+     * average where unmeasured. 0 if it did not report.
+     */
+    static double queuedWorkUsFlux(
+      const std::map<std::string, faabric::WorkerStats>& stats,
+      const std::string& ip);
+
+    /**
      * ModeFlux: executor time one request of `queueKey` takes, averaged over
      * the workers that measured it in their last window; 0 if none did.
      */
@@ -300,21 +317,15 @@ class StateAwareScheduler : public BatchScheduler
     /**
      * ModeFlux: expected wait (us) before one more request of `queueKey` could
      * start on `ip` -- its queue as last reported plus whatever was routed
-     * there since, drained by as many batches as the paridx may run there.
-     * Infinite if `ip` did not report.
+     * there since (`assignedSinceStats`), drained by as many batches as the
+     * paridx may run there. Infinite if `ip` did not report.
      */
-    double remoteWaitUsFlux(
+    static double remoteWaitUsFlux(
       const std::map<std::string, faabric::WorkerStats>& stats,
       const std::string& ip,
       const std::string& queueKey,
-      double slotTimeUs);
-
-    // ModeFlux: whether `ip` reported a queue of any paridx of operator
-    // `userFunc`, i.e. has run it and has warm executors for it.
-    static bool runsOperatorFlux(
-      const std::map<std::string, faabric::WorkerStats>& stats,
-      const std::string& ip,
-      const std::string& userFunc);
+      double slotTimeUs,
+      int assignedSinceStats);
 
     /**
      * The registered DAG node for `userFunc`, or nullptr when no application
@@ -345,11 +356,35 @@ class StateAwareScheduler : public BatchScheduler
                                     std::string& userFunc,
                                     const std::unique_ptr<Message>& msg);
 
+    // ModeFlux: what routing an operator's requests needs, looked up once
+    // per routing pass rather than once per request.
+    struct FluxOpRoute
+    {
+        // nullptr: not in the DAG.
+        std::shared_ptr<Node> node;
+        // Partitioned stateful only: its shard ring.
+        std::shared_ptr<faabric::util::ConsistentHashRing> ring;
+        // Non-partitioned stateful only: its shuffle counter.
+        std::shared_ptr<std::atomic_uint> counter;
+    };
+    using FluxOpRoutes = std::unordered_map<std::string, FluxOpRoute>;
+
+    // scheduleMessageFlux with the routes found so far this pass.
+    std::string scheduleMessageFlux(const HostMap& hostMap,
+                                    std::string& userFunc,
+                                    const std::unique_ptr<Message>& msg,
+                                    FluxOpRoutes& routes);
+
     std::string scheduleMessage(const HostMap& hostMap,
                                 const faabric::Message& msg);
 
     virtual std::string scheduleMessage(const HostMap& hostMap,
                                         const std::unique_ptr<Message>& msg);
+
+    // scheduleMessage within a routing pass; see FluxOpRoutes.
+    std::string scheduleMessage(const HostMap& hostMap,
+                                const std::unique_ptr<Message>& msg,
+                                FluxOpRoutes& routes);
 
     std::vector<std::string> scheduleMessagesBatch(
       const HostMap& hostMap,
@@ -584,11 +619,31 @@ class StateAwareScheduler : public BatchScheduler
     // scheduler lock
     std::shared_mutex scheduleMx;
 
+    // One stats round, and what routing reads off it, worked out once when
+    // the round arrives rather than for every request until the next.
+    struct FluxClusterSnapshot
+    {
+        std::map<std::string, faabric::WorkerStats> stats;
+        // ModeFlux, per queue: clusterSlotTimeUs over `stats`.
+        std::unordered_map<std::string, double> slotTimeUs;
+        // ModeFlux, per worker: the operators (user_func) of every queue it
+        // reported, i.e. those it has warm executors for.
+        std::unordered_map<std::string, std::unordered_set<std::string>>
+          operators;
+
+        double slotTimeOf(const std::string& queueKey) const
+        {
+            auto it = slotTimeUs.find(queueKey);
+            return it == slotTimeUs.end() ? 0 : it->second;
+        }
+    };
+
     std::shared_mutex clusterWorkerStatsMx;
     // Replaced whole by each stats round, never modified in place.
-    std::shared_ptr<const std::map<std::string, faabric::WorkerStats>>
-      clusterWorkerStats =
-        std::make_shared<std::map<std::string, faabric::WorkerStats>>();
+    std::shared_ptr<const FluxClusterSnapshot> clusterSnapshot =
+      std::make_shared<FluxClusterSnapshot>();
+
+    std::shared_ptr<const FluxClusterSnapshot> getClusterSnapshot();
 
     // Workers only; see setFluxLocalLoadProvider.
     std::function<FluxLocalLoad(const std::string& queueKey)> fluxLocalLoad;
@@ -817,6 +872,7 @@ class StateAwareScheduler : public BatchScheduler
     std::shared_mutex counterMx;
     std::map<std::string, std::shared_ptr<std::atomic_uint>> counterTable;
     unsigned int getNextCounter(const std::string& userFunc);
+    std::shared_ptr<std::atomic_uint> counterOf(const std::string& userFunc);
 
     std::unique_ptr<batch_scheduler::Application> application;
     std::map<std::string, ScheduledOperator> scheduledOperatorsMap;
@@ -875,7 +931,14 @@ class StateAwareScheduler : public BatchScheduler
     HashAndParallelismInfo getHashAndParallelismIndexFlux(
       const std::string& userFunction,
       const Node& node,
-      const faabric::Message& msg);
+      const faabric::Message& msg,
+      const FluxOpRoute* route = nullptr);
+
+    // The FluxOpRoute of `userFunc`, from `routes` or looked up and added.
+    // Places the operator's state first if it is stateful and nobody has.
+    const FluxOpRoute& fluxOpRoute(const std::string& userFunc,
+                                   const HostMap& hostMap,
+                                   FluxOpRoutes& routes);
 
     /**
      * ModeFlux: how many paridx `node` has. A partitioned operator has one:

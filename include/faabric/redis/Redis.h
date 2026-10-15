@@ -31,6 +31,7 @@ class RedisInstance
     std::string claimSha;
     std::string transferOwnersSha;
     std::string claimWithEpochSha;
+    std::string claimManyWithEpochSha;
 
     std::string ip;
     std::string hostname;
@@ -90,6 +91,19 @@ if not epoch then
     epoch = '0'
 end
 return { owner, epoch }
+)---";
+
+    // claimWithEpochCmd for several keys in one step. KEYS come in (owner,
+    // epoch) pairs, every owner claimed for ARGV[1]; returns each pair's
+    // owner and epoch, in order, as one flat array.
+    const std::string_view claimManyWithEpochCmd = R"---(
+local out = {}
+for i = 1, #KEYS / 2 do
+    redis.call('SETNX', KEYS[2 * i - 1], ARGV[1])
+    out[2 * i - 1] = redis.call('GET', KEYS[2 * i - 1])
+    out[2 * i] = redis.call('GET', KEYS[2 * i]) or '0'
+end
+return out
 )---";
 
     // Script to hand ownership of several keys from one holder to another,
@@ -239,6 +253,15 @@ class Redis
     std::pair<std::string, int64_t> claimOrGetWithEpoch(
       const std::string& ownerKey,
       const std::string& epochKey,
+      const std::string& proposedValue);
+
+    /**
+     * claimOrGetWithEpoch for several keys, in one round trip: `keys` holds
+     * (ownerKey, epochKey) pairs, every owner claimed for `proposedValue`.
+     * Returns each pair's (owner, epoch), in the order given.
+     */
+    std::vector<std::pair<std::string, int64_t>> claimOrGetManyWithEpoch(
+      const std::vector<std::pair<std::string, std::string>>& keys,
       const std::string& proposedValue);
 
     struct OwnerTransfer

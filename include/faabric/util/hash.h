@@ -111,6 +111,17 @@ class ConsistentHashRing
         return { h, it->second };
     }
 
+    // Same as above for a key that is not in a byte vector.
+    std::pair<size_t, int> getHashAndNode(std::string_view key)
+    {
+        faabric::util::SharedLock lock(ringMutex);
+        std::size_t h = faabric::util::hashBytes(key);
+        auto it = ring.lower_bound(h);
+        if (it == ring.end())
+            it = ring.begin();
+        return { h, it->second };
+    }
+
     std::string nodeWeightsToString()
     {
         faabric::util::SharedLock lock(ringMutex);

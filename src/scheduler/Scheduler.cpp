@@ -38,6 +38,16 @@ constexpr int DEFAULT_SLOT_NUM = 100;
 const std::string WORKER_ENQUEUE_TIME_KEY = "worker_queue_time_key";
 const std::string WORKER_ENQUEUE_SIZE_KEY = "worker_queue_size_key";
 
+namespace {
+// Whether `msg` has waited in a worker queue already and not run yet: the
+// enqueue time is set when it first reaches a worker, and dropped when it is
+// dispatched to run.
+bool queuedOnWorker(const faabric::Message& msg)
+{
+    return msg.metricrecorder().contains(WORKER_ENQUEUE_TIME_KEY);
+}
+}
+
 struct VmCpuData
 {
     long long idleTime;
@@ -367,8 +377,6 @@ void Scheduler::reset()
     }
     fluxMigrationCostUs = 0;
     fluxPreviousDepths.clear();
-    fluxStatePenaltyUs = 0;
-    fluxStateMoveSamples.clear();
     {
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
         fluxUnitRates.clear();
@@ -652,41 +660,6 @@ std::pair<double, double> Scheduler::fluxWorkRates(
     return { arrivalWorkUs, processWorkUs };
 }
 
-std::pair<double, double> Scheduler::fluxStateMoveCostModel()
-{
-    if (fluxStateMoveSamples.empty()) {
-        return { std::max(0.0, fluxMigrationCostUs.load()), 0.0 };
-    }
-
-    // Least squares fit of time = T_0 + bytes x per-byte time.
-    double n = static_cast<double>(fluxStateMoveSamples.size());
-    double sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
-    for (const auto& [bytes, us] : fluxStateMoveSamples) {
-        sumX += bytes;
-        sumY += us;
-        sumXX += bytes * bytes;
-        sumXY += bytes * us;
-    }
-    double meanX = sumX / n;
-    double meanY = sumY / n;
-    double varX = sumXX / n - meanX * meanX;
-    if (varX <= 0) {
-        // All moves carried about as much: no way to tell bytes from
-        // overhead, so it is all overhead.
-        return { meanY, 0.0 };
-    }
-    double perByteUs = (sumXY / n - meanX * meanY) / varX;
-    double fixedUs = meanY - perByteUs * meanX;
-    if (perByteUs < 0) {
-        return { meanY, 0.0 };
-    }
-    if (fixedUs < 0) {
-        // Through the origin instead.
-        return { 0.0, sumXX > 0 ? sumXY / sumXX : 0.0 };
-    }
-    return { fixedUs, perByteUs };
-}
-
 std::map<std::string, Scheduler::FluxParidxLoad>
 Scheduler::snapshotFluxParidxLoads()
 {
@@ -896,6 +869,15 @@ void Scheduler::enqueueMessageBatch(
         std::string userFuncPar = msg.user() + "_" + msg.function() + "_" +
                                   std::to_string(msg.parallelismid());
 
+        // Queue time runs from the first worker a request reaches to when it
+        // starts: one migrated, forwarded or rerouted on from another worker
+        // keeps that first arrival, so its wait there and the hops count as
+        // queueing. Dispatch time is the router's hop to that first worker.
+        if (!queuedOnWorker(msg)) {
+            (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_TIME_KEY] = current;
+            msg.set_dispatchreceivetime(current);
+        }
+
         if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
             std::string unitKey =
               faabric::batch_scheduler::StateAwareScheduler::fluxUnitKey(msg);
@@ -918,9 +900,7 @@ void Scheduler::enqueueMessageBatch(
         }
 
         instancesCounter[userFuncPar]++;
-        (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_TIME_KEY] = current;
         msg.set_starttimestamp(currentMillis);
-        msg.set_dispatchreceivetime(current);
         msg.set_executedhost(endPoint);
 
         faabric::util::BatchQueueBase* targetQueue = nullptr;
@@ -944,8 +924,11 @@ void Scheduler::enqueueMessageBatch(
             targetQueue = iterator->second.get();
         }
 
-        int waitMsgs = targetQueue->getMessagesCount();
-        (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
+        // The queue it first waited in, like its queue time.
+        if (!msg.metricrecorder().contains(WORKER_ENQUEUE_SIZE_KEY)) {
+            int waitMsgs = targetQueue->getMessagesCount();
+            (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_SIZE_KEY] = waitMsgs;
+        }
 
         // Thread Safe Queue Push
         targetQueue->addMessage(std::move(msgPtr));
@@ -1448,7 +1431,11 @@ void Scheduler::enqueueSchedMsgs(
     for (int i = 0; i < msgs.size(); i++) {
         auto msg = std::move(msgs[i]);
         auto host = hosts[i];
-        msg->set_plannerpoptime(currentTime);
+        // A request rerouted out of a worker queue keeps the times of its
+        // first route; what came after is its queue time.
+        if (!queuedOnWorker(*msg)) {
+            msg->set_plannerpoptime(currentTime);
+        }
         scheduledMsgsMap[host].push_back(std::move(msg));
     }
 }
@@ -1537,7 +1524,9 @@ void Scheduler::dispatchChainedMsgs()
             auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
             auto currentTime = faabric::util::getGlobalClock().epochMicros();
             for (auto& msg : chainedCallMsgs) {
-                msg->set_plannerdispatchtime(currentTime);
+                if (!queuedOnWorker(*msg)) {
+                    msg->set_plannerdispatchtime(currentTime);
+                }
                 auto* message = req->add_messages();
                 *message = std::move(*msg);
             }
@@ -1601,7 +1590,9 @@ void Scheduler::dispatchChainedMsgs()
                 continue;
             }
             for (auto& msg : msgsList) {
-                msg->set_plannerdispatchtime(currentTime);
+                if (!queuedOnWorker(*msg)) {
+                    msg->set_plannerdispatchtime(currentTime);
+                }
             }
             msgsCallMap[hostIp] = std::move(msgsList);
         }
@@ -2460,7 +2451,17 @@ bool Scheduler::divertMessageFlux(
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(fluxMigrationMx);
+    {
+        faabric::util::SharedLock lock(fluxMigrationMx);
+        if (!fluxMigratingUnits.contains(unitKey) &&
+            !fluxMovedUnits.contains(unitKey)) {
+            return false;
+        }
+    }
+
+    // Leaving or gone. Parking writes, so look again under the exclusive
+    // lock: the migration may have finished in between.
+    faabric::util::FullLock lock(fluxMigrationMx);
     if (fluxMigratingUnits.contains(unitKey)) {
         fluxPendingMsgs[unitKey].push_back(std::move(msg));
         return true;
@@ -2494,7 +2495,7 @@ bool Scheduler::lockUnitForDispatchFlux(
         return false;
     }
     if (fluxRouteRecords.load(std::memory_order_acquire) > 0) {
-        std::lock_guard<std::mutex> lock(fluxMigrationMx);
+        faabric::util::SharedLock lock(fluxMigrationMx);
         if (fluxMigratingUnits.contains(unitKey) ||
             fluxMovedUnits.contains(unitKey)) {
             return false;
@@ -2510,7 +2511,7 @@ void Scheduler::returnUndispatchableFlux(std::unique_ptr<faabric::Message> msg,
 {
     std::string forwardTo;
     {
-        std::lock_guard<std::mutex> lock(fluxMigrationMx);
+        faabric::util::FullLock lock(fluxMigrationMx);
         if (fluxMigratingUnits.contains(unitKey)) {
             // The migration forwards it with the unit, or puts it back.
             fluxPendingMsgs[unitKey].push_back(std::move(msg));
@@ -2547,7 +2548,7 @@ void Scheduler::returnUndispatchableFlux(std::unique_ptr<faabric::Message> msg,
 
 std::vector<faabric::ShardMove> Scheduler::getFluxShardMoves()
 {
-    std::lock_guard<std::mutex> lock(fluxMigrationMx);
+    faabric::util::SharedLock lock(fluxMigrationMx);
     std::vector<faabric::ShardMove> moves;
     moves.reserve(fluxMovedUnits.size());
     for (const auto& [unitKey, move] : fluxMovedUnits) {
@@ -2558,7 +2559,7 @@ std::vector<faabric::ShardMove> Scheduler::getFluxShardMoves()
 
 void Scheduler::clearFluxMigrationState()
 {
-    std::lock_guard<std::mutex> lock(fluxMigrationMx);
+    faabric::util::FullLock lock(fluxMigrationMx);
     fluxMigratingUnits.clear();
     fluxPendingMsgs.clear();
     fluxMovedUnits.clear();
@@ -2611,12 +2612,11 @@ void Scheduler::rebalanceFlux()
     int slots = std::max(1, fluxWorkerSlots);
     bool workerFull = runningExecutors.load(std::memory_order_relaxed) >= slots;
     auto loads = snapshotFluxParidxLoads();
-    // lambda_w and mu_w: work arriving here and work processed here.
-    auto [arrivalWorkUs, processWorkUs] = fluxWorkRates(loads);
+    // Work arriving here per second, over every paridx.
+    double arrivalWorkUs = fluxWorkRates(loads).first;
 
     // The planner's advice: where to send, and how much. Without it nothing
-    // moves -- but the overload rent below still accrues, so state can move
-    // as soon as there is somewhere to send it.
+    // moves.
     auto quota = decentralScheduler.getFluxOffloadQuota();
     std::erase_if(quota, [this](const auto& entry) {
         return entry.first == thisHost || entry.second <= 0;
@@ -2669,14 +2669,19 @@ void Scheduler::rebalanceFlux()
         return best;
     };
 
-    // ---- Stateless requests: shed the backlog now ----
+    // ---- What every queue will not get through before the next round ----
     //
-    // A stateless paridx is behind when more is waiting than it will finish
-    // before the next round: E = Q - mu H. What it finishes is judged by what
-    // it did finish in the last window -- measured, so it reflects the
-    // dispatch cadence and contention -- if it had work waiting all along;
-    // a paridx that was idle a round ago finished only what little it got,
-    // so for a fresh burst it is assumed to get all of its run slots.
+    //   D = Q + lambda_pinned H - mu H   (requests)
+    //
+    // mu is what the paridx did get through in the last window -- measured,
+    // so it reflects the dispatch cadence and contention -- if it had work
+    // waiting all along; a paridx that was idle a round ago finished only
+    // what little it got, so for a fresh burst it is assumed to get all of
+    // its run slots. lambda_pinned is what arrives meanwhile that can only
+    // run here. A stateless request that has not arrived yet can still be
+    // routed elsewhere when it does, so for a stateless paridx it is 0 and
+    // only what is queued counts. A unit's requests can only go to its owner,
+    // so for state what arrives before the next round counts too.
     struct StatelessBacklog
     {
         std::string userFuncPar;
@@ -2684,21 +2689,27 @@ void Scheduler::rebalanceFlux()
         double slotTimeUs;
         OrderKey first;
     };
+    struct StateDeficit
+    {
+        double deficitUs;
+        double slotTimeUs;
+    };
     std::vector<StatelessBacklog> statelessBacklogs;
+    std::map<std::string, StateDeficit> stateDeficits;
+    // Executor time queued here, over every measured paridx.
+    double queuedWorkUs = 0;
     for (const auto& [userFuncPar, queue] : queues) {
         int depth = queue->getMessagesCount();
         if (depth == 0) {
             continue;
         }
         fluxPreviousDepths[userFuncPar] = depth;
-        if (!isStateless(userFuncPar)) {
-            continue;
-        }
 
         double slotTimeUs = slotTimeOf(userFuncPar);
         if (slotTimeUs <= 0) {
             continue;
         }
+        queuedWorkUs += depth * slotTimeUs;
         FluxParidxLoad load;
         auto loadIt = loads.find(fluxFuncParStrOf(userFuncPar));
         if (loadIt != loads.end()) {
@@ -2709,21 +2720,33 @@ void Scheduler::rebalanceFlux()
         double ratePerSec = waitingAllAlong && load.ratePerSec > 0
                               ? load.ratePerSec
                               : runSlots * 1e6 / slotTimeUs;
-        double excess = depth - ratePerSec * horizonSec;
-        auto first = queue->headKey();
-        if (excess >= 1 && first) {
-            statelessBacklogs.push_back(
-              { userFuncPar, excess, slotTimeUs, *first });
+
+        if (isStateless(userFuncPar)) {
+            double excess = depth - ratePerSec * horizonSec;
+            auto first = queue->headKey();
+            if (excess >= 1 && first) {
+                statelessBacklogs.push_back(
+                  { userFuncPar, excess, slotTimeUs, *first });
+            }
+        } else {
+            double deficit =
+              depth + (load.arrivalRatePerSec - ratePerSec) * horizonSec;
+            if (deficit > 0) {
+                stateDeficits[userFuncPar] = { deficit * slotTimeUs,
+                                               slotTimeUs };
+            }
         }
     }
-    std::sort(statelessBacklogs.begin(),
-              statelessBacklogs.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
 
+    // ---- Stateless requests first: they are cheap to move ----
+    //
     // Of the excess, only what the advised workers can process in the next
     // round goes now -- their quota is exactly that -- oldest input first,
     // each request to the advised worker with the most quota left. The rest
     // is judged again next round, against fresh numbers.
+    std::sort(statelessBacklogs.begin(),
+              statelessBacklogs.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
     double statelessWorkUs = 0;
     int budgetRequests = fluxMigrateRequests;
     for (const auto& backlog : statelessBacklogs) {
@@ -2749,24 +2772,29 @@ void Scheduler::rebalanceFlux()
         }
     }
 
-    // ---- Units of state: move the load from now on ----
+    // ---- Then units of state: their backlog and their inflow move ----
     //
-    // Only the overload moving stateless requests did not absorb counts.
-    // It accrues as rent while it lasts, and is forgotten as soon as it
-    // stops.
-    double rentUs = std::max(
-      0.0, (arrivalWorkUs - processWorkUs) * horizonSec - statelessWorkUs);
-    if (rentUs <= 0) {
-        fluxStatePenaltyUs = 0;
-    } else {
-        fluxStatePenaltyUs += rentUs;
+    // Every unit of a paridx with a deficit is a candidate. Moving one takes
+    // away what is queued for it and what arrives for it from now on: over
+    // the next round, w = B + l H of executor time, B its backlog, l its
+    // arrivals. Fewest state bytes per unit of w go first -- small state,
+    // much work -- all units of a hand-over being frozen for as long as
+    // their bytes take to ship. Each goes to the advised worker with the
+    // most quota left that can take its w, until the deficit is covered,
+    // and only if the move leaves neither side as loaded as this worker is
+    // now: load being what a worker has to get through before the next
+    // round over what it can, (Q + lambda H) / (slots H).
+    double needUs = 0;
+    for (const auto& [userFuncPar, deficit] : stateDeficits) {
+        needUs += deficit.deficitUs;
     }
 
-    if (rentUs > 0 && !quota.empty()) {
-        // The load to take away, per second.
-        double needUs =
-          (arrivalWorkUs - processWorkUs) - statelessWorkUs / horizonSec;
-
+    if (needUs > 0 && quota.empty()) {
+        SPDLOG_DEBUG("Flux {} keeps its state: a deficit of {:.0f}us but no "
+                     "advice where to send it",
+                     thisHost,
+                     needUs);
+    } else if (needUs > 0) {
         std::map<std::string, FluxUnitRate> unitRates;
         {
             std::lock_guard<std::mutex> lock(fluxParidxRunMx);
@@ -2786,16 +2814,14 @@ void Scheduler::rebalanceFlux()
             }
         }
 
-        // Per candidate: the load it carries (us/s), its state bytes, and the
-        // executor time of the requests queued for it, which move with it. A
-        // shard's bytes are taken as an even share of its paridx's: counting
-        // them exactly would mean hashing every key.
+        // A shard's bytes are taken as an even share of its paridx's:
+        // counting them exactly would mean hashing every key.
         struct UnitCandidate
         {
             std::string unitKey;
-            double loadUs;
+            double workUs;
             double bytes;
-            double backlogUs;
+            int backlog;
         };
         std::vector<UnitCandidate> candidates;
         std::map<std::string, double> paridxBytes;
@@ -2803,37 +2829,21 @@ void Scheduler::rebalanceFlux()
                  std::map<int, faabric::util::BatchQueue::GroupSummary>>
           shardBacklogs;
         auto& state = faabric::state::getGlobalState();
-        for (const auto& [unitKey, rate] : unitRates) {
-            if (rate.ratePerSec <= 0 || !held.contains(unitKey)) {
+        for (const auto& unitKey : held) {
+            auto [userFuncPar, shardId] =
+              StateAwareScheduler::splitFluxUnitKey(unitKey);
+            auto deficitIt = stateDeficits.find(userFuncPar);
+            if (deficitIt == stateDeficits.end()) {
                 continue;
             }
             {
-                std::lock_guard<std::mutex> lock(fluxMigrationMx);
+                faabric::util::SharedLock lock(fluxMigrationMx);
                 if (fluxMigratingUnits.contains(unitKey) ||
                     fluxMovedUnits.contains(unitKey)) {
                     continue;
                 }
             }
-            auto [userFuncPar, shardId] =
-              StateAwareScheduler::splitFluxUnitKey(unitKey);
-            double slotTimeUs = slotTimeOf(userFuncPar);
-            if (slotTimeUs <= 0) {
-                continue;
-            }
-
-            auto [user, func, parStr] =
-              faabric::util::splitUserFuncPar(userFuncPar);
-            auto bytesIt = paridxBytes.find(userFuncPar);
-            if (bytesIt == paridxBytes.end()) {
-                bytesIt = paridxBytes
-                            .emplace(userFuncPar,
-                                     static_cast<double>(state.approxFSBytes(
-                                       user, func, std::stoi(parStr))))
-                            .first;
-            }
-            double bytes = shardId >= 0 ? bytesIt->second /
-                                            std::max(1, heldShards[userFuncPar])
-                                        : bytesIt->second;
+            double slotTimeUs = deficitIt->second.slotTimeUs;
 
             int backlog = 0;
             {
@@ -2861,119 +2871,118 @@ void Scheduler::rebalanceFlux()
                     }
                 }
             }
+            auto rateIt = unitRates.find(unitKey);
+            double arrivalsPerSec =
+              rateIt == unitRates.end() ? 0 : rateIt->second.ratePerSec;
+            double workUs =
+              (backlog + arrivalsPerSec * horizonSec) * slotTimeUs;
+            if (workUs <= 0) {
+                // Nothing queued for it and nothing arriving: moving it
+                // would take nothing off this worker.
+                continue;
+            }
 
-            candidates.push_back({ unitKey,
-                                   rate.ratePerSec * slotTimeUs,
-                                   bytes,
-                                   backlog * slotTimeUs });
+            auto [user, func, parStr] =
+              faabric::util::splitUserFuncPar(userFuncPar);
+            auto bytesIt = paridxBytes.find(userFuncPar);
+            if (bytesIt == paridxBytes.end()) {
+                bytesIt = paridxBytes
+                            .emplace(userFuncPar,
+                                     static_cast<double>(state.approxFSBytes(
+                                       user, func, std::stoi(parStr))))
+                            .first;
+            }
+            double bytes = shardId >= 0 ? bytesIt->second /
+                                            std::max(1, heldShards[userFuncPar])
+                                        : bytesIt->second;
+
+            candidates.push_back({ unitKey, workUs, bytes, backlog });
         }
-
-        // Fewest state bytes per unit of load first -- small state, many
-        // requests. All units of a hand-over are frozen together, for as long
-        // as their bytes take to ship, so carrying the overload in the fewest
-        // bytes is what makes the move cheapest.
         std::sort(candidates.begin(),
                   candidates.end(),
                   [](const auto& a, const auto& b) {
-                      return a.bytes * b.loadUs < b.bytes * a.loadUs;
+                      return a.bytes * b.workUs < b.bytes * a.workUs;
                   });
-        std::vector<std::string> picked;
-        double movedLoadUs = 0;
-        double movedBytes = 0;
-        double movedBacklogUs = 0;
+
+        // Load here now, and on `ip` once it has taken `extraUs` more on top
+        // of what it reported and what this round already sends it.
+        double loadNow =
+          (queuedWorkUs + arrivalWorkUs * horizonSec) / (slots * horizonUs);
+        auto targetLoad = [&](const std::string& ip, double extraUs) {
+            auto statsIt = stats.find(ip);
+            if (statsIt == stats.end()) {
+                return std::numeric_limits<double>::infinity();
+            }
+            const auto& targetStats = statsIt->second;
+            int targetSlots =
+              targetStats.workerslots() > 0 ? targetStats.workerslots() : slots;
+            double sentUs =
+              shipments.contains(ip) ? shipments.at(ip).workUs : 0;
+            double demandUs = StateAwareScheduler::queuedWorkUsFlux(stats, ip) +
+                              targetStats.arrivalworkus() * horizonSec +
+                              sentUs + extraUs;
+            return demandUs / (targetSlots * horizonUs);
+        };
+
+        double movedUs = 0;
+        int unitsPicked = 0;
+        int noRoom = 0;
+        int noRelief = 0;
         for (const auto& candidate : candidates) {
-            if (movedLoadUs >= needUs) {
+            if (movedUs >= needUs) {
                 break;
             }
-            picked.push_back(candidate.unitKey);
-            movedLoadUs += candidate.loadUs;
-            movedBytes += candidate.bytes;
-            movedBacklogUs += candidate.backlogUs;
+            // A unit goes whole, with every request queued for it.
+            if (unitsPicked > 0 && candidate.backlog > budgetRequests) {
+                continue;
+            }
+            // Where its work fits. The round's first unit goes even if it
+            // fits nowhere, to the worker with the most room left, or a unit
+            // bigger than any advice could never move.
+            std::string target = mostQuota(candidate.workUs);
+            if (target.empty() && unitsPicked == 0) {
+                target = mostQuota(0);
+            }
+            if (target.empty()) {
+                noRoom++;
+                continue;
+            }
+            double loadHere = (queuedWorkUs + arrivalWorkUs * horizonSec -
+                               statelessWorkUs - movedUs - candidate.workUs) /
+                              (slots * horizonUs);
+            double loadThere = targetLoad(target, candidate.workUs);
+            if (std::max(loadHere, loadThere) >= loadNow) {
+                noRelief++;
+                continue;
+            }
+
+            auto& shipment = shipments[target];
+            shipment.units.push_back(candidate.unitKey);
+            shipment.workUs += candidate.workUs;
+            quota[target] = std::max(0.0, quota[target] - candidate.workUs);
+            movedUs += candidate.workUs;
+            budgetRequests -= candidate.backlog;
+            unitsPicked++;
         }
 
-        // What the move would cost: the load it carries, held up for as long
-        // as the units are frozen.
-        auto [fixedUs, perByteUs] = fluxStateMoveCostModel();
-        double freezeUs = fixedUs + movedBytes * perByteUs;
-        double costUs = movedLoadUs * freezeUs / 1e6;
-
-        if (picked.empty()) {
-            // Nothing with measured load to move.
-        } else if (fluxStatePenaltyUs < costUs) {
-            SPDLOG_DEBUG("Flux {} keeps its state: overload so far {:.0f}us of "
-                         "the {:.0f}us moving {} units would cost",
-                         thisHost,
-                         fluxStatePenaltyUs,
-                         costUs,
-                         picked.size());
+        if (unitsPicked > 0) {
+            SPDLOG_INFO("Flux {} moves {} units of state ({:.0f}us of work) "
+                        "for a deficit of {:.0f}us, load here {:.2f}",
+                        thisHost,
+                        unitsPicked,
+                        movedUs,
+                        needUs,
+                        loadNow);
         } else {
-            // Utilisation here, before and after: arrivals over what it
-            // processes, which is its capacity while it is behind.
-            double capacityUs = processWorkUs > 0 ? processWorkUs : slots * 1e6;
-            double utilNow = arrivalWorkUs / capacityUs;
-            double utilAfter = (arrivalWorkUs - movedLoadUs) / capacityUs;
-
-            // The advised worker left least utilised by taking the load, of
-            // those with quota for the requests that go with it. An advised
-            // worker has room, so its capacity is its executor slots.
-            std::string target;
-            double targetUtil = std::numeric_limits<double>::infinity();
-            for (const auto& [ip, quotaUs] : quota) {
-                if (quotaUs < movedBacklogUs) {
-                    continue;
-                }
-                auto statsIt = stats.find(ip);
-                if (statsIt == stats.end()) {
-                    continue;
-                }
-                const auto& targetStats = statsIt->second;
-                int targetSlots = targetStats.workerslots() > 0
-                                    ? targetStats.workerslots()
-                                    : slots;
-                double alreadySentUs = shipments.contains(ip)
-                                         ? shipments[ip].workUs / horizonSec
-                                         : 0;
-                double util =
-                  (targetStats.arrivalworkus() + alreadySentUs + movedLoadUs) /
-                  (targetSlots * 1e6);
-                if (util < targetUtil) {
-                    target = ip;
-                    targetUtil = util;
-                }
-            }
-
-            if (target.empty()) {
-                SPDLOG_DEBUG("Flux {} keeps its state: no advised worker has "
-                             "quota for the {:.0f}us queued with it",
-                             thisHost,
-                             movedBacklogUs);
-            } else if (std::max(utilAfter, targetUtil) >= utilNow) {
-                SPDLOG_DEBUG("Flux {} keeps its state: moving it to {} would "
-                             "not lower the peak utilisation ({:.2f} -> "
-                             "{:.2f}/{:.2f})",
-                             thisHost,
-                             target,
-                             utilNow,
-                             utilAfter,
-                             targetUtil);
-            } else {
-                SPDLOG_INFO("Flux {} moves {} units to {}: overload {:.0f}us "
-                            ">= cost {:.0f}us, utilisation {:.2f} -> {:.2f} "
-                            "here, {:.2f} there",
-                            thisHost,
-                            picked.size(),
-                            target,
-                            fluxStatePenaltyUs,
-                            costUs,
-                            utilNow,
-                            utilAfter,
-                            targetUtil);
-                auto& shipment = shipments[target];
-                shipment.units.insert(
-                  shipment.units.end(), picked.begin(), picked.end());
-                shipment.workUs += movedBacklogUs;
-                quota[target] -= movedBacklogUs;
-            }
+            SPDLOG_DEBUG("Flux {} keeps its state: a deficit of {:.0f}us over "
+                         "{} candidates, {} fit no advised worker, {} would "
+                         "not lower the peak load ({:.2f} here)",
+                         thisHost,
+                         needUs,
+                         candidates.size(),
+                         noRoom,
+                         noRelief,
+                         loadNow);
         }
     }
 
@@ -2997,17 +3006,6 @@ void Scheduler::rebalanceFlux()
         double previousCostUs = fluxMigrationCostUs.load();
         fluxMigrationCostUs =
           previousCostUs <= 0 ? tookUs : 0.7 * previousCostUs + 0.3 * tookUs;
-
-        if (handover.units > 0) {
-            // State moved: a sample for the cost model, and the rent starts
-            // over.
-            fluxStateMoveSamples.emplace_back(
-              static_cast<double>(handover.stateBytes), tookUs);
-            while (fluxStateMoveSamples.size() > 32) {
-                fluxStateMoveSamples.pop_front();
-            }
-            fluxStatePenaltyUs = 0;
-        }
 
         unitsMoved += handover.units;
         statelessMoved += handover.statelessRequests;
@@ -3087,7 +3085,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
     // 2. Freeze them all first: from here their requests are parked, not
     // queued, and no new batch touching them is dispatched.
     {
-        std::lock_guard<std::mutex> lock(fluxMigrationMx);
+        faabric::util::FullLock lock(fluxMigrationMx);
         std::erase_if(moves, [this](const FluxUnitMove& m) {
             if (fluxMigratingUnits.contains(m.unitKey) ||
                 fluxMovedUnits.contains(m.unitKey)) {
@@ -3187,9 +3185,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
               any.user,
               any.func,
               any.parIdx,
-              [this, &userFunc](const std::string& key) {
-                  return decentralScheduler.fluxShardOfKey(userFunc, key);
-              },
+              decentralScheduler.fluxShardOfKeyFn(userFunc),
               shards);
         }
         for (const auto& move : moves) {
@@ -3279,7 +3275,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
         // back in the queue it came from.
         std::list<std::unique_ptr<faabric::Message>> parked;
         {
-            std::lock_guard<std::mutex> lock(fluxMigrationMx);
+            faabric::util::FullLock lock(fluxMigrationMx);
             for (const auto& move : moves) {
                 fluxMigratingUnits.erase(move.unitKey);
                 fluxRouteRecords.fetch_sub(1, std::memory_order_release);
@@ -3352,7 +3348,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
     // was parked while we were busy. From here their requests are forwarded.
     std::list<std::unique_ptr<faabric::Message>> parked;
     {
-        std::lock_guard<std::mutex> lock(fluxMigrationMx);
+        faabric::util::FullLock lock(fluxMigrationMx);
         for (const auto& move : moves) {
             fluxMigratingUnits.erase(move.unitKey);
             faabric::ShardMove record;
@@ -3380,14 +3376,11 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
         const FluxUnitMove& any = *paridxOf.at(userFuncPar);
         std::string userFunc = any.user + "_" + any.func;
         if (carryState && state.hasFS(any.user, any.func, any.parIdx)) {
-            state.eraseShards(
-              any.user,
-              any.func,
-              any.parIdx,
-              [this, &userFunc](const std::string& key) {
-                  return decentralScheduler.fluxShardOfKey(userFunc, key);
-              },
-              shards);
+            state.eraseShards(any.user,
+                              any.func,
+                              any.parIdx,
+                              decentralScheduler.fluxShardOfKeyFn(userFunc),
+                              shards);
         }
     }
     {
@@ -3481,7 +3474,7 @@ void Scheduler::receiveShardFlux(faabric::FluxShardMigrationRequest& req)
             fluxKnownUnits.insert(unitKey);
         }
         {
-            std::lock_guard<std::mutex> lock(fluxMigrationMx);
+            faabric::util::FullLock lock(fluxMigrationMx);
             // The unit may be coming back to a worker that once handed it
             // off.
             if (fluxMovedUnits.erase(unitKey) > 0) {

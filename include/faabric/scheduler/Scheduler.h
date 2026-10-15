@@ -542,8 +542,9 @@ class Scheduler
     std::atomic<int64_t> lastFluxExecutorLogMs{ 0 };
 
     // ---- ModeFlux rebalancing ----
-    // Guards the four maps below. Never held across a network call.
-    std::mutex fluxMigrationMx;
+    // Guards the four maps below. Never held across a network call. Shared
+    // for the enqueue and dispatch paths, which only look.
+    std::shared_mutex fluxMigrationMx;
     // Units being handed off right now. Requests for them are parked in
     // fluxPendingMsgs rather than queued, and nothing dispatches them.
     std::set<std::string> fluxMigratingUnits;
@@ -586,44 +587,33 @@ class Scheduler
     void fluxRebalanceLoop();
 
     /**
-     * ModeFlux: one rebalancing round. Two kinds of move, with different
-     * criteria, because they cost different things and do different things.
-     * Both go only to the workers the planner advised (FluxOffloadPlan), and
-     * each target gets its share of both in a single hand-over.
+     * ModeFlux: one rebalancing round. Both kinds of move go only to the
+     * workers the planner advised (FluxOffloadPlan), and each target gets its
+     * share of both in a single hand-over.
      *
-     * Stateless requests (cheap; sheds the backlog now). A stateless paridx
-     * is behind when more is waiting than it will finish before the next
-     * round (E = Q - mu H, mu its measured rate). Of that excess, only what
-     * the advised workers can process in the next round goes now, oldest
-     * first -- the rest is judged again next round. Their chained calls go
-     * with them and run on the other side as local calls.
+     * Every queue is judged by what it will not get through before the next
+     * round: D = Q + lambda_pinned H - mu H, Q what is queued, mu its rate,
+     * lambda_pinned what arrives meanwhile that can only run here. A
+     * stateless request not yet arrived can still be routed elsewhere when it
+     * does, so for a stateless paridx lambda_pinned is 0 and only the backlog
+     * counts. A unit's requests can only go to its owner, so for state the
+     * arrivals count too.
      *
-     * Units of state (expensive; moves the unit's load from now on). Only the
-     * overload that moving stateless requests did not absorb counts:
-     * r = max(0, (lambda_w - mu_w) H - O), lambda_w and mu_w the work
-     * arriving and processed here per second, O the stateless work moved this
-     * round. It accumulates as "rent" P while it lasts, and is forgotten as
-     * soon as it stops. Units are picked by fewest state bytes per unit of
-     * load they carry -- small state, many requests -- until they carry the
-     * overload; moving them would cost C = their load x the time they are
-     * frozen (T_0 + bytes x per-byte time, both measured). They move only once
-     * P >= C (ski rental), and only if afterwards neither this worker nor the
-     * target is as utilised as this worker was. A move resets P.
+     * Stateless requests first, as they are cheap to move. Of a stateless
+     * paridx's excess, only what the advised workers can process in the next
+     * round goes now, oldest first -- the rest is judged again next round.
+     * Their chained calls go with them and run on the other side as local
+     * calls.
+     *
+     * Then units of state, from the paridx with a deficit, until the deficit
+     * is covered. A unit takes with it its backlog and its arrivals from now
+     * on, w = B + l H over the next round. Fewest state bytes per unit of w
+     * go first -- small state, much work -- each to the advised worker with
+     * the most quota left that can take its w, and only if afterwards
+     * neither side is as loaded, (Q + lambda H) / (slots H), as this worker
+     * is now.
      */
     void rebalanceFlux();
-
-    // ModeFlux: the overload rent of state migration (see rebalanceFlux), in
-    // executor time (us). Only touched by the rebalancing thread.
-    double fluxStatePenaltyUs = 0;
-
-    // ModeFlux: (state bytes, hand-over time in us) of recent hand-overs that
-    // moved state, fitted to T = T_0 + bytes x per-byte time. Only touched by
-    // the rebalancing thread.
-    std::deque<std::pair<double, double>> fluxStateMoveSamples;
-
-    // {T_0 in us, us per byte}. Before any state has moved, the measured cost
-    // of hand-overs in general and nothing per byte.
-    std::pair<double, double> fluxStateMoveCostModel();
 
     /**
      * ModeFlux: hand `units` (unit keys, each with the requests waiting for
