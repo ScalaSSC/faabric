@@ -158,6 +158,12 @@ class State
                const std::string& func,
                int32_t parallelismId);
 
+    // Roughly how many bytes the local copy of a paridx's state holds; 0 if
+    // there is none.
+    size_t approxFSBytes(const std::string& user,
+                         const std::string& func,
+                         int32_t parallelismId);
+
     // Like createFS, but keeps an existing copy instead of replacing it. For
     // a paridx whose state may already have arrived by migration.
     std::shared_ptr<FunctionState> getOrCreateFS(const std::string& user,

@@ -364,6 +364,19 @@ std::vector<uint8_t> FunctionState::snapshotForMigration()
     return faabric::util::serializeParStateMap(allKeys);
 }
 
+size_t FunctionState::approxBytes()
+{
+    faabric::util::FullLock lock(funcStateMutex);
+    if (!partition) {
+        return stateSize;
+    }
+    size_t bytes = 0;
+    for (const auto& [key, state] : indivStateMap) {
+        bytes += key.size() + state.getState().size();
+    }
+    return bytes;
+}
+
 std::map<int, std::vector<uint8_t>> FunctionState::snapshotShards(
   const std::function<int(const std::string&)>& shardOf,
   const std::set<int>& shards)

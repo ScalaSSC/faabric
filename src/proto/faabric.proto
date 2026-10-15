@@ -460,6 +460,11 @@ message WorkerStats{
     int32 workerSlots = 12;
     int32 paridxCap = 13;
     FluxMigrationStats fluxMigration = 14;
+    // ModeFlux: work arriving at and processed by this worker over the last
+    // rebalancing window, in executor time (us) per second -- requests times
+    // the executor time one takes, summed over its queues.
+    double arrivalWorkUs = 15;
+    double processWorkUs = 16;
 }
 
 // ModeFlux: what one worker's migrations and forwarding have cost. Counters

@@ -494,6 +494,24 @@ bool State::hasFS(const std::string& user,
     return it != fsMap.end() && it->second != nullptr;
 }
 
+size_t State::approxFSBytes(const std::string& user,
+                            const std::string& func,
+                            int32_t parallelismId)
+{
+    std::string lookupKey =
+      faabric::util::keyForFunction(user, func, parallelismId);
+    std::shared_ptr<FunctionState> fs;
+    {
+        SharedLock sharedLock(fsmapMutex);
+        auto it = fsMap.find(lookupKey);
+        if (it == fsMap.end() || it->second == nullptr) {
+            return 0;
+        }
+        fs = it->second;
+    }
+    return fs->approxBytes();
+}
+
 std::shared_ptr<FunctionState> State::getOrCreateFS(const std::string& user,
                                                     const std::string& func,
                                                     int32_t parallelismId,

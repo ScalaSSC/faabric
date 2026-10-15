@@ -14,6 +14,7 @@
 #include <faabric/util/queue.h>
 #include <faabric/util/snapshot.h>
 
+#include <deque>
 #include <set>
 #include <shared_mutex>
 
@@ -345,12 +346,16 @@ class Scheduler
         int64_t lastChangeUs = 0;
         double runningIntegralUs = 0;
         int64_t finished = 0;
+        // Requests queued here in the current window.
+        int64_t arrived = 0;
         // The last complete window: requests finished per second, and the
         // executor time one request took (average running batches over that
         // rate). The latter keeps its last measured value through idle
         // windows.
         double ratePerSec = 0;
         double slotTimeUs = 0;
+        // ...and requests queued per second.
+        double arrivalRatePerSec = 0;
     };
     // Keyed by user/func/parIdx.
     std::mutex fluxParidxRunMx;
@@ -359,6 +364,28 @@ class Scheduler
     // Accounts the time since `running` last changed, and opens the first
     // window of a paridx seen for the first time.
     static void advanceFluxLoad(FluxParidxLoad& load, int64_t nowUs);
+
+    // ModeFlux: requests queued per unit of state (see fluxUnitKey), over the
+    // same windows as fluxParidxLoad and under the same lock. How much load a
+    // unit would take with it if it moved.
+    struct FluxUnitRate
+    {
+        int64_t arrived = 0;
+        double ratePerSec = 0;
+    };
+    std::map<std::string, FluxUnitRate> fluxUnitRates;
+    int64_t fluxUnitWindowStartUs = 0;
+
+    // Counts requests just queued here: per paridx (user/func/par), and per
+    // unit of state for those addressing one. Applied in one go per batch.
+    void countFluxArrivals(const std::map<std::string, int>& perParidx,
+                           const std::map<std::string, int>& perUnit);
+
+    // Work arriving here and work processed here over the last window, in
+    // executor time (us) per second: requests per second times the executor
+    // time one takes, summed over the paridx.
+    static std::pair<double, double> fluxWorkRates(
+      const std::map<std::string, FluxParidxLoad>& loads);
 
     // Takes one of the paridx's run slots for a batch about to be dispatched,
     // or returns false if all are in use. Handed back by
@@ -526,9 +553,6 @@ class Scheduler
     // was routed on a stale owner and is forwarded. Dropped if the unit ever
     // comes back.
     std::map<std::string, faabric::ShardMove> fluxMovedUnits;
-    // Earliest time (epoch ms) a unit may move again, so it does not bounce
-    // between workers on consecutive rounds of stale stats.
-    std::map<std::string, int64_t> fluxUnitCooldownUntilMs;
     // Size of fluxMigratingUnits + fluxMovedUnits, read lock-free by the
     // enqueue and dispatch paths to skip the mutex until the first migration.
     std::atomic<int> fluxRouteRecords{ 0 };
@@ -549,8 +573,6 @@ class Scheduler
     // a round plans for: what a paridx will not get through here before the
     // next round is what is worth moving.
     int fluxRebalancePeriod = 1000;
-    // ms a unit stays put after it moved.
-    int fluxMigrateCooldown = 5000;
     // Most requests one worker hands off per round, over all targets,
     // stateless and stateful alike. A unit goes whole or not at all, so one
     // whose backlog exceeds what is left is skipped -- unless it is the first
@@ -564,31 +586,44 @@ class Scheduler
     void fluxRebalanceLoop();
 
     /**
-     * ModeFlux: one rebalancing round.
+     * ModeFlux: one rebalancing round. Two kinds of move, with different
+     * criteria, because they cost different things and do different things.
+     * Both go only to the workers the planner advised (FluxOffloadPlan), and
+     * each target gets its share of both in a single hand-over.
      *
-     * When: a paridx is behind here -- more is waiting than it will finish
-     * before the next round, judged by the rate it actually achieved over
-     * the last window (or, for a fresh burst on a paridx that was idle, by
-     * all of its run slots).
+     * Stateless requests (cheap; sheds the backlog now). A stateless paridx
+     * is behind when more is waiting than it will finish before the next
+     * round (E = Q - mu H, mu its measured rate). Of that excess, only what
+     * the advised workers can process in the next round goes now, oldest
+     * first -- the rest is judged again next round. Their chained calls go
+     * with them and run on the other side as local calls.
      *
-     * How much: only that excess. What it will get through here stays.
-     *
-     * Which: stateless requests one by one, units of state whole with every
-     * request waiting for them; the oldest input first within each. A
-     * partitioned paridx sheds shards, a stateful one moves as a whole.
-     *
-     * Where: only to the workers the planner advised (FluxOffloadPlan), each
-     * item to the one with the most quota left, within the quota. Without
-     * advice, nothing moves: the planner sees every worker, and makes sure
-     * workers behind do not all descend on the same idle one.
-     *
-     * Stateless requests go first because their chained calls go with them
-     * and run on the other side as local calls.
-     *
-     * Each target gets its share in a single migration, and a round moves at
-     * most fluxMigrateRequests requests.
+     * Units of state (expensive; moves the unit's load from now on). Only the
+     * overload that moving stateless requests did not absorb counts:
+     * r = max(0, (lambda_w - mu_w) H - O), lambda_w and mu_w the work
+     * arriving and processed here per second, O the stateless work moved this
+     * round. It accumulates as "rent" P while it lasts, and is forgotten as
+     * soon as it stops. Units are picked by fewest state bytes per unit of
+     * load they carry -- small state, many requests -- until they carry the
+     * overload; moving them would cost C = their load x the time they are
+     * frozen (T_0 + bytes x per-byte time, both measured). They move only once
+     * P >= C (ski rental), and only if afterwards neither this worker nor the
+     * target is as utilised as this worker was. A move resets P.
      */
     void rebalanceFlux();
+
+    // ModeFlux: the overload rent of state migration (see rebalanceFlux), in
+    // executor time (us). Only touched by the rebalancing thread.
+    double fluxStatePenaltyUs = 0;
+
+    // ModeFlux: (state bytes, hand-over time in us) of recent hand-overs that
+    // moved state, fitted to T = T_0 + bytes x per-byte time. Only touched by
+    // the rebalancing thread.
+    std::deque<std::pair<double, double>> fluxStateMoveSamples;
+
+    // {T_0 in us, us per byte}. Before any state has moved, the measured cost
+    // of hand-overs in general and nothing per byte.
+    std::pair<double, double> fluxStateMoveCostModel();
 
     /**
      * ModeFlux: hand `units` (unit keys, each with the requests waiting for
@@ -598,10 +633,15 @@ class Scheduler
      * Blocks new dispatches of every unit, waits for running ones to finish,
      * ships the lot, flips all owners in Redis at once, then forwards
      * whatever arrived meanwhile. All or nothing: if the hand-over fails,
-     * every unit stays and every request goes back where it was. Returns
-     * {units moved, stateless requests moved}.
+     * every unit stays and every request goes back where it was.
      */
-    std::pair<int, int> migrateToWorkerFlux(
+    struct FluxHandover
+    {
+        int units = 0;
+        int statelessRequests = 0;
+        size_t stateBytes = 0;
+    };
+    FluxHandover migrateToWorkerFlux(
       const std::string& target,
       const std::vector<std::string>& units,
       const std::vector<std::pair<std::string, int>>& stateless);

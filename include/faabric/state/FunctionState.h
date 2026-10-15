@@ -77,6 +77,9 @@ class FunctionState
     // nothing is executing against it, since held locks do not travel.
     std::vector<uint8_t> snapshotForMigration();
 
+    // Roughly how many bytes a migration of the whole state would carry.
+    size_t approxBytes();
+
     // Partitioned state only. The keys whose shard (as `shardOf` computes it)
     // is in `shards`, serialised per shard in the format addMigrateState
     // merges back. The caller must make sure nothing is executing against
