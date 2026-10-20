@@ -131,6 +131,8 @@ Scheduler::Scheduler()
       [this](const std::string& userFuncPar) {
           return fluxLocalLoadOf(userFuncPar);
       });
+    decentralScheduler.setFluxLocalWorkProvider(
+      [this]() { return fluxLocalWorkOf(); });
     fluxRebalanceThread = std::thread(&Scheduler::fluxRebalanceLoop, this);
 
     // Initialize the dispatch worker pool
@@ -697,6 +699,32 @@ Scheduler::fluxLocalLoadOf(const std::string& userFuncPar)
     return local;
 }
 
+faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork
+Scheduler::fluxLocalWorkOf()
+{
+    faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork work;
+    auto loads = snapshotFluxParidxLoads();
+    auto snapshot = decentralScheduler.getClusterSnapshot();
+    {
+        faabric::util::SharedLock lock(waitingQueuesMx);
+        for (const auto& [userFuncPar, queue] : waitingQueues) {
+            int depth = queue->getMessagesCount();
+            if (depth == 0) {
+                continue;
+            }
+            auto it = loads.find(fluxFuncParStrOf(userFuncPar));
+            double slotTimeUs = it != loads.end() && it->second.slotTimeUs > 0
+                                  ? it->second.slotTimeUs
+                                  : snapshot->slotTimeOf(userFuncPar);
+            work.queuedUs += depth * slotTimeUs;
+        }
+    }
+    double horizonUs =
+      (fluxRebalancePeriod > 0 ? fluxRebalancePeriod : 1000) * 1000.0;
+    work.capacityUs = std::max(1, fluxWorkerSlots) * horizonUs;
+    return work;
+}
+
 void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
 {
     {
@@ -706,6 +734,9 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
             (*out.mutable_paridxrunning())[queueKey] = load.running;
             if (load.slotTimeUs > 0) {
                 (*out.mutable_paridxslottimeus())[queueKey] = load.slotTimeUs;
+            }
+            if (load.ratePerSec > 0) {
+                (*out.mutable_paridxratepersec())[queueKey] = load.ratePerSec;
             }
         }
     }
@@ -2601,8 +2632,8 @@ void Scheduler::fluxRebalanceLoop()
 
 void Scheduler::rebalanceFlux()
 {
-    auto statsPtr = decentralScheduler.getClusterWorkerStats();
-    const auto& stats = *statsPtr;
+    auto snapshot = decentralScheduler.getClusterSnapshot();
+    const auto& stats = snapshot->stats;
 
     using OrderKey = faabric::util::BatchQueue::OrderKey;
 
@@ -2639,7 +2670,12 @@ void Scheduler::rebalanceFlux()
         if (it != loads.end() && it->second.slotTimeUs > 0) {
             return it->second.slotTimeUs;
         }
-        return StateAwareScheduler::clusterSlotTimeUs(stats, userFuncPar);
+        return snapshot->slotTimeOf(userFuncPar);
+    };
+    auto operatorOf = [](const std::string& userFuncPar) {
+        auto [user, func, parStr] =
+          faabric::util::splitUserFuncPar(userFuncPar);
+        return user + "_" + func;
     };
     auto isStateless = [this](const std::string& userFuncPar) {
         auto [user, func, parStr] =
@@ -2653,17 +2689,35 @@ void Scheduler::rebalanceFlux()
     {
         std::vector<std::string> units;
         std::map<std::string, int> stateless;
-        // Executor time of the requests it carries.
+        // Executor time of the requests it carries, with that of the
+        // stateless requests they set off there.
         double workUs = 0;
+        // The operators (user_func) it carries work of.
+        std::set<std::string> operators;
     };
     std::map<std::string, FluxShipment> shipments;
-    auto mostQuota = [&quota](double needUs) -> std::string {
+    // The advised worker to send `workUs` of operator `userFunc` to, among
+    // those with that much quota left: one this round already sends the
+    // operator to, then one already running it, then the most quota. An
+    // operator thus fills one target before it spills onto the next.
+    auto pickTarget = [&](const std::string& userFunc,
+                          double workUs) -> std::string {
         std::string best;
-        double bestUs = 0;
+        std::tuple<bool, bool, double> bestKey{ false, false, 0 };
         for (const auto& [ip, us] : quota) {
-            if (us >= needUs && us > bestUs) {
+            if (us <= 0 || us < workUs) {
+                continue;
+            }
+            auto shipmentIt = shipments.find(ip);
+            std::tuple<bool, bool, double> key{
+                shipmentIt != shipments.end() &&
+                  shipmentIt->second.operators.contains(userFunc),
+                snapshot->runs(ip, userFunc),
+                us
+            };
+            if (best.empty() || key > bestKey) {
                 best = ip;
-                bestUs = us;
+                bestKey = key;
             }
         }
         return best;
@@ -2741,30 +2795,37 @@ void Scheduler::rebalanceFlux()
     // ---- Stateless requests first: they are cheap to move ----
     //
     // Of the excess, only what the advised workers can process in the next
-    // round goes now -- their quota is exactly that -- oldest input first,
-    // each request to the advised worker with the most quota left. The rest
-    // is judged again next round, against fresh numbers.
+    // round goes now -- their quota is exactly that -- oldest input first.
+    // A request takes up its executor time there and that of the stateless
+    // requests it sets off, which run there as local calls. Each operator's
+    // requests fill one target before the next (pickTarget). The rest is
+    // judged again next round, against fresh numbers.
     std::sort(statelessBacklogs.begin(),
               statelessBacklogs.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     double statelessWorkUs = 0;
     int budgetRequests = fluxMigrateRequests;
     for (const auto& backlog : statelessBacklogs) {
+        std::string userFunc = operatorOf(backlog.userFuncPar);
+        double requestUs =
+          backlog.slotTimeUs + snapshot->downstreamOf(userFunc);
         int remaining =
           std::min(static_cast<int>(std::ceil(backlog.excess)), budgetRequests);
         while (remaining > 0) {
-            std::string target = mostQuota(backlog.slotTimeUs);
+            std::string target = pickTarget(userFunc, requestUs);
             if (target.empty()) {
                 break;
             }
-            int n = std::min(
-              remaining, static_cast<int>(quota[target] / backlog.slotTimeUs));
+            int n =
+              std::min(remaining, static_cast<int>(quota[target] / requestUs));
             if (n <= 0) {
                 break;
             }
-            double workUs = n * backlog.slotTimeUs;
-            shipments[target].stateless[backlog.userFuncPar] += n;
-            shipments[target].workUs += workUs;
+            double workUs = n * requestUs;
+            auto& shipment = shipments[target];
+            shipment.stateless[backlog.userFuncPar] += n;
+            shipment.workUs += workUs;
+            shipment.operators.insert(userFunc);
             quota[target] -= workUs;
             statelessWorkUs += workUs;
             remaining -= n;
@@ -2776,14 +2837,17 @@ void Scheduler::rebalanceFlux()
     //
     // Every unit of a paridx with a deficit is a candidate. Moving one takes
     // away what is queued for it and what arrives for it from now on: over
-    // the next round, w = B + l H of executor time, B its backlog, l its
-    // arrivals. Fewest state bytes per unit of w go first -- small state,
-    // much work -- all units of a hand-over being frozen for as long as
-    // their bytes take to ship. Each goes to the advised worker with the
-    // most quota left that can take its w, until the deficit is covered,
-    // and only if the move leaves neither side as loaded as this worker is
-    // now: load being what a worker has to get through before the next
-    // round over what it can, (Q + lambda H) / (slots H).
+    // the next round, w = (B + l H) s of executor time, B its backlog, l its
+    // arrivals, s the time one takes. Fewest state bytes per unit of w go
+    // first -- small state, much work -- all units of a hand-over being
+    // frozen for as long as their bytes take to ship -- until the deficit is
+    // covered. Where it goes, its requests also set off the stateless ones
+    // downstream of them, so it takes up (B + l H)(s + downstream) there.
+    // Each goes to an advised worker with that much quota left, the units of
+    // one operator filling one target before the next (pickTarget), and only
+    // if the move leaves neither side as loaded as this worker is now: load
+    // being what a worker has to get through before the next round over what
+    // it can, (Q + lambda H) / (slots H).
     double needUs = 0;
     for (const auto& [userFuncPar, deficit] : stateDeficits) {
         needUs += deficit.deficitUs;
@@ -2819,6 +2883,10 @@ void Scheduler::rebalanceFlux()
         struct UnitCandidate
         {
             std::string unitKey;
+            std::string userFunc;
+            // What moving it takes off this paridx, and what it takes up
+            // where it goes.
+            double reliefUs;
             double workUs;
             double bytes;
             int backlog;
@@ -2874,9 +2942,12 @@ void Scheduler::rebalanceFlux()
             auto rateIt = unitRates.find(unitKey);
             double arrivalsPerSec =
               rateIt == unitRates.end() ? 0 : rateIt->second.ratePerSec;
+            double requests = backlog + arrivalsPerSec * horizonSec;
+            std::string userFunc = operatorOf(userFuncPar);
+            double reliefUs = requests * slotTimeUs;
             double workUs =
-              (backlog + arrivalsPerSec * horizonSec) * slotTimeUs;
-            if (workUs <= 0) {
+              requests * (slotTimeUs + snapshot->downstreamOf(userFunc));
+            if (reliefUs <= 0) {
                 // Nothing queued for it and nothing arriving: moving it
                 // would take nothing off this worker.
                 continue;
@@ -2896,12 +2967,13 @@ void Scheduler::rebalanceFlux()
                                             std::max(1, heldShards[userFuncPar])
                                         : bytesIt->second;
 
-            candidates.push_back({ unitKey, workUs, bytes, backlog });
+            candidates.push_back(
+              { unitKey, userFunc, reliefUs, workUs, bytes, backlog });
         }
         std::sort(candidates.begin(),
                   candidates.end(),
                   [](const auto& a, const auto& b) {
-                      return a.bytes * b.workUs < b.bytes * a.workUs;
+                      return a.bytes * b.reliefUs < b.bytes * a.reliefUs;
                   });
 
         // Load here now, and on `ip` once it has taken `extraUs` more on top
@@ -2918,18 +2990,19 @@ void Scheduler::rebalanceFlux()
               targetStats.workerslots() > 0 ? targetStats.workerslots() : slots;
             double sentUs =
               shipments.contains(ip) ? shipments.at(ip).workUs : 0;
-            double demandUs = StateAwareScheduler::queuedWorkUsFlux(stats, ip) +
+            double demandUs = snapshot->queuedOf(ip) +
                               targetStats.arrivalworkus() * horizonSec +
                               sentUs + extraUs;
             return demandUs / (targetSlots * horizonUs);
         };
 
+        double relievedUs = 0;
         double movedUs = 0;
         int unitsPicked = 0;
         int noRoom = 0;
         int noRelief = 0;
         for (const auto& candidate : candidates) {
-            if (movedUs >= needUs) {
+            if (relievedUs >= needUs) {
                 break;
             }
             // A unit goes whole, with every request queued for it.
@@ -2937,11 +3010,11 @@ void Scheduler::rebalanceFlux()
                 continue;
             }
             // Where its work fits. The round's first unit goes even if it
-            // fits nowhere, to the worker with the most room left, or a unit
-            // bigger than any advice could never move.
-            std::string target = mostQuota(candidate.workUs);
+            // fits nowhere, or a unit bigger than any advice could never move.
+            std::string target =
+              pickTarget(candidate.userFunc, candidate.workUs);
             if (target.empty() && unitsPicked == 0) {
-                target = mostQuota(0);
+                target = pickTarget(candidate.userFunc, 0);
             }
             if (target.empty()) {
                 noRoom++;
@@ -2959,7 +3032,9 @@ void Scheduler::rebalanceFlux()
             auto& shipment = shipments[target];
             shipment.units.push_back(candidate.unitKey);
             shipment.workUs += candidate.workUs;
+            shipment.operators.insert(candidate.userFunc);
             quota[target] = std::max(0.0, quota[target] - candidate.workUs);
+            relievedUs += candidate.reliefUs;
             movedUs += candidate.workUs;
             budgetRequests -= candidate.backlog;
             unitsPicked++;

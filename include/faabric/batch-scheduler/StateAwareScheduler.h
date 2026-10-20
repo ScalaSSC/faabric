@@ -11,6 +11,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -120,6 +121,71 @@ class StateAwareScheduler : public BatchScheduler
     std::shared_ptr<const std::map<std::string, faabric::WorkerStats>>
     getClusterWorkerStats();
 
+    // One stats round, and what routing reads off it, worked out once when
+    // the round arrives rather than for every request until the next.
+    struct FluxClusterSnapshot
+    {
+        std::map<std::string, faabric::WorkerStats> stats;
+        // ModeFlux, per queue: clusterSlotTimeUs over `stats`.
+        std::unordered_map<std::string, double> slotTimeUs;
+        // ModeFlux, per worker: the operators (user_func) of every queue it
+        // reported, i.e. those it has warm executors for.
+        std::unordered_map<std::string, std::unordered_set<std::string>>
+          operators;
+        // ModeFlux, per worker and operator: its requests queued or running
+        // there.
+        std::unordered_map<std::string, std::unordered_map<std::string, int>>
+          presence;
+        // ModeFlux, per worker: executor time queued there (queuedWorkUsFlux).
+        std::unordered_map<std::string, double> queuedUs;
+        // ModeFlux, per operator: executor time, per request of it, of the
+        // stateless requests it sets off downstream. Those run where it runs
+        // -- chained stateless calls stay local -- so this is the work one of
+        // its requests brings to a worker besides its own. Stateful
+        // operators downstream count nothing: their requests go to their
+        // unit's owner. Nor do stateless ones with several callers (see
+        // fluxLocalChildren).
+        std::unordered_map<std::string, double> downstreamWorkUs;
+        // Time from the stats round before to this one; 0 for the first.
+        double roundUs = 0;
+
+        double slotTimeOf(const std::string& queueKey) const
+        {
+            auto it = slotTimeUs.find(queueKey);
+            return it == slotTimeUs.end() ? 0 : it->second;
+        }
+
+        double downstreamOf(const std::string& userFunc) const
+        {
+            auto it = downstreamWorkUs.find(userFunc);
+            return it == downstreamWorkUs.end() ? 0 : it->second;
+        }
+
+        double queuedOf(const std::string& ip) const
+        {
+            auto it = queuedUs.find(ip);
+            return it == queuedUs.end() ? 0 : it->second;
+        }
+
+        bool runs(const std::string& ip, const std::string& userFunc) const
+        {
+            auto it = operators.find(ip);
+            return it != operators.end() && it->second.contains(userFunc);
+        }
+
+        int presenceOf(const std::string& ip, const std::string& userFunc) const
+        {
+            auto it = presence.find(ip);
+            if (it == presence.end()) {
+                return 0;
+            }
+            auto opIt = it->second.find(userFunc);
+            return opIt == it->second.end() ? 0 : opIt->second;
+        }
+    };
+
+    std::shared_ptr<const FluxClusterSnapshot> getClusterSnapshot();
+
     /**
      * ModeFlux: what a worker knows about one of its own queues right now.
      * The cluster stats are a round old, and a worker routing its own chained
@@ -142,6 +208,23 @@ class StateAwareScheduler : public BatchScheduler
       std::function<FluxLocalLoad(const std::string& queueKey)> provider)
     {
         fluxLocalLoad = std::move(provider);
+    }
+
+    /**
+     * ModeFlux: what a worker has to get through before its next
+     * rebalancing round -- the executor time queued in all its queues -- and
+     * what it can, its executor slots over that time.
+     */
+    struct FluxLocalWork
+    {
+        double queuedUs = 0;
+        double capacityUs = 0;
+    };
+
+    // Workers only: how the scheduler reads its host's work as a whole.
+    void setFluxLocalWorkProvider(std::function<FluxLocalWork()> provider)
+    {
+        fluxLocalWork = std::move(provider);
     }
 
     /**
@@ -281,21 +364,36 @@ class StateAwareScheduler : public BatchScheduler
       const std::unique_ptr<Message>& msg);
 
     /**
-     * ModeFlux stateless routing.
+     * ModeFlux stateless routing. An operator's requests are kept together,
+     * and spread over more workers only as far as one cannot get through
+     * them. A request is sized with what it sets off: its executor time and
+     * that of the stateless requests downstream of it, which run where it
+     * runs (FluxClusterSnapshot::downstreamWorkUs).
      *
      * A worker keeps its own chained requests -- which keeps an application's
-     * operators together on the worker already running them -- unless it has
-     * no run slot free for one and the planner has advised it where to send
-     * work; then it goes to the advised worker with the most quota left.
+     * operators together on the worker already running them -- while a run
+     * slot is free or it still gets through them, and all else it has,
+     * before its next round. Past that, if the planner has advised it where
+     * to send work, they go to an advised worker: the one this operator
+     * already goes to this round, then one already running it, then the one
+     * with the most quota left.
      *
-     * The planner has no local. It sends each input where it can start
-     * soonest; among hosts within one request's service time of the best, one
-     * already running the operator goes first, for its warm executors.
+     * The planner sends each input to the first host with room for it before
+     * the next stats round: one already running the operator, most of it
+     * first, before one that is not, and the one with the most room among
+     * equals. If none has room, the least loaded host.
      */
     std::string scheduleStatelessMessageFlux(
       std::string& userFunc,
       const HostMap& hostMap,
       const std::unique_ptr<Message>& msg);
+
+    // The planner's fallback for an operator nobody has measured yet: where
+    // an input starts soonest by queue length, warm hosts breaking ties.
+    std::string scheduleStatelessByWaitFlux(
+      const std::string& userFunc,
+      const HostMap& hostMap,
+      const FluxClusterSnapshot& snapshot);
 
     /**
      * ModeFlux: executor time queued on `ip` as it last reported -- each
@@ -619,34 +717,24 @@ class StateAwareScheduler : public BatchScheduler
     // scheduler lock
     std::shared_mutex scheduleMx;
 
-    // One stats round, and what routing reads off it, worked out once when
-    // the round arrives rather than for every request until the next.
-    struct FluxClusterSnapshot
-    {
-        std::map<std::string, faabric::WorkerStats> stats;
-        // ModeFlux, per queue: clusterSlotTimeUs over `stats`.
-        std::unordered_map<std::string, double> slotTimeUs;
-        // ModeFlux, per worker: the operators (user_func) of every queue it
-        // reported, i.e. those it has warm executors for.
-        std::unordered_map<std::string, std::unordered_set<std::string>>
-          operators;
-
-        double slotTimeOf(const std::string& queueKey) const
-        {
-            auto it = slotTimeUs.find(queueKey);
-            return it == slotTimeUs.end() ? 0 : it->second;
-        }
-    };
-
     std::shared_mutex clusterWorkerStatsMx;
     // Replaced whole by each stats round, never modified in place.
     std::shared_ptr<const FluxClusterSnapshot> clusterSnapshot =
       std::make_shared<FluxClusterSnapshot>();
 
-    std::shared_ptr<const FluxClusterSnapshot> getClusterSnapshot();
+    // ModeFlux, set at registerApp, guarded by scheduleMx: per operator, its
+    // stateless children whose only caller it is. Their requests run where
+    // it runs. A stateless operator with several callers is in none's list.
+    std::unordered_map<std::string, std::vector<std::string>> fluxLocalChildren;
+
+    // Fills `snapshot.downstreamWorkUs`: fluxLocalChildren, weighed with the
+    // throughputs and executor times its stats report.
+    void computeDownstreamWorkFlux(FluxClusterSnapshot& snapshot);
 
     // Workers only; see setFluxLocalLoadProvider.
     std::function<FluxLocalLoad(const std::string& queueKey)> fluxLocalLoad;
+    // Workers only; see setFluxLocalWorkProvider.
+    std::function<FluxLocalWork()> fluxLocalWork;
 
     // ModeFlux: requests routed to each host since the last stats round, per
     // queue. The stats cannot show them yet, so without these every decision
@@ -658,10 +746,24 @@ class StateAwareScheduler : public BatchScheduler
     // Workers only: the planner's latest advice, drawn down as work is sent.
     std::mutex fluxOffloadMx;
     std::map<std::string, double> fluxOffloadQuotaUs;
-    // Workers only: requests the current routing pass kept here, per queue.
-    // The live queue does not show them until the pass is over and they are
-    // enqueued. Cleared at the start of every scheduleMessagesBatch.
+    // Workers only: requests the current routing pass kept here, per queue,
+    // and their executor time with what they set off downstream. The live
+    // queue does not show them until the pass is over and they are enqueued.
+    // With them, this host's work as it stood when the pass began, read once
+    // for the pass. All cleared at the start of every scheduleMessagesBatch.
     std::map<std::string, int> fluxKeptThisPass;
+    double fluxKeptWorkThisPass = 0;
+    std::optional<FluxLocalWork> fluxPassWork;
+    // Planner only, guarded by fluxAssignedMx: executor time, with what it
+    // sets off downstream, routed to each host since the last stats round;
+    // the same per second over the round before, which that round's stats
+    // already count among the host's arrivals; and when that round came.
+    std::unordered_map<std::string, double> fluxAssignedWorkUs;
+    std::unordered_map<std::string, double> fluxPrevAssignedRateUs;
+    int64_t fluxLastStatsUs = 0;
+    // Planner only, guarded by fluxAssignedMx: before any stats round, the
+    // one host each operator's inputs go to.
+    std::unordered_map<std::string, std::string> fluxStartupHost;
 
     // See setFluxPartitionShards.
     int fluxPartitionShards = 200;

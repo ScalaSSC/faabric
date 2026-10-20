@@ -408,6 +408,12 @@ class Scheduler
     faabric::batch_scheduler::StateAwareScheduler::FluxLocalLoad
     fluxLocalLoadOf(const std::string& userFuncPar);
 
+    // What the StateAwareScheduler reads about this worker as a whole when
+    // routing chained requests: the executor time queued here, against its
+    // executor slots over a rebalancing period.
+    faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork
+    fluxLocalWorkOf();
+
     // Time (us) handing work over to another worker has taken, averaged over
     // recent migrations: from freezing the units to flipping their owners.
     // What a moved request loses before it can start on the other side.
@@ -603,15 +609,20 @@ class Scheduler
      * paridx's excess, only what the advised workers can process in the next
      * round goes now, oldest first -- the rest is judged again next round.
      * Their chained calls go with them and run on the other side as local
-     * calls.
+     * calls, so each takes up its own executor time there and that of the
+     * stateless requests downstream of it.
      *
      * Then units of state, from the paridx with a deficit, until the deficit
      * is covered. A unit takes with it its backlog and its arrivals from now
-     * on, w = B + l H over the next round. Fewest state bytes per unit of w
-     * go first -- small state, much work -- each to the advised worker with
-     * the most quota left that can take its w, and only if afterwards
-     * neither side is as loaded, (Q + lambda H) / (slots H), as this worker
-     * is now.
+     * on, (B + l H) s over the next round. Fewest state bytes per unit of
+     * that go first -- small state, much work -- each to an advised worker
+     * with quota for it and what its requests set off downstream, and only
+     * if afterwards neither side is as loaded, (Q + lambda H) / (slots H), as
+     * this worker is now.
+     *
+     * Either way an operator's work fills one target before it spills onto
+     * the next: the target this round already sends it to first, then one
+     * already running it, then the one with the most quota left.
      */
     void rebalanceFlux();
 

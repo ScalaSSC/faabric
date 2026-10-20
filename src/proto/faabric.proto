@@ -465,6 +465,11 @@ message WorkerStats{
     // the executor time one takes, summed over its queues.
     double arrivalWorkUs = 15;
     double processWorkUs = 16;
+    // ModeFlux, per paridx (keyed like instanceQueueNum): requests finished
+    // per second over the last rebalancing window. Each request finishes
+    // once, wherever it went, so summed over workers it is the operator's
+    // throughput -- unlike arrivals, which a migrated request makes twice.
+    map<string, double> paridxRatePerSec = 17;
 }
 
 // ModeFlux: what one worker's migrations and forwarding have cost. Counters
