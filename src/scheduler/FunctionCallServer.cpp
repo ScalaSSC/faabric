@@ -382,16 +382,22 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
     }
     scheduler.setClusterWorkerStats(std::move(clusterStats));
 
-    // ModeFlux: the planner's advice for this worker, if it is behind.
+    // ModeFlux: the planner's advice for this worker -- where to send work if
+    // it is behind, and what to hand over to bring an operator together.
     std::map<std::string, double> offloadQuotaUs;
+    std::map<std::string, std::string> mergeTo;
     auto planIt = parsedMsg.fluxoffloadplans().find(
       faabric::util::getSystemConfig().endpointHost);
     if (planIt != parsedMsg.fluxoffloadplans().end()) {
         for (const auto& [target, quotaUs] : planIt->second.quotaus()) {
             offloadQuotaUs[target] = quotaUs;
         }
+        for (const auto& [userFunc, target] : planIt->second.mergeto()) {
+            mergeTo[userFunc] = target;
+        }
     }
     scheduler.setFluxOffloadQuota(std::move(offloadQuotaUs));
+    scheduler.setFluxMergeAdvice(std::move(mergeTo));
 
     faabric::WorkerStats out;
 

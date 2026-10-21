@@ -9,6 +9,7 @@
 #include <faabric/util/hash.h>
 #include <faabric/util/locks.h>
 
+#include <deque>
 #include <functional>
 #include <map>
 #include <optional>
@@ -148,6 +149,27 @@ class StateAwareScheduler : public BatchScheduler
         std::unordered_map<std::string, double> downstreamWorkUs;
         // Time from the stats round before to this one; 0 for the first.
         double roundUs = 0;
+        // ModeFlux, per worker and operator, over that round: its requests
+        // finished there per second plus those queued, spread over the
+        // round -- how much of the operator is active there -- and their
+        // executor time, alone and with what they set off downstream.
+        std::unordered_map<std::string, std::unordered_map<std::string, double>>
+          opRatePerSec;
+        std::unordered_map<std::string, std::unordered_map<std::string, double>>
+          opWorkUs;
+        std::unordered_map<std::string, std::unordered_map<std::string, double>>
+          opChainWorkUs;
+        // ModeFlux, per worker: what it had to get through over the round
+        // (queued + arriving) and what it could (slots x round).
+        std::unordered_map<std::string, double> demandUs;
+        std::unordered_map<std::string, double> capacityUs;
+        // ModeFlux, per worker and stateful operator: units held there.
+        std::unordered_map<std::string, std::unordered_map<std::string, int>>
+          heldUnits;
+        // ModeFlux, per operator: its DAG neighbours, callers and callees.
+        std::shared_ptr<
+          const std::unordered_map<std::string, std::vector<std::string>>>
+          neighbours;
 
         double slotTimeOf(const std::string& queueKey) const
         {
@@ -171,6 +193,43 @@ class StateAwareScheduler : public BatchScheduler
         {
             auto it = operators.find(ip);
             return it != operators.end() && it->second.contains(userFunc);
+        }
+
+        static double valueIn(
+          const std::unordered_map<std::string,
+                                   std::unordered_map<std::string, double>>&
+            perWorker,
+          const std::string& ip,
+          const std::string& userFunc)
+        {
+            auto it = perWorker.find(ip);
+            if (it == perWorker.end()) {
+                return 0;
+            }
+            auto opIt = it->second.find(userFunc);
+            return opIt == it->second.end() ? 0 : opIt->second;
+        }
+
+        // How many of `userFunc`'s DAG neighbours were active on `ip` in
+        // the round: the more, the more of its chained calls stay local
+        // there.
+        int neighboursOn(const std::string& ip,
+                         const std::string& userFunc) const
+        {
+            if (!neighbours) {
+                return 0;
+            }
+            auto it = neighbours->find(userFunc);
+            if (it == neighbours->end()) {
+                return 0;
+            }
+            int n = 0;
+            for (const auto& neighbour : it->second) {
+                if (valueIn(opRatePerSec, ip, neighbour) > 0) {
+                    n++;
+                }
+            }
+            return n;
         }
 
         int presenceOf(const std::string& ip, const std::string& userFunc) const
@@ -244,6 +303,31 @@ class StateAwareScheduler : public BatchScheduler
     std::map<std::string, faabric::FluxOffloadPlan> planFluxOffload(
       const std::map<std::string, faabric::WorkerStats>& stats,
       double horizonUs);
+
+    /**
+     * ModeFlux, planner: add to `plans` the advice to bring a stateful
+     * operator spread over several workers back together, step by step, once
+     * its load is low enough -- conservatively, performance first.
+     *
+     * The target is the holder where the operator's DAG neighbours are most
+     * active, so the most chained calls stay local, then the one holding
+     * most of it. Holders hand theirs over smallest first, as many as the
+     * target can take: all of them onto one if the operator is light, onto
+     * one fewer worker if only part fits, the rest left for a later round. A
+     * holder takes part only if:
+     *  - the stats of the whole last kFluxMergeWindowSec are in, and in
+     *    every round of it the target would have got through its own work
+     *    and what is merged onto it, the stateless requests that sets off
+     *    downstream included, so those still run there: the recent peak,
+     *    not the current load, has to fit;
+     *  - neither it nor the target is short of executors in this round;
+     *  - the operator's neighbours are no more active on it than on the
+     *    target, so no more chained calls cross workers than before;
+     *  - it takes part in no other merge this round.
+     * Operators go least spread first. Call after setClusterWorkerStats,
+     * with the round's plans.
+     */
+    void planFluxMerges(std::map<std::string, faabric::FluxOffloadPlan>& plans);
 
     /**
      * ModeFlux, workers: the planner's latest advice for this worker. The
@@ -370,18 +454,22 @@ class StateAwareScheduler : public BatchScheduler
      * that of the stateless requests downstream of it, which run where it
      * runs (FluxClusterSnapshot::downstreamWorkUs).
      *
-     * A worker keeps its own chained requests -- which keeps an application's
-     * operators together on the worker already running them -- while a run
-     * slot is free or it still gets through them, and all else it has,
-     * before its next round. Past that, if the planner has advised it where
-     * to send work, they go to an advised worker: the one this operator
-     * already goes to this round, then one already running it, then the one
-     * with the most quota left.
+     * Among places with room, the one where the operator's DAG neighbours
+     * run comes first -- so the fewest chained calls cross workers -- then
+     * the one where the operator itself runs, then the one with most room.
+     *
+     * A worker keeps its own chained requests -- the caller runs here, so
+     * here is where its neighbour is -- while a run slot is free or it still
+     * gets through them, and all else it has, before its next round. Past
+     * that, if the planner has advised it where to send work, they go to an
+     * advised worker: the one where most of the operator's neighbours run,
+     * then the one this operator already goes to this round, then one
+     * already running it, then the one with the most quota left.
      *
      * The planner sends each input to the first host with room for it before
-     * the next stats round: one already running the operator, most of it
-     * first, before one that is not, and the one with the most room among
-     * equals. If none has room, the least loaded host.
+     * the next stats round: the one where most of its neighbours run, then
+     * one already running it, most of it first, then the one with the most
+     * room. If none has room, the least loaded host.
      */
     std::string scheduleStatelessMessageFlux(
       std::string& userFunc,
@@ -726,10 +814,20 @@ class StateAwareScheduler : public BatchScheduler
     // stateless children whose only caller it is. Their requests run where
     // it runs. A stateless operator with several callers is in none's list.
     std::unordered_map<std::string, std::vector<std::string>> fluxLocalChildren;
+    // ModeFlux, set at registerApp, guarded by scheduleMx: per operator,
+    // every operator it calls or is called by.
+    std::shared_ptr<
+      const std::unordered_map<std::string, std::vector<std::string>>>
+      fluxNeighbours;
 
     // Fills `snapshot.downstreamWorkUs`: fluxLocalChildren, weighed with the
     // throughputs and executor times its stats report.
     void computeDownstreamWorkFlux(FluxClusterSnapshot& snapshot);
+
+    // Fills the per-worker, per-operator activity of `snapshot`, and each
+    // worker's demand, capacity and units held. After
+    // computeDownstreamWorkFlux, whose result it uses.
+    void computeOperatorActivityFlux(FluxClusterSnapshot& snapshot);
 
     // Workers only; see setFluxLocalLoadProvider.
     std::function<FluxLocalLoad(const std::string& queueKey)> fluxLocalLoad;
@@ -990,6 +1088,13 @@ class StateAwareScheduler : public BatchScheduler
 
     // Window (in seconds) over which computeChainedCostCoeff samples metrics.
     static constexpr int kChainedCostWindowSec = 10;
+
+    // ModeFlux, planner only: the stats rounds of the last
+    // kFluxMergeWindowSec, oldest first, for planFluxMerges. The window is
+    // the planner's metrics window, as for chained-call costs.
+    static constexpr int kFluxMergeWindowSec = kChainedCostWindowSec;
+    std::mutex fluxHistoryMx;
+    std::deque<std::shared_ptr<const FluxClusterSnapshot>> fluxHistory;
 
     // Estimated CPU cost of one chained call, expressed in units of processed
     // tuples (avg per-call cost / t_e), derived from the cluster-average

@@ -211,6 +211,15 @@ class Scheduler
         decentralScheduler.setFluxOffloadQuota(std::move(quotaUs));
     }
 
+    // ModeFlux: the planner's advice to hand every unit of an operator held
+    // here to another worker (FluxOffloadPlan.mergeTo). Acted on, at most
+    // once, by the next rebalancing round that finds this worker not short.
+    void setFluxMergeAdvice(std::map<std::string, std::string> mergeTo)
+    {
+        std::lock_guard<std::mutex> lock(fluxMergeMx);
+        fluxMergeAdvice = std::move(mergeTo);
+    }
+
     // `msg` is the first message of the batch that finished.
     void notifyExecutorFinished(const faabric::Message& msg);
 
@@ -591,6 +600,10 @@ class Scheduler
     int fluxWorkerSlots = 0;
 
     void fluxRebalanceLoop();
+
+    // See setFluxMergeAdvice.
+    std::mutex fluxMergeMx;
+    std::map<std::string, std::string> fluxMergeAdvice;
 
     /**
      * ModeFlux: one rebalancing round. Both kinds of move go only to the

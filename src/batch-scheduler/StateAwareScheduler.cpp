@@ -207,6 +207,23 @@ bool StateAwareScheduler::registerApp(
             fluxLocalChildren[src].push_back(dest);
         }
     }
+
+    // ModeFlux: every operator's DAG neighbours, both ways.
+    std::unordered_map<std::string, std::unordered_set<std::string>> linked;
+    for (const auto& [src, dests] : application->getConnections()) {
+        for (const auto& dest : dests) {
+            if (dest != src) {
+                linked[src].insert(dest);
+                linked[dest].insert(src);
+            }
+        }
+    }
+    auto neighbours = std::make_shared<
+      std::unordered_map<std::string, std::vector<std::string>>>();
+    for (const auto& [userFunc, others] : linked) {
+        (*neighbours)[userFunc].assign(others.begin(), others.end());
+    }
+    fluxNeighbours = std::move(neighbours);
     return true;
 }
 
@@ -814,10 +831,83 @@ void StateAwareScheduler::setClusterWorkerStats(
               sumAndCount.first / sumAndCount.second;
         }
         computeDownstreamWorkFlux(*snapshot);
+        computeOperatorActivityFlux(*snapshot);
+    }
+    std::shared_ptr<const FluxClusterSnapshot> done = std::move(snapshot);
+
+    // The planner keeps the rounds of its metrics window for merges. A
+    // round with no length -- the first after a flush -- says nothing of a
+    // rate, and an empty round is a flush: what came before is gone.
+    if (isplanner && scheduleMode == ModeFlux) {
+        std::lock_guard<std::mutex> lock(fluxHistoryMx);
+        if (done->stats.empty()) {
+            fluxHistory.clear();
+        } else if (done->roundUs > 0) {
+            fluxHistory.push_back(done);
+            double spanUs = 0;
+            for (const auto& round : fluxHistory) {
+                spanUs += round->roundUs;
+            }
+            while (fluxHistory.size() > 1 &&
+                   spanUs - fluxHistory.front()->roundUs >=
+                     kFluxMergeWindowSec * 1e6) {
+                spanUs -= fluxHistory.front()->roundUs;
+                fluxHistory.pop_front();
+            }
+        }
     }
 
     faabric::util::FullLock lock(clusterWorkerStatsMx);
-    clusterSnapshot = std::move(snapshot);
+    clusterSnapshot = std::move(done);
+}
+
+void StateAwareScheduler::computeOperatorActivityFlux(
+  FluxClusterSnapshot& snapshot)
+{
+    {
+        faabric::util::SharedLock lock(scheduleMx);
+        snapshot.neighbours = fluxNeighbours;
+    }
+
+    double roundUs = snapshot.roundUs > 0 ? snapshot.roundUs : 1e6;
+    double roundSec = roundUs / 1e6;
+    for (const auto& [ip, workerStats] : snapshot.stats) {
+        auto& rates = snapshot.opRatePerSec[ip];
+        auto& work = snapshot.opWorkUs[ip];
+        auto& chainWork = snapshot.opChainWorkUs[ip];
+        const auto& finished = workerStats.paridxratepersec();
+        const auto& slotTimes = workerStats.paridxslottimeus();
+        for (const auto& [queueKey, depth] : workerStats.instancequeuenum()) {
+            auto rateIt = finished.find(queueKey);
+            double ratePerSec = rateIt == finished.end() ? 0 : rateIt->second;
+            double requests = ratePerSec * roundSec + std::max(0, depth);
+            if (requests <= 0) {
+                continue;
+            }
+            std::string userFunc = operatorOfQueue(queueKey);
+            rates[userFunc] += requests / roundSec;
+            auto slotIt = slotTimes.find(queueKey);
+            double slotTimeUs = slotIt != slotTimes.end() && slotIt->second > 0
+                                  ? slotIt->second
+                                  : snapshot.slotTimeOf(queueKey);
+            if (slotTimeUs > 0) {
+                work[userFunc] += requests * slotTimeUs;
+                chainWork[userFunc] +=
+                  requests * (slotTimeUs + snapshot.downstreamOf(userFunc));
+            }
+        }
+
+        snapshot.demandUs[ip] =
+          snapshot.queuedOf(ip) + workerStats.arrivalworkus() * roundSec;
+        snapshot.capacityUs[ip] =
+          std::max(1, workerStats.workerslots()) * roundUs;
+        auto& held = snapshot.heldUnits[ip];
+        for (const auto& [userFunc, units] : workerStats.fluxheldunits()) {
+            if (units > 0) {
+                held[userFunc] = units;
+            }
+        }
+    }
 }
 
 void StateAwareScheduler::computeDownstreamWorkFlux(
@@ -1041,6 +1131,225 @@ StateAwareScheduler::planFluxOffload(
     return plans;
 }
 
+void StateAwareScheduler::planFluxMerges(
+  std::map<std::string, faabric::FluxOffloadPlan>& plans)
+{
+    std::deque<std::shared_ptr<const FluxClusterSnapshot>> history;
+    {
+        std::lock_guard<std::mutex> lock(fluxHistoryMx);
+        history = fluxHistory;
+    }
+    double spanUs = 0;
+    for (const auto& round : history) {
+        spanUs += round->roundUs;
+    }
+    // Nothing until the whole window is in: no peak can be ruled out yet.
+    if (history.empty() || spanUs < kFluxMergeWindowSec * 1e6) {
+        return;
+    }
+    const auto& now = *history.back();
+
+    auto valueOf = [](const auto& map, const std::string& key) {
+        auto it = map.find(key);
+        return it == map.end() ? 0.0 : static_cast<double>(it->second);
+    };
+    // Whether `ip` got through what it had in `round`, and `extraUs` more.
+    auto keepsUp = [&valueOf](const FluxClusterSnapshot& round,
+                              const std::string& ip,
+                              double extraUs) {
+        double capacityUs = valueOf(round.capacityUs, ip);
+        return round.demandUs.contains(ip) && capacityUs > 0 &&
+               valueOf(round.demandUs, ip) + extraUs <= capacityUs;
+    };
+    // The share of the requests of `userFunc`'s neighbours that were on `ip`.
+    auto neighbourShare = [&now](const std::string& userFunc,
+                                 const std::string& ip) {
+        if (!now.neighbours) {
+            return 0.0;
+        }
+        auto it = now.neighbours->find(userFunc);
+        if (it == now.neighbours->end()) {
+            return 0.0;
+        }
+        double here = 0;
+        double total = 0;
+        for (const auto& [worker, rates] : now.opRatePerSec) {
+            for (const auto& neighbour : it->second) {
+                auto rateIt = rates.find(neighbour);
+                double rate = rateIt == rates.end() ? 0 : rateIt->second;
+                total += rate;
+                if (worker == ip) {
+                    here += rate;
+                }
+            }
+        }
+        return total > 0 ? here / total : 0.0;
+    };
+
+    // Every stateful operator held on more than one worker, with how much of
+    // it each holds.
+    std::map<std::string, std::vector<std::pair<std::string, int>>> holders;
+    for (const auto& [ip, held] : now.heldUnits) {
+        for (const auto& [userFunc, units] : held) {
+            holders[userFunc].emplace_back(ip, units);
+        }
+    }
+    auto loadOf = [&](const std::string& ip) {
+        double capacityUs = valueOf(now.capacityUs, ip);
+        return capacityUs > 0 ? valueOf(now.demandUs, ip) / capacityUs
+                              : std::numeric_limits<double>::infinity();
+    };
+    struct Spread
+    {
+        std::string userFunc;
+        std::vector<std::pair<std::string, int>> holding;
+        // Executor time of it, downstream included, off its biggest holder.
+        double spreadUs = 0;
+    };
+    std::vector<Spread> spreads;
+    for (auto& [userFunc, holding] : holders) {
+        if (holding.size() < 2) {
+            continue;
+        }
+        Spread spread{ userFunc, holding, 0 };
+        auto biggest = std::max_element(
+          holding.begin(), holding.end(), [](const auto& a, const auto& b) {
+              return a.second < b.second;
+          });
+        for (const auto& [ip, units] : holding) {
+            if (ip != biggest->first) {
+                spread.spreadUs +=
+                  FluxClusterSnapshot::valueIn(now.opChainWorkUs, ip, userFunc);
+            }
+        }
+        spreads.push_back(std::move(spread));
+    }
+    // The least spread first: the smallest merges are the safest.
+    std::sort(spreads.begin(), spreads.end(), [](const auto& a, const auto& b) {
+        return a.spreadUs < b.spreadUs;
+    });
+
+    std::set<std::string> involved;
+    for (const auto& spread : spreads) {
+        const std::string& userFunc = spread.userFunc;
+        int unitsTotal = 0;
+        for (const auto& [ip, units] : spread.holding) {
+            unitsTotal += units;
+        }
+
+        // Where it could go: where its DAG neighbours are most active, so
+        // the most of its chained calls -- to the state downstream of it
+        // too -- stay local; then where most of it already is, which moves
+        // the least state; then the least loaded.
+        auto targets = spread.holding;
+        std::sort(
+          targets.begin(), targets.end(), [&](const auto& a, const auto& b) {
+              double shareA = neighbourShare(userFunc, a.first);
+              double shareB = neighbourShare(userFunc, b.first);
+              if (shareA != shareB) {
+                  return shareA > shareB;
+              }
+              if (a.second != b.second) {
+                  return a.second > b.second;
+              }
+              return loadOf(a.first) < loadOf(b.first);
+          });
+
+        for (const auto& [target, targetUnits] : targets) {
+            if (involved.contains(target) || !keepsUp(now, target, 0)) {
+                continue;
+            }
+
+            // Those that may hand theirs over: not short themselves, in no
+            // other merge this round, and with the operator's neighbours no
+            // more active on them than on the target. The smallest first.
+            double targetShare = neighbourShare(userFunc, target);
+            std::vector<std::pair<std::string, int>> candidates;
+            for (const auto& [source, units] : spread.holding) {
+                if (source == target || involved.contains(source) ||
+                    !keepsUp(now, source, 0) ||
+                    neighbourShare(userFunc, source) > targetShare) {
+                    continue;
+                }
+                candidates.emplace_back(source, units);
+            }
+            std::sort(candidates.begin(),
+                      candidates.end(),
+                      [&](const auto& a, const auto& b) {
+                          return FluxClusterSnapshot::valueIn(
+                                   now.opChainWorkUs, a.first, userFunc) <
+                                 FluxClusterSnapshot::valueIn(
+                                   now.opChainWorkUs, b.first, userFunc);
+                      });
+
+            // Take them on one at a time while the target would still have
+            // got through all of it, downstream included, in every round of
+            // the window: three onto one if it is light, three onto two if
+            // only part fits, the rest left for a later round. The share of
+            // the operator a set of units carried in an earlier round, when
+            // it may have sat elsewhere, is taken as their share of the
+            // units it has off the target now.
+            int unitsOff = unitsTotal - targetUnits;
+            std::vector<std::string> sources;
+            int unitsMoving = 0;
+            double peakLoad = 0;
+            for (const auto& [source, units] : candidates) {
+                double fraction =
+                  unitsOff > 0
+                    ? static_cast<double>(unitsMoving + units) / unitsOff
+                    : 1.0;
+                bool fits = true;
+                double trialPeak = 0;
+                for (const auto& round : history) {
+                    double offUs = 0;
+                    for (const auto& [ip, work] : round->opChainWorkUs) {
+                        if (ip != target) {
+                            offUs += FluxClusterSnapshot::valueIn(
+                              round->opChainWorkUs, ip, userFunc);
+                        }
+                    }
+                    double addedUs = fraction * offUs;
+                    if (!keepsUp(*round, target, addedUs)) {
+                        fits = false;
+                        break;
+                    }
+                    trialPeak =
+                      std::max(trialPeak,
+                               (valueOf(round->demandUs, target) + addedUs) /
+                                 valueOf(round->capacityUs, target));
+                }
+                if (!fits) {
+                    break;
+                }
+                sources.push_back(source);
+                unitsMoving += units;
+                peakLoad = trialPeak;
+            }
+            if (sources.empty()) {
+                continue;
+            }
+
+            std::ostringstream oss;
+            for (const auto& source : sources) {
+                (*plans[source].mutable_mergeto())[userFunc] = target;
+                involved.insert(source);
+                oss << source << " ";
+            }
+            involved.insert(target);
+            SPDLOG_INFO("Flux advises merging {} onto {} from {}({} of {} "
+                        "holders, peak load {:.2f} over the last {:.0f}s)",
+                        userFunc,
+                        target,
+                        oss.str(),
+                        sources.size(),
+                        spread.holding.size() - 1,
+                        peakLoad,
+                        spanUs / 1e6);
+            break;
+        }
+    }
+}
+
 void StateAwareScheduler::setFluxOffloadQuota(
   std::map<std::string, double> quotaUs)
 {
@@ -1235,16 +1544,18 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         {
             std::lock_guard<std::mutex> lock(fluxOffloadMx);
             double* targetQuotaUs = nullptr;
-            std::tuple<bool, bool, double> bestKey{ false, false, 0 };
+            std::tuple<int, bool, bool, double> bestKey{ 0, false, false, 0 };
             for (auto& [ip, quotaUs] : fluxOffloadQuotaUs) {
                 if (ip == localHost || !hostMap.contains(ip) ||
                     quotaUs < workUs) {
                     continue;
                 }
-                std::tuple<bool, bool, double> key{ sentThisRound.contains(ip),
-                                                    snapshot->runs(ip,
-                                                                   userFunc),
-                                                    quotaUs };
+                std::tuple<int, bool, bool, double> key{
+                    snapshot->neighboursOn(ip, userFunc),
+                    sentThisRound.contains(ip),
+                    snapshot->runs(ip, userFunc),
+                    quotaUs
+                };
                 if (targetQuotaUs == nullptr || key > bestKey) {
                     target = ip;
                     targetQuotaUs = &quotaUs;
@@ -1305,7 +1616,7 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     // before it spills onto the next. Only if no host has room does it go to
     // the least loaded one.
     const std::string* chosen = nullptr;
-    std::tuple<bool, int, double> chosenKey{ false, 0, 0 };
+    std::tuple<int, bool, int, double> chosenKey{ 0, false, 0, 0 };
     const std::string* leastLoaded = nullptr;
     double leastLoad = std::numeric_limits<double>::infinity();
     std::lock_guard<std::mutex> lock(fluxAssignedMx);
@@ -1347,10 +1658,12 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                 routedHere = it->second;
             }
         }
-        std::tuple<bool, int, double> key{ snapshot->runs(ip, userFunc),
-                                           snapshot->presenceOf(ip, userFunc) +
-                                             routedHere,
-                                           capacityUs - demandUs };
+        std::tuple<int, bool, int, double> key{
+            snapshot->neighboursOn(ip, userFunc),
+            snapshot->runs(ip, userFunc),
+            snapshot->presenceOf(ip, userFunc) + routedHere,
+            capacityUs - demandUs
+        };
         if (chosen == nullptr || key > chosenKey) {
             chosen = &ip;
             chosenKey = key;
@@ -6014,6 +6327,10 @@ void StateAwareScheduler::resetScheduler()
         fluxPrevAssignedRateUs.clear();
         fluxLastStatsUs = 0;
         fluxStartupHost.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(fluxHistoryMx);
+        fluxHistory.clear();
     }
     {
         std::lock_guard<std::mutex> lock(fluxOffloadMx);

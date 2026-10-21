@@ -380,6 +380,10 @@ void Scheduler::reset()
     fluxMigrationCostUs = 0;
     fluxPreviousDepths.clear();
     {
+        std::lock_guard<std::mutex> lock(fluxMergeMx);
+        fluxMergeAdvice.clear();
+    }
+    {
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
         fluxUnitRates.clear();
         fluxUnitWindowStartUs = 0;
@@ -781,16 +785,17 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
         auto [userFuncPar, shardId] =
           faabric::batch_scheduler::StateAwareScheduler::splitFluxUnitKey(
             unitKey);
-        if (shardId >= 0) {
-            held++;
-            continue;
-        }
         auto [user, func, par] = faabric::util::splitUserFuncPar(userFuncPar);
-        auto node = decentralScheduler.lookupNode(user + "_" + func);
-        if (node != nullptr &&
-            node->type != faabric::batch_scheduler::NodeType::STATELESS) {
-            held++;
+        std::string userFunc = user + "_" + func;
+        if (shardId < 0) {
+            auto node = decentralScheduler.lookupNode(userFunc);
+            if (node == nullptr ||
+                node->type == faabric::batch_scheduler::NodeType::STATELESS) {
+                continue;
+            }
         }
+        held++;
+        (*out.mutable_fluxheldunits())[userFunc]++;
     }
     migration->set_heldunits(held);
 }
@@ -2697,19 +2702,22 @@ void Scheduler::rebalanceFlux()
     };
     std::map<std::string, FluxShipment> shipments;
     // The advised worker to send `workUs` of operator `userFunc` to, among
-    // those with that much quota left: one this round already sends the
-    // operator to, then one already running it, then the most quota. An
-    // operator thus fills one target before it spills onto the next.
+    // those with that much quota left: the one where most of its DAG
+    // neighbours are active, so the fewest of its chained calls cross
+    // workers; then one this round already sends the operator to, then one
+    // already running it, then the most quota. An operator thus fills one
+    // target before it spills onto the next.
     auto pickTarget = [&](const std::string& userFunc,
                           double workUs) -> std::string {
         std::string best;
-        std::tuple<bool, bool, double> bestKey{ false, false, 0 };
+        std::tuple<int, bool, bool, double> bestKey{ 0, false, false, 0 };
         for (const auto& [ip, us] : quota) {
             if (us <= 0 || us < workUs) {
                 continue;
             }
             auto shipmentIt = shipments.find(ip);
-            std::tuple<bool, bool, double> key{
+            std::tuple<int, bool, bool, double> key{
+                snapshot->neighboursOn(ip, userFunc),
                 shipmentIt != shipments.end() &&
                   shipmentIt->second.operators.contains(userFunc),
                 snapshot->runs(ip, userFunc),
@@ -3059,6 +3067,66 @@ void Scheduler::rebalanceFlux()
                          noRelief,
                          loadNow);
         }
+    }
+
+    // ---- Merges the planner advised: only in a calm round ----
+    //
+    // Every unit of the operator held here goes to the advised worker, which
+    // holds most of it. Only when this worker is short of nothing this round
+    // -- performance first: a merge is never worth delaying a busy worker --
+    // and only once per piece of advice.
+    std::map<std::string, std::string> mergeTo;
+    {
+        std::lock_guard<std::mutex> lock(fluxMergeMx);
+        mergeTo = std::move(fluxMergeAdvice);
+        fluxMergeAdvice.clear();
+    }
+    bool calm = statelessBacklogs.empty() && stateDeficits.empty();
+    if (!mergeTo.empty() && calm) {
+        std::set<std::string> held;
+        {
+            faabric::util::SharedLock lock(fluxKnownUnitsMx);
+            held = fluxKnownUnits;
+        }
+        for (const auto& [userFunc, target] : mergeTo) {
+            if (target == thisHost) {
+                continue;
+            }
+            std::vector<std::string> units;
+            for (const auto& unitKey : held) {
+                auto [userFuncPar, shardId] =
+                  StateAwareScheduler::splitFluxUnitKey(unitKey);
+                if (operatorOf(userFuncPar) != userFunc ||
+                    (shardId < 0 && isStateless(userFuncPar))) {
+                    continue;
+                }
+                {
+                    faabric::util::SharedLock lock(fluxMigrationMx);
+                    if (fluxMigratingUnits.contains(unitKey) ||
+                        fluxMovedUnits.contains(unitKey)) {
+                        continue;
+                    }
+                }
+                units.push_back(unitKey);
+            }
+            if (units.empty()) {
+                continue;
+            }
+            SPDLOG_INFO("Flux {} merges {} units of {} onto {} as advised",
+                        thisHost,
+                        units.size(),
+                        userFunc,
+                        target);
+            auto& shipment = shipments[target];
+            shipment.units.insert(
+              shipment.units.end(), units.begin(), units.end());
+            shipment.operators.insert(userFunc);
+        }
+    } else if (!mergeTo.empty()) {
+        SPDLOG_DEBUG("Flux {} defers {} advised merges: it is short this "
+                     "round",
+                     thisHost,
+                     mergeTo.size());
     }
 
     // ---- One hand-over per target ----

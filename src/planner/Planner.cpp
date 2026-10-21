@@ -1503,21 +1503,23 @@ void Planner::updateRuntimeStats()
                 for (const auto& [ip, stats] : clusterStats) {
                     schedStats[ip] = stats;
                 }
+                stateAwareScheduler->setClusterWorkerStats(
+                  std::move(schedStats));
 
                 // ModeFlux: advise every worker behind where to send what it
-                // cannot get through before the next round. Goes out with the
-                // next fetch, alongside these stats.
+                // cannot get through before the next round, and those holding
+                // part of an operator that now fits on one worker to hand it
+                // over. Goes out with the next fetch, alongside these stats.
                 if (scheduleMode == batch_scheduler::ModeFlux) {
+                    auto snapshot = stateAwareScheduler->getClusterSnapshot();
                     auto plans = stateAwareScheduler->planFluxOffload(
-                      schedStats, runtimeReconfigPeriod * 1000.0);
+                      snapshot->stats, runtimeReconfigPeriod * 1000.0);
+                    stateAwareScheduler->planFluxMerges(plans);
                     auto& outPlans = *lastRoundStats.mutable_fluxoffloadplans();
                     for (auto& [ip, plan] : plans) {
                         outPlans[ip] = std::move(plan);
                     }
                 }
-
-                stateAwareScheduler->setClusterWorkerStats(
-                  std::move(schedStats));
             }
         }
 

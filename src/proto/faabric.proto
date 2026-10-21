@@ -470,6 +470,8 @@ message WorkerStats{
     // once, wherever it went, so summed over workers it is the operator's
     // throughput -- unlike arrivals, which a migrated request makes twice.
     map<string, double> paridxRatePerSec = 17;
+    // ModeFlux: units of state held here, per stateful operator (user_func).
+    map<string, int32> fluxHeldUnits = 18;
 }
 
 // ModeFlux: what one worker's migrations and forwarding have cost. Counters
@@ -566,4 +568,9 @@ message FluxOffloadPlan
   // Target worker -> executor time (us) this worker may send it until the
   // next plan arrives.
   map<string, double> quotaUs = 1;
+  // Stateful operator (user_func) -> the worker to hand every unit of it
+  // held here to, once load has stayed low enough for it to run on one
+  // worker. Advice too: the worker only acts on it in a round it is not
+  // short itself.
+  map<string, string> mergeTo = 2;
 }
