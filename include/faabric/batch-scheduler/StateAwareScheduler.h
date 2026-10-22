@@ -122,6 +122,41 @@ class StateAwareScheduler : public BatchScheduler
     std::shared_ptr<const std::map<std::string, faabric::WorkerStats>>
     getClusterWorkerStats();
 
+    // ModeFlux: what routing needs from the DAG, worked out once at
+    // registerApp.
+    struct FluxDag
+    {
+        // Per operator, its stateless children whose only caller it is.
+        // Their requests run where it runs. A stateless operator with
+        // several callers is in none's list.
+        std::unordered_map<std::string, std::vector<std::string>> localChildren;
+        // Every operator in some localChildren list: its requests are set
+        // off here by work already counted with its caller's.
+        std::unordered_set<std::string> localChildOps;
+        // Per operator, every operator it calls or is called by.
+        std::unordered_map<std::string, std::vector<std::string>> neighbours;
+        // The stateful operators, partitioned or not: their requests can
+        // only go to their unit's owner.
+        std::unordered_set<std::string> statefulOps;
+    };
+
+    // ModeFlux: the DAG as registered. Never null.
+    std::shared_ptr<const FluxDag> getFluxDag();
+
+    /**
+     * ModeFlux: what a worker has to get through before its next round, in
+     * executor time, from what it reported: every request queued there with
+     * the stateless requests it will set off there, and the same of what
+     * arrives from outside over `horizonUs`. Arrivals of an operator's local
+     * children are not counted again: their caller's share covers them.
+     */
+    static double demandWorkUsFlux(const faabric::WorkerStats& workerStats,
+                                   double horizonUs)
+    {
+        return workerStats.queuedchainworkus() +
+               workerStats.arrivalchainworkus() * horizonUs / 1e6;
+    }
+
     // One stats round, and what routing reads off it, worked out once when
     // the round arrives rather than for every request until the next.
     struct FluxClusterSnapshot
@@ -137,15 +172,13 @@ class StateAwareScheduler : public BatchScheduler
         // there.
         std::unordered_map<std::string, std::unordered_map<std::string, int>>
           presence;
-        // ModeFlux, per worker: executor time queued there (queuedWorkUsFlux).
-        std::unordered_map<std::string, double> queuedUs;
         // ModeFlux, per operator: executor time, per request of it, of the
         // stateless requests it sets off downstream. Those run where it runs
         // -- chained stateless calls stay local -- so this is the work one of
         // its requests brings to a worker besides its own. Stateful
         // operators downstream count nothing: their requests go to their
         // unit's owner. Nor do stateless ones with several callers (see
-        // fluxLocalChildren).
+        // FluxDag::localChildren).
         std::unordered_map<std::string, double> downstreamWorkUs;
         // Time from the stats round before to this one; 0 for the first.
         double roundUs = 0;
@@ -160,16 +193,14 @@ class StateAwareScheduler : public BatchScheduler
         std::unordered_map<std::string, std::unordered_map<std::string, double>>
           opChainWorkUs;
         // ModeFlux, per worker: what it had to get through over the round
-        // (queued + arriving) and what it could (slots x round).
+        // (demandWorkUsFlux) and what it could (slots x round).
         std::unordered_map<std::string, double> demandUs;
         std::unordered_map<std::string, double> capacityUs;
         // ModeFlux, per worker and stateful operator: units held there.
         std::unordered_map<std::string, std::unordered_map<std::string, int>>
           heldUnits;
-        // ModeFlux, per operator: its DAG neighbours, callers and callees.
-        std::shared_ptr<
-          const std::unordered_map<std::string, std::vector<std::string>>>
-          neighbours;
+        // ModeFlux: the DAG as registered when the round arrived.
+        std::shared_ptr<const FluxDag> dag;
 
         double slotTimeOf(const std::string& queueKey) const
         {
@@ -181,12 +212,6 @@ class StateAwareScheduler : public BatchScheduler
         {
             auto it = downstreamWorkUs.find(userFunc);
             return it == downstreamWorkUs.end() ? 0 : it->second;
-        }
-
-        double queuedOf(const std::string& ip) const
-        {
-            auto it = queuedUs.find(ip);
-            return it == queuedUs.end() ? 0 : it->second;
         }
 
         bool runs(const std::string& ip, const std::string& userFunc) const
@@ -216,11 +241,11 @@ class StateAwareScheduler : public BatchScheduler
         int neighboursOn(const std::string& ip,
                          const std::string& userFunc) const
         {
-            if (!neighbours) {
+            if (!dag) {
                 return 0;
             }
-            auto it = neighbours->find(userFunc);
-            if (it == neighbours->end()) {
+            auto it = dag->neighbours.find(userFunc);
+            if (it == dag->neighbours.end()) {
                 return 0;
             }
             int n = 0;
@@ -271,8 +296,11 @@ class StateAwareScheduler : public BatchScheduler
 
     /**
      * ModeFlux: what a worker has to get through before its next
-     * rebalancing round -- the executor time queued in all its queues -- and
-     * what it can, its executor slots over that time.
+     * rebalancing round that it cannot send elsewhere -- every request
+     * queued there, and every stateful request bound to arrive, each with
+     * the stateless requests it will set off there -- and what it can, its
+     * executor slots over that time. Stateless requests yet to arrive are
+     * left out: they can still be routed elsewhere when they do.
      */
     struct FluxLocalWork
     {
@@ -482,15 +510,6 @@ class StateAwareScheduler : public BatchScheduler
       const std::string& userFunc,
       const HostMap& hostMap,
       const FluxClusterSnapshot& snapshot);
-
-    /**
-     * ModeFlux: executor time queued on `ip` as it last reported -- each
-     * queue's requests times the time one takes there, or the cluster's
-     * average where unmeasured. 0 if it did not report.
-     */
-    static double queuedWorkUsFlux(
-      const std::map<std::string, faabric::WorkerStats>& stats,
-      const std::string& ip);
 
     /**
      * ModeFlux: executor time one request of `queueKey` takes, averaged over
@@ -810,18 +829,11 @@ class StateAwareScheduler : public BatchScheduler
     std::shared_ptr<const FluxClusterSnapshot> clusterSnapshot =
       std::make_shared<FluxClusterSnapshot>();
 
-    // ModeFlux, set at registerApp, guarded by scheduleMx: per operator, its
-    // stateless children whose only caller it is. Their requests run where
-    // it runs. A stateless operator with several callers is in none's list.
-    std::unordered_map<std::string, std::vector<std::string>> fluxLocalChildren;
-    // ModeFlux, set at registerApp, guarded by scheduleMx: per operator,
-    // every operator it calls or is called by.
-    std::shared_ptr<
-      const std::unordered_map<std::string, std::vector<std::string>>>
-      fluxNeighbours;
+    // ModeFlux, set at registerApp, guarded by scheduleMx.
+    std::shared_ptr<const FluxDag> fluxDag = std::make_shared<FluxDag>();
 
-    // Fills `snapshot.downstreamWorkUs`: fluxLocalChildren, weighed with the
-    // throughputs and executor times its stats report.
+    // Fills `snapshot.downstreamWorkUs`: the DAG's local children, weighed
+    // with the throughputs and executor times its stats report.
     void computeDownstreamWorkFlux(FluxClusterSnapshot& snapshot);
 
     // Fills the per-worker, per-operator activity of `snapshot`, and each

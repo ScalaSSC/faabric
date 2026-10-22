@@ -423,6 +423,19 @@ class Scheduler
     faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork
     fluxLocalWorkOf();
 
+    // ModeFlux: this worker's work, in executor time, each request with the
+    // stateless requests it will set off here: what is queued, and per
+    // second what arrived from outside over the last window -- arrivals of
+    // an operator's local children left out, their caller's share covering
+    // them -- and, of that, what can only run here, the stateful.
+    struct FluxWorkerWork
+    {
+        double queuedUs = 0;
+        double arrivalUsPerSec = 0;
+        double pinnedUsPerSec = 0;
+    };
+    FluxWorkerWork fluxWorkerWorkOf();
+
     // Time (us) handing work over to another worker has taken, averaged over
     // recent migrations: from freezing the units to flipping their owners.
     // What a moved request loses before it can start on the other side.

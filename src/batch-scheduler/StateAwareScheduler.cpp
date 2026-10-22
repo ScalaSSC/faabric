@@ -182,16 +182,23 @@ bool StateAwareScheduler::registerApp(
     application->displayApplication();
     application->buildInvertConnections();
 
-    // ModeFlux: which requests run where an operator runs, read off the DAG
-    // once. A chained stateless call stays on the worker that made it, so an
-    // operator's stateless children run where it runs. A stateless operator
-    // called by more than one operator is left out: how much of it each
-    // caller sets off is not known, so for now it counts for none of them.
-    fluxLocalChildren.clear();
+    // ModeFlux: what routing needs from the DAG, read off it once.
+    //
+    // Which requests run where an operator runs: a chained stateless call
+    // stays on the worker that made it, so an operator's stateless children
+    // run where it runs. A stateless operator called by more than one
+    // operator is left out: how much of it each caller sets off is not
+    // known, so for now it counts for none of them.
+    auto dag = std::make_shared<FluxDag>();
     std::unordered_map<std::string, std::unordered_set<std::string>> callers;
+    std::unordered_map<std::string, std::unordered_set<std::string>> linked;
     for (const auto& [src, dests] : application->getConnections()) {
         for (const auto& dest : dests) {
             callers[dest].insert(src);
+            if (dest != src) {
+                linked[src].insert(dest);
+                linked[dest].insert(src);
+            }
         }
     }
     const auto& nodes = application->getNodes();
@@ -204,27 +211,27 @@ bool StateAwareScheduler::registerApp(
                 callers[dest].size() != 1 || !seen.insert(dest).second) {
                 continue;
             }
-            fluxLocalChildren[src].push_back(dest);
+            dag->localChildren[src].push_back(dest);
+            dag->localChildOps.insert(dest);
         }
     }
-
-    // ModeFlux: every operator's DAG neighbours, both ways.
-    std::unordered_map<std::string, std::unordered_set<std::string>> linked;
-    for (const auto& [src, dests] : application->getConnections()) {
-        for (const auto& dest : dests) {
-            if (dest != src) {
-                linked[src].insert(dest);
-                linked[dest].insert(src);
-            }
-        }
-    }
-    auto neighbours = std::make_shared<
-      std::unordered_map<std::string, std::vector<std::string>>>();
     for (const auto& [userFunc, others] : linked) {
-        (*neighbours)[userFunc].assign(others.begin(), others.end());
+        dag->neighbours[userFunc].assign(others.begin(), others.end());
     }
-    fluxNeighbours = std::move(neighbours);
+    for (const auto& [name, node] : nodes) {
+        if (node->type != NodeType::STATELESS) {
+            dag->statefulOps.insert(name);
+        }
+    }
+    fluxDag = std::move(dag);
     return true;
+}
+
+std::shared_ptr<const StateAwareScheduler::FluxDag>
+StateAwareScheduler::getFluxDag()
+{
+    faabric::util::SharedLock lock(scheduleMx);
+    return fluxDag;
 }
 
 void StateAwareScheduler::initApp(const HostMap& hostMap)
@@ -800,6 +807,7 @@ void StateAwareScheduler::setClusterWorkerStats(
     auto snapshot = std::make_shared<FluxClusterSnapshot>();
     snapshot->stats = std::move(stats);
     snapshot->roundUs = roundUs;
+    snapshot->dag = getFluxDag();
     if (scheduleMode == ModeFlux) {
         // Hosts in the order clusterSlotTimeUs visits them, so the means come
         // out the same to the last bit.
@@ -824,7 +832,6 @@ void StateAwareScheduler::setClusterWorkerStats(
                 presence[userFunc] +=
                   depth + (runningIt == running.end() ? 0 : runningIt->second);
             }
-            snapshot->queuedUs[ip] = queuedWorkUs(snapshot->stats, workerStats);
         }
         for (const auto& [queueKey, sumAndCount] : slotTimeSums) {
             snapshot->slotTimeUs[queueKey] =
@@ -864,11 +871,6 @@ void StateAwareScheduler::setClusterWorkerStats(
 void StateAwareScheduler::computeOperatorActivityFlux(
   FluxClusterSnapshot& snapshot)
 {
-    {
-        faabric::util::SharedLock lock(scheduleMx);
-        snapshot.neighbours = fluxNeighbours;
-    }
-
     double roundUs = snapshot.roundUs > 0 ? snapshot.roundUs : 1e6;
     double roundSec = roundUs / 1e6;
     for (const auto& [ip, workerStats] : snapshot.stats) {
@@ -897,8 +899,7 @@ void StateAwareScheduler::computeOperatorActivityFlux(
             }
         }
 
-        snapshot.demandUs[ip] =
-          snapshot.queuedOf(ip) + workerStats.arrivalworkus() * roundSec;
+        snapshot.demandUs[ip] = demandWorkUsFlux(workerStats, roundUs);
         snapshot.capacityUs[ip] =
           std::max(1, workerStats.workerslots()) * roundUs;
         auto& held = snapshot.heldUnits[ip];
@@ -914,11 +915,7 @@ void StateAwareScheduler::computeDownstreamWorkFlux(
   FluxClusterSnapshot& snapshot)
 {
     // Which children run where each operator runs: from registration.
-    std::unordered_map<std::string, std::vector<std::string>> children;
-    {
-        faabric::util::SharedLock lock(scheduleMx);
-        children = fluxLocalChildren;
-    }
+    const auto& children = snapshot.dag->localChildren;
     if (children.empty()) {
         return;
     }
@@ -1006,14 +1003,6 @@ StateAwareScheduler::getClusterWorkerStats()
     return { snapshot, &snapshot->stats };
 }
 
-double StateAwareScheduler::queuedWorkUsFlux(
-  const std::map<std::string, faabric::WorkerStats>& stats,
-  const std::string& ip)
-{
-    auto it = stats.find(ip);
-    return it == stats.end() ? 0 : queuedWorkUs(stats, it->second);
-}
-
 std::map<std::string, faabric::FluxOffloadPlan>
 StateAwareScheduler::planFluxOffload(
   const std::map<std::string, faabric::WorkerStats>& stats,
@@ -1031,11 +1020,9 @@ StateAwareScheduler::planFluxOffload(
     for (const auto& [ip, workerStats] : stats) {
         int slots = std::max(1, workerStats.workerslots());
         int cap = workerStats.paridxcap() > 0 ? workerStats.paridxcap() : slots;
-        double queuedUs = queuedWorkUs(stats, workerStats);
         // What it has to get through before the next round: what is queued,
-        // and what arrives meanwhile.
-        double demandUs =
-          queuedUs + workerStats.arrivalworkus() * horizonUs / 1e6;
+        // and what arrives meanwhile, with what they set off there.
+        double demandUs = demandWorkUsFlux(workerStats, horizonUs);
 
         std::set<std::string> operators;
         int backedUp = 0;
@@ -1164,11 +1151,8 @@ void StateAwareScheduler::planFluxMerges(
     // The share of the requests of `userFunc`'s neighbours that were on `ip`.
     auto neighbourShare = [&now](const std::string& userFunc,
                                  const std::string& ip) {
-        if (!now.neighbours) {
-            return 0.0;
-        }
-        auto it = now.neighbours->find(userFunc);
-        if (it == now.neighbours->end()) {
+        auto it = now.dag->neighbours.find(userFunc);
+        if (it == now.dag->neighbours.end()) {
             return 0.0;
         }
         double here = 0;
@@ -1605,16 +1589,17 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     double workUs = slotTimeUs + snapshot->downstreamOf(userFunc);
     double horizonUs = snapshot->roundUs > 0 ? snapshot->roundUs : 1e6;
 
-    // Each host's work before the next round, against what it can do. Its
-    // arrivals as measured, less those this planner routed there the round
-    // before, plus those it has routed there since: the planner's own share
-    // as it now stands.
+    // Each host's work before the next round, against what it can do: what
+    // is queued there and what arrives from outside, each with what it sets
+    // off there (demandWorkUsFlux). Its arrivals as measured, less those this
+    // planner routed there the round before, plus those it has routed there
+    // since: the planner's own share as it now stands.
     //
-    // The input goes to the first host with room for it: one already running
-    // the operator, with most of it there, before one that is not, and among
-    // those the one with the most room. An operator thus fills one host
-    // before it spills onto the next. Only if no host has room does it go to
-    // the least loaded one.
+    // The input goes to the first host with room for it: the one where most
+    // of its DAG neighbours run, then one already running the operator, with
+    // most of it there, then the one with the most room. An operator thus
+    // fills one host before it spills onto the next. Only if no host has room
+    // does it go to the least loaded one.
     const std::string* chosen = nullptr;
     std::tuple<int, bool, int, double> chosenKey{ 0, false, 0, 0 };
     const std::string* leastLoaded = nullptr;
@@ -1636,9 +1621,9 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         double routedUs =
           routedIt == fluxAssignedWorkUs.end() ? 0 : routedIt->second;
         double demandUs =
-          snapshot->queuedOf(ip) +
-          std::max(0.0, workerStats.arrivalworkus() - prevRateUs) * horizonUs /
-            1e6 +
+          workerStats.queuedchainworkus() +
+          std::max(0.0, workerStats.arrivalchainworkus() - prevRateUs) *
+            horizonUs / 1e6 +
           routedUs;
 
         double load = (demandUs + workUs) / capacityUs;

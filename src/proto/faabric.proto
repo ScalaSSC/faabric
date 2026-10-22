@@ -472,6 +472,13 @@ message WorkerStats{
     map<string, double> paridxRatePerSec = 17;
     // ModeFlux: units of state held here, per stateful operator (user_func).
     map<string, int32> fluxHeldUnits = 18;
+    // ModeFlux, in executor time (us): every request queued here with the
+    // stateless requests it will set off here; and, per second over the last
+    // rebalancing window, the same of what arrived from outside -- arrivals
+    // of an operator's local children are left out, their caller's share
+    // covering them. See StateAwareScheduler::demandWorkUsFlux.
+    double queuedChainWorkUs = 19;
+    double arrivalChainWorkUs = 20;
 }
 
 // ModeFlux: what one worker's migrations and forwarding have cost. Counters

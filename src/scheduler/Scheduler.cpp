@@ -703,12 +703,29 @@ Scheduler::fluxLocalLoadOf(const std::string& userFuncPar)
     return local;
 }
 
-faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork
-Scheduler::fluxLocalWorkOf()
+Scheduler::FluxWorkerWork Scheduler::fluxWorkerWorkOf()
 {
-    faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork work;
+    FluxWorkerWork work;
     auto loads = snapshotFluxParidxLoads();
     auto snapshot = decentralScheduler.getClusterSnapshot();
+    auto dag = decentralScheduler.getFluxDag();
+
+    // A request's executor time here with that of what it sets off here.
+    auto chainUsOf = [&](const std::string& userFuncPar,
+                         const std::string& userFunc,
+                         double slotTimeUs) {
+        if (slotTimeUs <= 0) {
+            slotTimeUs = snapshot->slotTimeOf(userFuncPar);
+        }
+        return slotTimeUs > 0 ? slotTimeUs + snapshot->downstreamOf(userFunc)
+                              : 0;
+    };
+    auto operatorOf = [](const std::string& userFuncPar) {
+        auto [user, func, parStr] =
+          faabric::util::splitUserFuncPar(userFuncPar);
+        return user + "_" + func;
+    };
+
     {
         faabric::util::SharedLock lock(waitingQueuesMx);
         for (const auto& [userFuncPar, queue] : waitingQueues) {
@@ -717,14 +734,43 @@ Scheduler::fluxLocalWorkOf()
                 continue;
             }
             auto it = loads.find(fluxFuncParStrOf(userFuncPar));
-            double slotTimeUs = it != loads.end() && it->second.slotTimeUs > 0
-                                  ? it->second.slotTimeUs
-                                  : snapshot->slotTimeOf(userFuncPar);
-            work.queuedUs += depth * slotTimeUs;
+            double slotTimeUs = it != loads.end() ? it->second.slotTimeUs : 0;
+            work.queuedUs +=
+              depth *
+              chainUsOf(userFuncPar, operatorOf(userFuncPar), slotTimeUs);
         }
     }
+
+    for (const auto& [funcParStr, load] : loads) {
+        if (load.arrivalRatePerSec <= 0) {
+            continue;
+        }
+        std::string userFuncPar = fluxQueueKeyOf(funcParStr);
+        std::string userFunc = operatorOf(userFuncPar);
+        if (dag->localChildOps.contains(userFunc)) {
+            continue;
+        }
+        double arrivalUs = load.arrivalRatePerSec *
+                           chainUsOf(userFuncPar, userFunc, load.slotTimeUs);
+        work.arrivalUsPerSec += arrivalUs;
+        if (dag->statefulOps.contains(userFunc)) {
+            work.pinnedUsPerSec += arrivalUs;
+        }
+    }
+    return work;
+}
+
+faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork
+Scheduler::fluxLocalWorkOf()
+{
+    // What cannot go elsewhere: all that is queued, and the stateful
+    // requests bound to arrive before the next round.
     double horizonUs =
       (fluxRebalancePeriod > 0 ? fluxRebalancePeriod : 1000) * 1000.0;
+    auto workerWork = fluxWorkerWorkOf();
+    faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork work;
+    work.queuedUs =
+      workerWork.queuedUs + workerWork.pinnedUsPerSec * horizonUs / 1e6;
     work.capacityUs = std::max(1, fluxWorkerSlots) * horizonUs;
     return work;
 }
@@ -751,6 +797,9 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
           fluxWorkRates(snapshotFluxParidxLoads());
         out.set_arrivalworkus(arrivalWorkUs);
         out.set_processworkus(processWorkUs);
+        auto work = fluxWorkerWorkOf();
+        out.set_queuedchainworkus(work.queuedUs);
+        out.set_arrivalchainworkus(work.arrivalUsPerSec);
     }
 
     auto* migration = out.mutable_fluxmigration();
@@ -2648,8 +2697,6 @@ void Scheduler::rebalanceFlux()
     int slots = std::max(1, fluxWorkerSlots);
     bool workerFull = runningExecutors.load(std::memory_order_relaxed) >= slots;
     auto loads = snapshotFluxParidxLoads();
-    // Work arriving here per second, over every paridx.
-    double arrivalWorkUs = fluxWorkRates(loads).first;
 
     // The planner's advice: where to send, and how much. Without it nothing
     // moves.
@@ -2758,8 +2805,6 @@ void Scheduler::rebalanceFlux()
     };
     std::vector<StatelessBacklog> statelessBacklogs;
     std::map<std::string, StateDeficit> stateDeficits;
-    // Executor time queued here, over every measured paridx.
-    double queuedWorkUs = 0;
     for (const auto& [userFuncPar, queue] : queues) {
         int depth = queue->getMessagesCount();
         if (depth == 0) {
@@ -2771,7 +2816,6 @@ void Scheduler::rebalanceFlux()
         if (slotTimeUs <= 0) {
             continue;
         }
-        queuedWorkUs += depth * slotTimeUs;
         FluxParidxLoad load;
         auto loadIt = loads.find(fluxFuncParStrOf(userFuncPar));
         if (loadIt != loads.end()) {
@@ -2986,8 +3030,12 @@ void Scheduler::rebalanceFlux()
 
         // Load here now, and on `ip` once it has taken `extraUs` more on top
         // of what it reported and what this round already sends it.
-        double loadNow =
-          (queuedWorkUs + arrivalWorkUs * horizonSec) / (slots * horizonUs);
+        // What a worker has to get through before the next round, each
+        // request with what it sets off there, over what it can.
+        auto workerWork = fluxWorkerWorkOf();
+        double demandHereUs =
+          workerWork.queuedUs + workerWork.arrivalUsPerSec * horizonSec;
+        double loadNow = demandHereUs / (slots * horizonUs);
         auto targetLoad = [&](const std::string& ip, double extraUs) {
             auto statsIt = stats.find(ip);
             if (statsIt == stats.end()) {
@@ -2998,9 +3046,9 @@ void Scheduler::rebalanceFlux()
               targetStats.workerslots() > 0 ? targetStats.workerslots() : slots;
             double sentUs =
               shipments.contains(ip) ? shipments.at(ip).workUs : 0;
-            double demandUs = snapshot->queuedOf(ip) +
-                              targetStats.arrivalworkus() * horizonSec +
-                              sentUs + extraUs;
+            double demandUs =
+              StateAwareScheduler::demandWorkUsFlux(targetStats, horizonUs) +
+              sentUs + extraUs;
             return demandUs / (targetSlots * horizonUs);
         };
 
@@ -3028,9 +3076,9 @@ void Scheduler::rebalanceFlux()
                 noRoom++;
                 continue;
             }
-            double loadHere = (queuedWorkUs + arrivalWorkUs * horizonSec -
-                               statelessWorkUs - movedUs - candidate.workUs) /
-                              (slots * horizonUs);
+            double loadHere =
+              (demandHereUs - statelessWorkUs - movedUs - candidate.workUs) /
+              (slots * horizonUs);
             double loadThere = targetLoad(target, candidate.workUs);
             if (std::max(loadHere, loadThere) >= loadNow) {
                 noRelief++;
