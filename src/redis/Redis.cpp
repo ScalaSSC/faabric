@@ -623,13 +623,24 @@ std::vector<std::pair<std::string, int64_t>> Redis::claimOrGetManyWithEpoch(
   const std::vector<std::pair<std::string, std::string>>& keys,
   const std::string& proposedValue)
 {
+    return claimOrGetManyWithEpoch(keys,
+                                   std::vector<std::string>{ proposedValue });
+}
+
+std::vector<std::pair<std::string, int64_t>> Redis::claimOrGetManyWithEpoch(
+  const std::vector<std::pair<std::string, std::string>>& keys,
+  const std::vector<std::string>& proposedValues)
+{
     if (keys.empty()) {
         return {};
+    }
+    if (proposedValues.size() != 1 && proposedValues.size() != keys.size()) {
+        throw std::runtime_error("One proposed value, or one per key pair");
     }
 
     // EVALSHA sha numkeys key... arg
     std::vector<std::string> args;
-    args.reserve(3 + 2 * keys.size() + 1);
+    args.reserve(3 + 2 * keys.size() + proposedValues.size());
     args.emplace_back("EVALSHA");
     args.emplace_back(instance.claimManyWithEpochSha);
     args.emplace_back(std::to_string(2 * keys.size()));
@@ -637,7 +648,9 @@ std::vector<std::pair<std::string, int64_t>> Redis::claimOrGetManyWithEpoch(
         args.push_back(ownerKey);
         args.push_back(epochKey);
     }
-    args.push_back(proposedValue);
+    for (const auto& value : proposedValues) {
+        args.push_back(value);
+    }
 
     std::vector<const char*> argv;
     std::vector<size_t> argvLen;

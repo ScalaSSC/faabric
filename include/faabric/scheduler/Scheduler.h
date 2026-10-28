@@ -204,6 +204,15 @@ class Scheduler
     // it reports every round.
     void fillFluxWorkerStats(faabric::WorkerStats& out);
 
+    // ModeFlux: one stats round handled here took `cpuNs` of CPU time, and
+    // the stats it reported were `bytes` long.
+    void recordFluxStatsRound(int64_t cpuNs, int64_t bytes)
+    {
+        fluxOverhead.statsCpuNs.fetch_add(cpuNs, std::memory_order_relaxed);
+        fluxOverhead.statsRounds.fetch_add(1, std::memory_order_relaxed);
+        fluxOverhead.lastStatsBytes.store(bytes, std::memory_order_relaxed);
+    }
+
     // ModeFlux: the planner's advice for this worker (see FluxOffloadPlan).
     // Empty when the planner saw no need, or nowhere to send.
     void setFluxOffloadQuota(std::map<std::string, double> quotaUs)
@@ -460,6 +469,10 @@ class Scheduler
         std::atomic<int64_t> fwdTombstone{ 0 };
         std::atomic<int64_t> fwdOwner{ 0 };
         std::atomic<int64_t> rerouted{ 0 };
+        std::atomic<int64_t> splitUnits{ 0 };
+        std::atomic<int64_t> mergeUnits{ 0 };
+        std::atomic<int64_t> remigrations{ 0 };
+        std::atomic<int64_t> spilled{ 0 };
 
         void reset()
         {
@@ -476,12 +489,59 @@ class Scheduler
                                    &inStateBytes,
                                    &fwdTombstone,
                                    &fwdOwner,
-                                   &rerouted }) {
+                                   &rerouted,
+                                   &splitUnits,
+                                   &mergeUnits,
+                                   &remigrations,
+                                   &spilled }) {
                 counter->store(0, std::memory_order_relaxed);
             }
         }
     };
     FluxMigrationCounters fluxCounters;
+
+    // ModeFlux: what scheduling, rebalancing and stats cost here, as
+    // reported in FluxOverheadStats. Reset by flushes.
+    struct FluxOverheadCounters
+    {
+        std::atomic<int64_t> routingCpuNs{ 0 };
+        std::atomic<int64_t> routedRequests{ 0 };
+        std::atomic<int64_t> rebalanceCpuNs{ 0 };
+        std::atomic<int64_t> rebalanceRounds{ 0 };
+        std::atomic<int64_t> statsCpuNs{ 0 };
+        std::atomic<int64_t> statsRounds{ 0 };
+        std::atomic<int64_t> lastStatsBytes{ 0 };
+        std::atomic<int64_t> handovers{ 0 };
+        std::atomic<int64_t> prepareUs{ 0 };
+        std::atomic<int64_t> waitUs{ 0 };
+        std::atomic<int64_t> packUs{ 0 };
+        std::atomic<int64_t> sendUs{ 0 };
+        std::atomic<int64_t> flipUs{ 0 };
+        std::atomic<int64_t> forwardUs{ 0 };
+        std::atomic<int64_t> parkedRequests{ 0 };
+
+        void reset()
+        {
+            for (auto* counter : { &routingCpuNs,
+                                   &routedRequests,
+                                   &rebalanceCpuNs,
+                                   &rebalanceRounds,
+                                   &statsCpuNs,
+                                   &statsRounds,
+                                   &lastStatsBytes,
+                                   &handovers,
+                                   &prepareUs,
+                                   &waitUs,
+                                   &packUs,
+                                   &sendUs,
+                                   &flipUs,
+                                   &forwardUs,
+                                   &parkedRequests }) {
+                counter->store(0, std::memory_order_relaxed);
+            }
+        }
+    };
+    FluxOverheadCounters fluxOverhead;
 
     // Marks `msg` as having gone on to another worker once more.
     static void countForward(faabric::Message& msg)
@@ -582,6 +642,9 @@ class Scheduler
     // was routed on a stale owner and is forwarded. Dropped if the unit ever
     // comes back.
     std::map<std::string, faabric::ShardMove> fluxMovedUnits;
+    // When each unit last left this worker (us), to count one that comes
+    // back soon after as a ping-pong.
+    std::unordered_map<std::string, int64_t> fluxMovedOutAtUs;
     // Size of fluxMigratingUnits + fluxMovedUnits, read lock-free by the
     // enqueue and dispatch paths to skip the mutex until the first migration.
     std::atomic<int> fluxRouteRecords{ 0 };
@@ -667,6 +730,15 @@ class Scheduler
         int units = 0;
         int statelessRequests = 0;
         size_t stateBytes = 0;
+        // Wall time (us) of each phase; see FluxOverheadStats.
+        int64_t prepareUs = 0;
+        int64_t waitUs = 0;
+        int64_t packUs = 0;
+        int64_t sendUs = 0;
+        int64_t flipUs = 0;
+        int64_t forwardUs = 0;
+        // Requests parked while the units were frozen.
+        int64_t parked = 0;
     };
     FluxHandover migrateToWorkerFlux(
       const std::string& target,

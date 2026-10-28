@@ -29,6 +29,21 @@
 
 namespace faabric::planner {
 
+// ModeFlux, planner: what one stats round cost -- CPU time (ns) of building
+// the snapshot, the offload advice and the merge advice; the round's wall
+// time (us) from asking the workers to the advice being ready; and the
+// bytes sent to and received from the workers.
+struct FluxControlPlaneRound
+{
+    int workers = 0;
+    int64_t snapshotCpuNs = 0;
+    int64_t offloadCpuNs = 0;
+    int64_t mergeCpuNs = 0;
+    int64_t wallUs = 0;
+    int64_t bytesOut = 0;
+    int64_t bytesIn = 0;
+};
+
 class ApplicationMetrics
 {
   public:
@@ -57,7 +72,15 @@ class ApplicationMetrics
 
         int64_t tempStartTime = std::numeric_limits<int64_t>::max();
         int64_t tempEndTime = std::numeric_limits<int64_t>::min();
+        // When the input reached the planner, before any admission wait.
+        // Every request it sets off inherits it.
+        int64_t tempArrivalTime = std::numeric_limits<int64_t>::max();
+        // Whether any request it set off was migrated or forwarded.
+        bool anyForwarded = false;
         for (auto& [msgId, msg] : msgMap) {
+            if (msg->forwardcount() > 0) {
+                anyForwarded = true;
+            }
             std::string operatorName = getOperatorName(msg);
             std::string instanceName = getInstanceName(msg);
             if (!instances.contains(instanceName)) {
@@ -78,6 +101,10 @@ class ApplicationMetrics
 
             if (msg->plannerqueuetime() < tempStartTime) {
                 tempStartTime = msg->plannerqueuetime();
+            }
+            if (msg->inputarrivaltime() > 0 &&
+                msg->inputarrivaltime() < tempArrivalTime) {
+                tempArrivalTime = msg->inputarrivaltime();
             }
             if (msg->workerexecuteend() > tempEndTime) {
                 tempEndTime = msg->workerexecuteend();
@@ -112,6 +139,32 @@ class ApplicationMetrics
             totalLatenciesOverTen[tempLatencyMilli]++;
         }
 
+        // Arrival latency: from the input's arrival at the planner to the end
+        // of the last request it set off. Unlike the two above, it counts the
+        // wait for admission.
+        bool hasArrival =
+          tempArrivalTime != std::numeric_limits<int64_t>::max() &&
+          tempEndTime >= tempArrivalTime;
+        int64_t arrivalLatencyMicro =
+          hasArrival ? tempEndTime - tempArrivalTime : 0;
+        if (hasArrival) {
+            if (arrivalLatencyMicro < 10000) {
+                arrivalLatenciesUnderTen[static_cast<int>(
+                  arrivalLatencyMicro)]++;
+            } else {
+                arrivalLatenciesOverTen[static_cast<int>(arrivalLatencyMicro /
+                                                         1000)]++;
+            }
+            // The same again, split by whether migration touched the input.
+            auto& [underTen, overTen] =
+              anyForwarded ? arrivalForwardedLatencies : arrivalDirectLatencies;
+            if (arrivalLatencyMicro < 10000) {
+                underTen[static_cast<int>(arrivalLatencyMicro)]++;
+            } else {
+                overTen[static_cast<int>(arrivalLatencyMicro / 1000)]++;
+            }
+        }
+
         if (tempStartTime < startTime) {
             startTime = tempStartTime;
         }
@@ -129,6 +182,12 @@ class ApplicationMetrics
             int latencyMs = static_cast<int>(tempTotalLatencyMicro / 1000);
             int binIdx = histConfig.getBinIdx(latencyMs);
             runtimeMetricsHistory[secondKey].latencyBins[binIdx]++;
+            if (hasArrival) {
+                auto& record = runtimeMetricsHistory[secondKey];
+                record.arrivalLatencyBins[histConfig.getBinIdx(
+                  static_cast<int>(arrivalLatencyMicro / 1000))]++;
+                record.arrivalCount++;
+            }
 
             // Accumulate the per-second average latency separately: this map
             // is never trimmed, so the percentiles below always cover the
@@ -187,10 +246,18 @@ class ApplicationMetrics
         // Currently the initialization size is 1000, which means recording
         // latencies up to 1 second in microsecond granularity.
         std::vector<int> latencyBins;
+        // The same, from each input's arrival at the planner -- admission
+        // wait included -- to the end of the last request it set off. Only
+        // inputs carrying an arrival time are counted, in arrivalCount.
+        std::vector<int> arrivalLatencyBins;
+        int arrivalCount = 0;
         void init(int totalBins)
         {
             if (latencyBins.empty()) {
                 latencyBins.resize(totalBins, 0);
+            }
+            if (arrivalLatencyBins.empty()) {
+                arrivalLatencyBins.resize(totalBins, 0);
             }
         }
         int workersNum = 0;
@@ -234,6 +301,233 @@ class ApplicationMetrics
     // (fluxMigrationSummary), also logged. The shares put them next to the
     // work done: requests moved, and requests sent on because routing was
     // off, per request processed. Caller holds opMx.
+    // ModeFlux: what scheduling, rebalancing and the stats rounds cost --
+    // per worker as each reports it, and on the planner per round -- with
+    // their totals and averages. New keys only: nothing above changes.
+    // Caller holds opMx.
+    void addFluxOverheadMetrics(rapidjson::Document& doc) const
+    {
+        auto& alloc = doc.GetAllocator();
+
+        // ---- Workers ----
+        rapidjson::Value perWorkerObj(rapidjson::kObjectType);
+        rapidjson::Value summaryObj(rapidjson::kObjectType);
+        faabric::FluxOverheadStats clusterTotal;
+        long long clusterBytesSum = 0;
+        long long clusterBytesReports = 0;
+        int64_t clusterBytesMax = 0;
+        bool anyWorker = false;
+
+        auto summarise = [&alloc](const faabric::FluxOverheadStats& total,
+                                  long long bytesSum,
+                                  long long bytesReports,
+                                  int64_t bytesMax) {
+            rapidjson::Value obj(rapidjson::kObjectType);
+            for (const auto& field : fluxOverheadFields()) {
+                obj.AddMember(rapidjson::StringRef(field.name),
+                              static_cast<int64_t>((total.*field.get)()),
+                              alloc);
+            }
+            auto ratio = [](double num, double den) {
+                return den > 0 ? num / den : 0.0;
+            };
+            obj.AddMember(
+              "routing_us_per_request",
+              ratio(total.routingcpuns() / 1000.0, total.routedrequests()),
+              alloc);
+            obj.AddMember(
+              "rebalance_us_per_round",
+              ratio(total.rebalancecpuns() / 1000.0, total.rebalancerounds()),
+              alloc);
+            obj.AddMember(
+              "stats_us_per_round",
+              ratio(total.statscpuns() / 1000.0, total.statsrounds()),
+              alloc);
+            obj.AddMember("stats_bytes_mean",
+                          ratio(static_cast<double>(bytesSum), bytesReports),
+                          alloc);
+            obj.AddMember("stats_bytes_max", bytesMax, alloc);
+            double handovers = static_cast<double>(total.handovers());
+            obj.AddMember("prepare_us_per_handover",
+                          ratio(total.prepareus(), handovers),
+                          alloc);
+            obj.AddMember(
+              "wait_us_per_handover", ratio(total.waitus(), handovers), alloc);
+            obj.AddMember(
+              "pack_us_per_handover", ratio(total.packus(), handovers), alloc);
+            obj.AddMember(
+              "send_us_per_handover", ratio(total.sendus(), handovers), alloc);
+            obj.AddMember(
+              "flip_us_per_handover", ratio(total.flipus(), handovers), alloc);
+            obj.AddMember("forward_us_per_handover",
+                          ratio(total.forwardus(), handovers),
+                          alloc);
+            obj.AddMember("parked_per_handover",
+                          ratio(total.parkedrequests(), handovers),
+                          alloc);
+            return obj;
+        };
+
+        for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+            if (workerNode.fluxOverheadHistory.empty()) {
+                continue;
+            }
+            anyWorker = true;
+
+            rapidjson::Value workerArr(rapidjson::kArrayType);
+            faabric::FluxOverheadStats previous;
+            faabric::FluxOverheadStats total;
+            long long bytesSum = 0;
+            long long bytesReports = 0;
+            int64_t bytesMax = 0;
+            for (const auto& [second, report] :
+                 workerNode.fluxOverheadHistory) {
+                // What the counters grew by since the report before; one
+                // that went down was reset by a flush, so all of it is new.
+                faabric::FluxOverheadStats delta;
+                for (const auto& field : fluxOverheadFields()) {
+                    int64_t now = (report.*field.get)();
+                    int64_t before = (previous.*field.get)();
+                    (delta.*field.set)(now >= before ? now - before : now);
+                    (total.*field.set)((total.*field.get)() +
+                                       (delta.*field.get)());
+                }
+                previous = report;
+                int64_t bytes = report.laststatsbytes();
+                if (bytes > 0) {
+                    bytesSum += bytes;
+                    bytesReports++;
+                    bytesMax = std::max(bytesMax, bytes);
+                }
+
+                std::string entry = std::to_string(second);
+                for (const auto& field : fluxOverheadFields()) {
+                    int64_t value = (delta.*field.get)();
+                    // CPU time reads better in microseconds.
+                    if (field.nanos) {
+                        value /= 1000;
+                    }
+                    entry += " / " + std::to_string(value);
+                }
+                entry += " / " + std::to_string(bytes);
+                workerArr.PushBack(
+                  rapidjson::Value(entry.c_str(), alloc).Move(), alloc);
+            }
+
+            perWorkerObj.AddMember(
+              rapidjson::Value(ip.c_str(), alloc).Move(), workerArr, alloc);
+            summaryObj.AddMember(
+              rapidjson::Value(ip.c_str(), alloc).Move(),
+              summarise(total, bytesSum, bytesReports, bytesMax),
+              alloc);
+            for (const auto& field : fluxOverheadFields()) {
+                (clusterTotal.*field.set)((clusterTotal.*field.get)() +
+                                          (total.*field.get)());
+            }
+            clusterBytesSum += bytesSum;
+            clusterBytesReports += bytesReports;
+            clusterBytesMax = std::max(clusterBytesMax, bytesMax);
+        }
+
+        if (anyWorker) {
+            summaryObj.AddMember("cluster",
+                                 summarise(clusterTotal,
+                                           clusterBytesSum,
+                                           clusterBytesReports,
+                                           clusterBytesMax),
+                                 alloc);
+            doc.AddMember("fluxOverhead: second / routing_cpu_us / routed / "
+                          "rebalance_cpu_us / rebalance_rounds / stats_cpu_us "
+                          "/ stats_rounds / handovers / prepare_us / wait_us / "
+                          "pack_us / send_us / flip_us / forward_us / parked "
+                          "/ stats_bytes",
+                          perWorkerObj,
+                          alloc);
+            doc.AddMember("fluxOverheadSummary", summaryObj, alloc);
+        }
+
+        // ---- Planner ----
+        if (fluxControlPlaneRounds.empty() && plannerRouting.empty()) {
+            return;
+        }
+        rapidjson::Value roundsArr(rapidjson::kArrayType);
+        struct MeanMax
+        {
+            double sum = 0;
+            double max = 0;
+            void add(double v)
+            {
+                sum += v;
+                max = std::max(max, v);
+            }
+        };
+        MeanMax snapshotUs, offloadUs, mergeUs, wallMs, bytesOut, bytesIn;
+        for (const auto& [second, round] : fluxControlPlaneRounds) {
+            std::string entry =
+              std::to_string(second) + " / " + std::to_string(round.workers) +
+              " / " + std::to_string(round.snapshotCpuNs / 1000) + " / " +
+              std::to_string(round.offloadCpuNs / 1000) + " / " +
+              std::to_string(round.mergeCpuNs / 1000) + " / " +
+              std::to_string(round.wallUs / 1000) + " / " +
+              std::to_string(round.bytesOut) + " / " +
+              std::to_string(round.bytesIn);
+            roundsArr.PushBack(rapidjson::Value(entry.c_str(), alloc).Move(),
+                               alloc);
+            snapshotUs.add(round.snapshotCpuNs / 1000.0);
+            offloadUs.add(round.offloadCpuNs / 1000.0);
+            mergeUs.add(round.mergeCpuNs / 1000.0);
+            wallMs.add(round.wallUs / 1000.0);
+            bytesOut.add(static_cast<double>(round.bytesOut));
+            bytesIn.add(static_cast<double>(round.bytesIn));
+        }
+        doc.AddMember("fluxControlPlane: second / workers / snapshot_cpu_us / "
+                      "offload_cpu_us / merge_cpu_us / round_wall_ms / "
+                      "bytes_out / bytes_in",
+                      roundsArr,
+                      alloc);
+
+        rapidjson::Value routingArr(rapidjson::kArrayType);
+        int64_t routingNs = 0;
+        int64_t routedInputs = 0;
+        for (const auto& [second, routing] : plannerRouting) {
+            std::string entry = std::to_string(second) + " / " +
+                                std::to_string(routing.cpuNs / 1000) + " / " +
+                                std::to_string(routing.inputs);
+            routingArr.PushBack(rapidjson::Value(entry.c_str(), alloc).Move(),
+                                alloc);
+            routingNs += routing.cpuNs;
+            routedInputs += routing.inputs;
+        }
+        doc.AddMember(
+          "fluxPlannerRouting: second / cpu_us / inputs", routingArr, alloc);
+
+        rapidjson::Value planner(rapidjson::kObjectType);
+        double rounds = static_cast<double>(fluxControlPlaneRounds.size());
+        auto mean = [rounds](const MeanMax& m) {
+            return rounds > 0 ? m.sum / rounds : 0.0;
+        };
+        planner.AddMember("rounds", static_cast<int64_t>(rounds), alloc);
+        planner.AddMember("snapshot_cpu_us_mean", mean(snapshotUs), alloc);
+        planner.AddMember("snapshot_cpu_us_max", snapshotUs.max, alloc);
+        planner.AddMember("offload_cpu_us_mean", mean(offloadUs), alloc);
+        planner.AddMember("offload_cpu_us_max", offloadUs.max, alloc);
+        planner.AddMember("merge_cpu_us_mean", mean(mergeUs), alloc);
+        planner.AddMember("merge_cpu_us_max", mergeUs.max, alloc);
+        planner.AddMember("round_wall_ms_mean", mean(wallMs), alloc);
+        planner.AddMember("round_wall_ms_max", wallMs.max, alloc);
+        planner.AddMember("bytes_out_mean", mean(bytesOut), alloc);
+        planner.AddMember("bytes_out_max", bytesOut.max, alloc);
+        planner.AddMember("bytes_in_mean", mean(bytesIn), alloc);
+        planner.AddMember("bytes_in_max", bytesIn.max, alloc);
+        planner.AddMember("routing_us_per_input",
+                          routedInputs > 0 ? routingNs / 1000.0 /
+                                               static_cast<double>(routedInputs)
+                                           : 0.0,
+                          alloc);
+        planner.AddMember("routed_inputs", routedInputs, alloc);
+        doc.AddMember("fluxControlPlaneSummary", planner, alloc);
+    }
+
     void addFluxMigrationMetrics(rapidjson::Document& doc) const
     {
         auto& alloc = doc.GetAllocator();
@@ -244,6 +538,7 @@ class ApplicationMetrics
         int64_t endSec = runtimeMetricsHistory.rbegin()->first;
 
         rapidjson::Value perSecondObj(rapidjson::kObjectType);
+        rapidjson::Value perSecondExtraObj(rapidjson::kObjectType);
         rapidjson::Value summaryObj(rapidjson::kObjectType);
         faabric::FluxMigrationStats clusterTotal;
         long long clusterProcessed = 0;
@@ -252,10 +547,13 @@ class ApplicationMetrics
         auto summarise = [&alloc](const faabric::FluxMigrationStats& total,
                                   long long processed) {
             rapidjson::Value obj(rapidjson::kObjectType);
-            for (const auto& field : fluxCounterFields()) {
-                obj.AddMember(rapidjson::StringRef(field.name),
-                              static_cast<int64_t>((total.*field.get)()),
-                              alloc);
+            for (const auto* fields :
+                 { &fluxCounterFields(), &fluxExtraCounterFields() }) {
+                for (const auto& field : *fields) {
+                    obj.AddMember(rapidjson::StringRef(field.name),
+                                  static_cast<int64_t>((total.*field.get)()),
+                                  alloc);
+                }
             }
             obj.AddMember("held_units", total.heldunits(), alloc);
             obj.AddMember("cost_us", total.costus(), alloc);
@@ -279,6 +577,7 @@ class ApplicationMetrics
             anyWorker = true;
 
             rapidjson::Value workerArr(rapidjson::kArrayType);
+            rapidjson::Value workerExtraArr(rapidjson::kArrayType);
             faabric::FluxMigrationStats previous;
             faabric::FluxMigrationStats total;
             long long processed = 0;
@@ -314,10 +613,24 @@ class ApplicationMetrics
                 entry += std::to_string(delta.heldunits());
                 workerArr.PushBack(
                   rapidjson::Value(entry.c_str(), alloc).Move(), alloc);
+
+                std::string extraEntry;
+                for (const auto& field : fluxExtraCounterFields()) {
+                    if (!extraEntry.empty()) {
+                        extraEntry += " / ";
+                    }
+                    extraEntry += std::to_string((delta.*field.get)());
+                }
+                workerExtraArr.PushBack(
+                  rapidjson::Value(extraEntry.c_str(), alloc).Move(), alloc);
             }
 
             perSecondObj.AddMember(
               rapidjson::Value(ip.c_str(), alloc).Move(), workerArr, alloc);
+            perSecondExtraObj.AddMember(
+              rapidjson::Value(ip.c_str(), alloc).Move(),
+              workerExtraArr,
+              alloc);
             summaryObj.AddMember(rapidjson::Value(ip.c_str(), alloc).Move(),
                                  summarise(total, processed),
                                  alloc);
@@ -371,6 +684,10 @@ class ApplicationMetrics
                       "in_state_bytes / fwd_tombstone / fwd_owner / rerouted "
                       "/ held_units",
                       perSecondObj,
+                      alloc);
+        doc.AddMember("fluxMigrationsExtra: split_units / merge_units / "
+                      "remigrations / spilled",
+                      perSecondExtraObj,
                       alloc);
         doc.AddMember("fluxMigrationSummary", summaryObj, alloc);
     }
@@ -487,6 +804,73 @@ class ApplicationMetrics
         doc.AddMember("p95TotalLatency", p95TotalLatency, alloc);
         doc.AddMember("p99TotalLatency", p99TotalLatency, alloc);
 
+        // Arrival latency (us): from each input's arrival at the planner,
+        // admission wait included, to the end of the last request it set off.
+        {
+            std::map<int, long> combined;
+            for (const auto& [latencyMicro, freq] : arrivalLatenciesUnderTen) {
+                combined[latencyMicro] += freq;
+            }
+            for (const auto& [latencyMilli, freq] : arrivalLatenciesOverTen) {
+                combined[latencyMilli * 1000] += freq;
+            }
+            long arrivalCountAll = 0;
+            for (const auto& [latency, freq] : combined) {
+                arrivalCountAll += freq;
+            }
+            int medianArrival = 0;
+            int p95Arrival = 0;
+            int p99Arrival = 0;
+            if (arrivalCountAll > 0) {
+                long cumCount = 0;
+                for (const auto& [latencyMicro, freq] : combined) {
+                    cumCount += freq;
+                    if (medianArrival == 0 &&
+                        cumCount >= arrivalCountAll * 0.50) {
+                        medianArrival = latencyMicro;
+                    }
+                    if (p95Arrival == 0 && cumCount >= arrivalCountAll * 0.95) {
+                        p95Arrival = latencyMicro;
+                    }
+                    if (p99Arrival == 0 && cumCount >= arrivalCountAll * 0.99) {
+                        p99Arrival = latencyMicro;
+                        break;
+                    }
+                }
+            }
+            doc.AddMember("medianArrivalLatency", medianArrival, alloc);
+            doc.AddMember("p95ArrivalLatency", p95Arrival, alloc);
+            doc.AddMember("p99ArrivalLatency", p99Arrival, alloc);
+        }
+
+        // Arrival latency of the inputs any of whose requests was migrated
+        // or forwarded, and of those none of whose were.
+        for (const auto& [prefix, histogram] :
+             { std::pair{ "Forwarded", &arrivalForwardedLatencies },
+               std::pair{ "Direct", &arrivalDirectLatencies } }) {
+            auto [median, p95, p99, n] =
+              percentilesOf(histogram->first, histogram->second);
+            std::string tag(prefix);
+            doc.AddMember(
+              rapidjson::Value(("medianArrivalLatency" + tag).c_str(), alloc)
+                .Move(),
+              median,
+              alloc);
+            doc.AddMember(
+              rapidjson::Value(("p95ArrivalLatency" + tag).c_str(), alloc)
+                .Move(),
+              p95,
+              alloc);
+            doc.AddMember(
+              rapidjson::Value(("p99ArrivalLatency" + tag).c_str(), alloc)
+                .Move(),
+              p99,
+              alloc);
+            doc.AddMember(
+              rapidjson::Value(("arrivalCount" + tag).c_str(), alloc).Move(),
+              static_cast<int64_t>(n),
+              alloc);
+        }
 
         std::vector<int64_t> secondAvgLatencies;
         secondAvgLatencies.reserve(latencyBySecond.size());
@@ -699,6 +1083,51 @@ class ApplicationMetrics
                       historyArray,
                       alloc);
 
+        // Arrival latency per second, in its own history so the one above
+        // keeps its layout: the second (epoch) the inputs ended in, how many,
+        // and their percentiles (ms).
+        rapidjson::Value arrivalHistoryArray(rapidjson::kArrayType);
+        for (const auto& [secondKey, record] : runtimeMetricsHistory) {
+            if (record.arrivalCount <= 0) {
+                continue;
+            }
+            long target50 = record.arrivalCount * 0.50;
+            long target95 = record.arrivalCount * 0.95;
+            long target99 = record.arrivalCount * 0.99;
+            int secMedian = 0;
+            int secP95 = 0;
+            int secP99 = 0;
+            long cumCount = 0;
+            for (int i = 0; i < histConfig.totalBins; ++i) {
+                if (record.arrivalLatencyBins[i] == 0) {
+                    continue;
+                }
+                cumCount += record.arrivalLatencyBins[i];
+                int currentLatMs = histConfig.getLatencyMs(i);
+                if (secMedian == 0 && cumCount >= target50) {
+                    secMedian = currentLatMs;
+                }
+                if (secP95 == 0 && cumCount >= target95) {
+                    secP95 = currentLatMs;
+                }
+                if (secP99 == 0 && cumCount >= target99) {
+                    secP99 = currentLatMs;
+                    break;
+                }
+            }
+            std::string entryStr = std::to_string(secondKey) + " / " +
+                                   std::to_string(record.arrivalCount) + " / " +
+                                   std::to_string(secMedian) + " / " +
+                                   std::to_string(secP95) + " / " +
+                                   std::to_string(secP99);
+            arrivalHistoryArray.PushBack(
+              rapidjson::Value(entryStr.c_str(), alloc).Move(), alloc);
+        }
+        doc.AddMember("arrivalLatencyHistory: second / count / p50latency (ms) "
+                      "/ p95latency (ms) / p99latency (ms)",
+                      arrivalHistoryArray,
+                      alloc);
+
         // Optionally, if you want to include per-instance metrics, add them
         // here.
         rapidjson::Value instancesObj(rapidjson::kObjectType);
@@ -818,6 +1247,7 @@ class ApplicationMetrics
           alloc);
 
         addFluxMigrationMetrics(doc);
+        addFluxOverheadMetrics(doc);
 
         // Per-second RLS update inputs: one entry per saturated host per
         // second. Format: throughput / execTime(us) / localChained /
@@ -913,7 +1343,58 @@ class ApplicationMetrics
         // ModeFlux: the worker's migration counters as reported each second
         // (cumulative since the last flush).
         std::map<time_t, faabric::FluxMigrationStats> fluxMigrationHistory;
+        // ModeFlux: the worker's overhead counters as reported each second
+        // (cumulative since the last flush).
+        std::map<time_t, faabric::FluxOverheadStats> fluxOverheadHistory;
     };
+
+    // The cumulative counters of FluxOverheadStats, in output order. `nanos`
+    // marks CPU times, printed per second in microseconds.
+    struct FluxOverheadField
+    {
+        const char* name;
+        int64_t (faabric::FluxOverheadStats::*get)() const;
+        void (faabric::FluxOverheadStats::*set)(int64_t);
+        bool nanos;
+    };
+    static const std::vector<FluxOverheadField>& fluxOverheadFields()
+    {
+        using S = faabric::FluxOverheadStats;
+        static const std::vector<FluxOverheadField> fields = {
+            { "routing_cpu_ns", &S::routingcpuns, &S::set_routingcpuns, true },
+            { "routed", &S::routedrequests, &S::set_routedrequests, false },
+            { "rebalance_cpu_ns",
+              &S::rebalancecpuns,
+              &S::set_rebalancecpuns,
+              true },
+            { "rebalance_rounds",
+              &S::rebalancerounds,
+              &S::set_rebalancerounds,
+              false },
+            { "stats_cpu_ns", &S::statscpuns, &S::set_statscpuns, true },
+            { "stats_rounds", &S::statsrounds, &S::set_statsrounds, false },
+            { "handovers", &S::handovers, &S::set_handovers, false },
+            { "prepare_us", &S::prepareus, &S::set_prepareus, false },
+            { "wait_us", &S::waitus, &S::set_waitus, false },
+            { "pack_us", &S::packus, &S::set_packus, false },
+            { "send_us", &S::sendus, &S::set_sendus, false },
+            { "flip_us", &S::flipus, &S::set_flipus, false },
+            { "forward_us", &S::forwardus, &S::set_forwardus, false },
+            { "parked", &S::parkedrequests, &S::set_parkedrequests, false },
+        };
+        return fields;
+    }
+
+    // ModeFlux, planner: one stats round's cost, and the planner's routing of
+    // inputs per second -- CPU time (ns) and inputs routed.
+    std::vector<std::pair<int64_t, FluxControlPlaneRound>>
+      fluxControlPlaneRounds;
+    struct PlannerRoutingSecond
+    {
+        int64_t cpuNs = 0;
+        int64_t inputs = 0;
+    };
+    std::map<int64_t, PlannerRoutingSecond> plannerRouting;
 
     // The cumulative counters of FluxMigrationStats, in output order.
     struct FluxCounterField
@@ -947,15 +1428,33 @@ class ApplicationMetrics
 
     // What the counters grew by between two reports. A counter that went
     // down was reset by a flush in between, so all of it is new.
+    // Counters added later, kept out of fluxCounterFields so the per-second
+    // "fluxMigrations" entries keep their layout: their own per-second
+    // history ("fluxMigrationsExtra") and summary fields.
+    static const std::vector<FluxCounterField>& fluxExtraCounterFields()
+    {
+        using S = faabric::FluxMigrationStats;
+        static const std::vector<FluxCounterField> fields = {
+            { "split_units", &S::splitunits, &S::set_splitunits },
+            { "merge_units", &S::mergeunits, &S::set_mergeunits },
+            { "remigrations", &S::remigrations, &S::set_remigrations },
+            { "spilled", &S::spilled, &S::set_spilled },
+        };
+        return fields;
+    }
+
     static faabric::FluxMigrationStats fluxMigrationDelta(
       const faabric::FluxMigrationStats& current,
       const faabric::FluxMigrationStats& previous)
     {
         faabric::FluxMigrationStats delta;
-        for (const auto& field : fluxCounterFields()) {
-            int64_t now = (current.*field.get)();
-            int64_t before = (previous.*field.get)();
-            (delta.*field.set)(now >= before ? now - before : now);
+        for (const auto* fields :
+             { &fluxCounterFields(), &fluxExtraCounterFields() }) {
+            for (const auto& field : *fields) {
+                int64_t now = (current.*field.get)();
+                int64_t before = (previous.*field.get)();
+                (delta.*field.set)(now >= before ? now - before : now);
+            }
         }
         delta.set_heldunits(current.heldunits());
         delta.set_costus(current.costus());
@@ -965,8 +1464,11 @@ class ApplicationMetrics
     static void addFluxMigration(faabric::FluxMigrationStats& total,
                                  const faabric::FluxMigrationStats& delta)
     {
-        for (const auto& field : fluxCounterFields()) {
-            (total.*field.set)((total.*field.get)() + (delta.*field.get)());
+        for (const auto* fields :
+             { &fluxCounterFields(), &fluxExtraCounterFields() }) {
+            for (const auto& field : *fields) {
+                (total.*field.set)((total.*field.get)() + (delta.*field.get)());
+            }
         }
         total.set_heldunits(delta.heldunits());
         total.set_costus(delta.costus());
@@ -1010,6 +1512,24 @@ class ApplicationMetrics
         }
     }
 
+    // ModeFlux, planner: one stats round's control-plane cost.
+    void recordFluxControlPlane(const FluxControlPlaneRound& round)
+    {
+        faabric::util::FullLock lock(opMx);
+        fluxControlPlaneRounds.emplace_back(
+          faabric::util::getGlobalClock().epochSeconds(), round);
+    }
+
+    // ModeFlux, planner: routing `inputs` inputs took `cpuNs` of CPU time.
+    void recordPlannerRouting(int64_t cpuNs, int64_t inputs)
+    {
+        faabric::util::FullLock lock(opMx);
+        auto& second =
+          plannerRouting[faabric::util::getGlobalClock().epochSeconds()];
+        second.cpuNs += cpuNs;
+        second.inputs += inputs;
+    }
+
     void recordWorkerMetrics(
       const std::map<std::string, std::unique_ptr<faabric::WorkerStats>>&
         results)
@@ -1027,6 +1547,10 @@ class ApplicationMetrics
               statsPtr->cpuload();
             clusterWorkerMetrics[ip].executorsHistory[currentTime] =
               statsPtr->executorsnum();
+            if (statsPtr->has_fluxoverhead()) {
+                clusterWorkerMetrics[ip].fluxOverheadHistory[currentTime] =
+                  statsPtr->fluxoverhead();
+            }
             if (statsPtr->has_fluxmigration()) {
                 clusterWorkerMetrics[ip].fluxMigrationHistory[currentTime] =
                   statsPtr->fluxmigration();
@@ -1498,7 +2022,13 @@ class ApplicationMetrics
         latenciesOverTen.clear();
         totalLatenciesUnderTen.clear();
         totalLatenciesOverTen.clear();
+        arrivalLatenciesUnderTen.clear();
+        arrivalLatenciesOverTen.clear();
+        arrivalForwardedLatencies = {};
+        arrivalDirectLatencies = {};
         latencyBySecond.clear();
+        fluxControlPlaneRounds.clear();
+        plannerRouting.clear();
 
         for (auto& [instName, instancePtr] : instances) {
             instancePtr->reset();
@@ -1523,6 +2053,51 @@ class ApplicationMetrics
     std::map<int, int> latenciesUnderTen;
     std::map<int, int> totalLatenciesOverTen;
     std::map<int, int> totalLatenciesUnderTen;
+    // Arrival latency, as latencies*/totalLatencies*: microseconds under
+    // 10 ms, milliseconds above.
+    std::map<int, int> arrivalLatenciesOverTen;
+    std::map<int, int> arrivalLatenciesUnderTen;
+    // The same split by whether any request of the input was migrated or
+    // forwarded: {under 10 ms in us, above in ms}.
+    std::pair<std::map<int, int>, std::map<int, int>> arrivalForwardedLatencies;
+    std::pair<std::map<int, int>, std::map<int, int>> arrivalDirectLatencies;
+
+    // {median, p95, p99, count} (us) of a latency histogram kept as
+    // microseconds under 10 ms and milliseconds above.
+    static std::tuple<int, int, int, long> percentilesOf(
+      const std::map<int, int>& underTen,
+      const std::map<int, int>& overTen)
+    {
+        std::map<int, long> combined;
+        for (const auto& [latencyMicro, freq] : underTen) {
+            combined[latencyMicro] += freq;
+        }
+        for (const auto& [latencyMilli, freq] : overTen) {
+            combined[latencyMilli * 1000] += freq;
+        }
+        long total = 0;
+        for (const auto& [latency, freq] : combined) {
+            total += freq;
+        }
+        int median = 0;
+        int p95 = 0;
+        int p99 = 0;
+        long cumCount = 0;
+        for (const auto& [latencyMicro, freq] : combined) {
+            cumCount += freq;
+            if (median == 0 && cumCount >= total * 0.50) {
+                median = latencyMicro;
+            }
+            if (p95 == 0 && cumCount >= total * 0.95) {
+                p95 = latencyMicro;
+            }
+            if (p99 == 0 && cumCount >= total * 0.99) {
+                p99 = latencyMicro;
+                break;
+            }
+        }
+        return { median, p95, p99, total };
+    }
 
     // Per-second latency aggregate, one entry per wall-clock second. Feeds the
     // "latencyBySecond" percentiles, which treat each second (not each

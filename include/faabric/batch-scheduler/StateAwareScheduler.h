@@ -383,6 +383,57 @@ class StateAwareScheduler : public BatchScheduler
     int getFluxPartitionShards() const { return fluxPartitionShards; }
 
     /**
+     * ModeFlux ablations, for experiments only. `flux_disable` is a bitmask
+     * of the mechanisms to switch off; set on the planner and every worker
+     * alike, before the application runs.
+     */
+    // No unit of state is split off to another worker (Algorithm 3).
+    static constexpr int kFluxDisableStateMigration = 1;
+    // The planner advises no merges.
+    static constexpr int kFluxDisableMerge = 2;
+    // Routing balances instead of filling: the planner sends an input where
+    // it starts soonest, and a worker keeps a chained request only while a
+    // run slot is free.
+    static constexpr int kFluxDisablePacking = 4;
+    // Targets are chosen by room alone: neither DAG neighbours nor where the
+    // operator already runs count.
+    static constexpr int kFluxDisableAffinity = 8;
+    // A request is sized by its own executor time: what it sets off
+    // downstream counts nothing.
+    static constexpr int kFluxDisableDownstream = 16;
+
+    void setFluxDisable(int value) { fluxDisable = value; }
+
+    /**
+     * ModeFlux, for experiments only: where state is put, instead of every
+     * unit of an operator on its home.
+     *  1: spread -- unit i on the i-th host (mod hosts);
+     *  2: by operator -- each stateful operator on a run of as many hosts as
+     *     its declared parallelism, operators one after another in name
+     *     order, its units spread over that run.
+     * Either way state then stays put: it implies kFluxDisableStateMigration
+     * and kFluxDisableMerge.
+     */
+    void setFluxStaticPlacement(int value) { fluxStaticPlacement = value; }
+
+    // Whether any of `mechanisms` (kFluxDisable* bits) is switched off.
+    bool fluxDisabled(int mechanisms) const
+    {
+        int off = fluxDisable.load(std::memory_order_relaxed);
+        if (fluxStaticPlacement.load(std::memory_order_relaxed) != 0) {
+            off |= kFluxDisableStateMigration | kFluxDisableMerge;
+        }
+        return (off & mechanisms) != 0;
+    }
+
+    // The window a unit moved out and back in again counts as a ping-pong:
+    // that merges are checked against.
+    static constexpr int fluxRemigrationWindowSec()
+    {
+        return kFluxMergeWindowSec;
+    }
+
+    /**
      * ModeFlux names every unit of state that is owned, locked and moved as
      * a whole: a stateful operator's paridx ("user_func_par"), or one shard
      * of a partitioned operator's paridx ("user_func_par#shard"). A negative
@@ -877,6 +928,14 @@ class StateAwareScheduler : public BatchScheduler
 
     // See setFluxPartitionShards.
     int fluxPartitionShards = 200;
+    // See setFluxDisable and setFluxStaticPlacement.
+    std::atomic<int> fluxDisable{ 0 };
+    std::atomic<int> fluxStaticPlacement{ 0 };
+
+    // Under a static placement, the owner `unitKey` is put on; empty
+    // otherwise.
+    std::string fluxStaticOwner(const std::string& unitKey,
+                                const HostMap& hostMap);
 
     bool isplanner = true;
     int scheduleMode = 0;

@@ -479,6 +479,39 @@ message WorkerStats{
     // covering them. See StateAwareScheduler::demandWorkUsFlux.
     double queuedChainWorkUs = 19;
     double arrivalChainWorkUs = 20;
+    // ModeFlux: what this worker's scheduling and rebalancing cost.
+    FluxOverheadStats fluxOverhead = 21;
+}
+
+// ModeFlux: what one worker's scheduling, rebalancing and stats cost,
+// cumulative since the last flush. CPU time is the working thread's own
+// (CLOCK_THREAD_CPUTIME_ID): it leaves out waiting and being preempted.
+message FluxOverheadStats {
+    // Routing chained requests: CPU time, and requests routed.
+    int64 routingCpuNs = 1;
+    int64 routedRequests = 2;
+    // Rebalancing decisions, hand-overs left out: CPU time, and rounds.
+    int64 rebalanceCpuNs = 3;
+    int64 rebalanceRounds = 4;
+    // Handling a stats round -- taking in the cluster view and the advice,
+    // filling these stats: CPU time, and rounds. And the size of the stats
+    // reported the round before (bytes, not cumulative).
+    int64 statsCpuNs = 5;
+    int64 statsRounds = 6;
+    int64 lastStatsBytes = 7;
+    // Hand-overs that went through, and the wall time (us) of each phase
+    // summed over them: reading the owners before freezing, waiting out the
+    // batches running on the units, packing state and requests, sending and
+    // installing them, flipping owners in Redis, forwarding what was parked.
+    // And the requests parked while frozen.
+    int64 handovers = 8;
+    int64 prepareUs = 9;
+    int64 waitUs = 10;
+    int64 packUs = 11;
+    int64 sendUs = 12;
+    int64 flipUs = 13;
+    int64 forwardUs = 14;
+    int64 parkedRequests = 15;
 }
 
 // ModeFlux: what one worker's migrations and forwarding have cost. Counters
@@ -510,6 +543,14 @@ message FluxMigrationStats
   // Units of state held here now, and the current migration cost estimate.
   int32 heldUnits = 15;
   double costUs = 16;
+  // Units moved out to take load off this worker (split), and to bring an
+  // operator together on another (merge); units that came back within the
+  // merge window of leaving (ping-pong); and chained stateless requests sent
+  // to another worker at routing because this one was short (spilled).
+  int64 splitUnits = 17;
+  int64 mergeUnits = 18;
+  int64 remigrations = 19;
+  int64 spilled = 20;
 }
 
 // ModeFlux: a unit of state left its previous owner for `host`. The unit is

@@ -4,6 +4,7 @@
 #include <faabric/state/State.h>
 #include <faabric/transport/common.h>
 #include <faabric/transport/macros.h>
+#include <faabric/util/clock.h>
 #include <faabric/util/config.h>
 #include <faabric/util/func.h>
 #include <faabric/util/logging.h>
@@ -373,6 +374,10 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
 {
     PARSE_MSG(faabric::WorkerRuntimeStatsRequest, buffer.data(), buffer.size())
 
+    // What handling the round costs here, in CPU time; see
+    // FluxOverheadStats.
+    int64_t roundStartNs = faabric::util::getCpuTimeNano();
+
     // SPDLOG_DEBUG("Getting worker RUNTIME stats for host");
 
     // Store the planner's previous-round view of all workers
@@ -421,6 +426,12 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
         *out.add_shardmoves() = std::move(move);
     }
     scheduler.fillFluxWorkerStats(out);
+
+    int64_t roundEndNs = faabric::util::getCpuTimeNano();
+    if (roundStartNs >= 0 && roundEndNs >= roundStartNs) {
+        scheduler.recordFluxStatsRound(
+          roundEndNs - roundStartNs, static_cast<int64_t>(out.ByteSizeLong()));
+    }
 
     return std::make_unique<faabric::WorkerStats>(std::move(out));
 }

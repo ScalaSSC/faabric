@@ -448,8 +448,10 @@ void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
     }
 
     // Every unit starts on one worker: the operator's home, fixed by whoever
-    // routes to it first.
-    std::string home = fluxHomeOf(userFunc, hostMap);
+    // routes to it first -- unless an experiment fixes where state goes.
+    bool placedStatically = fluxStaticPlacement.load() != 0;
+    std::string home =
+      placedStatically ? std::string("static") : fluxHomeOf(userFunc, hostMap);
 
     int parallelism = fluxParallelism(node);
     std::vector<std::string> units;
@@ -474,10 +476,14 @@ void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
     // older move report arriving later from winning over it.
     std::vector<std::pair<std::string, std::string>> keys;
     keys.reserve(units.size());
+    std::vector<std::string> proposed;
     for (const auto& unit : units) {
         keys.emplace_back(fluxOwnerKey(unit), fluxEpochKey(unit));
+        proposed.push_back(placedStatically ? fluxStaticOwner(unit, hostMap)
+                                            : home);
     }
-    auto claimed = redis::Redis::getState().claimOrGetManyWithEpoch(keys, home);
+    auto claimed =
+      redis::Redis::getState().claimOrGetManyWithEpoch(keys, proposed);
     std::map<std::string, std::pair<std::string, int64_t>> owners;
     std::map<std::string, int> unitsPerOwner;
     for (size_t i = 0; i < units.size(); i++) {
@@ -509,6 +515,52 @@ void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
     fluxInitialisedOps.insert(userFunc);
 }
 
+std::string StateAwareScheduler::fluxStaticOwner(const std::string& unitKey,
+                                                 const HostMap& hostMap)
+{
+    int mode = fluxStaticPlacement.load();
+    if (mode == 0 || hostMap.empty()) {
+        return "";
+    }
+    std::vector<const std::string*> hosts;
+    hosts.reserve(hostMap.size());
+    for (const auto& [ip, host] : hostMap) {
+        hosts.push_back(&ip);
+    }
+    int n = static_cast<int>(hosts.size());
+
+    auto [userFuncPar, shardId] = splitFluxUnitKey(unitKey);
+    auto [user, func, parStr] = faabric::util::splitUserFuncPar(userFuncPar);
+    int index = shardId >= 0 ? shardId : std::stoi(parStr);
+    if (mode == 1) {
+        return *hosts[index % n];
+    }
+
+    // By operator: stateful operators in name order, each on a run of as
+    // many hosts as its declared parallelism, one run after another.
+    std::string userFunc = user + "_" + func;
+    int start = 0;
+    int width = 1;
+    {
+        faabric::util::SharedLock lock(scheduleMx);
+        if (!application) {
+            return *hosts[index % n];
+        }
+        for (const auto& [name, node] : application->getNodes()) {
+            if (node->type == NodeType::STATELESS) {
+                continue;
+            }
+            int declared = std::clamp(node->parallelism, 1, n);
+            if (name == userFunc) {
+                width = declared;
+                break;
+            }
+            start += declared;
+        }
+    }
+    return *hosts[(start + index % width) % n];
+}
+
 std::string StateAwareScheduler::resolveStateHost(
   const std::string& userFuncPar,
   const HostMap& hostMap)
@@ -538,11 +590,15 @@ std::string StateAwareScheduler::resolveStateHost(
     // keeps the planner and every worker scheduler agreeing on one owner.
     // NB - deliberately outside the lock: this is a network round trip, and
     // holding scheduleMx across it would serialise all routing on this host.
-    // Propose the operator's home: where the rest of its units started.
-    std::string unitUserFuncPar = splitFluxUnitKey(userFuncPar).first;
-    auto [user, func, parStr] =
-      faabric::util::splitUserFuncPar(unitUserFuncPar);
-    std::string candidate = fluxHomeOf(user + "_" + func, hostMap);
+    // Propose the operator's home: where the rest of its units started --
+    // or, under a static placement, where this unit belongs.
+    std::string candidate = fluxStaticOwner(userFuncPar, hostMap);
+    if (candidate.empty()) {
+        std::string unitUserFuncPar = splitFluxUnitKey(userFuncPar).first;
+        auto [user, func, parStr] =
+          faabric::util::splitUserFuncPar(unitUserFuncPar);
+        candidate = fluxHomeOf(user + "_" + func, hostMap);
+    }
     redis::Redis& redis = redis::Redis::getState();
     auto [owner, epoch] = redis.claimOrGetWithEpoch(
       fluxOwnerKey(userFuncPar), fluxEpochKey(userFuncPar), candidate);
@@ -915,8 +971,9 @@ void StateAwareScheduler::computeDownstreamWorkFlux(
   FluxClusterSnapshot& snapshot)
 {
     // Which children run where each operator runs: from registration.
+    // Ablated, nothing downstream is counted.
     const auto& children = snapshot.dag->localChildren;
-    if (children.empty()) {
+    if (children.empty() || fluxDisabled(kFluxDisableDownstream)) {
         return;
     }
 
@@ -1121,6 +1178,11 @@ StateAwareScheduler::planFluxOffload(
 void StateAwareScheduler::planFluxMerges(
   std::map<std::string, faabric::FluxOffloadPlan>& plans)
 {
+    if (fluxDisabled(kFluxDisableMerge)) {
+        return;
+    }
+    bool affinity = !fluxDisabled(kFluxDisableAffinity);
+
     std::deque<std::shared_ptr<const FluxClusterSnapshot>> history;
     {
         std::lock_guard<std::mutex> lock(fluxHistoryMx);
@@ -1228,8 +1290,8 @@ void StateAwareScheduler::planFluxMerges(
         auto targets = spread.holding;
         std::sort(
           targets.begin(), targets.end(), [&](const auto& a, const auto& b) {
-              double shareA = neighbourShare(userFunc, a.first);
-              double shareB = neighbourShare(userFunc, b.first);
+              double shareA = affinity ? neighbourShare(userFunc, a.first) : 0;
+              double shareB = affinity ? neighbourShare(userFunc, b.first) : 0;
               if (shareA != shareB) {
                   return shareA > shareB;
               }
@@ -1252,7 +1314,8 @@ void StateAwareScheduler::planFluxMerges(
             for (const auto& [source, units] : spread.holding) {
                 if (source == target || involved.contains(source) ||
                     !keepsUp(now, source, 0) ||
-                    neighbourShare(userFunc, source) > targetShare) {
+                    (affinity &&
+                     neighbourShare(userFunc, source) > targetShare)) {
                     continue;
                 }
                 candidates.emplace_back(source, units);
@@ -1503,7 +1566,9 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
             std::lock_guard<std::mutex> lock(fluxAssignedMx);
             int& kept = fluxKeptThisPass[queueKey];
             bool slotFree = local.queued + kept < local.freeRequests;
-            bool keepsUp = passWork.has_value() &&
+            // Ablated packing keeps it only while a run slot is free.
+            bool keepsUp = !fluxDisabled(kFluxDisablePacking) &&
+                           passWork.has_value() &&
                            passWork->queuedUs + fluxKeptWorkThisPass + workUs <=
                              passWork->capacityUs;
             if (slotFree || keepsUp || workUs <= 0) {
@@ -1519,11 +1584,13 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
             }
         }
 
-        // Short: to an advised worker, the one this operator already goes to
-        // this round first, then one already running it, then the one with
-        // the most quota left -- so it spreads over as few workers as it
-        // must. Picked and drawn in one go, so two requests cannot both spend
-        // the same quota.
+        // Short: to an advised worker, the one where most of the operator's
+        // neighbours run first, then the one it already goes to this round,
+        // then one already running it, then the one with the most quota left
+        // -- so it spreads over as few workers as it must. Picked and drawn
+        // in one go, so two requests cannot both spend the same quota.
+        bool packing = !fluxDisabled(kFluxDisablePacking);
+        bool affinity = !fluxDisabled(kFluxDisableAffinity);
         std::string target;
         {
             std::lock_guard<std::mutex> lock(fluxOffloadMx);
@@ -1534,10 +1601,12 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                     quotaUs < workUs) {
                     continue;
                 }
+                // Ablated packing drops filling one target first; ablated
+                // affinity drops neighbours and where it already runs.
                 std::tuple<int, bool, bool, double> key{
-                    snapshot->neighboursOn(ip, userFunc),
-                    sentThisRound.contains(ip),
-                    snapshot->runs(ip, userFunc),
+                    affinity ? snapshot->neighboursOn(ip, userFunc) : 0,
+                    packing && sentThisRound.contains(ip),
+                    affinity && snapshot->runs(ip, userFunc),
                     quotaUs
                 };
                 if (targetQuotaUs == nullptr || key > bestKey) {
@@ -1581,9 +1650,13 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     }
 
     double slotTimeUs = snapshot->slotTimeOf(queueKey);
-    if (slotTimeUs <= 0) {
+    // Ablated packing balances instead: where it starts soonest.
+    if (slotTimeUs <= 0 || fluxDisabled(kFluxDisablePacking)) {
         return scheduleStatelessByWaitFlux(userFunc, hostMap, *snapshot);
     }
+    // Ablated affinity still fills one host before the next, in a fixed
+    // order of hosts, but without looking at where anything runs.
+    bool affinity = !fluxDisabled(kFluxDisableAffinity);
     // Its executor time, with that of the stateless requests it sets off,
     // which run where it runs.
     double workUs = slotTimeUs + snapshot->downstreamOf(userFunc);
@@ -1643,12 +1716,13 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                 routedHere = it->second;
             }
         }
-        std::tuple<int, bool, int, double> key{
-            snapshot->neighboursOn(ip, userFunc),
-            snapshot->runs(ip, userFunc),
-            snapshot->presenceOf(ip, userFunc) + routedHere,
-            capacityUs - demandUs
-        };
+        std::tuple<int, bool, int, double> key{ 0, false, 0, 0 };
+        if (affinity) {
+            key = { snapshot->neighboursOn(ip, userFunc),
+                    snapshot->runs(ip, userFunc),
+                    snapshot->presenceOf(ip, userFunc) + routedHere,
+                    capacityUs - demandUs };
+        }
         if (chosen == nullptr || key > chosenKey) {
             chosen = &ip;
             chosenKey = key;
@@ -1673,12 +1747,16 @@ std::string StateAwareScheduler::scheduleStatelessByWaitFlux(
   const HostMap& hostMap,
   const FluxClusterSnapshot& snapshot)
 {
-    // Its executor time is not measured anywhere yet, so there is no telling
-    // how much room it takes: where it starts soonest by queue length, among
-    // hosts about as good one already running the operator.
+    // Where it starts soonest: by executor time if measured, else by queue
+    // length -- an operator nobody has measured yet takes no telling how
+    // much room. Among hosts about as good, the one where most of its DAG
+    // neighbours run, then one already running it, unless affinity is
+    // ablated.
     const std::string queueKey = userFunc + "_0";
     const auto& stats = snapshot.stats;
-    double unitUs = 1;
+    double slotTimeUs = snapshot.slotTimeOf(queueKey);
+    double unitUs = slotTimeUs > 0 ? slotTimeUs : 1;
+    bool affinity = !fluxDisabled(kFluxDisableAffinity);
 
     std::vector<std::pair<const std::string*, double>> waits;
     waits.reserve(hostMap.size());
@@ -1705,18 +1783,19 @@ std::string StateAwareScheduler::scheduleStatelessByWaitFlux(
     }
 
     const std::string* chosen = nullptr;
-    bool chosenWarm = false;
-    double chosenWaitUs = 0;
+    std::tuple<int, bool, double> chosenKey{ 0, false, 0 };
     for (const auto& [ip, waitUs] : waits) {
         if (waitUs > bestWaitUs + unitUs) {
             continue;
         }
-        bool warm = snapshot.runs(*ip, userFunc);
-        if (chosen == nullptr || (warm && !chosenWarm) ||
-            (warm == chosenWarm && waitUs < chosenWaitUs)) {
+        std::tuple<int, bool, double> key{
+            affinity ? snapshot.neighboursOn(*ip, userFunc) : 0,
+            affinity && snapshot.runs(*ip, userFunc),
+            -waitUs
+        };
+        if (chosen == nullptr || key > chosenKey) {
             chosen = ip;
-            chosenWarm = warm;
-            chosenWaitUs = waitUs;
+            chosenKey = key;
         }
     }
 

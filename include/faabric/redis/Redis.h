@@ -94,12 +94,17 @@ return { owner, epoch }
 )---";
 
     // claimWithEpochCmd for several keys in one step. KEYS come in (owner,
-    // epoch) pairs, every owner claimed for ARGV[1]; returns each pair's
-    // owner and epoch, in order, as one flat array.
+    // epoch) pairs, pair i's owner claimed for ARGV[i] -- or every one for
+    // ARGV[1] if that is the only argument; returns each pair's owner and
+    // epoch, in order, as one flat array.
     const std::string_view claimManyWithEpochCmd = R"---(
 local out = {}
 for i = 1, #KEYS / 2 do
-    redis.call('SETNX', KEYS[2 * i - 1], ARGV[1])
+    local proposed = ARGV[1]
+    if #ARGV > 1 then
+        proposed = ARGV[i]
+    end
+    redis.call('SETNX', KEYS[2 * i - 1], proposed)
     out[2 * i - 1] = redis.call('GET', KEYS[2 * i - 1])
     out[2 * i] = redis.call('GET', KEYS[2 * i]) or '0'
 end
@@ -263,6 +268,12 @@ class Redis
     std::vector<std::pair<std::string, int64_t>> claimOrGetManyWithEpoch(
       const std::vector<std::pair<std::string, std::string>>& keys,
       const std::string& proposedValue);
+
+    // The same with a value proposed per pair, `proposedValues[i]` for
+    // `keys[i]`.
+    std::vector<std::pair<std::string, int64_t>> claimOrGetManyWithEpoch(
+      const std::vector<std::pair<std::string, std::string>>& keys,
+      const std::vector<std::string>& proposedValues);
 
     struct OwnerTransfer
     {

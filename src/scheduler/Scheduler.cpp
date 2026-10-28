@@ -389,6 +389,7 @@ void Scheduler::reset()
         fluxUnitWindowStartUs = 0;
     }
     fluxCounters.reset();
+    fluxOverhead.reset();
 
     // This function is called when planner flush executors. In this case,
     // planner didn't flush the hostmap, the scheduler also should not flush it.
@@ -709,6 +710,8 @@ Scheduler::FluxWorkerWork Scheduler::fluxWorkerWorkOf()
     auto loads = snapshotFluxParidxLoads();
     auto snapshot = decentralScheduler.getClusterSnapshot();
     auto dag = decentralScheduler.getFluxDag();
+    bool noDownstream = decentralScheduler.fluxDisabled(
+      faabric::batch_scheduler::StateAwareScheduler::kFluxDisableDownstream);
 
     // A request's executor time here with that of what it sets off here.
     auto chainUsOf = [&](const std::string& userFuncPar,
@@ -747,7 +750,9 @@ Scheduler::FluxWorkerWork Scheduler::fluxWorkerWorkOf()
         }
         std::string userFuncPar = fluxQueueKeyOf(funcParStr);
         std::string userFunc = operatorOf(userFuncPar);
-        if (dag->localChildOps.contains(userFunc)) {
+        // A local child's arrivals are counted with its caller -- unless
+        // downstream work is ablated, and counts for nothing there.
+        if (dag->localChildOps.contains(userFunc) && !noDownstream) {
             continue;
         }
         double arrivalUs = load.arrivalRatePerSec *
@@ -820,6 +825,27 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
     migration->set_fwdtombstone(load(fluxCounters.fwdTombstone));
     migration->set_fwdowner(load(fluxCounters.fwdOwner));
     migration->set_rerouted(load(fluxCounters.rerouted));
+    migration->set_splitunits(load(fluxCounters.splitUnits));
+    migration->set_mergeunits(load(fluxCounters.mergeUnits));
+    migration->set_remigrations(load(fluxCounters.remigrations));
+    migration->set_spilled(load(fluxCounters.spilled));
+
+    auto* overhead = out.mutable_fluxoverhead();
+    overhead->set_routingcpuns(load(fluxOverhead.routingCpuNs));
+    overhead->set_routedrequests(load(fluxOverhead.routedRequests));
+    overhead->set_rebalancecpuns(load(fluxOverhead.rebalanceCpuNs));
+    overhead->set_rebalancerounds(load(fluxOverhead.rebalanceRounds));
+    overhead->set_statscpuns(load(fluxOverhead.statsCpuNs));
+    overhead->set_statsrounds(load(fluxOverhead.statsRounds));
+    overhead->set_laststatsbytes(load(fluxOverhead.lastStatsBytes));
+    overhead->set_handovers(load(fluxOverhead.handovers));
+    overhead->set_prepareus(load(fluxOverhead.prepareUs));
+    overhead->set_waitus(load(fluxOverhead.waitUs));
+    overhead->set_packus(load(fluxOverhead.packUs));
+    overhead->set_sendus(load(fluxOverhead.sendUs));
+    overhead->set_flipus(load(fluxOverhead.flipUs));
+    overhead->set_forwardus(load(fluxOverhead.forwardUs));
+    overhead->set_parkedrequests(load(fluxOverhead.parkedRequests));
     migration->set_costus(fluxMigrationCostUs.load());
 
     // Units of state held here: every shard, and every paridx of a stateful
@@ -1637,8 +1663,19 @@ void Scheduler::dispatchChainedMsgs()
         if (!localChainedCallMsgs.empty()) {
             // Schedule the chained calls
             // auto start = faabric::util::getCpuTimeNano();
+            // Routing only, in CPU time: what the scheduling decisions cost.
+            auto routable = routableHosts();
+            int64_t routingStartNs = faabric::util::getCpuTimeNano();
             auto hosts = decentralScheduler.scheduleMessagesBatch(
-              routableHosts(), localChainedCallMsgs);
+              routable, localChainedCallMsgs);
+            int64_t routingEndNs = faabric::util::getCpuTimeNano();
+            if (routingStartNs >= 0 && routingEndNs >= routingStartNs) {
+                fluxOverhead.routingCpuNs.fetch_add(
+                  routingEndNs - routingStartNs, std::memory_order_relaxed);
+                fluxOverhead.routedRequests.fetch_add(
+                  static_cast<int64_t>(localChainedCallMsgs.size()),
+                  std::memory_order_relaxed);
+            }
             // auto end = faabric::util::getCpuTimeNano();
             // if (start > 0 && end >= start) {
             //     cpuScheduleTime.fetch_add(end - start,
@@ -1646,11 +1683,18 @@ void Scheduler::dispatchChainedMsgs()
             // }
 
             // Statistics the chained calls
+            int64_t spilled = 0;
             for (int i = 0; i < localChainedCallMsgs.size(); i++) {
                 auto msg = localChainedCallMsgs[i].get();
                 std::string userFuncPar = faabric::util::getUserFuncPar(*msg);
                 chainedCallsCounter[userFuncPar][hosts[i]]++;
+                // A stateless request could have run here: it went elsewhere
+                // only because this worker was short.
+                if (msg->messagetype() == 0 && hosts[i] != thisHost) {
+                    spilled++;
+                }
             }
+            fluxCounters.spilled.fetch_add(spilled, std::memory_order_relaxed);
             enqueueSchedMsgs(hosts, std::move(localChainedCallMsgs));
         }
 
@@ -1746,6 +1790,12 @@ void Scheduler::resetParameter(std::string key, int32_t value)
     } else if (key == "flux_rebalance_period") {
         fluxRebalancePeriod = value;
         SPDLOG_INFO("Reset flux_rebalance_period parameter to : {}", value);
+    } else if (key == "flux_disable") {
+        decentralScheduler.setFluxDisable(value);
+        SPDLOG_INFO("Reset flux_disable parameter to : {}", value);
+    } else if (key == "flux_static_placement") {
+        decentralScheduler.setFluxStaticPlacement(value);
+        SPDLOG_INFO("Reset flux_static_placement parameter to : {}", value);
     } else if (key == "flux_migrate_cooldown") {
         // State moves are paced by their cost now (ski rental), not a timer.
         SPDLOG_WARN("{} is no longer used by ModeFlux; ignored", key);
@@ -2648,6 +2698,7 @@ void Scheduler::clearFluxMigrationState()
     fluxMigratingUnits.clear();
     fluxPendingMsgs.clear();
     fluxMovedUnits.clear();
+    fluxMovedOutAtUs.clear();
     fluxRouteRecords.store(0, std::memory_order_release);
 }
 
@@ -2686,6 +2737,8 @@ void Scheduler::fluxRebalanceLoop()
 
 void Scheduler::rebalanceFlux()
 {
+    // The decisions' CPU time, up to the hand-overs.
+    int64_t decideStartNs = faabric::util::getCpuTimeNano();
     auto snapshot = decentralScheduler.getClusterSnapshot();
     const auto& stats = snapshot->stats;
 
@@ -2746,6 +2799,9 @@ void Scheduler::rebalanceFlux()
         double workUs = 0;
         // The operators (user_func) it carries work of.
         std::set<std::string> operators;
+        // Whether its units go to bring an operator together (a merge)
+        // rather than to take load off this worker (a split).
+        bool merge = false;
     };
     std::map<std::string, FluxShipment> shipments;
     // The advised worker to send `workUs` of operator `userFunc` to, among
@@ -2754,6 +2810,8 @@ void Scheduler::rebalanceFlux()
     // workers; then one this round already sends the operator to, then one
     // already running it, then the most quota. An operator thus fills one
     // target before it spills onto the next.
+    bool affinity = !decentralScheduler.fluxDisabled(
+      StateAwareScheduler::kFluxDisableAffinity);
     auto pickTarget = [&](const std::string& userFunc,
                           double workUs) -> std::string {
         std::string best;
@@ -2763,11 +2821,13 @@ void Scheduler::rebalanceFlux()
                 continue;
             }
             auto shipmentIt = shipments.find(ip);
+            // Ablated affinity looks at neither neighbours nor where the
+            // operator already runs.
             std::tuple<int, bool, bool, double> key{
-                snapshot->neighboursOn(ip, userFunc),
+                affinity ? snapshot->neighboursOn(ip, userFunc) : 0,
                 shipmentIt != shipments.end() &&
                   shipmentIt->second.operators.contains(userFunc),
-                snapshot->runs(ip, userFunc),
+                affinity && snapshot->runs(ip, userFunc),
                 us
             };
             if (best.empty() || key > bestKey) {
@@ -2908,6 +2968,13 @@ void Scheduler::rebalanceFlux()
     if (needUs > 0 && quota.empty()) {
         SPDLOG_DEBUG("Flux {} keeps its state: a deficit of {:.0f}us but no "
                      "advice where to send it",
+                     thisHost,
+                     needUs);
+    } else if (needUs > 0 &&
+               decentralScheduler.fluxDisabled(
+                 StateAwareScheduler::kFluxDisableStateMigration)) {
+        SPDLOG_DEBUG("Flux {} keeps its state: a deficit of {:.0f}us, but "
+                     "state migration is switched off",
                      thisHost,
                      needUs);
     } else if (needUs > 0) {
@@ -3130,6 +3197,10 @@ void Scheduler::rebalanceFlux()
         fluxMergeAdvice.clear();
     }
     bool calm = statelessBacklogs.empty() && stateDeficits.empty();
+    if (decentralScheduler.fluxDisabled(
+          StateAwareScheduler::kFluxDisableMerge)) {
+        mergeTo.clear();
+    }
     if (!mergeTo.empty() && calm) {
         std::set<std::string> held;
         {
@@ -3169,6 +3240,7 @@ void Scheduler::rebalanceFlux()
             shipment.units.insert(
               shipment.units.end(), units.begin(), units.end());
             shipment.operators.insert(userFunc);
+            shipment.merge = true;
         }
     } else if (!mergeTo.empty()) {
         SPDLOG_DEBUG("Flux {} defers {} advised merges: it is short this "
@@ -3176,6 +3248,13 @@ void Scheduler::rebalanceFlux()
                      thisHost,
                      mergeTo.size());
     }
+
+    int64_t decideEndNs = faabric::util::getCpuTimeNano();
+    if (decideStartNs >= 0 && decideEndNs >= decideStartNs) {
+        fluxOverhead.rebalanceCpuNs.fetch_add(decideEndNs - decideStartNs,
+                                              std::memory_order_relaxed);
+    }
+    fluxOverhead.rebalanceRounds.fetch_add(1, std::memory_order_relaxed);
 
     // ---- One hand-over per target ----
     int unitsMoved = 0;
@@ -3197,6 +3276,42 @@ void Scheduler::rebalanceFlux()
         double previousCostUs = fluxMigrationCostUs.load();
         fluxMigrationCostUs =
           previousCostUs <= 0 ? tookUs : 0.7 * previousCostUs + 0.3 * tookUs;
+        if (handover.units > 0) {
+            (shipment.merge ? fluxCounters.mergeUnits : fluxCounters.splitUnits)
+              .fetch_add(handover.units, std::memory_order_relaxed);
+        }
+        fluxOverhead.handovers.fetch_add(1, std::memory_order_relaxed);
+        fluxOverhead.prepareUs.fetch_add(handover.prepareUs,
+                                         std::memory_order_relaxed);
+        fluxOverhead.waitUs.fetch_add(handover.waitUs,
+                                      std::memory_order_relaxed);
+        fluxOverhead.packUs.fetch_add(handover.packUs,
+                                      std::memory_order_relaxed);
+        fluxOverhead.sendUs.fetch_add(handover.sendUs,
+                                      std::memory_order_relaxed);
+        fluxOverhead.flipUs.fetch_add(handover.flipUs,
+                                      std::memory_order_relaxed);
+        fluxOverhead.forwardUs.fetch_add(handover.forwardUs,
+                                         std::memory_order_relaxed);
+        fluxOverhead.parkedRequests.fetch_add(handover.parked,
+                                              std::memory_order_relaxed);
+        SPDLOG_INFO("Flux {} handed {} units ({} bytes) and {} stateless "
+                    "requests to {} in {:.1f} ms ({}): prepare {} / wait {} / "
+                    "pack {} / send {} / flip {} / forward {} us, {} parked",
+                    thisHost,
+                    handover.units,
+                    handover.stateBytes,
+                    handover.statelessRequests,
+                    target,
+                    tookUs / 1000,
+                    shipment.merge ? "merge" : "split",
+                    handover.prepareUs,
+                    handover.waitUs,
+                    handover.packUs,
+                    handover.sendUs,
+                    handover.flipUs,
+                    handover.forwardUs,
+                    handover.parked);
 
         unitsMoved += handover.units;
         statelessMoved += handover.statelessRequests;
@@ -3230,6 +3345,10 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
         int64_t epoch;
         std::unique_ptr<faabric::util::FullLock> lock;
     };
+
+    // Wall time at the start of each phase, for FluxOverheadStats.
+    auto nowUs = []() { return faabric::util::getGlobalClock().epochMicros(); };
+    int64_t prepareAtUs = nowUs();
 
     // 1. Keep only the units Redis says we own, and read their epochs: the
     // move publishes epoch + 1, and the receiver needs it before the flip.
@@ -3275,6 +3394,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
 
     // 2. Freeze them all first: from here their requests are parked, not
     // queued, and no new batch touching them is dispatched.
+    int64_t waitAtUs = nowUs();
     {
         faabric::util::FullLock lock(fluxMigrationMx);
         std::erase_if(moves, [this](const FluxUnitMove& m) {
@@ -3300,6 +3420,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
 
     // 4. Pack every unit's state and waiting requests, then the stateless
     // requests.
+    int64_t packAtUs = nowUs();
     auto& state = faabric::state::getGlobalState();
     faabric::FluxShardMigrationRequest req;
     req.set_sourcehost(thisHost);
@@ -3432,6 +3553,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
     // 5. Hand it all over. Until the flip below, Redis still names us for
     // every unit, so nothing new is routed to the target before the state
     // has arrived.
+    int64_t sendAtUs = nowUs();
     bool installed = false;
     try {
         faabric::scheduler::getFunctionCallClient(target)->migrateShardFlux(
@@ -3511,6 +3633,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
 
     // 6. Flip every owner at once. Only the owner moves a unit, so the checks
     // in the script can only fail if something outside Flux rewrote a key.
+    int64_t flipAtUs = nowUs();
     std::vector<redis::Redis::OwnerTransfer> transfers;
     for (const auto& move : moves) {
         transfers.push_back({ fluxOwnerKey(move.unitKey),
@@ -3537,6 +3660,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
 
     // 7. Leave a forwarding record for every unit, and hand over whatever
     // was parked while we were busy. From here their requests are forwarded.
+    int64_t forwardAtUs = nowUs();
     std::list<std::unique_ptr<faabric::Message>> parked;
     {
         faabric::util::FullLock lock(fluxMigrationMx);
@@ -3549,6 +3673,8 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
             record.set_epoch(move.epoch + 1);
             // One record swapped for another: fluxRouteRecords is unchanged.
             fluxMovedUnits[move.unitKey] = std::move(record);
+            fluxMovedOutAtUs[move.unitKey] =
+              faabric::util::getGlobalClock().epochMicros();
         }
         parked = collectParked();
     }
@@ -3627,6 +3753,13 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
     handover.units = static_cast<int>(moves.size());
     handover.statelessRequests = statelessRequests;
     handover.stateBytes = stateBytes;
+    handover.prepareUs = waitAtUs - prepareAtUs;
+    handover.waitUs = packAtUs - waitAtUs;
+    handover.packUs = sendAtUs - packAtUs;
+    handover.sendUs = flipAtUs - sendAtUs;
+    handover.flipUs = forwardAtUs - flipAtUs;
+    handover.forwardUs = nowUs() - forwardAtUs;
+    handover.parked = static_cast<int64_t>(nParked);
     return handover;
 }
 
@@ -3667,9 +3800,20 @@ void Scheduler::receiveShardFlux(faabric::FluxShardMigrationRequest& req)
         {
             faabric::util::FullLock lock(fluxMigrationMx);
             // The unit may be coming back to a worker that once handed it
-            // off.
+            // off -- a ping-pong if it left only just now.
             if (fluxMovedUnits.erase(unitKey) > 0) {
                 fluxRouteRecords.fetch_sub(1, std::memory_order_release);
+            }
+            auto leftIt = fluxMovedOutAtUs.find(unitKey);
+            if (leftIt != fluxMovedOutAtUs.end()) {
+                int64_t awayUs = faabric::util::getGlobalClock().epochMicros() -
+                                 leftIt->second;
+                if (awayUs <=
+                    StateAwareScheduler::fluxRemigrationWindowSec() * 1e6) {
+                    fluxCounters.remigrations.fetch_add(
+                      1, std::memory_order_relaxed);
+                }
+                fluxMovedOutAtUs.erase(leftIt);
             }
         }
         decentralScheduler.updateStateHostFlux(

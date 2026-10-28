@@ -624,8 +624,16 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
         message->Swap(req->mutable_messages(i));
         messages.push_back(std::move(message));
     }
+    // Routing only, in CPU time: what the scheduling decisions cost.
+    int64_t routingStartNs = faabric::util::getCpuTimeNano();
     auto hosts =
       stateAwareScheduler->scheduleMessagesBatch(state.activeHosts, messages);
+    int64_t routingEndNs = faabric::util::getCpuTimeNano();
+    if (scheduleMode == batch_scheduler::ModeFlux && state.applicationMetrics &&
+        routingStartNs >= 0 && routingEndNs >= routingStartNs) {
+        state.applicationMetrics->recordPlannerRouting(
+          routingEndNs - routingStartNs, static_cast<int64_t>(messages.size()));
+    }
 
     doEnqueueSchedMessages(hosts, std::move(messages)); // Move ownership
 }
@@ -1205,6 +1213,20 @@ bool Planner::resetParameter(
         }
         SPDLOG_INFO("Flux partitioned shard count set to {}", value);
     }
+    if (key == "flux_disable") {
+        // Experiments only: mechanisms switched off (kFluxDisable* bits).
+        if (stateAwareScheduler) {
+            stateAwareScheduler->setFluxDisable(value);
+        }
+        SPDLOG_INFO("Flux disabled mechanisms set to {}", value);
+    }
+    if (key == "flux_static_placement") {
+        // Experiments only: 0 home, 1 spread, 2 by operator.
+        if (stateAwareScheduler) {
+            stateAwareScheduler->setFluxStaticPlacement(value);
+        }
+        SPDLOG_INFO("Flux static placement set to {}", value);
+    }
 
     // Forward to worker hosts
     auto reqPtr =
@@ -1484,7 +1506,22 @@ void Planner::updateRuntimeStats()
             lastRoundStats.Clear();
         } else {
             faabric::util::FullLock rflock(reconfigMx);
+            // ModeFlux: what the round costs -- the same request goes to
+            // every worker, each sends its stats back.
+            FluxControlPlaneRound round;
+            int64_t roundStartUs =
+              faabric::util::getGlobalClock().epochMicros();
+            round.workers = static_cast<int>(targetIps.size());
+            round.bytesOut =
+              static_cast<int64_t>(lastRoundStats.ByteSizeLong()) *
+              static_cast<int64_t>(targetIps.size());
             auto results = fetchWorkerStatsAsync(targetIps, lastRoundStats);
+            for (const auto& [ip, stats] : results) {
+                if (stats) {
+                    round.bytesIn +=
+                      static_cast<int64_t>(stats->ByteSizeLong());
+                }
+            }
 
             if (state.applicationMetrics) {
                 state.applicationMetrics->recordWorkerMetrics(results);
@@ -1503,8 +1540,11 @@ void Planner::updateRuntimeStats()
                 for (const auto& [ip, stats] : clusterStats) {
                     schedStats[ip] = stats;
                 }
+                int64_t snapshotStartNs = faabric::util::getCpuTimeNano();
                 stateAwareScheduler->setClusterWorkerStats(
                   std::move(schedStats));
+                round.snapshotCpuNs =
+                  faabric::util::getCpuTimeNano() - snapshotStartNs;
 
                 // ModeFlux: advise every worker behind where to send what it
                 // cannot get through before the next round, and those holding
@@ -1512,14 +1552,26 @@ void Planner::updateRuntimeStats()
                 // over. Goes out with the next fetch, alongside these stats.
                 if (scheduleMode == batch_scheduler::ModeFlux) {
                     auto snapshot = stateAwareScheduler->getClusterSnapshot();
+                    int64_t offloadStartNs = faabric::util::getCpuTimeNano();
                     auto plans = stateAwareScheduler->planFluxOffload(
                       snapshot->stats, runtimeReconfigPeriod * 1000.0);
+                    int64_t mergeStartNs = faabric::util::getCpuTimeNano();
                     stateAwareScheduler->planFluxMerges(plans);
+                    round.offloadCpuNs = mergeStartNs - offloadStartNs;
+                    round.mergeCpuNs =
+                      faabric::util::getCpuTimeNano() - mergeStartNs;
                     auto& outPlans = *lastRoundStats.mutable_fluxoffloadplans();
                     for (auto& [ip, plan] : plans) {
                         outPlans[ip] = std::move(plan);
                     }
                 }
+            }
+
+            if (scheduleMode == batch_scheduler::ModeFlux &&
+                state.applicationMetrics) {
+                round.wallUs =
+                  faabric::util::getGlobalClock().epochMicros() - roundStartUs;
+                state.applicationMetrics->recordFluxControlPlane(round);
             }
         }
 
