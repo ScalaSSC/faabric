@@ -1053,6 +1053,7 @@ bool Planner::resetParameter(
         "soft_affinity_wb",
         "nl_min_fit_samples",
         "clast_placement",
+        "stable_warmup_sec",
     };
 
     faabric::util::FullLock lock(plannerMx);
@@ -1152,6 +1153,12 @@ bool Planner::resetParameter(
             }
             SPDLOG_INFO("Planner CLAST placement for schedule modes 3/4: {}",
                         isClastPlacement ? "ON" : "OFF");
+        } else if (key == "stable_warmup_sec") {
+            // Experiments: the *Stable latencies leave out the first this
+            // many seconds of a run.
+            if (state.applicationMetrics) {
+                state.applicationMetrics->setStableWarmupSec(value);
+            }
         } else if (state.applicationMetrics &&
                    state.applicationMetrics->setThreshold(key, value)) {
             // threshold keys handled inside ApplicationMetrics

@@ -156,12 +156,19 @@ class ApplicationMetrics
                                                          1000)]++;
             }
             // The same again, split by whether migration touched the input.
-            auto& [underTen, overTen] =
-              anyForwarded ? arrivalForwardedLatencies : arrivalDirectLatencies;
-            if (arrivalLatencyMicro < 10000) {
-                underTen[static_cast<int>(arrivalLatencyMicro)]++;
-            } else {
-                overTen[static_cast<int>(arrivalLatencyMicro / 1000)]++;
+            addLatency(anyForwarded ? arrivalForwardedLatencies
+                                    : arrivalDirectLatencies,
+                       arrivalLatencyMicro);
+
+            // And again for the run once warmed up: inputs that reached the
+            // planner stableWarmupSec or more after the first one did.
+            firstArrivalTime = std::min(firstArrivalTime, tempArrivalTime);
+            if (tempArrivalTime - firstArrivalTime >=
+                static_cast<int64_t>(stableWarmupSec) * 1000000) {
+                addLatency(arrivalStableLatencies, arrivalLatencyMicro);
+                addLatency(anyForwarded ? arrivalForwardedStableLatencies
+                                        : arrivalDirectStableLatencies,
+                           arrivalLatencyMicro);
             }
         }
 
@@ -844,10 +851,16 @@ class ApplicationMetrics
         }
 
         // Arrival latency of the inputs any of whose requests was migrated
-        // or forwarded, and of those none of whose were.
+        // or forwarded, and of those none of whose were; then all three again
+        // over the run once warmed up (*Stable), leaving out the inputs that
+        // reached the planner within stableWarmupSec of the first one.
+        doc.AddMember("stableWarmupSec", stableWarmupSec, alloc);
         for (const auto& [prefix, histogram] :
              { std::pair{ "Forwarded", &arrivalForwardedLatencies },
-               std::pair{ "Direct", &arrivalDirectLatencies } }) {
+               std::pair{ "Direct", &arrivalDirectLatencies },
+               std::pair{ "Stable", &arrivalStableLatencies },
+               std::pair{ "ForwardedStable", &arrivalForwardedStableLatencies },
+               std::pair{ "DirectStable", &arrivalDirectStableLatencies } }) {
             auto [median, p95, p99, n] =
               percentilesOf(histogram->first, histogram->second);
             std::string tag(prefix);
@@ -2011,6 +2024,17 @@ class ApplicationMetrics
         return true;
     }
 
+    // Experiments: the *Stable arrival latencies leave out the inputs that
+    // reached the planner within this many seconds of the first one.
+    void setStableWarmupSec(int seconds)
+    {
+        faabric::util::FullLock lock(opMx);
+        stableWarmupSec = std::max(0, seconds);
+        SPDLOG_INFO("ApplicationMetrics: stable latencies leave out the "
+                    "first {}s",
+                    stableWarmupSec);
+    }
+
     void reset()
     {
         faabric::util::FullLock lock(opMx);
@@ -2026,6 +2050,11 @@ class ApplicationMetrics
         arrivalLatenciesOverTen.clear();
         arrivalForwardedLatencies = {};
         arrivalDirectLatencies = {};
+        // stableWarmupSec is a setting, and stays.
+        firstArrivalTime = std::numeric_limits<int64_t>::max();
+        arrivalStableLatencies = {};
+        arrivalForwardedStableLatencies = {};
+        arrivalDirectStableLatencies = {};
         latencyBySecond.clear();
         fluxControlPlaneRounds.clear();
         plannerRouting.clear();
@@ -2061,6 +2090,29 @@ class ApplicationMetrics
     // forwarded: {under 10 ms in us, above in ms}.
     std::pair<std::map<int, int>, std::map<int, int>> arrivalForwardedLatencies;
     std::pair<std::map<int, int>, std::map<int, int>> arrivalDirectLatencies;
+    // All three again, of the inputs that reached the planner
+    // stableWarmupSec or more after the first one (firstArrivalTime, us)
+    // did.
+    int stableWarmupSec = 0;
+    int64_t firstArrivalTime = std::numeric_limits<int64_t>::max();
+    std::pair<std::map<int, int>, std::map<int, int>> arrivalStableLatencies;
+    std::pair<std::map<int, int>, std::map<int, int>>
+      arrivalForwardedStableLatencies;
+    std::pair<std::map<int, int>, std::map<int, int>>
+      arrivalDirectStableLatencies;
+
+    // Adds one latency to a histogram kept as {microseconds under 10 ms,
+    // milliseconds above}.
+    static void addLatency(
+      std::pair<std::map<int, int>, std::map<int, int>>& histogram,
+      int64_t latencyMicro)
+    {
+        if (latencyMicro < 10000) {
+            histogram.first[static_cast<int>(latencyMicro)]++;
+        } else {
+            histogram.second[static_cast<int>(latencyMicro / 1000)]++;
+        }
+    }
 
     // {median, p95, p99, count} (us) of a latency histogram kept as
     // microseconds under 10 ms and milliseconds above.

@@ -730,6 +730,11 @@ class Scheduler
         int units = 0;
         int statelessRequests = 0;
         size_t stateBytes = 0;
+        // Requests queued for the units, which went with them.
+        int queuedRequests = 0;
+        // Size of the hand-over message: state, queued and stateless
+        // requests. Parked requests follow in a batch of their own.
+        size_t sentBytes = 0;
         // Wall time (us) of each phase; see FluxOverheadStats.
         int64_t prepareUs = 0;
         int64_t waitUs = 0;

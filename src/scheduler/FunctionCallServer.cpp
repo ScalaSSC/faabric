@@ -372,11 +372,12 @@ void serializeWorkerMetrics(
 std::unique_ptr<google::protobuf::Message>
 FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
 {
-    PARSE_MSG(faabric::WorkerRuntimeStatsRequest, buffer.data(), buffer.size())
-
-    // What handling the round costs here, in CPU time; see
+    // What handling the round costs here, in CPU time, reading the cluster's
+    // stats included -- the part that grows with the cluster; see
     // FluxOverheadStats.
     int64_t roundStartNs = faabric::util::getCpuTimeNano();
+
+    PARSE_MSG(faabric::WorkerRuntimeStatsRequest, buffer.data(), buffer.size())
 
     // SPDLOG_DEBUG("Getting worker RUNTIME stats for host");
 

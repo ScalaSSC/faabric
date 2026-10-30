@@ -3295,16 +3295,19 @@ void Scheduler::rebalanceFlux()
                                          std::memory_order_relaxed);
         fluxOverhead.parkedRequests.fetch_add(handover.parked,
                                               std::memory_order_relaxed);
-        SPDLOG_INFO("Flux {} handed {} units ({} bytes) and {} stateless "
-                    "requests to {} in {:.1f} ms ({}): prepare {} / wait {} / "
-                    "pack {} / send {} / flip {} / forward {} us, {} parked",
+        SPDLOG_INFO("Flux {} handed {} units ({} state bytes, {} queued "
+                    "requests) and {} stateless requests to {} in {:.1f} ms "
+                    "({}, {} bytes sent): prepare {} / wait {} / pack {} / "
+                    "send {} / flip {} / forward {} us, {} parked",
                     thisHost,
                     handover.units,
                     handover.stateBytes,
+                    handover.queuedRequests,
                     handover.statelessRequests,
                     target,
                     tookUs / 1000,
                     shipment.merge ? "merge" : "split",
+                    handover.sentBytes,
                     handover.prepareUs,
                     handover.waitUs,
                     handover.packUs,
@@ -3760,6 +3763,9 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
     handover.flipUs = forwardAtUs - flipAtUs;
     handover.forwardUs = nowUs() - forwardAtUs;
     handover.parked = static_cast<int64_t>(nParked);
+    // Taken after the phases, so it adds to none of them.
+    handover.queuedRequests = unitRequests;
+    handover.sentBytes = req.ByteSizeLong();
     return handover;
 }
 
