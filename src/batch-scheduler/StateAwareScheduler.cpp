@@ -842,6 +842,7 @@ void StateAwareScheduler::setClusterWorkerStats(
         }
         fluxAssignedWorkUs.clear();
         fluxStartupHost.clear();
+        pheromoneAssigned.clear();
         // An empty round is a flush: what came before says nothing.
         fluxLastStatsUs = stats.empty() ? 0 : nowUs;
     }
@@ -2009,6 +2010,10 @@ std::string StateAwareScheduler::scheduleMessageFlux(
   const std::unique_ptr<Message>& msg,
   FluxOpRoutes& routes)
 {
+    if (pheromone) {
+        return scheduleMessagePheromone(hostMap, userFunc, msg, routes);
+    }
+
     // Stateful of either kind: the placement is the state's placement. The
     // operator's whole unit set is placed the first time any of it is routed
     // to (fluxOpRoute), then this message's unit is picked -- the shard its
@@ -2041,6 +2046,108 @@ std::string StateAwareScheduler::scheduleMessageFlux(
     msg->set_shardid(std::max(parallelismInfo.shardIdx, 0));
 
     return host;
+}
+
+std::string StateAwareScheduler::scheduleMessagePheromone(
+  const HostMap& hostMap,
+  const std::string& userFunc,
+  const std::unique_ptr<Message>& msg,
+  FluxOpRoutes& routes)
+{
+    // A stateful request still names its unit as under ModeFlux -- its paridx,
+    // and its shard if partitioned -- but nothing is placed: the state is in
+    // Redis, read and locked wherever the request runs.
+    auto routeIt = routes.find(userFunc);
+    if (routeIt == routes.end()) {
+        FluxOpRoute route;
+        route.node = lookupNode(userFunc);
+        if (route.node != nullptr && route.node->type != NodeType::STATELESS) {
+            if (fluxIsPartitioned(*route.node)) {
+                int shards = fluxPartitionShards > 0 ? fluxPartitionShards : 1;
+                route.ring = getFluxHashRing(userFunc, shards);
+            } else {
+                route.counter = counterOf(userFunc);
+            }
+        }
+        routeIt = routes.emplace(userFunc, std::move(route)).first;
+    }
+    const FluxOpRoute& route = routeIt->second;
+    if (route.node != nullptr && route.node->type != NodeType::STATELESS) {
+        auto info =
+          getHashAndParallelismIndexFlux(userFunc, *route.node, *msg, &route);
+        msg->set_messagetype(info.messageType);
+        msg->set_hash(info.hash);
+        msg->set_parallelismid(info.parallelismIdx);
+        msg->set_shardid(std::max(info.shardIdx, 0));
+    } else {
+        msg->set_messagetype(0);
+    }
+
+    // Worker, as Pheromone's local scheduler: what is triggered here runs
+    // here. With no executor idle it waits here for one, and the worker sends
+    // it on to the coordinator if none frees up soon -- unless the
+    // coordinator is what sent it here.
+    if (!isplanner) {
+        std::lock_guard<std::mutex> lock(fluxAssignedMx);
+        if (!pheromonePassIdle) {
+            pheromonePassIdle = pheromoneIdle ? pheromoneIdle() : 1;
+        }
+        if (*pheromonePassIdle <= 0 && msg->forwardcount() == 0) {
+            (*msg->mutable_metricrecorder())[PHEROMONE_DEFER_KEY] =
+              faabric::util::getGlobalClock().epochMicros();
+        }
+        --*pheromonePassIdle;
+        return localHost;
+    }
+
+    // Planner, as the coordinator: the worker with the most idle executors,
+    // as its last stats showed them less what has been sent there since; of
+    // those with any idle, one already running the operator first, its
+    // executors warm.
+    auto snapshot = getClusterSnapshot();
+    std::vector<const std::string*> hosts;
+    hosts.reserve(hostMap.size());
+    for (const auto& [ip, _] : hostMap) {
+        hosts.push_back(&ip);
+    }
+    if (hosts.empty()) {
+        throw std::runtime_error("Pheromone: no host to route " + userFunc);
+    }
+    size_t start = pheromoneNextHost.fetch_add(1, std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lock(fluxAssignedMx);
+    const std::string* chosen = nullptr;
+    std::tuple<bool, bool, int> chosenKey{ false, false, 0 };
+    for (size_t i = 0; i < hosts.size(); i++) {
+        const std::string& ip = *hosts[(start + i) % hosts.size()];
+        int executors = maxExecutorsPerWorker > 0 ? maxExecutorsPerWorker : 10;
+        int busy = 0;
+        auto statsIt = snapshot->stats.find(ip);
+        if (statsIt != snapshot->stats.end()) {
+            const auto& stats = statsIt->second;
+            if (stats.paridxcap() > 0) {
+                executors = stats.paridxcap();
+            }
+            busy += static_cast<int>(std::lround(stats.executorsnum()));
+            for (const auto& [_, queued] : stats.instancequeuenum()) {
+                busy += queued;
+            }
+        }
+        auto assignedIt = pheromoneAssigned.find(ip);
+        if (assignedIt != pheromoneAssigned.end()) {
+            busy += assignedIt->second;
+        }
+        int idle = executors - busy;
+        std::tuple<bool, bool, int> key{ idle > 0,
+                                         snapshot->runs(ip, userFunc),
+                                         idle };
+        if (chosen == nullptr || key > chosenKey) {
+            chosen = &ip;
+            chosenKey = key;
+        }
+    }
+    pheromoneAssigned[*chosen]++;
+    return *chosen;
 }
 
 std::string StateAwareScheduler::scheduleMessage(const HostMap& hostMap,
@@ -2120,6 +2227,7 @@ std::vector<std::string> StateAwareScheduler::scheduleMessagesBatch(
         fluxKeptThisPass.clear();
         fluxKeptWorkThisPass = 0;
         fluxPassWork.reset();
+        pheromonePassIdle.reset();
     }
 
     // What each operator's routing needs is looked up once for the pass.
@@ -5679,8 +5787,9 @@ void StateAwareScheduler::rescheduleAppFaaSFlowAdaptive(
     }
 
     int usedHostCount =
-      metrics ? metrics->computeAdaptiveHostCount(avgInputRate, numHosts)
-              : numHosts;
+      metrics && faasFlowAdaptiveHosts
+        ? metrics->computeAdaptiveHostCount(avgInputRate, numHosts)
+        : numHosts;
     SPDLOG_INFO("Adaptive: usedHostCount={}", usedHostCount);
 
     // Distribute reqResource proportionally to each operator's processedTuples.
@@ -6347,7 +6456,8 @@ void StateAwareScheduler::runtimeDistTune(
 
 void StateAwareScheduler::setScheduleMode(int mode)
 {
-    scheduleMode = mode;
+    pheromone = mode == ModePheromone;
+    scheduleMode = pheromone ? ModeFlux : mode;
 }
 
 void StateAwareScheduler::setRuntimeReconfig(bool value)
@@ -6391,6 +6501,8 @@ void StateAwareScheduler::resetScheduler()
         fluxPrevAssignedRateUs.clear();
         fluxLastStatsUs = 0;
         fluxStartupHost.clear();
+        pheromonePassIdle.reset();
+        pheromoneAssigned.clear();
     }
     {
         std::lock_guard<std::mutex> lock(fluxHistoryMx);

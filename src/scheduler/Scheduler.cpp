@@ -133,7 +133,20 @@ Scheduler::Scheduler()
       });
     decentralScheduler.setFluxLocalWorkProvider(
       [this]() { return fluxLocalWorkOf(); });
+    decentralScheduler.setPheromoneIdleProvider([this]() {
+        int queued = 0;
+        {
+            faabric::util::SharedLock lock(waitingQueuesMx);
+            for (const auto& [_, queue] : waitingQueues) {
+                queued += queue->getMessagesCount();
+            }
+        }
+        std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+        return maxExecutors - fluxRunningTotal - queued;
+    });
     fluxRebalanceThread = std::thread(&Scheduler::fluxRebalanceLoop, this);
+    pheromoneForwardThread =
+      std::thread(&Scheduler::pheromoneForwardLoop, this);
 
     // Initialize the dispatch worker pool
     int numDispatchers = 4;
@@ -167,6 +180,9 @@ Scheduler::~Scheduler()
     }
     if (fluxRebalanceThread.joinable()) {
         fluxRebalanceThread.join();
+    }
+    if (pheromoneForwardThread.joinable()) {
+        pheromoneForwardThread.join();
     }
 
     // Safely shutdown dispatch threads
@@ -285,6 +301,9 @@ void Scheduler::reset()
     if (fluxRebalanceThread.joinable()) {
         fluxRebalanceThread.join();
     }
+    if (pheromoneForwardThread.joinable()) {
+        pheromoneForwardThread.join();
+    }
 
     // Drop the pools, then shut their executors down outside any lock: an
     // executor finishing meanwhile finds its pool gone and is not taken back.
@@ -365,6 +384,7 @@ void Scheduler::reset()
     {
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
         fluxParidxLoad.clear();
+        fluxRunningTotal = 0;
     }
     {
         // The queues are gone. A dispatcher still working on one finds it
@@ -405,6 +425,8 @@ void Scheduler::reset()
     dispatchChainedMsgsThread =
       std::thread(&Scheduler::dispatchChainedMsgs, this);
     fluxRebalanceThread = std::thread(&Scheduler::fluxRebalanceLoop, this);
+    pheromoneForwardThread =
+      std::thread(&Scheduler::pheromoneForwardLoop, this);
 
     faabric::util::FullLock rflock(reconfigMx);
     decentralScheduler.resetScheduler();
@@ -566,10 +588,15 @@ bool Scheduler::reserveParidxRunFlux(const std::string& funcParStr)
     {
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
         auto& load = fluxParidxLoad[funcParStr];
-        if (load.running < maxExecutors) {
+        // Pheromone has a fixed set of executors per worker, whatever runs
+        // on them.
+        bool workerFree =
+          !decentralScheduler.isPheromone() || fluxRunningTotal < maxExecutors;
+        if (workerFree && load.running < maxExecutors) {
             advanceFluxLoad(load,
                             faabric::util::getGlobalClock().epochMicros());
             load.running++;
+            fluxRunningTotal++;
             return true;
         }
     }
@@ -586,6 +613,7 @@ void Scheduler::releaseParidxRunFlux(const std::string& funcParStr)
         advanceFluxLoad(it->second,
                         faabric::util::getGlobalClock().epochMicros());
         it->second.running--;
+        fluxRunningTotal = std::max(0, fluxRunningTotal - 1);
     }
 }
 
@@ -599,6 +627,7 @@ void Scheduler::finishParidxRunFlux(const std::string& funcParStr, int requests)
     advanceFluxLoad(it->second, faabric::util::getGlobalClock().epochMicros());
     if (it->second.running > 0) {
         it->second.running--;
+        fluxRunningTotal = std::max(0, fluxRunningTotal - 1);
     }
     it->second.finished += std::max(1, requests);
 }
@@ -972,6 +1001,7 @@ void Scheduler::enqueueMessageBatch(
     // ModeFlux: requests queued here, per paridx and per unit of state.
     std::map<std::string, int> fluxParidxArrivals;
     std::map<std::string, int> fluxUnitArrivals;
+    bool pheromone = decentralScheduler.isPheromone();
 
     while (!msgs.empty()) {
         std::unique_ptr<faabric::Message> msgPtr = std::move(msgs.front());
@@ -992,17 +1022,22 @@ void Scheduler::enqueueMessageBatch(
         if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
             std::string unitKey =
               faabric::batch_scheduler::StateAwareScheduler::fluxUnitKey(msg);
-            // Before admitMessageFlux: a unit mid-migration or already gone
-            // must not be recreated here.
-            if (divertMessageFlux(msgPtr, unitKey, fluxForwards)) {
-                continue;
-            }
-            std::string owner = admitMessageFlux(msg, userFuncPar, unitKey);
-            if (!owner.empty()) {
-                countForward(msg);
-                fluxCounters.fwdOwner.fetch_add(1, std::memory_order_relaxed);
-                fluxForwards[owner].push_back(std::move(msgPtr));
-                continue;
+            // Pheromone keeps no owners: any worker runs any unit, against
+            // its state in Redis.
+            if (!pheromone) {
+                // Before admitMessageFlux: a unit mid-migration or already
+                // gone must not be recreated here.
+                if (divertMessageFlux(msgPtr, unitKey, fluxForwards)) {
+                    continue;
+                }
+                std::string owner = admitMessageFlux(msg, userFuncPar, unitKey);
+                if (!owner.empty()) {
+                    countForward(msg);
+                    fluxCounters.fwdOwner.fetch_add(1,
+                                                    std::memory_order_relaxed);
+                    fluxForwards[owner].push_back(std::move(msgPtr));
+                    continue;
+                }
             }
             fluxParidxArrivals[faabric::util::funcParToString(msg, false)]++;
             if (msg.messagetype() != 0) {
@@ -1226,8 +1261,9 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
     bool fluxStatefulQueue = false;
     if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
         auto node = decentralScheduler.lookupNode(user + "_" + func);
+        // Pheromone holds no units: its stateful requests run where they are.
         fluxStatefulQueue =
-          node != nullptr &&
+          !decentralScheduler.isPheromone() && node != nullptr &&
           node->type != faabric::batch_scheduler::NodeType::STATELESS;
     }
 
@@ -1369,6 +1405,8 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             int workerQueueTime = now - (*metrics)[WORKER_ENQUEUE_TIME_KEY];
             message->set_workerqueuewaittime(workerQueueTime);
             metrics->erase(WORKER_ENQUEUE_TIME_KEY);
+            // Pheromone: it got an executor here in time.
+            metrics->erase(faabric::batch_scheduler::PHEROMONE_DEFER_KEY);
         }
 
         if (newReq->messages_size() != 0) {
@@ -1762,9 +1800,26 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         SPDLOG_INFO("Reset executeBatchsize parameter to : {}",
                     executeBatchsize);
     } else if (key == "schedule_mode") {
+        // Pheromone runs as ModeFlux; see ModePheromone.
         decentralScheduler.setScheduleMode(value);
-        scheduleMode = value;
+        bool pheromone = value == faabric::batch_scheduler::ModePheromone;
+        scheduleMode = pheromone ? faabric::batch_scheduler::ModeFlux : value;
+        // Pheromone keeps state in Redis. Turned on here, it is turned off
+        // here too, so a mode chosen after it does not inherit it.
+        auto& state = faabric::state::getGlobalState();
+        if (pheromone) {
+            pheromoneSetRemoteState =
+              pheromoneSetRemoteState || !state.accessRemote;
+            state.accessRemote = true;
+        } else if (pheromoneSetRemoteState) {
+            state.accessRemote = false;
+            pheromoneSetRemoteState = false;
+        }
         SPDLOG_INFO("Reset schedule_mode parameter to : {}", value);
+    } else if (key == "pheromone_forward_delay_ms") {
+        pheromoneForwardDelayMs = std::max(0, value);
+        SPDLOG_INFO("Pheromone forwards requests waiting {} ms",
+                    pheromoneForwardDelayMs.load());
     } else if (key == "dispatch_period") {
         dispatchPeriod = value;
         SPDLOG_INFO("Reset dispatchPeriod parameter to : {}", dispatchPeriod);
@@ -1926,8 +1981,13 @@ void Scheduler::notifyExecutorFinished(const faabric::Message& msg)
 
     // Its run slot and executor are free again, so its queue may dispatch.
     // Only now: a dispatcher woken any earlier would find neither free, and
-    // nothing would wake it again.
-    markDispatchPending(faabric::util::getUserFuncPar(msg));
+    // nothing would wake it again. Under Pheromone the executor is the
+    // worker's, so any queue may be the one waiting for it.
+    if (decentralScheduler.isPheromone()) {
+        markAllDispatchPending();
+    } else {
+        markDispatchPending(faabric::util::getUserFuncPar(msg));
+    }
 }
 
 double Scheduler::getAverageExecutors() const
@@ -2722,7 +2782,7 @@ void Scheduler::fluxRebalanceLoop()
         rollFluxParidxWindows();
 
         if (scheduleMode != faabric::batch_scheduler::ModeFlux ||
-            fluxRebalancePeriod <= 0) {
+            fluxRebalancePeriod <= 0 || decentralScheduler.isPheromone()) {
             continue;
         }
 
@@ -2733,6 +2793,67 @@ void Scheduler::fluxRebalanceLoop()
               "Flux rebalancing on {} failed: {}", thisHost, e.what());
         }
     }
+}
+
+void Scheduler::pheromoneForwardLoop()
+{
+    while (!stopThreadTimer) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (scheduleMode != faabric::batch_scheduler::ModeFlux ||
+            !decentralScheduler.isPheromone()) {
+            continue;
+        }
+        try {
+            forwardDeferredPheromone();
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR(
+              "Pheromone forwarding on {} failed: {}", thisHost, e.what());
+        }
+    }
+}
+
+void Scheduler::forwardDeferredPheromone()
+{
+    int64_t nowUs = faabric::util::getGlobalClock().epochMicros();
+    int64_t delayUs = static_cast<int64_t>(pheromoneForwardDelayMs) * 1000;
+    auto due = [nowUs, delayUs](const faabric::Message& msg) {
+        auto it = msg.metricrecorder().find(
+          faabric::batch_scheduler::PHEROMONE_DEFER_KEY);
+        return it != msg.metricrecorder().end() &&
+               nowUs - it->second >= delayUs;
+    };
+
+    // Queues are only ever erased by reset(), which stops this thread first,
+    // so the pointers outlive the lock.
+    std::vector<faabric::util::BatchQueue*> queues;
+    {
+        faabric::util::SharedLock lock(waitingQueuesMx);
+        for (const auto& [_, queue] : waitingQueues) {
+            queues.push_back(queue.get());
+        }
+    }
+    // Still in its queue means it has not started: no executor freed up for
+    // it in time.
+    std::vector<std::unique_ptr<faabric::Message>> forwards;
+    for (auto* queue : queues) {
+        auto taken = queue->takeIf(due);
+        std::move(taken.begin(), taken.end(), std::back_inserter(forwards));
+    }
+    if (forwards.empty()) {
+        return;
+    }
+
+    auto req = faabric::util::batchExecFactory("FAASM", "Func", 0);
+    for (auto& msg : forwards) {
+        msg->mutable_metricrecorder()->erase(
+          faabric::batch_scheduler::PHEROMONE_DEFER_KEY);
+        // Once forwarded, it runs wherever the coordinator sends it.
+        countForward(*msg);
+        req->add_messages()->Swap(msg.get());
+    }
+    fluxCounters.spilled.fetch_add(static_cast<int64_t>(forwards.size()),
+                                   std::memory_order_relaxed);
+    faabric::planner::getPlannerClient().enqueueFunctions(req);
 }
 
 void Scheduler::rebalanceFlux()

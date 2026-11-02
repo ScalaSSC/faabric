@@ -32,6 +32,9 @@ class RedisInstance
     std::string transferOwnersSha;
     std::string claimWithEpochSha;
     std::string claimManyWithEpochSha;
+    std::string lockStateSha;
+    std::string writeStateUnlockSha;
+    std::string releaseStateSha;
 
     std::string ip;
     std::string hostname;
@@ -132,6 +135,55 @@ for i = 1, n do
     redis.call('SET', KEYS[2 * i], tonumber(ARGV[2 + i]) + 1)
 end
 return 1
+)---";
+
+    // State locks. KEYS[1..n] are the locks of n state keys and KEYS[n+1..2n]
+    // the keys themselves; ARGV[1] is the caller's token, ARGV[2] the lease
+    // in ms. Takes every lock that is free or already the caller's, and
+    // leaves the others alone. Returns, for each lock taken, its index and
+    // the key's value ('' if unset), as one flat array.
+    const std::string_view lockStateCmd = R"---(
+local n = #KEYS / 2
+local out = {}
+for i = 1, n do
+    local holder = redis.call('GET', KEYS[i])
+    if not holder or holder == ARGV[1] then
+        redis.call('SET', KEYS[i], ARGV[1], 'PX', ARGV[2])
+        out[#out + 1] = i
+        out[#out + 1] = redis.call('GET', KEYS[n + i]) or ''
+    end
+end
+return out
+)---";
+
+    // KEYS come in (lock, key) pairs, ARGV[1] is the caller's token and
+    // ARGV[1 + i] pair i's new value. Writes a key and releases its lock only
+    // if the caller still holds the lock: one whose lease ran out may be
+    // someone else's by now, and their value must not be overwritten.
+    // Returns how many pairs were not the caller's.
+    const std::string_view writeStateUnlockCmd = R"---(
+local lost = 0
+for i = 1, #KEYS / 2 do
+    if redis.call('GET', KEYS[2 * i - 1]) == ARGV[1] then
+        redis.call('SET', KEYS[2 * i], ARGV[1 + i])
+        redis.call('DEL', KEYS[2 * i - 1])
+    else
+        lost = lost + 1
+    end
+end
+return lost
+)---";
+
+    // Releases every lock in KEYS still held under the token ARGV[1].
+    const std::string_view releaseStateCmd = R"---(
+local released = 0
+for i = 1, #KEYS do
+    if redis.call('GET', KEYS[i]) == ARGV[1] then
+        redis.call('DEL', KEYS[i])
+        released = released + 1
+    end
+end
+return released
 )---";
 };
 
@@ -293,17 +345,31 @@ class Redis
                         const std::string& fromValue,
                         const std::string& toValue);
 
-    std::vector<uint8_t> getAndLock(const std::string& key);
+    /**
+     * ------ State locks (access_state_remote) ------
+     *
+     * Each state key `k` has a lock `k_lock` holding the token of the thread
+     * that took it -- unique across workers -- under a lease. Locks are taken
+     * and given back only by the scripts above, so a check and the change it
+     * guards never interleave with another worker's. A thread waits only
+     * while holding no lock it took here, so threads cannot deadlock however
+     * their keys overlap; the lease frees the locks of a thread that dies
+     * holding them.
+     */
 
-    void setAndUnlock(const std::string& key, const std::vector<uint8_t>& value);
-
-    // Non-blocking multi-key variants: keys already locked by someone else
-    // are silently skipped rather than waited on.
-    std::map<std::string, std::vector<uint8_t>> getAndLockMulti(
+    // Takes the locks of as many of `keys` as are free, and returns the
+    // value of each one taken (empty if unset). Blocks, holding nothing,
+    // until it takes at least one.
+    std::map<std::string, std::vector<uint8_t>> lockStateKeys(
       const std::set<std::string>& keys);
 
-    void setAndUnlockMulti(
+    // Writes each key in `values` and releases its lock, provided this thread
+    // still holds it; a key whose lock it lost is left alone and logged.
+    void writeStateAndUnlock(
       const std::map<std::string, std::vector<uint8_t>>& values);
+
+    // Releases whatever state locks this thread still holds.
+    void releaseStateLocks();
 
     long getLong(const std::string& key);
 
@@ -349,7 +415,13 @@ class Redis
 
     const RedisInstance& instance;
 
-    std::map<std::string, uint32_t> lockOwners;
+    // This thread's state-lock token, and the state keys it holds locked.
+    std::string stateLockToken;
+    std::set<std::string> heldStateLocks;
+
+    UniqueRedisReply evalStateScript(const std::string& sha,
+                                     const std::vector<std::string_view>& keys,
+                                     const std::vector<std::string_view>& args);
 
     UniqueRedisReply dequeueBase(const std::string& queueName, int timeout);
 };

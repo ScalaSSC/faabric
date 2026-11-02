@@ -378,6 +378,9 @@ class Scheduler
     // Keyed by user/func/parIdx.
     std::mutex fluxParidxRunMx;
     std::map<std::string, FluxParidxLoad> fluxParidxLoad;
+    // Batches running over every paridx, guarded by fluxParidxRunMx.
+    // Pheromone caps it at maxExecutors: a fixed set of executors per worker.
+    int fluxRunningTotal = 0;
 
     // Accounts the time since `running` last changed, and opens the first
     // window of a paridx seen for the first time.
@@ -676,6 +679,17 @@ class Scheduler
     int fluxWorkerSlots = 0;
 
     void fluxRebalanceLoop();
+
+    // Pheromone: requests that found no idle executor here and are still
+    // waiting this long (ms) after go to the planner, the coordinator.
+    std::atomic<int> pheromoneForwardDelayMs = 5;
+    // Whether choosing Pheromone turned access_state_remote on, so that
+    // choosing another mode turns it off again.
+    bool pheromoneSetRemoteState = false;
+    std::thread pheromoneForwardThread;
+    void pheromoneForwardLoop();
+    // Hands every request here that has waited too long to the planner.
+    void forwardDeferredPheromone();
 
     // See setFluxMergeAdvice.
     std::mutex fluxMergeMx;

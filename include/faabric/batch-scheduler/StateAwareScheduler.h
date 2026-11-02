@@ -35,7 +35,7 @@ inline const std::string NONE_STRING = "None";
 // from config and over HTTP.
 enum ScheduleMode : int
 {
-    ModeBinpack = 0,          // Capacity Binpack
+    ModeBinpack = 0, // Capacity Binpack
     ModeFaaSFlowAdaptive = 3,
     ModeNonlinear = 4,
     ModeApportion = 5,
@@ -45,7 +45,18 @@ enum ScheduleMode : int
     // ownership, which is claimed on demand in Redis by whichever scheduler
     // routes the first request for it.
     ModeFlux = 12,
+    // Pheromone (Yu et al., NSDI'23), a baseline. Its operators are not
+    // pinned either, so it runs on ModeFlux's machinery: setting it makes
+    // scheduleMode read ModeFlux, with isPheromone() true. It keeps no state
+    // owners and moves nothing: state lives in Redis, every request runs on
+    // the worker it reaches if an executor there is idle, and goes to the
+    // planner, acting as Pheromone's coordinator, if none frees up soon.
+    ModePheromone = 13,
 };
+
+// Pheromone: when a request first found no idle executor on its worker (us);
+// the worker sends it to the planner if it is still waiting a while later.
+inline const std::string PHEROMONE_DEFER_KEY = "pheromonedeferat";
 
 struct HashAndParallelismInfo
 {
@@ -109,6 +120,12 @@ class StateAwareScheduler : public BatchScheduler
     // workers by CLAST's capacity-aware packer (the mode-0 placement). See
     // rescheduleAppClastPlacement.
     void setClastPlacement(bool value) { isClastPlacement = value; }
+
+    // Schedule mode 3 (FaaSFlow): whether a re-partition first shrinks the
+    // workers to the count its input rate needs. FaaSFlow itself partitions
+    // over every worker it has, so experiments comparing against it turn this
+    // off; on by default, as earlier experiments ran it.
+    void setFaaSFlowAdaptiveHosts(bool value) { faasFlowAdaptiveHosts = value; }
 
     // Cluster-wide view: the stats the planner fetched from every worker in
     // its previous runtime-stats round, keyed by worker IP. Lives here rather
@@ -312,6 +329,16 @@ class StateAwareScheduler : public BatchScheduler
     void setFluxLocalWorkProvider(std::function<FluxLocalWork()> provider)
     {
         fluxLocalWork = std::move(provider);
+    }
+
+    // Pheromone (ModePheromone): whether this scheduler runs it.
+    bool isPheromone() const { return pheromone.load(); }
+
+    // Workers only: how many of the host's executors are idle, less the
+    // requests already waiting for one.
+    void setPheromoneIdleProvider(std::function<int()> provider)
+    {
+        pheromoneIdle = std::move(provider);
     }
 
     /**
@@ -915,6 +942,28 @@ class StateAwareScheduler : public BatchScheduler
     std::map<std::string, int> fluxKeptThisPass;
     double fluxKeptWorkThisPass = 0;
     std::optional<FluxLocalWork> fluxPassWork;
+
+    // Pheromone. Set with the schedule mode; scheduleMode then reads
+    // ModeFlux.
+    std::atomic<bool> pheromone = false;
+    // Workers only; see setPheromoneIdleProvider. The current routing pass
+    // reads it once, then counts down the requests it keeps here. Guarded by
+    // fluxAssignedMx, and cleared with the other per-pass fields.
+    std::function<int()> pheromoneIdle;
+    std::optional<int> pheromonePassIdle;
+    // Planner only, guarded by fluxAssignedMx: requests sent to each host
+    // since the last stats round, which those stats do not show yet.
+    std::map<std::string, int> pheromoneAssigned;
+    // Planner only: where to start looking, so that hosts equally idle --
+    // all of them, before the first stats -- take turns.
+    std::atomic<size_t> pheromoneNextHost = 0;
+
+    // Pheromone's routing of `msg`, an operator of the DAG or not: on a worker
+    // the worker itself, on the planner the most idle worker.
+    std::string scheduleMessagePheromone(const HostMap& hostMap,
+                                         const std::string& userFunc,
+                                         const std::unique_ptr<Message>& msg,
+                                         FluxOpRoutes& routes);
     // Planner only, guarded by fluxAssignedMx: executor time, with what it
     // sets off downstream, routed to each host since the last stats round;
     // the same per second over the round before, which that round's stats
@@ -945,6 +994,9 @@ class StateAwareScheduler : public BatchScheduler
     // the planner via resetParameter("clast_placement"). Ignored by every other
     // schedule mode.
     bool isClastPlacement = false;
+
+    // Schedule mode 3 only; see setFaaSFlowAdaptiveHosts.
+    bool faasFlowAdaptiveHosts = true;
 
     // Per-worker capacity safety margin for groupNodesCapacity. Default matches
     // the planner's workerLoadHeadroom default.

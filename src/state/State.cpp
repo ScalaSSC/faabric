@@ -309,7 +309,8 @@ std::vector<uint8_t> State::readFuncStateLock(const std::string& user,
           faabric::util::keyForFunction(user, func, parallelismId);
         redis::Redis& redis = redis::Redis::getState();
         if (lock) {
-            return redis.getAndLock(key);
+            // One key: lockStateKeys returns once it holds it.
+            return std::move(redis.lockStateKeys({ key }).at(key));
         }
         return redis.get(key);
     }
@@ -334,7 +335,7 @@ void State::setFuncState(const std::string& user,
         redis::Redis& redis = redis::Redis::getState();
         std::vector<uint8_t> value(buffer, buffer + bufferLen);
         if (unlock) {
-            redis.setAndUnlock(key, value);
+            redis.writeStateAndUnlock({ { key, std::move(value) } });
         } else {
             redis.set(key, value);
         }
@@ -382,8 +383,11 @@ std::map<std::string, std::vector<uint8_t>> State::readIndivFuncStateLock(
             redisKeys.insert(fsKey + "_" + key);
         }
 
+        // As the local path: the keys it could lock, at least one -- the
+        // caller works through those and comes back for the rest, holding
+        // nothing in between.
         redis::Redis& redis = redis::Redis::getState();
-        auto redisResult = redis.getAndLockMulti(redisKeys);
+        auto redisResult = redis.lockStateKeys(redisKeys);
 
         // Strip the function-state prefix back off so the returned map uses
         // the same bare keys the caller passed in
@@ -417,7 +421,7 @@ void State::writeIndivFuncStateUnlock(const std::string& user,
         }
 
         redis::Redis& redis = redis::Redis::getState();
-        redis.setAndUnlockMulti(redisValues);
+        redis.writeStateAndUnlock(redisValues);
         return;
     }
 

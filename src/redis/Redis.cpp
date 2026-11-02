@@ -1,5 +1,6 @@
 #include <faabric/redis/Redis.h>
 
+#include <chrono>
 #include <cstdarg>
 #include <faabric/util/bytes.h>
 #include <faabric/util/config.h>
@@ -8,7 +9,8 @@
 #include <faabric/util/network.h>
 #include <faabric/util/random.h>
 #include <faabric/util/timing.h>
-#include <chrono>
+#include <random>
+#include <sstream>
 #include <thread>
 
 namespace faabric::redis {
@@ -45,14 +47,17 @@ RedisInstance::RedisInstance(RedisRole roleIn)
     port = std::stoi(portStr);
 
     // Load scripts
-    if (delifeqSha.empty() || schedPublishSha.empty() || claimSha.empty() ||
-        transferOwnersSha.empty() || claimWithEpochSha.empty() ||
-        claimManyWithEpochSha.empty()) {
+    auto anyMissing = [this]() {
+        return delifeqSha.empty() || schedPublishSha.empty() ||
+               claimSha.empty() || transferOwnersSha.empty() ||
+               claimWithEpochSha.empty() || claimManyWithEpochSha.empty() ||
+               lockStateSha.empty() || writeStateUnlockSha.empty() ||
+               releaseStateSha.empty();
+    };
+    if (anyMissing()) {
         std::unique_lock<std::mutex> lock(scriptsLock);
 
-        if (delifeqSha.empty() || schedPublishSha.empty() || claimSha.empty() ||
-            transferOwnersSha.empty() || claimWithEpochSha.empty() ||
-            claimManyWithEpochSha.empty()) {
+        if (anyMissing()) {
             printf("Loading scripts for Redis instance at %s\n",
                    hostname.c_str());
             redisContext* context = redisConnect(ip.c_str(), port);
@@ -64,6 +69,10 @@ RedisInstance::RedisInstance(RedisRole roleIn)
             claimWithEpochSha = this->loadScript(context, claimWithEpochCmd);
             claimManyWithEpochSha =
               this->loadScript(context, claimManyWithEpochCmd);
+            lockStateSha = this->loadScript(context, lockStateCmd);
+            writeStateUnlockSha =
+              this->loadScript(context, writeStateUnlockCmd);
+            releaseStateSha = this->loadScript(context, releaseStateCmd);
 
             redisFree(context);
         }
@@ -106,6 +115,14 @@ Redis::Redis(const RedisInstance& instanceIn)
 
         throw std::runtime_error("Failed to connect to redis");
     }
+
+    // One connection per thread, so one token per thread: this worker, this
+    // thread, and a random part that no restart repeats.
+    std::ostringstream token;
+    token << faabric::util::getSystemConfig().endpointHost << "/"
+          << std::this_thread::get_id() << "/"
+          << faabric::util::randomString(12);
+    stateLockToken = token.str();
 }
 
 Redis::~Redis()
@@ -755,114 +772,178 @@ bool Redis::transferOwners(const std::vector<OwnerTransfer>& transfers,
     return reply->integer == 1;
 }
 
-static constexpr int STATE_LOCK_TIMEOUT_SECS = 1;
-
-std::vector<uint8_t> Redis::getAndLock(const std::string& key)
-{
-    std::string lockKey = key + "_lock";
-    uint32_t lockId = faabric::util::generateGid();
-    while (!this->setnxex(lockKey, lockId, STATE_LOCK_TIMEOUT_SECS)) {
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
-    }
-    lockOwners[key] = lockId;
-
-    return this->get(key);
+namespace {
+// How long a state lock outlives a thread that dies holding it. Locks are
+// held for one function's read-update-write, milliseconds; a lease this long
+// only ever runs out on a thread that is gone or stalled.
+constexpr int64_t kStateLockLeaseMs = 10000;
+// Waiting for a lock: backoff bounds, and when to say it is taking long.
+constexpr int64_t kStateLockMinBackoffUs = 50;
+constexpr int64_t kStateLockMaxBackoffUs = 2000;
+constexpr int64_t kStateLockSlowWaitUs = 5000000;
 }
 
-void Redis::setAndUnlock(const std::string& key,
-                         const std::vector<uint8_t>& value)
+UniqueRedisReply Redis::evalStateScript(
+  const std::string& sha,
+  const std::vector<std::string_view>& keys,
+  const std::vector<std::string_view>& args)
 {
-    this->set(key, value);
-
-    auto it = lockOwners.find(key);
-    if (it != lockOwners.end()) {
-        this->delIfEq(key + "_lock", it->second);
-        lockOwners.erase(it);
-    } else {
-        this->del(key + "_lock");
+    std::string numKeys = std::to_string(keys.size());
+    std::vector<const char*> argv;
+    std::vector<size_t> argvLen;
+    argv.reserve(3 + keys.size() + args.size());
+    argvLen.reserve(3 + keys.size() + args.size());
+    auto push = [&](std::string_view arg) {
+        argv.push_back(arg.data());
+        argvLen.push_back(arg.size());
+    };
+    push("EVALSHA");
+    push(sha);
+    push(numKeys);
+    for (auto key : keys) {
+        push(key);
     }
+    for (auto arg : args) {
+        push(arg);
+    }
+
+    auto reply = wrapReply((redisReply*)redisCommandArgv(
+      context, static_cast<int>(argv.size()), argv.data(), argvLen.data()));
+    if (reply == nullptr) {
+        throw std::runtime_error("No reply from Redis to a state lock script");
+    }
+    if (reply->type == REDIS_REPLY_ERROR) {
+        SPDLOG_ERROR("State lock script failed: {}", reply->str);
+        throw std::runtime_error("State lock script failed in Redis");
+    }
+    return reply;
 }
 
-std::map<std::string, std::vector<uint8_t>> Redis::getAndLockMulti(
+std::map<std::string, std::vector<uint8_t>> Redis::lockStateKeys(
   const std::set<std::string>& keys)
 {
-    std::map<std::string, std::vector<uint8_t>> result;
+    std::map<std::string, std::vector<uint8_t>> taken;
     if (keys.empty()) {
-        return result;
+        return taken;
     }
 
-    std::map<std::string, uint32_t> lockIds;
+    std::vector<std::string> lockKeys;
+    lockKeys.reserve(keys.size());
+    std::vector<std::string_view> scriptKeys;
+    scriptKeys.reserve(2 * keys.size());
     for (const auto& key : keys) {
-        uint32_t lockId = faabric::util::generateGid();
-        lockIds[key] = lockId;
-        redisAppendCommand(context,
-                           "SET %s_lock %i EX %i NX",
-                           key.c_str(),
-                           lockId,
-                           STATE_LOCK_TIMEOUT_SECS);
+        lockKeys.push_back(key + "_lock");
     }
-
-    std::vector<std::string> lockedKeys;
+    for (const auto& lockKey : lockKeys) {
+        scriptKeys.push_back(lockKey);
+    }
+    std::vector<const std::string*> keyAt;
+    keyAt.reserve(keys.size());
     for (const auto& key : keys) {
-        void* rawReply = nullptr;
-        redisGetReply(context, &rawReply);
-        auto reply = wrapReply((redisReply*)rawReply);
-        if (reply != nullptr && reply->type != REDIS_REPLY_NIL) {
-            lockedKeys.push_back(key);
-            lockOwners[key] = lockIds[key];
+        scriptKeys.push_back(key);
+        keyAt.push_back(&key);
+    }
+    std::string lease = std::to_string(kStateLockLeaseMs);
+
+    // Holding nothing while waiting, the backoff is randomised so threads
+    // after the same keys do not keep colliding.
+    thread_local std::minstd_rand jitter(
+      std::hash<std::string>{}(stateLockToken));
+    int64_t backoffUs = kStateLockMinBackoffUs;
+    auto startedAt = std::chrono::steady_clock::now();
+    bool warned = false;
+    while (true) {
+        auto reply = evalStateScript(
+          instance.lockStateSha, scriptKeys, { stateLockToken, lease });
+        if (reply->type != REDIS_REPLY_ARRAY || reply->elements % 2 != 0) {
+            throw std::runtime_error("Unexpected reply taking state locks");
         }
-    }
-
-    if (lockedKeys.empty()) {
-        return result;
-    }
-
-    for (const auto& key : lockedKeys) {
-        redisAppendCommand(context, "GET %s", key.c_str());
-    }
-
-    for (const auto& key : lockedKeys) {
-        void* rawReply = nullptr;
-        redisGetReply(context, &rawReply);
-        auto reply = wrapReply((redisReply*)rawReply);
-
-        std::vector<uint8_t> value;
-        if (reply != nullptr && reply->type != REDIS_REPLY_NIL) {
-            value = getBytesFromReply(*reply);
+        for (size_t i = 0; i + 1 < reply->elements; i += 2) {
+            // Lua indices count from one.
+            size_t index = static_cast<size_t>(reply->element[i]->integer) - 1;
+            const std::string& key = *keyAt.at(index);
+            taken.emplace(key, getBytesFromReply(*reply->element[i + 1]));
+            heldStateLocks.insert(key);
         }
-        result.emplace(key, std::move(value));
-    }
+        if (!taken.empty()) {
+            return taken;
+        }
 
-    return result;
+        auto waitedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - startedAt)
+                          .count();
+        if (!warned && waitedUs > kStateLockSlowWaitUs) {
+            SPDLOG_WARN("Waited {} ms for any of {} state locks (first {})",
+                        waitedUs / 1000,
+                        keys.size(),
+                        *keys.begin());
+            warned = true;
+        }
+        std::uniform_int_distribution<int64_t> spread(backoffUs / 2, backoffUs);
+        std::this_thread::sleep_for(std::chrono::microseconds(spread(jitter)));
+        backoffUs = std::min(2 * backoffUs, kStateLockMaxBackoffUs);
+    }
 }
 
-void Redis::setAndUnlockMulti(
+void Redis::writeStateAndUnlock(
   const std::map<std::string, std::vector<uint8_t>>& values)
 {
     if (values.empty()) {
         return;
     }
 
-    for (const auto& [key, value] : values) {
-        redisAppendCommand(
-          context, "SET %s %b", key.c_str(), value.data(), value.size());
+    std::vector<std::string> lockKeys;
+    lockKeys.reserve(values.size());
+    for (const auto& [key, _] : values) {
+        lockKeys.push_back(key + "_lock");
     }
-    flushPipeline((long)values.size());
+    std::vector<std::string_view> scriptKeys;
+    scriptKeys.reserve(2 * values.size());
+    std::vector<std::string_view> args;
+    args.reserve(1 + values.size());
+    args.emplace_back(stateLockToken);
+    size_t i = 0;
+    for (const auto& [key, value] : values) {
+        scriptKeys.push_back(lockKeys[i++]);
+        scriptKeys.push_back(key);
+        args.emplace_back(reinterpret_cast<const char*>(value.data()),
+                          value.size());
+    }
 
-    for (const auto& [key, value] : values) {
-        auto it = lockOwners.find(key);
-        if (it != lockOwners.end()) {
-            redisAppendCommand(context,
-                               "EVALSHA %s 1 %s_lock %i",
-                               instance.delifeqSha.c_str(),
-                               key.c_str(),
-                               it->second);
-            lockOwners.erase(it);
-        } else {
-            redisAppendCommand(context, "DEL %s_lock", key.c_str());
-        }
+    auto reply =
+      evalStateScript(instance.writeStateUnlockSha, scriptKeys, args);
+    for (const auto& [key, _] : values) {
+        heldStateLocks.erase(key);
     }
-    flushPipeline((long)values.size());
+    if (reply->type == REDIS_REPLY_INTEGER && reply->integer > 0) {
+        // Its lease ran out, or it was never taken: either way the value is
+        // not this thread's to write.
+        SPDLOG_ERROR("Lost {} of {} state locks before writing back (first "
+                     "{}); those writes were dropped",
+                     reply->integer,
+                     values.size(),
+                     values.begin()->first);
+    }
+}
+
+void Redis::releaseStateLocks()
+{
+    if (heldStateLocks.empty()) {
+        return;
+    }
+
+    std::vector<std::string> lockKeys;
+    lockKeys.reserve(heldStateLocks.size());
+    for (const auto& key : heldStateLocks) {
+        lockKeys.push_back(key + "_lock");
+    }
+    std::vector<std::string_view> scriptKeys(lockKeys.begin(), lockKeys.end());
+    auto reply =
+      evalStateScript(instance.releaseStateSha, scriptKeys, { stateLockToken });
+    SPDLOG_WARN("Released {} state locks never written back (first {})",
+                reply->type == REDIS_REPLY_INTEGER ? reply->integer : 0,
+                *heldStateLocks.begin());
+    heldStateLocks.clear();
 }
 
 long Redis::getLong(const std::string& key)

@@ -1053,6 +1053,7 @@ bool Planner::resetParameter(
         "soft_affinity_wb",
         "nl_min_fit_samples",
         "clast_placement",
+        "faasflow_adaptive_hosts",
         "stable_warmup_sec",
     };
 
@@ -1153,6 +1154,13 @@ bool Planner::resetParameter(
             }
             SPDLOG_INFO("Planner CLAST placement for schedule modes 3/4: {}",
                         isClastPlacement ? "ON" : "OFF");
+        } else if (key == "faasflow_adaptive_hosts") {
+            // Mode 3: 0 re-partitions over every worker, as FaaSFlow does.
+            if (stateAwareScheduler) {
+                stateAwareScheduler->setFaaSFlowAdaptiveHosts(value == 1);
+            }
+            SPDLOG_INFO("Planner FaaSFlow adaptive worker count: {}",
+                        value == 1 ? "ON" : "OFF");
         } else if (key == "stable_warmup_sec") {
             // Experiments: the *Stable latencies leave out the first this
             // many seconds of a run.
@@ -1181,7 +1189,10 @@ bool Planner::resetParameter(
         // Re-push the CLAST-placement flag: it may have been set before the
         // scheduler existed, and it only takes effect for modes 3 and 4.
         stateAwareScheduler->setClastPlacement(isClastPlacement);
-        scheduleMode = value;
+        // Pheromone runs as ModeFlux; see ModePheromone.
+        scheduleMode = value == batch_scheduler::ModePheromone
+                         ? batch_scheduler::ModeFlux
+                         : value;
         if (state.applicationMetrics) {
             state.applicationMetrics->setCoeffEstimatorEnabled(
               coeffEstimatorUsedBy(scheduleMode));
@@ -1557,7 +1568,9 @@ void Planner::updateRuntimeStats()
                 // cannot get through before the next round, and those holding
                 // part of an operator that now fits on one worker to hand it
                 // over. Goes out with the next fetch, alongside these stats.
-                if (scheduleMode == batch_scheduler::ModeFlux) {
+                // Pheromone moves nothing, so has no advice to give.
+                if (scheduleMode == batch_scheduler::ModeFlux &&
+                    !stateAwareScheduler->isPheromone()) {
                     auto snapshot = stateAwareScheduler->getClusterSnapshot();
                     int64_t offloadStartNs = faabric::util::getCpuTimeNano();
                     auto plans = stateAwareScheduler->planFluxOffload(

@@ -5,6 +5,7 @@
 #include <faabric/mpi/MpiWorldRegistry.h>
 #include <faabric/planner/PlannerClient.h>
 #include <faabric/proto/faabric.pb.h>
+#include <faabric/redis/Redis.h>
 #include <faabric/scheduler/Scheduler.h>
 #include <faabric/snapshot/SnapshotClient.h>
 #include <faabric/snapshot/SnapshotRegistry.h>
@@ -405,6 +406,12 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                     }
                 }
                 stateLocks.clear();
+            }
+            // Remote state locks are this thread's: give back any the batch
+            // took and never wrote back, rather than leave the keys to wait
+            // out the lease.
+            if (faabric::state::getGlobalState().accessRemote) {
+                faabric::redis::Redis::getState().releaseStateLocks();
             }
             faabric::scheduler::getScheduler().notifyExecutorFinished(firstMsg);
 
