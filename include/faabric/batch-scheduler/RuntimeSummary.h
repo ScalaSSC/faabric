@@ -237,7 +237,9 @@ class RuntimeSummary
     std::shared_mutex summaryMx;
     std::string localHost = faabric::util::getSystemConfig().endpointHost;
     bool isPlanner = false;
-    std::atomic<double> alpha = 0.2;
+    // Learning rate of TuneImplDist (eta in lcsched's paper, 0.3); set with
+    // the `alpha` parameter, in thousandths.
+    std::atomic<double> alpha = 0.3;
 
     // MAP<instance name: operatorType>
     std::map<std::string, LocalStatelessOperatorType> localOperatorsMap;
