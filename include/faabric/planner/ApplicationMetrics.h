@@ -77,11 +77,29 @@ class ApplicationMetrics
         int64_t tempArrivalTime = std::numeric_limits<int64_t>::max();
         // Whether any request it set off was migrated or forwarded.
         bool anyForwarded = false;
+        // Per operator: its requests in this input, their execution time and
+        // the CPU time of it (fluxOccupancySummary, once warmed up).
+        std::map<std::string, FluxExecSums> inputExec;
         for (auto& [msgId, msg] : msgMap) {
             if (msg->forwardcount() > 0) {
                 anyForwarded = true;
             }
             std::string operatorName = getOperatorName(msg);
+            if (msg->workerexecutestart() > 0 &&
+                msg->workerexecuteend() >= msg->workerexecutestart()) {
+                auto& exec = inputExec[operatorName];
+                exec.requests++;
+                exec.wallUs += static_cast<double>(msg->workerexecuteend() -
+                                                   msg->workerexecutestart());
+                exec.cpuUs += static_cast<double>(
+                  std::max<int64_t>(0, msg->workerexecutecputime()));
+                if (msg->workerdispatchtime() > 0 &&
+                    msg->workerexecutestart() >= msg->workerdispatchtime()) {
+                    exec.handoffs++;
+                    exec.handoffUs += static_cast<double>(
+                      msg->workerexecutestart() - msg->workerdispatchtime());
+                }
+            }
             std::string instanceName = getInstanceName(msg);
             if (!instances.contains(instanceName)) {
                 instances[instanceName] =
@@ -169,6 +187,14 @@ class ApplicationMetrics
                 addLatency(anyForwarded ? arrivalForwardedStableLatencies
                                         : arrivalDirectStableLatencies,
                            arrivalLatencyMicro);
+                for (const auto& [operatorName, exec] : inputExec) {
+                    auto& total = fluxExecStable[operatorName];
+                    total.requests += exec.requests;
+                    total.wallUs += exec.wallUs;
+                    total.cpuUs += exec.cpuUs;
+                    total.handoffs += exec.handoffs;
+                    total.handoffUs += exec.handoffUs;
+                }
             }
         }
 
@@ -533,6 +559,253 @@ class ApplicationMetrics
                           alloc);
         planner.AddMember("routed_inputs", routedInputs, alloc);
         doc.AddMember("fluxControlPlaneSummary", planner, alloc);
+    }
+
+    // ModeFlux: where a request's time on its worker goes, per operator, and
+    // what each worker's cores carried. New keys only. Caller holds opMx.
+    //  - fluxOccupancySummary, per operator, over the run once warmed up (as
+    //    the *Stable latencies): requests; slot_us, the time a request held a
+    //    run slot, weighted by the requests that finished; exec_wall_us and
+    //    exec_cpu_us, the time in the function and the CPU time of it;
+    //    dispatch_us = slot - exec wall, spent outside the function (waiting
+    //    for an executor thread, resetting it, handing back results);
+    //    wait_us = exec wall - exec cpu, spent waiting inside it.
+    //  - fluxCapacity, per worker and second: executors held and cores busy
+    //    over its capacity window, and the slots planned with; and
+    //    fluxCapacitySummary, their means once warmed up, per worker and
+    //    over the cluster.
+    void addFluxOccupancyMetrics(rapidjson::Document& doc) const
+    {
+        auto& alloc = doc.GetAllocator();
+        // Warmed up from stableWarmupSec after the first input reached the
+        // planner, as the *Stable latencies; everything before any input.
+        bool anyInput = firstArrivalTime != std::numeric_limits<int64_t>::max();
+        int64_t stableFromSec =
+          anyInput ? firstArrivalTime / 1000000 + stableWarmupSec : 0;
+
+        // ---- Per operator ----
+        std::map<std::string, std::pair<double, double>> slotSums;
+        for (const auto& [second, perOperator] : fluxSlotTimeBySecond) {
+            if (second < stableFromSec) {
+                continue;
+            }
+            for (const auto& [userFunc, sums] : perOperator) {
+                slotSums[userFunc].first += sums.first;
+                slotSums[userFunc].second += sums.second;
+            }
+        }
+        std::set<std::string> operators;
+        for (const auto& [userFunc, sums] : slotSums) {
+            operators.insert(userFunc);
+        }
+        for (const auto& [userFunc, exec] : fluxExecStable) {
+            operators.insert(userFunc);
+        }
+        rapidjson::Value occupancyObj(rapidjson::kObjectType);
+        for (const auto& userFunc : operators) {
+            double slotUs = 0;
+            auto slotIt = slotSums.find(userFunc);
+            if (slotIt != slotSums.end() && slotIt->second.second > 0) {
+                slotUs = slotIt->second.first / slotIt->second.second;
+            }
+            long long requests = 0;
+            double wallUs = 0;
+            double cpuUs = 0;
+            double handoffUs = 0;
+            auto execIt = fluxExecStable.find(userFunc);
+            if (execIt != fluxExecStable.end() && execIt->second.requests > 0) {
+                requests = execIt->second.requests;
+                wallUs = execIt->second.wallUs / requests;
+                cpuUs = execIt->second.cpuUs / requests;
+                if (execIt->second.handoffs > 0) {
+                    handoffUs =
+                      execIt->second.handoffUs / execIt->second.handoffs;
+                }
+            }
+            rapidjson::Value obj(rapidjson::kObjectType);
+            obj.AddMember("requests", static_cast<int64_t>(requests), alloc);
+            obj.AddMember("slot_us", slotUs, alloc);
+            obj.AddMember("exec_wall_us", wallUs, alloc);
+            obj.AddMember("exec_cpu_us", cpuUs, alloc);
+            obj.AddMember("dispatch_us", slotUs - wallUs, alloc);
+            obj.AddMember("wait_us", wallUs - cpuUs, alloc);
+            obj.AddMember("handoff_us", handoffUs, alloc);
+            occupancyObj.AddMember(
+              rapidjson::Value(userFunc.c_str(), alloc).Move(), obj, alloc);
+        }
+
+        // ---- What the cores carried ----
+        struct Means
+        {
+            double occupied = 0;
+            double busy = 0;
+            double slots = 0;
+            double slotsMin = std::numeric_limits<double>::infinity();
+            double slotsMax = 0;
+            long n = 0;
+            void add(const FluxCapacityPoint& point)
+            {
+                occupied += point.occupiedExecutors;
+                busy += point.busyCores;
+                slots += point.capacitySlots;
+                slotsMin = std::min(slotsMin, point.capacitySlots);
+                slotsMax = std::max(slotsMax, point.capacitySlots);
+                n++;
+            }
+            rapidjson::Value toJson(rapidjson::Document::AllocatorType& a) const
+            {
+                rapidjson::Value obj(rapidjson::kObjectType);
+                obj.AddMember("seconds", static_cast<int64_t>(n), a);
+                obj.AddMember("occupied_executors_mean", occupied / n, a);
+                obj.AddMember("busy_cores_mean", busy / n, a);
+                obj.AddMember("capacity_slots_mean", slots / n, a);
+                obj.AddMember("capacity_slots_min", slotsMin, a);
+                obj.AddMember("capacity_slots_max", slotsMax, a);
+                return obj;
+            }
+        };
+        rapidjson::Value perWorkerObj(rapidjson::kObjectType);
+        rapidjson::Value summaryObj(rapidjson::kObjectType);
+        Means cluster;
+        for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+            if (workerNode.fluxCapacityHistory.empty()) {
+                continue;
+            }
+            rapidjson::Value workerArr(rapidjson::kArrayType);
+            Means worker;
+            for (const auto& [second, point] : workerNode.fluxCapacityHistory) {
+                std::string entry = fmt::format("{} / {:.2f} / {:.2f} / {:.2f}",
+                                                second,
+                                                point.occupiedExecutors,
+                                                point.busyCores,
+                                                point.capacitySlots);
+                workerArr.PushBack(
+                  rapidjson::Value(entry.c_str(), alloc).Move(), alloc);
+                if (second >= stableFromSec) {
+                    worker.add(point);
+                    cluster.add(point);
+                }
+            }
+            perWorkerObj.AddMember(
+              rapidjson::Value(ip.c_str(), alloc).Move(), workerArr, alloc);
+            if (worker.n > 0) {
+                summaryObj.AddMember(rapidjson::Value(ip.c_str(), alloc).Move(),
+                                     worker.toJson(alloc),
+                                     alloc);
+            }
+        }
+        if (cluster.n > 0) {
+            summaryObj.AddMember("cluster", cluster.toJson(alloc), alloc);
+        }
+
+        // ---- The way from a queue to an executor ----
+        // Per worker, over the run once warmed up: from its first report at
+        // or after stableFromSec to its last (the counters are cumulative).
+        rapidjson::Value dispatchObj(rapidjson::kObjectType);
+        faabric::FluxOverheadStats clusterDelta;
+        double clusterDispatcherUs = 0;
+        auto addDispatch = [&alloc](const faabric::FluxOverheadStats& delta,
+                                    double dispatcherUs) {
+            auto ratio = [](double num, double den) {
+                return den > 0 ? num / den : 0.0;
+            };
+            rapidjson::Value obj(rapidjson::kObjectType);
+            obj.AddMember(
+              "dispatched_batches", delta.dispatchedbatches(), alloc);
+            obj.AddMember("dispatcher_busy_share",
+                          ratio(delta.dispatchbusyus(), dispatcherUs),
+                          alloc);
+            obj.AddMember(
+              "dispatch_busy_us_per_batch",
+              ratio(delta.dispatchbusyus(), delta.dispatchedbatches()),
+              alloc);
+            obj.AddMember("pending_wait_us_mean",
+                          ratio(delta.pendingwaitus(), delta.pendingpicks()),
+                          alloc);
+            obj.AddMember("resets", delta.resets(), alloc);
+            obj.AddMember("light_resets", delta.lightresets(), alloc);
+            obj.AddMember(
+              "reset_us_mean", ratio(delta.resetus(), delta.resets()), alloc);
+            obj.AddMember("reset_cpu_us_mean",
+                          ratio(delta.resetcpuns() / 1000.0, delta.resets()),
+                          alloc);
+            return obj;
+        };
+        for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+            const auto& history = workerNode.fluxOverheadHistory;
+            if (history.empty()) {
+                continue;
+            }
+            auto fromIt = history.lower_bound(stableFromSec);
+            if (fromIt == history.end()) {
+                fromIt = history.begin();
+            }
+            const auto& last = history.rbegin()->second;
+            const auto& from = fromIt->second;
+            bool fromStart = fromIt == history.begin();
+            auto diff = [fromStart](int64_t now, int64_t before) {
+                return fromStart || now < before ? now : now - before;
+            };
+            faabric::FluxOverheadStats delta;
+            delta.set_resets(diff(last.resets(), from.resets()));
+            delta.set_lightresets(diff(last.lightresets(), from.lightresets()));
+            delta.set_resetus(diff(last.resetus(), from.resetus()));
+            delta.set_resetcpuns(diff(last.resetcpuns(), from.resetcpuns()));
+            delta.set_dispatchbusyus(
+              diff(last.dispatchbusyus(), from.dispatchbusyus()));
+            delta.set_dispatchedbatches(
+              diff(last.dispatchedbatches(), from.dispatchedbatches()));
+            delta.set_pendingwaitus(
+              diff(last.pendingwaitus(), from.pendingwaitus()));
+            delta.set_pendingpicks(
+              diff(last.pendingpicks(), from.pendingpicks()));
+            if (delta.dispatchedbatches() == 0 && delta.resets() == 0) {
+                continue;
+            }
+            // Dispatcher time available over the span -- every dispatcher
+            // thread, the whole time. From the start, the first report covers
+            // a second of its own.
+            int64_t spanSec =
+              history.rbegin()->first - fromIt->first + (fromStart ? 1 : 0);
+            double dispatcherUs =
+              static_cast<double>(std::max(1, last.dispatchers())) *
+              static_cast<double>(std::max<int64_t>(1, spanSec)) * 1e6;
+            dispatchObj.AddMember(rapidjson::Value(ip.c_str(), alloc).Move(),
+                                  addDispatch(delta, dispatcherUs),
+                                  alloc);
+            clusterDelta.set_resets(clusterDelta.resets() + delta.resets());
+            clusterDelta.set_lightresets(clusterDelta.lightresets() +
+                                         delta.lightresets());
+            clusterDelta.set_resetus(clusterDelta.resetus() + delta.resetus());
+            clusterDelta.set_resetcpuns(clusterDelta.resetcpuns() +
+                                        delta.resetcpuns());
+            clusterDelta.set_dispatchbusyus(clusterDelta.dispatchbusyus() +
+                                            delta.dispatchbusyus());
+            clusterDelta.set_dispatchedbatches(
+              clusterDelta.dispatchedbatches() + delta.dispatchedbatches());
+            clusterDelta.set_pendingwaitus(clusterDelta.pendingwaitus() +
+                                           delta.pendingwaitus());
+            clusterDelta.set_pendingpicks(clusterDelta.pendingpicks() +
+                                          delta.pendingpicks());
+            clusterDispatcherUs += dispatcherUs;
+        }
+        if (clusterDispatcherUs > 0) {
+            dispatchObj.AddMember(
+              "cluster", addDispatch(clusterDelta, clusterDispatcherUs), alloc);
+        }
+        if (!dispatchObj.ObjectEmpty()) {
+            doc.AddMember("fluxDispatchSummary", dispatchObj, alloc);
+        }
+
+        if (operators.empty() && perWorkerObj.ObjectEmpty()) {
+            return;
+        }
+        doc.AddMember("fluxOccupancySummary", occupancyObj, alloc);
+        doc.AddMember("fluxCapacity: second / occupied_executors / busy_cores "
+                      "/ capacity_slots",
+                      perWorkerObj,
+                      alloc);
+        doc.AddMember("fluxCapacitySummary", summaryObj, alloc);
     }
 
     void addFluxMigrationMetrics(rapidjson::Document& doc) const
@@ -1261,6 +1534,7 @@ class ApplicationMetrics
 
         addFluxMigrationMetrics(doc);
         addFluxOverheadMetrics(doc);
+        addFluxOccupancyMetrics(doc);
 
         // Per-second RLS update inputs: one entry per saturated host per
         // second. Format: throughput / execTime(us) / localChained /
@@ -1347,6 +1621,43 @@ class ApplicationMetrics
     {
         std::map<time_t, InstanceRecord> history;
     };
+    // ModeFlux: one second of what a worker's cores carried, as it reported
+    // it -- executors held and cores busy over its capacity window -- and the
+    // slots planned with.
+    struct FluxCapacityPoint
+    {
+        double occupiedExecutors = 0;
+        double busyCores = 0;
+        double capacitySlots = 0;
+    };
+    // ModeFlux: requests of one operator, the time they spent in the
+    // function and the CPU time of it (us).
+    struct FluxExecSums
+    {
+        long long requests = 0;
+        double wallUs = 0;
+        double cpuUs = 0;
+        // From the worker handing the batch to an executor to the function
+        // starting, over the requests that carry both times.
+        long long handoffs = 0;
+        double handoffUs = 0;
+    };
+    // Per operator, over the inputs that count once warmed up (as the
+    // *Stable latencies).
+    std::map<std::string, FluxExecSums> fluxExecStable;
+    // Per second and operator: requests finished per second times the time
+    // each held a run slot, and requests finished per second, summed over
+    // its queues on every worker.
+    std::map<time_t, std::map<std::string, std::pair<double, double>>>
+      fluxSlotTimeBySecond;
+
+    // user_func_par (a queue) to user_func (its operator).
+    static std::string operatorOfQueue(const std::string& queueKey)
+    {
+        auto pos = queueKey.rfind('_');
+        return pos == std::string::npos ? queueKey : queueKey.substr(0, pos);
+    }
+
     struct WorkerNodeMetrics
     {
         std::map<std::string, InstanceTimeSeries> instances;
@@ -1359,6 +1670,9 @@ class ApplicationMetrics
         // ModeFlux: the worker's overhead counters as reported each second
         // (cumulative since the last flush).
         std::map<time_t, faabric::FluxOverheadStats> fluxOverheadHistory;
+        // ModeFlux: what its cores carried each second -- executors held and
+        // cores busy over its capacity window -- and the slots planned with.
+        std::map<time_t, FluxCapacityPoint> fluxCapacityHistory;
     };
 
     // The cumulative counters of FluxOverheadStats, in output order. `nanos`
@@ -1567,6 +1881,33 @@ class ApplicationMetrics
             if (statsPtr->has_fluxmigration()) {
                 clusterWorkerMetrics[ip].fluxMigrationHistory[currentTime] =
                   statsPtr->fluxmigration();
+            }
+            // ModeFlux: what its cores carried, and the slots planned with
+            // (as StateAwareScheduler::capacitySlotsFlux reads them).
+            if (statsPtr->workerslots() > 0) {
+                double slots = statsPtr->fluxcapacityslots() > 0
+                                 ? statsPtr->fluxcapacityslots()
+                                 : std::max(1, statsPtr->workerslots());
+                clusterWorkerMetrics[ip].fluxCapacityHistory[currentTime] = {
+                    statsPtr->fluxoccupiedexecutors(),
+                    statsPtr->fluxbusycores(),
+                    slots
+                };
+            }
+            // ModeFlux: the time each request held a run slot, per
+            // operator, weighted by the requests that finished.
+            for (const auto& [queueKey, slotTimeUs] :
+                 statsPtr->paridxslottimeus()) {
+                auto rateIt = statsPtr->paridxratepersec().find(queueKey);
+                if (slotTimeUs <= 0 ||
+                    rateIt == statsPtr->paridxratepersec().end() ||
+                    rateIt->second <= 0) {
+                    continue;
+                }
+                auto& sums =
+                  fluxSlotTimeBySecond[currentTime][operatorOfQueue(queueKey)];
+                sums.first += rateIt->second * slotTimeUs;
+                sums.second += rateIt->second;
             }
 
             // Aggregate across all instances on this host before RLS update.
@@ -2058,6 +2399,8 @@ class ApplicationMetrics
         latencyBySecond.clear();
         fluxControlPlaneRounds.clear();
         plannerRouting.clear();
+        fluxExecStable.clear();
+        fluxSlotTimeBySecond.clear();
 
         for (auto& [instName, instancePtr] : instances) {
             instancePtr->reset();

@@ -957,8 +957,7 @@ void StateAwareScheduler::computeOperatorActivityFlux(
         }
 
         snapshot.demandUs[ip] = demandWorkUsFlux(workerStats, roundUs);
-        snapshot.capacityUs[ip] =
-          std::max(1, workerStats.workerslots()) * roundUs;
+        snapshot.capacityUs[ip] = capacitySlotsFlux(workerStats) * roundUs;
         auto& held = snapshot.heldUnits[ip];
         for (const auto& [userFunc, units] : workerStats.fluxheldunits()) {
             if (units > 0) {
@@ -1076,8 +1075,9 @@ StateAwareScheduler::planFluxOffload(
     std::vector<Side> room;
 
     for (const auto& [ip, workerStats] : stats) {
-        int slots = std::max(1, workerStats.workerslots());
-        int cap = workerStats.paridxcap() > 0 ? workerStats.paridxcap() : slots;
+        double slots = capacitySlotsFlux(workerStats);
+        double cap =
+          workerStats.paridxcap() > 0 ? workerStats.paridxcap() : slots;
         // What it has to get through before the next round: what is queued,
         // and what arrives meanwhile, with what they set off there.
         double demandUs = demandWorkUsFlux(workerStats, horizonUs);
@@ -1093,7 +1093,7 @@ StateAwareScheduler::planFluxOffload(
 
         // What it can run before the next round: its executor slots, but no
         // paridx more than `cap` batches at once.
-        int usableSlots =
+        double usableSlots =
           backedUp > 0 ? std::min(slots, backedUp * cap) : slots;
         double excessUs = demandUs - usableSlots * horizonUs;
         if (excessUs > 0) {
@@ -1498,7 +1498,9 @@ double StateAwareScheduler::remoteWaitUsFlux(
     // As many batches of the paridx as can run there at once: its cap, or
     // fewer if the worker has fewer executor slots free (plus those it
     // already runs).
-    int slots = workerStats.workerslots();
+    int slots = workerStats.workerslots() > 0
+                  ? static_cast<int>(std::floor(capacitySlotsFlux(workerStats)))
+                  : 0;
     int cap = workerStats.paridxcap();
     int freeSlots =
       slots > 0
@@ -1686,8 +1688,7 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
             continue;
         }
         const auto& workerStats = statsIt->second;
-        int slots = std::max(1, workerStats.workerslots());
-        double capacityUs = slots * horizonUs;
+        double capacityUs = capacitySlotsFlux(workerStats) * horizonUs;
         auto prevIt = fluxPrevAssignedRateUs.find(ip);
         double prevRateUs =
           prevIt == fluxPrevAssignedRateUs.end() ? 0 : prevIt->second;

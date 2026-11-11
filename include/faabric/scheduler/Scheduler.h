@@ -204,6 +204,22 @@ class Scheduler
     // it reports every round.
     void fillFluxWorkerStats(faabric::WorkerStats& out);
 
+    // An executor reset itself after a batch, taking `wallUs` of wall time
+    // and `cpuNs` of CPU time (any mode; see FluxOverheadStats).
+    void recordExecutorReset(int64_t wallUs, int64_t cpuNs)
+    {
+        fluxOverhead.resets.fetch_add(1, std::memory_order_relaxed);
+        fluxOverhead.resetUs.fetch_add(wallUs, std::memory_order_relaxed);
+        fluxOverhead.resetCpuNs.fetch_add(cpuNs, std::memory_order_relaxed);
+    }
+
+    // The reset under way was done in place, not by re-instantiating the
+    // module (light_reset).
+    void countLightReset()
+    {
+        fluxOverhead.lightResets.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // ModeFlux: one stats round handled here took `cpuNs` of CPU time, and
     // the stats it reported were `bytes` long.
     void recordFluxStatsRound(int64_t cpuNs, int64_t bytes)
@@ -522,24 +538,31 @@ class Scheduler
         std::atomic<int64_t> flipUs{ 0 };
         std::atomic<int64_t> forwardUs{ 0 };
         std::atomic<int64_t> parkedRequests{ 0 };
+        // The way from a queue to an executor (all modes): resets after a
+        // batch, dispatching, and queues waiting for a dispatcher.
+        std::atomic<int64_t> resets{ 0 };
+        std::atomic<int64_t> resetUs{ 0 };
+        std::atomic<int64_t> resetCpuNs{ 0 };
+        std::atomic<int64_t> dispatchBusyUs{ 0 };
+        std::atomic<int64_t> dispatchedBatches{ 0 };
+        std::atomic<int64_t> pendingWaitUs{ 0 };
+        std::atomic<int64_t> pendingPicks{ 0 };
+        std::atomic<int64_t> lightResets{ 0 };
 
         void reset()
         {
-            for (auto* counter : { &routingCpuNs,
-                                   &routedRequests,
-                                   &rebalanceCpuNs,
-                                   &rebalanceRounds,
-                                   &statsCpuNs,
-                                   &statsRounds,
-                                   &lastStatsBytes,
-                                   &handovers,
-                                   &prepareUs,
-                                   &waitUs,
-                                   &packUs,
-                                   &sendUs,
-                                   &flipUs,
-                                   &forwardUs,
-                                   &parkedRequests }) {
+            for (auto* counter : { &routingCpuNs,   &routedRequests,
+                                   &rebalanceCpuNs, &rebalanceRounds,
+                                   &statsCpuNs,     &statsRounds,
+                                   &lastStatsBytes, &handovers,
+                                   &prepareUs,      &waitUs,
+                                   &packUs,         &sendUs,
+                                   &flipUs,         &forwardUs,
+                                   &parkedRequests, &resets,
+                                   &resetUs,        &resetCpuNs,
+                                   &dispatchBusyUs, &dispatchedBatches,
+                                   &pendingWaitUs,  &pendingPicks,
+                                   &lightResets }) {
                 counter->store(0, std::memory_order_relaxed);
             }
         }
@@ -677,6 +700,37 @@ class Scheduler
     // Executors a worker can run at once. Flux caps executors per paridx, not
     // per worker; this is what bounds a worker as a whole.
     int fluxWorkerSlots = 0;
+
+    // ModeFlux: what this worker's cores carry. Every window closed by
+    // rollFluxParidxWindows adds one sample -- its length, the executor time
+    // held over it, and the CPU time this process took -- and the last
+    // kFluxCapacityWindowSec of them give the executors held and the cores
+    // kept busy on average, and the slots the worker is taken to have:
+    // fluxWorkerSlots cores, each carrying held / busy executors, and never
+    // fewer than fluxWorkerSlots. Samples under fluxParidxRunMx; the results
+    // are read without it. Reset by flushes.
+    struct FluxCapacitySample
+    {
+        int64_t spanUs = 0;
+        double occupiedUs = 0;
+        double cpuUs = 0;
+    };
+    std::deque<FluxCapacitySample> fluxCapacitySamples;
+    int64_t fluxCapacityLastRollUs = 0;
+    int64_t fluxCapacityLastCpuNs = -1;
+    std::atomic<double> fluxOccupiedExecutors{ 0 };
+    std::atomic<double> fluxBusyCores{ 0 };
+    // 0 until measured.
+    std::atomic<double> fluxCapacitySlots{ 0 };
+
+    // Caller holds fluxParidxRunMx.
+    void rollFluxCapacity(int64_t nowUs, int64_t cpuNs, double occupiedUs);
+
+    // The slots to plan with here: as measured, or fluxWorkerSlots before
+    // they are, outside ModeFlux, under Pheromone, or with the dynamic
+    // capacity ablated.
+    double fluxCapacitySlotsNow() const;
+    bool fluxDynamicCapacityOn() const;
 
     void fluxRebalanceLoop();
 

@@ -64,6 +64,9 @@ class InstanceMetrics
         int newExecutorPrepTime = msg->executorpreparetime();
         int newWorkerExecuteTime =
           msg->workerexecuteend() - msg->workerexecutestart();
+        // The CPU time spent in the function over that span (us).
+        double newWorkerExecuteCpuTime = static_cast<double>(
+          std::max<int64_t>(0, msg->workerexecutecputime()));
         int newExecuteBatchSize = msg->executebatchsize();
         bool isSchedLocally = msg->isscheduledlocally();
 
@@ -96,6 +99,10 @@ class InstanceMetrics
         avgWorkerExecuteTime =
           avgWorkerExecuteTime +
           (static_cast<double>(newWorkerExecuteTime) - avgWorkerExecuteTime) /
+            static_cast<double>(count);
+        avgWorkerExecuteCpuTime =
+          avgWorkerExecuteCpuTime +
+          (newWorkerExecuteCpuTime - avgWorkerExecuteCpuTime) /
             static_cast<double>(count);
         int recordBatchSize = ++batchCounter[newExecuteBatchSize];
         if (recordBatchSize >= newExecuteBatchSize) {
@@ -142,6 +149,8 @@ class InstanceMetrics
         doc.AddMember("avgWorkerQueueTime", avgWorkerQueueTime, alloc);
         doc.AddMember("avgExecutorPrepTime", avgExecutorPrepTime, alloc);
         doc.AddMember("avgWorkerExecuteTime", avgWorkerExecuteTime, alloc);
+        doc.AddMember(
+          "avgWorkerExecuteCpuTime", avgWorkerExecuteCpuTime, alloc);
         doc.AddMember("avgExecuteBatchSize", avgExecuteBatchSize, alloc);
 
         rapidjson::Value hostStatsObj(rapidjson::kObjectType);
@@ -196,6 +205,7 @@ class InstanceMetrics
         avgWorkerQueueTime = 0.0;
         avgExecutorPrepTime = 0.0;
         avgWorkerExecuteTime = 0.0;
+        avgWorkerExecuteCpuTime = 0.0;
         avgExecuteBatchSize = 0.0;
 
         batchCounter.clear();
@@ -221,6 +231,7 @@ class InstanceMetrics
     double avgWorkerQueueTime = 0.0;
     double avgExecutorPrepTime = 0.0;
     double avgWorkerExecuteTime = 0.0;
+    double avgWorkerExecuteCpuTime = 0.0;
     double avgExecuteBatchSize = 0.0;
     std::map<int, int> batchCounter;
     std::map<std::string, int> hostStats;

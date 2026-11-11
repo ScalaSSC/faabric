@@ -26,6 +26,8 @@
 #include <faabric/util/string_tools.h>
 #include <faabric/util/timing.h>
 
+#include <atomic>
+
 // Default snapshot size here is set to support 32-bit WebAssembly, but could be
 // made configurable on the function call or language.
 #define ONE_MB (1024L * 1024L)
@@ -36,6 +38,20 @@
 #define STREAM_BATCH -2
 
 namespace faabric::executor {
+
+namespace {
+std::atomic<bool> lightResetOn{ false };
+}
+
+void setLightReset(bool on)
+{
+    lightResetOn.store(on, std::memory_order_relaxed);
+}
+
+bool lightResetEnabled()
+{
+    return lightResetOn.load(std::memory_order_relaxed);
+}
 
 // TODO - avoid the copy of the message here?
 Executor::Executor(faabric::Message& msg)
@@ -362,41 +378,9 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                   executeBatchSize);
             }
 
-            std::atomic_thread_fence(std::memory_order_release);
-            int oldTaskCount = 0;
-            bool isLastThreadInExecutor = false;
-            oldTaskCount = batchCounter.fetch_sub(1);
-            isLastThreadInExecutor = oldTaskCount == 1;
-            assert(oldTaskCount >= 1);
-
-            faabric::Message firstMsg = task.req->messages().at(0);
-            SPDLOG_DEBUG("Task {} finished by thread {}:{} ({} left)",
-                         faabric::util::funcToString(firstMsg, true),
-                         id,
-                         threadPoolIdx,
-                         oldTaskCount - 1);
-
-            if (isLastThreadInExecutor) {
-                reset(firstMsg);
-                releaseClaim();
-            }
-
-            // Return this thread index to the pool available for scheduling
-            {
-                faabric::util::UniqueLock lock(threadsMutex);
-                availablePoolThreads.insert(threadPoolIdx);
-            }
-
-            // Only now back to the scheduler's pool: handed out any earlier,
-            // the next batch could find no thread free to run on.
-            if (isLastThreadInExecutor) {
-                faabric::scheduler::getScheduler().returnExecutor(this);
-            }
-
-            // Enqueue the message result
-            faabric::scheduler::getScheduler().enqueueSetResults(
-              std::move(task.req));
-
+            // The batch is done with its state: its locks go before the
+            // reset, which only touches the module, so that a migration
+            // waiting for this batch does not wait for the reset as well.
             if (!stateLocks.empty()) {
                 SPDLOG_DEBUG(
                   "statelock unlocked by thread {}:{}", id, threadPoolIdx);
@@ -413,6 +397,57 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             if (faabric::state::getGlobalState().accessRemote) {
                 faabric::redis::Redis::getState().releaseStateLocks();
             }
+
+            faabric::Message firstMsg = task.req->messages().at(0);
+
+            // So do the results: whoever waits for them -- the planner,
+            // admitting the next inputs as these complete -- need not wait for
+            // the reset either.
+            faabric::scheduler::getScheduler().enqueueSetResults(
+              std::move(task.req));
+
+            std::atomic_thread_fence(std::memory_order_release);
+            int oldTaskCount = 0;
+            bool isLastThreadInExecutor = false;
+            oldTaskCount = batchCounter.fetch_sub(1);
+            isLastThreadInExecutor = oldTaskCount == 1;
+            assert(oldTaskCount >= 1);
+
+            SPDLOG_DEBUG("Task {} finished by thread {}:{} ({} left)",
+                         faabric::util::funcToString(firstMsg, true),
+                         id,
+                         threadPoolIdx,
+                         oldTaskCount - 1);
+
+            if (isLastThreadInExecutor) {
+                // What making the module clean again costs: wall and CPU
+                // time, reported with the worker's overheads.
+                int64_t resetStartUs =
+                  faabric::util::getGlobalClock().epochMicros();
+                int64_t resetStartCpuNs = faabric::util::getCpuTimeNano();
+                reset(firstMsg);
+                int64_t resetCpuNs =
+                  resetStartCpuNs >= 0
+                    ? faabric::util::getCpuTimeNano() - resetStartCpuNs
+                    : 0;
+                faabric::scheduler::getScheduler().recordExecutorReset(
+                  faabric::util::getGlobalClock().epochMicros() - resetStartUs,
+                  std::max<int64_t>(0, resetCpuNs));
+                releaseClaim();
+            }
+
+            // Return this thread index to the pool available for scheduling
+            {
+                faabric::util::UniqueLock lock(threadsMutex);
+                availablePoolThreads.insert(threadPoolIdx);
+            }
+
+            // Only now back to the scheduler's pool: handed out any earlier,
+            // the next batch could find no thread free to run on.
+            if (isLastThreadInExecutor) {
+                faabric::scheduler::getScheduler().returnExecutor(this);
+            }
+
             faabric::scheduler::getScheduler().notifyExecutorFinished(firstMsg);
 
             continue;

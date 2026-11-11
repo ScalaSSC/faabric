@@ -407,6 +407,13 @@ void Scheduler::reset()
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
         fluxUnitRates.clear();
         fluxUnitWindowStartUs = 0;
+        // What the cores carried says nothing about the next run.
+        fluxCapacitySamples.clear();
+        fluxCapacityLastRollUs = 0;
+        fluxCapacityLastCpuNs = -1;
+        fluxOccupiedExecutors.store(0, std::memory_order_relaxed);
+        fluxBusyCores.store(0, std::memory_order_relaxed);
+        fluxCapacitySlots.store(0, std::memory_order_relaxed);
     }
     fluxCounters.reset();
     fluxOverhead.reset();
@@ -635,13 +642,18 @@ void Scheduler::finishParidxRunFlux(const std::string& funcParStr, int requests)
 void Scheduler::rollFluxParidxWindows()
 {
     int64_t nowUs = faabric::util::getGlobalClock().epochMicros();
+    // Everything this process ran, executors and the rest alike.
+    int64_t cpuNs = faabric::util::getCpuTimeNano(CLOCK_PROCESS_CPUTIME_ID);
     std::lock_guard<std::mutex> lock(fluxParidxRunMx);
+    // Executor time held over the window, by every paridx together.
+    double occupiedUs = 0;
     for (auto& [funcParStr, load] : fluxParidxLoad) {
         advanceFluxLoad(load, nowUs);
         int64_t windowUs = nowUs - load.windowStartUs;
         if (windowUs <= 0) {
             continue;
         }
+        occupiedUs += load.runningIntegralUs;
         load.ratePerSec = load.finished * 1e6 / windowUs;
         if (load.finished > 0) {
             // Little's law: batches in flight over requests per second is
@@ -664,6 +676,89 @@ void Scheduler::rollFluxParidxWindows()
         }
     }
     fluxUnitWindowStartUs = nowUs;
+
+    rollFluxCapacity(nowUs, cpuNs, occupiedUs);
+}
+
+void Scheduler::rollFluxCapacity(int64_t nowUs,
+                                 int64_t cpuNs,
+                                 double occupiedUs)
+{
+    // A window's executor time held, and the CPU time the process took
+    // meanwhile. The first roll only marks where the next window starts.
+    if (fluxCapacityLastRollUs > 0 && nowUs > fluxCapacityLastRollUs &&
+        cpuNs >= 0 && fluxCapacityLastCpuNs >= 0 &&
+        cpuNs >= fluxCapacityLastCpuNs) {
+        fluxCapacitySamples.push_back(
+          { nowUs - fluxCapacityLastRollUs,
+            occupiedUs,
+            static_cast<double>(cpuNs - fluxCapacityLastCpuNs) / 1000.0 });
+    }
+    fluxCapacityLastRollUs = nowUs;
+    fluxCapacityLastCpuNs = cpuNs;
+
+    // Only the last kFluxCapacityWindowSec of them.
+    const int64_t windowUs =
+      static_cast<int64_t>(
+        faabric::batch_scheduler::StateAwareScheduler::kFluxCapacityWindowSec) *
+      1000000;
+    int64_t spanUs = 0;
+    double heldUs = 0;
+    double busyUs = 0;
+    for (const auto& sample : fluxCapacitySamples) {
+        spanUs += sample.spanUs;
+        heldUs += sample.occupiedUs;
+        busyUs += sample.cpuUs;
+    }
+    while (fluxCapacitySamples.size() > 1 &&
+           spanUs - fluxCapacitySamples.front().spanUs >= windowUs) {
+        spanUs -= fluxCapacitySamples.front().spanUs;
+        heldUs -= fluxCapacitySamples.front().occupiedUs;
+        busyUs -= fluxCapacitySamples.front().cpuUs;
+        fluxCapacitySamples.pop_front();
+    }
+    if (spanUs <= 0) {
+        return;
+    }
+
+    // An executor holds its slot for the whole of a request -- running, and
+    // waiting on locks, state and the host -- so a core carries as many
+    // executors as were held per core kept busy. The cores carry at least
+    // one each; with nothing held or nothing burnt, nothing says more.
+    double cores = std::max(1, fluxWorkerSlots);
+    double capacity = cores;
+    if (heldUs > 0 && busyUs > 0) {
+        capacity = std::max(cores, cores * heldUs / busyUs);
+    }
+    fluxOccupiedExecutors.store(heldUs / spanUs, std::memory_order_relaxed);
+    fluxBusyCores.store(busyUs / spanUs, std::memory_order_relaxed);
+    fluxCapacitySlots.store(capacity, std::memory_order_relaxed);
+    SPDLOG_DEBUG("Flux {} capacity over {:.1f}s: {:.1f} executors held, {:.2f} "
+                 "cores busy, {:.1f} slots",
+                 thisHost,
+                 spanUs / 1e6,
+                 heldUs / spanUs,
+                 busyUs / spanUs,
+                 capacity);
+}
+
+bool Scheduler::fluxDynamicCapacityOn() const
+{
+    return scheduleMode == faabric::batch_scheduler::ModeFlux &&
+           !decentralScheduler.isPheromone() &&
+           !decentralScheduler.fluxDisabled(
+             faabric::batch_scheduler::StateAwareScheduler::
+               kFluxDisableDynamicCapacity);
+}
+
+double Scheduler::fluxCapacitySlotsNow() const
+{
+    double cores = std::max(1, fluxWorkerSlots);
+    if (!fluxDynamicCapacityOn()) {
+        return cores;
+    }
+    double measured = fluxCapacitySlots.load(std::memory_order_relaxed);
+    return measured > 0 ? measured : cores;
 }
 
 void Scheduler::countFluxArrivals(const std::map<std::string, int>& perParidx,
@@ -726,7 +821,7 @@ Scheduler::fluxLocalLoadOf(const std::string& userFuncPar)
     }
 
     bool workerSlotFree =
-      runningExecutors.load(std::memory_order_relaxed) < fluxWorkerSlots;
+      runningExecutors.load(std::memory_order_relaxed) < fluxCapacitySlotsNow();
     local.freeRequests = workerSlotFree ? std::max(0, maxExecutors - running) *
                                             std::max(1, executeBatchsize)
                                         : 0;
@@ -805,7 +900,7 @@ Scheduler::fluxLocalWorkOf()
     faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork work;
     work.queuedUs =
       workerWork.queuedUs + workerWork.pinnedUsPerSec * horizonUs / 1e6;
-    work.capacityUs = std::max(1, fluxWorkerSlots) * horizonUs;
+    work.capacityUs = fluxCapacitySlotsNow() * horizonUs;
     return work;
 }
 
@@ -826,6 +921,15 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
     }
     out.set_workerslots(fluxWorkerSlots);
     out.set_paridxcap(maxExecutors);
+    // What the cores carried, always reported; the slots planned with only
+    // when measured and in use (0 tells the others to take workerSlots).
+    out.set_fluxoccupiedexecutors(
+      fluxOccupiedExecutors.load(std::memory_order_relaxed));
+    out.set_fluxbusycores(fluxBusyCores.load(std::memory_order_relaxed));
+    out.set_fluxcapacityslots(
+      fluxDynamicCapacityOn()
+        ? fluxCapacitySlots.load(std::memory_order_relaxed)
+        : 0);
     {
         auto [arrivalWorkUs, processWorkUs] =
           fluxWorkRates(snapshotFluxParidxLoads());
@@ -875,6 +979,15 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
     overhead->set_flipus(load(fluxOverhead.flipUs));
     overhead->set_forwardus(load(fluxOverhead.forwardUs));
     overhead->set_parkedrequests(load(fluxOverhead.parkedRequests));
+    overhead->set_resets(load(fluxOverhead.resets));
+    overhead->set_resetus(load(fluxOverhead.resetUs));
+    overhead->set_resetcpuns(load(fluxOverhead.resetCpuNs));
+    overhead->set_dispatchbusyus(load(fluxOverhead.dispatchBusyUs));
+    overhead->set_dispatchedbatches(load(fluxOverhead.dispatchedBatches));
+    overhead->set_pendingwaitus(load(fluxOverhead.pendingWaitUs));
+    overhead->set_pendingpicks(load(fluxOverhead.pendingPicks));
+    overhead->set_dispatchers(static_cast<int32_t>(dispatchThreads.size()));
+    overhead->set_lightresets(load(fluxOverhead.lightResets));
     migration->set_costus(fluxMigrationCostUs.load());
 
     // Units of state held here: every shard, and every paridx of a stateful
@@ -1161,6 +1274,7 @@ std::string Scheduler::pickDispatchQueue()
             if (picked.empty() || head < pickedHead) {
                 picked = userFuncPar;
                 pickedHead = head;
+                pickedSince = since;
             }
         } else if (picked.empty() || since < pickedSince) {
             picked = userFuncPar;
@@ -1171,6 +1285,14 @@ std::string Scheduler::pickDispatchQueue()
     if (!picked.empty()) {
         dispatchPending.erase(picked);
         dispatchActive.insert(picked);
+        // How long it waited, marked ready, for a dispatcher to pick it.
+        int64_t waitedUs =
+          faabric::util::getGlobalClock().epochMicros() - pickedSince;
+        if (pickedSince != INT64_MAX && waitedUs >= 0) {
+            fluxOverhead.pendingWaitUs.fetch_add(waitedUs,
+                                                 std::memory_order_relaxed);
+            fluxOverhead.pendingPicks.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     return picked;
 }
@@ -1218,8 +1340,12 @@ void Scheduler::dispatchWorkerLoop()
                 queue = it->second.get();
             }
         }
+        int64_t busyStartUs = faabric::util::getGlobalClock().epochMicros();
         bool moreNow =
           queue != nullptr && executeBatchForQueue(userFuncPar, *queue);
+        fluxOverhead.dispatchBusyUs.fetch_add(
+          faabric::util::getGlobalClock().epochMicros() - busyStartUs,
+          std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> lock(dispatchMx);
@@ -1433,6 +1559,13 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             }
             // The running batch owns the run slot from here.
             runSlot.held = false;
+            int64_t dispatchUs = faabric::util::getGlobalClock().epochMicros();
+            for (int i = 0; i < newReq->messages_size(); i++) {
+                newReq->mutable_messages()->at(i).set_workerdispatchtime(
+                  dispatchUs);
+            }
+            fluxOverhead.dispatchedBatches.fetch_add(1,
+                                                     std::memory_order_relaxed);
             e->executeBatchTasks(newReq, std::move(stateLocks));
             // if (!runningThreads.contains(threadClockId)) {
             //     faabric::util::FullLock cpuLock(cpuRecordMx);
@@ -1860,6 +1993,11 @@ void Scheduler::resetParameter(std::string key, int32_t value)
     } else if (key == "flux_worker_slots") {
         fluxWorkerSlots = value;
         SPDLOG_INFO("Reset flux_worker_slots parameter to : {}", value);
+    } else if (key == "light_reset") {
+        // Any mode: executors restore their module in place after a batch
+        // instead of re-instantiating it. 0 (default) keeps the full reset.
+        faabric::executor::setLightReset(value != 0);
+        SPDLOG_INFO("Reset light_reset parameter to : {}", value);
     } else if (key == "alpha") {
         double newAlpha = value / 1000.0;
         SPDLOG_INFO("Alpha is set to {}", newAlpha);
@@ -2868,7 +3006,8 @@ void Scheduler::rebalanceFlux()
     double horizonUs =
       (fluxRebalancePeriod > 0 ? fluxRebalancePeriod : 1000) * 1000.0;
     double horizonSec = horizonUs / 1e6;
-    int slots = std::max(1, fluxWorkerSlots);
+    // What this worker's cores were measured to carry, as it reports them.
+    double slots = fluxCapacitySlotsNow();
     bool workerFull = runningExecutors.load(std::memory_order_relaxed) >= slots;
     auto loads = snapshotFluxParidxLoads();
 
@@ -3230,8 +3369,10 @@ void Scheduler::rebalanceFlux()
                 return std::numeric_limits<double>::infinity();
             }
             const auto& targetStats = statsIt->second;
-            int targetSlots =
-              targetStats.workerslots() > 0 ? targetStats.workerslots() : slots;
+            double targetSlots =
+              targetStats.workerslots() > 0
+                ? StateAwareScheduler::capacitySlotsFlux(targetStats)
+                : slots;
             double sentUs =
               shipments.contains(ip) ? shipments.at(ip).workUs : 0;
             double demandUs =

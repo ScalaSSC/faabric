@@ -192,6 +192,14 @@ message Message {
     // or the real owner of its state, or rerouted at dispatch. Statistics
     // only; nothing decides on it.
     int32 forwardCount = 103;
+    // CPU time (us) the executing thread spent in the function itself, over
+    // the same span as workerExecuteStart..workerExecuteEnd. The rest of
+    // that span is waiting: on locks, state, the host. Statistics only.
+    int64 workerExecuteCpuTime = 104;
+    // When the worker handed the batch to an executor (us). Up to
+    // workerExecuteStart, the hand-over: the executor thread waking up and
+    // setting the function up. Statistics only.
+    int64 workerDispatchTime = 105;
 }
 
 // ---------------------------------------------
@@ -481,6 +489,16 @@ message WorkerStats{
     double arrivalChainWorkUs = 20;
     // ModeFlux: what this worker's scheduling and rebalancing cost.
     FluxOverheadStats fluxOverhead = 21;
+    // ModeFlux, over the last capacity window (StateAwareScheduler::
+    // kFluxCapacityWindowSec): executors held on average (batches holding a
+    // run slot, integrated over time), cores this process kept busy on
+    // average, and the executor slots the worker is taken to have --
+    // workerSlots cores, each carrying as many executors as it did:
+    // max(workerSlots, workerSlots x occupied / busy). 0 = not measured; then
+    // workerSlots is the capacity.
+    double fluxOccupiedExecutors = 22;
+    double fluxBusyCores = 23;
+    double fluxCapacitySlots = 24;
 }
 
 // ModeFlux: what one worker's scheduling, rebalancing and stats cost,
@@ -512,6 +530,24 @@ message FluxOverheadStats {
     int64 flipUs = 13;
     int64 forwardUs = 14;
     int64 parkedRequests = 15;
+    // The way from a queue to an executor, all modes alike (not in the
+    // fluxOverhead history, whose layout stays; see fluxDispatchSummary):
+    // executor resets after a batch -- how many, their wall time (us) and
+    // CPU time (ns); the dispatcher threads' wall time (us) spent dispatching
+    // and the batches they handed out; how long (us, summed) a queue marked
+    // ready waited for a dispatcher to pick it, and how many picks; and how
+    // many dispatcher threads there are (not cumulative).
+    int64 resets = 16;
+    int64 resetUs = 17;
+    int64 resetCpuNs = 18;
+    int64 dispatchBusyUs = 19;
+    int64 dispatchedBatches = 20;
+    int64 pendingWaitUs = 21;
+    int64 pendingPicks = 22;
+    int32 dispatchers = 23;
+    // Of the resets, those done in place (light_reset) rather than by
+    // re-instantiating the module.
+    int64 lightResets = 24;
 }
 
 // ModeFlux: what one worker's migrations and forwarding have cost. Counters

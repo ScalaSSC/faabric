@@ -123,4 +123,11 @@ class Executor
 
     void threadPoolThread(std::stop_token st, int threadPoolIdx);
 };
+
+// Whether executors restore their module in place after a batch instead of
+// re-instantiating it ("light reset"), where the VM supports it (WAMR; see
+// WAMRWasmModule::reset). Any VM falls back to its full reset whenever it
+// cannot. Off by default; set with the "light_reset" parameter.
+void setLightReset(bool on);
+bool lightResetEnabled();
 }

@@ -174,6 +174,28 @@ class StateAwareScheduler : public BatchScheduler
                workerStats.arrivalchainworkus() * horizonUs / 1e6;
     }
 
+    /**
+     * ModeFlux: the executor slots a worker is taken to have, as it
+     * reported them. An executor holds its slot for the whole of a request,
+     * waiting on locks and state as well as running, so a core carries more
+     * than one: each worker measures how many over the last
+     * kFluxCapacityWindowSec and reports workerSlots cores times that
+     * (fluxCapacitySlots). Before it has, or with the dynamic capacity
+     * ablated, its configured slots.
+     */
+    static double capacitySlotsFlux(const faabric::WorkerStats& workerStats)
+    {
+        if (workerStats.fluxcapacityslots() > 0) {
+            return workerStats.fluxcapacityslots();
+        }
+        return std::max(1, workerStats.workerslots());
+    }
+
+    // The window over which a worker measures how many executors its cores
+    // carry: as long as the planner's metrics window, so a merge's backtest
+    // and the capacity it is checked against cover the same span.
+    static constexpr int kFluxCapacityWindowSec = 10;
+
     // One stats round, and what routing reads off it, worked out once when
     // the round arrives rather than for every request until the next.
     struct FluxClusterSnapshot
@@ -428,6 +450,9 @@ class StateAwareScheduler : public BatchScheduler
     // A request is sized by its own executor time: what it sets off
     // downstream counts nothing.
     static constexpr int kFluxDisableDownstream = 16;
+    // A worker's capacity is its configured slots (flux_worker_slots), not
+    // what its cores were measured to carry (capacitySlotsFlux).
+    static constexpr int kFluxDisableDynamicCapacity = 32;
 
     void setFluxDisable(int value) { fluxDisable = value; }
 
@@ -1216,6 +1241,9 @@ class StateAwareScheduler : public BatchScheduler
     // kFluxMergeWindowSec, oldest first, for planFluxMerges. The window is
     // the planner's metrics window, as for chained-call costs.
     static constexpr int kFluxMergeWindowSec = kChainedCostWindowSec;
+    static_assert(kFluxCapacityWindowSec == kFluxMergeWindowSec,
+                  "a merge's backtest and the capacity it is checked against "
+                  "must cover the same span");
     std::mutex fluxHistoryMx;
     std::deque<std::shared_ptr<const FluxClusterSnapshot>> fluxHistory;
 
