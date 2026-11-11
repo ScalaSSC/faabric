@@ -46,8 +46,11 @@ class Scheduler
 
     void enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs);
 
+    // `locallyTriggered`: the requests were set off by functions that ran
+    // here and were routed back here (see FluxParidxLoad::arrivedExternal).
     void enqueueMessageBatch(std::list<std::unique_ptr<faabric::Message>> msgs,
-                             std::string invokeHost);
+                             std::string invokeHost,
+                             bool locallyTriggered = false);
 
     void setMessageResults();
 
@@ -380,16 +383,21 @@ class Scheduler
         int64_t lastChangeUs = 0;
         double runningIntegralUs = 0;
         int64_t finished = 0;
-        // Requests queued here in the current window.
+        // Requests queued here in the current window, and of those, the ones
+        // that came from elsewhere rather than from functions that ran here.
+        // For an exclusive stateless successor only the latter are new work:
+        // the rest is in its caller's chain work.
         int64_t arrived = 0;
+        int64_t arrivedExternal = 0;
         // The last complete window: requests finished per second, and the
         // executor time one request took (average running batches over that
         // rate). The latter keeps its last measured value through idle
         // windows.
         double ratePerSec = 0;
         double slotTimeUs = 0;
-        // ...and requests queued per second.
+        // ...and requests queued per second, all and from elsewhere.
         double arrivalRatePerSec = 0;
+        double externalArrivalRatePerSec = 0;
     };
     // Keyed by user/func/parIdx.
     std::mutex fluxParidxRunMx;
@@ -415,8 +423,11 @@ class Scheduler
 
     // Counts requests just queued here: per paridx (user/func/par), and per
     // unit of state for those addressing one. Applied in one go per batch.
+    // `external`: the requests came from elsewhere -- the planner, another
+    // worker, a migration -- rather than from functions that ran here.
     void countFluxArrivals(const std::map<std::string, int>& perParidx,
-                           const std::map<std::string, int>& perUnit);
+                           const std::map<std::string, int>& perUnit,
+                           bool external);
 
     // Work arriving here and work processed here over the last window, in
     // executor time (us) per second: requests per second times the executor

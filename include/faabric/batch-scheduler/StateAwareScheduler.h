@@ -164,8 +164,9 @@ class StateAwareScheduler : public BatchScheduler
      * ModeFlux: what a worker has to get through before its next round, in
      * executor time, from what it reported: every request queued there with
      * the stateless requests it will set off there, and the same of what
-     * arrives from outside over `horizonUs`. Arrivals of an operator's local
-     * children are not counted again: their caller's share covers them.
+     * arrives over `horizonUs`. Of an operator's local children only what
+     * arrives from elsewhere counts: what their callers there set off is in
+     * those callers' share already.
      */
     static double demandWorkUsFlux(const faabric::WorkerStats& workerStats,
                                    double horizonUs)

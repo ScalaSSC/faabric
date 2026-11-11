@@ -482,9 +482,10 @@ message WorkerStats{
     map<string, int32> fluxHeldUnits = 18;
     // ModeFlux, in executor time (us): every request queued here with the
     // stateless requests it will set off here; and, per second over the last
-    // rebalancing window, the same of what arrived from outside -- arrivals
-    // of an operator's local children are left out, their caller's share
-    // covering them. See StateAwareScheduler::demandWorkUsFlux.
+    // rebalancing window, the same of what arrived -- of an operator's local
+    // children only what came from elsewhere (offloaded, migrated), what
+    // their callers here set off being in those callers' share. See
+    // StateAwareScheduler::demandWorkUsFlux.
     double queuedChainWorkUs = 19;
     double arrivalChainWorkUs = 20;
     // ModeFlux: what this worker's scheduling and rebalancing cost.

@@ -662,10 +662,12 @@ void Scheduler::rollFluxParidxWindows()
             load.slotTimeUs = avgRunning * 1e6 / load.ratePerSec;
         }
         load.arrivalRatePerSec = load.arrived * 1e6 / windowUs;
+        load.externalArrivalRatePerSec = load.arrivedExternal * 1e6 / windowUs;
         load.windowStartUs = nowUs;
         load.runningIntegralUs = 0;
         load.finished = 0;
         load.arrived = 0;
+        load.arrivedExternal = 0;
     }
 
     if (fluxUnitWindowStartUs > 0 && nowUs > fluxUnitWindowStartUs) {
@@ -762,7 +764,8 @@ double Scheduler::fluxCapacitySlotsNow() const
 }
 
 void Scheduler::countFluxArrivals(const std::map<std::string, int>& perParidx,
-                                  const std::map<std::string, int>& perUnit)
+                                  const std::map<std::string, int>& perUnit,
+                                  bool external)
 {
     if (perParidx.empty() && perUnit.empty()) {
         return;
@@ -773,6 +776,9 @@ void Scheduler::countFluxArrivals(const std::map<std::string, int>& perParidx,
         auto& load = fluxParidxLoad[funcParStr];
         advanceFluxLoad(load, nowUs);
         load.arrived += n;
+        if (external) {
+            load.arrivedExternal += n;
+        }
     }
     for (const auto& [unitKey, n] : perUnit) {
         fluxUnitRates[unitKey].arrived += n;
@@ -869,18 +875,21 @@ Scheduler::FluxWorkerWork Scheduler::fluxWorkerWorkOf()
     }
 
     for (const auto& [funcParStr, load] : loads) {
-        if (load.arrivalRatePerSec <= 0) {
-            continue;
-        }
         std::string userFuncPar = fluxQueueKeyOf(funcParStr);
         std::string userFunc = operatorOf(userFuncPar);
-        // A local child's arrivals are counted with its caller -- unless
-        // downstream work is ablated, and counts for nothing there.
-        if (dag->localChildOps.contains(userFunc) && !noDownstream) {
+        // What a local child's callers set off here is counted with them; only
+        // what reaches it from elsewhere -- offloaded or migrated by another
+        // worker -- is new work. Unless downstream work is ablated, and counts
+        // for nothing in its callers.
+        double ratePerSec =
+          dag->localChildOps.contains(userFunc) && !noDownstream
+            ? load.externalArrivalRatePerSec
+            : load.arrivalRatePerSec;
+        if (ratePerSec <= 0) {
             continue;
         }
-        double arrivalUs = load.arrivalRatePerSec *
-                           chainUsOf(userFuncPar, userFunc, load.slotTimeUs);
+        double arrivalUs =
+          ratePerSec * chainUsOf(userFuncPar, userFunc, load.slotTimeUs);
         work.arrivalUsPerSec += arrivalUs;
         if (dag->statefulOps.contains(userFunc)) {
             work.pinnedUsPerSec += arrivalUs;
@@ -1075,7 +1084,8 @@ std::unique_ptr<faabric::MessageBatch> convertListToBatch(
 
 void Scheduler::enqueueMessageBatch(
   std::list<std::unique_ptr<faabric::Message>> msgs,
-  std::string invokeHost)
+  std::string invokeHost,
+  bool locallyTriggered)
 {
     // If the scheduler is updating state information, we may need to transfer
     // them to other nodes. So, just enqueue them in chained call temporarily.
@@ -1197,7 +1207,7 @@ void Scheduler::enqueueMessageBatch(
     for (const auto& [instancesName, count] : instancesCounter) {
         runtimeStats.instanceAdd(instancesName, invokeHost, count);
     }
-    countFluxArrivals(fluxParidxArrivals, fluxUnitArrivals);
+    countFluxArrivals(fluxParidxArrivals, fluxUnitArrivals, !locallyTriggered);
 
     // Something to dispatch in every queue that received requests.
     for (const auto& [userFuncPar, count] : instancesCounter) {
@@ -1903,9 +1913,11 @@ void Scheduler::dispatchChainedMsgs()
             SPDLOG_DEBUG("Dispatching messages to host {} with message size {}",
                          hostIp,
                          msgs.size());
-            // If locally, we put the messages into a batch directly
+            // If locally, we put the messages into a batch directly. Chained
+            // calls set off here and kept here: their work, for an exclusive
+            // stateless successor, is in its caller's chain work already.
             if (hostIp == thisHost) {
-                enqueueMessageBatch(std::move(msgs), thisHost);
+                enqueueMessageBatch(std::move(msgs), thisHost, true);
             } else {
                 // Otherwise, we send the messages to the remote host
                 faabric::scheduler::getFunctionCallClient(hostIp)
