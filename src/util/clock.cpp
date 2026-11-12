@@ -1,5 +1,7 @@
 #include <faabric/util/clock.h>
 
+#include <sys/resource.h>
+
 namespace faabric::util {
 Clock& getGlobalClock()
 {
@@ -103,4 +105,12 @@ const int64_t getCpuTimeNano(const clockid_t clk)
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
+const int64_t getThreadMinorFaults()
+{
+    rusage usage{};
+    if (getrusage(RUSAGE_THREAD, &usage) != 0) {
+        return -1;
+    }
+    return static_cast<int64_t>(usage.ru_minflt);
+}
 }

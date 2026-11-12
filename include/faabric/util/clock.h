@@ -36,4 +36,6 @@ const int64_t getCpuTimeNano();
 
 const int64_t getCpuTimeNano(const clockid_t clk);
 
+// The calling thread's minor page faults so far, or -1 if unknown.
+const int64_t getThreadMinorFaults();
 }

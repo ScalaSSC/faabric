@@ -997,6 +997,13 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
     overhead->set_pendingpicks(load(fluxOverhead.pendingPicks));
     overhead->set_dispatchers(static_cast<int32_t>(dispatchThreads.size()));
     overhead->set_lightresets(load(fluxOverhead.lightResets));
+    overhead->set_resetcopiedbytes(load(fluxOverhead.resetCopiedBytes));
+    overhead->set_resetzeroedbytes(load(fluxOverhead.resetZeroedBytes));
+    overhead->set_resetdroppedbytes(load(fluxOverhead.resetDroppedBytes));
+    overhead->set_grownresets(load(fluxOverhead.grownResets));
+    overhead->set_execminorfaults(load(fluxOverhead.execMinorFaults));
+    overhead->set_resetminorfaults(load(fluxOverhead.resetMinorFaults));
+    overhead->set_faultbatches(load(fluxOverhead.faultBatches));
     migration->set_costus(fluxMigrationCostUs.load());
 
     // Units of state held here: every shard, and every paridx of a stateful

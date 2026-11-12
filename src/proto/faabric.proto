@@ -549,6 +549,21 @@ message FluxOverheadStats {
     // Of the resets, those done in place (light_reset) rather than by
     // re-instantiating the module.
     int64 lightResets = 24;
+    // What the light resets did to linear memory, summed over them: bytes
+    // copied back from the clean image (its non-zero pages), bytes of
+    // touched pages zeroed in place, and bytes given back to the kernel
+    // (MADV_DONTNEED) beyond what is kept. And how many of them found the
+    // memory grown past its first size.
+    int64 resetCopiedBytes = 25;
+    int64 resetZeroedBytes = 26;
+    int64 resetDroppedBytes = 27;
+    int64 grownResets = 28;
+    // Minor page faults of the executor threads, in the batch (claimed to
+    // the function's end) and in the reset after it, over the batches
+    // measured.
+    int64 execMinorFaults = 29;
+    int64 resetMinorFaults = 30;
+    int64 faultBatches = 31;
 }
 
 // ModeFlux: what one worker's migrations and forwarding have cost. Counters

@@ -729,7 +729,52 @@ class ApplicationMetrics
             obj.AddMember("reset_cpu_us_mean",
                           ratio(delta.resetcpuns() / 1000.0, delta.resets()),
                           alloc);
+            // Per light reset: what it did to linear memory.
+            double lightResets = static_cast<double>(delta.lightresets());
+            obj.AddMember("reset_copied_bytes_mean",
+                          ratio(delta.resetcopiedbytes(), lightResets),
+                          alloc);
+            obj.AddMember("reset_zeroed_bytes_mean",
+                          ratio(delta.resetzeroedbytes(), lightResets),
+                          alloc);
+            obj.AddMember("reset_dropped_bytes_mean",
+                          ratio(delta.resetdroppedbytes(), lightResets),
+                          alloc);
+            obj.AddMember("grown_reset_share",
+                          ratio(delta.grownresets(), lightResets),
+                          alloc);
+            double faultBatches = static_cast<double>(delta.faultbatches());
+            obj.AddMember("exec_minor_faults_per_batch",
+                          ratio(delta.execminorfaults(), faultBatches),
+                          alloc);
+            obj.AddMember("reset_minor_faults_per_batch",
+                          ratio(delta.resetminorfaults(), faultBatches),
+                          alloc);
             return obj;
+        };
+        // The cumulative counters taken over the span.
+        using S = faabric::FluxOverheadStats;
+        struct DispatchField
+        {
+            int64_t (S::*get)() const;
+            void (S::*set)(int64_t);
+        };
+        static const std::vector<DispatchField> dispatchFields = {
+            { &S::resets, &S::set_resets },
+            { &S::lightresets, &S::set_lightresets },
+            { &S::resetus, &S::set_resetus },
+            { &S::resetcpuns, &S::set_resetcpuns },
+            { &S::dispatchbusyus, &S::set_dispatchbusyus },
+            { &S::dispatchedbatches, &S::set_dispatchedbatches },
+            { &S::pendingwaitus, &S::set_pendingwaitus },
+            { &S::pendingpicks, &S::set_pendingpicks },
+            { &S::resetcopiedbytes, &S::set_resetcopiedbytes },
+            { &S::resetzeroedbytes, &S::set_resetzeroedbytes },
+            { &S::resetdroppedbytes, &S::set_resetdroppedbytes },
+            { &S::grownresets, &S::set_grownresets },
+            { &S::execminorfaults, &S::set_execminorfaults },
+            { &S::resetminorfaults, &S::set_resetminorfaults },
+            { &S::faultbatches, &S::set_faultbatches },
         };
         for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
             const auto& history = workerNode.fluxOverheadHistory;
@@ -747,18 +792,10 @@ class ApplicationMetrics
                 return fromStart || now < before ? now : now - before;
             };
             faabric::FluxOverheadStats delta;
-            delta.set_resets(diff(last.resets(), from.resets()));
-            delta.set_lightresets(diff(last.lightresets(), from.lightresets()));
-            delta.set_resetus(diff(last.resetus(), from.resetus()));
-            delta.set_resetcpuns(diff(last.resetcpuns(), from.resetcpuns()));
-            delta.set_dispatchbusyus(
-              diff(last.dispatchbusyus(), from.dispatchbusyus()));
-            delta.set_dispatchedbatches(
-              diff(last.dispatchedbatches(), from.dispatchedbatches()));
-            delta.set_pendingwaitus(
-              diff(last.pendingwaitus(), from.pendingwaitus()));
-            delta.set_pendingpicks(
-              diff(last.pendingpicks(), from.pendingpicks()));
+            for (const auto& field : dispatchFields) {
+                int64_t value = diff((last.*field.get)(), (from.*field.get)());
+                (delta.*field.set)(value);
+            }
             if (delta.dispatchedbatches() == 0 && delta.resets() == 0) {
                 continue;
             }
@@ -773,20 +810,10 @@ class ApplicationMetrics
             dispatchObj.AddMember(rapidjson::Value(ip.c_str(), alloc).Move(),
                                   addDispatch(delta, dispatcherUs),
                                   alloc);
-            clusterDelta.set_resets(clusterDelta.resets() + delta.resets());
-            clusterDelta.set_lightresets(clusterDelta.lightresets() +
-                                         delta.lightresets());
-            clusterDelta.set_resetus(clusterDelta.resetus() + delta.resetus());
-            clusterDelta.set_resetcpuns(clusterDelta.resetcpuns() +
-                                        delta.resetcpuns());
-            clusterDelta.set_dispatchbusyus(clusterDelta.dispatchbusyus() +
-                                            delta.dispatchbusyus());
-            clusterDelta.set_dispatchedbatches(
-              clusterDelta.dispatchedbatches() + delta.dispatchedbatches());
-            clusterDelta.set_pendingwaitus(clusterDelta.pendingwaitus() +
-                                           delta.pendingwaitus());
-            clusterDelta.set_pendingpicks(clusterDelta.pendingpicks() +
-                                          delta.pendingpicks());
+            for (const auto& field : dispatchFields) {
+                (clusterDelta.*field.set)((clusterDelta.*field.get)() +
+                                          (delta.*field.get)());
+            }
             clusterDispatcherUs += dispatcherUs;
         }
         if (clusterDispatcherUs > 0) {

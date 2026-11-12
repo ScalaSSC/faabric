@@ -347,6 +347,9 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
               threadPoolIdx,
               task.req->appid());
             faabric::scheduler::getScheduler().notifyExecutorStart();
+            // Minor page faults this thread takes in the batch and in the
+            // reset after it (fluxDispatchSummary).
+            int64_t execStartFaults = faabric::util::getThreadMinorFaults();
             // Set up context
             ExecutorContext::set(this, task.req, task.messageIndex);
 
@@ -369,6 +372,7 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
             }
             // Unset context
             ExecutorContext::unset();
+            int64_t execEndFaults = faabric::util::getThreadMinorFaults();
 
             // Set the return value
             for (int i = 0; i < task.req->messages_size(); i++) {
@@ -419,12 +423,15 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                          threadPoolIdx,
                          oldTaskCount - 1);
 
+            int64_t resetFaults = 0;
             if (isLastThreadInExecutor) {
                 // What making the module clean again costs: wall and CPU
                 // time, reported with the worker's overheads.
                 int64_t resetStartUs =
                   faabric::util::getGlobalClock().epochMicros();
                 int64_t resetStartCpuNs = faabric::util::getCpuTimeNano();
+                int64_t resetStartFaults =
+                  faabric::util::getThreadMinorFaults();
                 reset(firstMsg);
                 int64_t resetCpuNs =
                   resetStartCpuNs >= 0
@@ -433,7 +440,16 @@ void Executor::threadPoolThread(std::stop_token st, int threadPoolIdx)
                 faabric::scheduler::getScheduler().recordExecutorReset(
                   faabric::util::getGlobalClock().epochMicros() - resetStartUs,
                   std::max<int64_t>(0, resetCpuNs));
+                int64_t resetEndFaults = faabric::util::getThreadMinorFaults();
+                if (resetStartFaults >= 0 &&
+                    resetEndFaults >= resetStartFaults) {
+                    resetFaults = resetEndFaults - resetStartFaults;
+                }
                 releaseClaim();
+            }
+            if (execStartFaults >= 0 && execEndFaults >= execStartFaults) {
+                faabric::scheduler::getScheduler().recordBatchFaults(
+                  execEndFaults - execStartFaults, resetFaults);
             }
 
             // Return this thread index to the pool available for scheduling

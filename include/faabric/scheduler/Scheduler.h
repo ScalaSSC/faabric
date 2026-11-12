@@ -217,10 +217,35 @@ class Scheduler
     }
 
     // The reset under way was done in place, not by re-instantiating the
-    // module (light_reset).
-    void countLightReset()
+    // module (light_reset): it copied `copiedBytes` back from the clean
+    // image, zeroed `zeroedBytes` in place and dropped `droppedBytes`, and
+    // `grew` says whether the memory had grown past its first size.
+    void countLightReset(int64_t copiedBytes,
+                         int64_t zeroedBytes,
+                         int64_t droppedBytes,
+                         bool grew)
     {
         fluxOverhead.lightResets.fetch_add(1, std::memory_order_relaxed);
+        fluxOverhead.resetCopiedBytes.fetch_add(copiedBytes,
+                                                std::memory_order_relaxed);
+        fluxOverhead.resetZeroedBytes.fetch_add(zeroedBytes,
+                                                std::memory_order_relaxed);
+        fluxOverhead.resetDroppedBytes.fetch_add(droppedBytes,
+                                                 std::memory_order_relaxed);
+        if (grew) {
+            fluxOverhead.grownResets.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // An executor thread took `execFaults` minor page faults running a batch
+    // and `resetFaults` in the reset after it (0 if it did not reset).
+    void recordBatchFaults(int64_t execFaults, int64_t resetFaults)
+    {
+        fluxOverhead.execMinorFaults.fetch_add(execFaults,
+                                               std::memory_order_relaxed);
+        fluxOverhead.resetMinorFaults.fetch_add(resetFaults,
+                                                std::memory_order_relaxed);
+        fluxOverhead.faultBatches.fetch_add(1, std::memory_order_relaxed);
     }
 
     // ModeFlux: one stats round handled here took `cpuNs` of CPU time, and
@@ -559,21 +584,31 @@ class Scheduler
         std::atomic<int64_t> pendingWaitUs{ 0 };
         std::atomic<int64_t> pendingPicks{ 0 };
         std::atomic<int64_t> lightResets{ 0 };
+        std::atomic<int64_t> resetCopiedBytes{ 0 };
+        std::atomic<int64_t> resetZeroedBytes{ 0 };
+        std::atomic<int64_t> resetDroppedBytes{ 0 };
+        std::atomic<int64_t> grownResets{ 0 };
+        std::atomic<int64_t> execMinorFaults{ 0 };
+        std::atomic<int64_t> resetMinorFaults{ 0 };
+        std::atomic<int64_t> faultBatches{ 0 };
 
         void reset()
         {
-            for (auto* counter : { &routingCpuNs,   &routedRequests,
-                                   &rebalanceCpuNs, &rebalanceRounds,
-                                   &statsCpuNs,     &statsRounds,
-                                   &lastStatsBytes, &handovers,
-                                   &prepareUs,      &waitUs,
-                                   &packUs,         &sendUs,
-                                   &flipUs,         &forwardUs,
-                                   &parkedRequests, &resets,
-                                   &resetUs,        &resetCpuNs,
-                                   &dispatchBusyUs, &dispatchedBatches,
-                                   &pendingWaitUs,  &pendingPicks,
-                                   &lightResets }) {
+            for (auto* counter : { &routingCpuNs,     &routedRequests,
+                                   &rebalanceCpuNs,   &rebalanceRounds,
+                                   &statsCpuNs,       &statsRounds,
+                                   &lastStatsBytes,   &handovers,
+                                   &prepareUs,        &waitUs,
+                                   &packUs,           &sendUs,
+                                   &flipUs,           &forwardUs,
+                                   &parkedRequests,   &resets,
+                                   &resetUs,          &resetCpuNs,
+                                   &dispatchBusyUs,   &dispatchedBatches,
+                                   &pendingWaitUs,    &pendingPicks,
+                                   &lightResets,      &resetCopiedBytes,
+                                   &resetZeroedBytes, &resetDroppedBytes,
+                                   &grownResets,      &execMinorFaults,
+                                   &resetMinorFaults, &faultBatches }) {
                 counter->store(0, std::memory_order_relaxed);
             }
         }
