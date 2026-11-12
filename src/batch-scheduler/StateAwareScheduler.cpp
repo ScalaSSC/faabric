@@ -1083,16 +1083,16 @@ StateAwareScheduler::planFluxOffload(
         double demandUs = demandWorkUsFlux(workerStats, horizonUs);
 
         std::set<std::string> operators;
-        int backedUp = 0;
         for (const auto& [queueKey, depth] : workerStats.instancequeuenum()) {
             if (depth > 0) {
                 operators.insert(operatorOfQueue(queueKey));
-                backedUp++;
             }
         }
 
         // What it can run before the next round: its executor slots, but no
-        // paridx more than `cap` batches at once.
+        // operator with work waiting more than `cap` batches at once, however
+        // many paridx of it are here.
+        double backedUp = static_cast<double>(operators.size());
         double usableSlots =
           backedUp > 0 ? std::min(slots, backedUp * cap) : slots;
         double excessUs = demandUs - usableSlots * horizonUs;

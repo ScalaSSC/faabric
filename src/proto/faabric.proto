@@ -464,7 +464,8 @@ message WorkerStats{
     map<string, int32> paridxRunning = 10;
     map<string, double> paridxSlotTimeUs = 11;
     // ModeFlux: executors this worker can run at once (flux_worker_slots), and
-    // the most batches one paridx may run at once here (max_executors).
+    // the most batches one operator may run at once here, over all its paridx
+    // (max_executors).
     int32 workerSlots = 12;
     int32 paridxCap = 13;
     FluxMigrationStats fluxMigration = 14;
