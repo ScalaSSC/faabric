@@ -382,12 +382,21 @@ void Planner::setMessageResultBatch(
                  batchMsg->messages_size());
 
     RETURN_IF_OUTPUTTING
+    int64_t cpuStartNs = faabric::util::getCpuTimeNano();
+    int64_t waitStartUs = faabric::util::getGlobalClock().epochMicros();
     faabric::util::FullLock reqStatusLock(state.reqStatusMx);
+    int64_t heldStartUs = faabric::util::getGlobalClock().epochMicros();
     RETURN_IF_OUTPUTTING
 
     SPDLOG_DEBUG("InFlightApps size before set: {}", state.inFlightApps.size());
-    for (int msgIdx = 0; msgIdx < batchMsg->messages_size(); msgIdx++) {
-        auto msg = batchMsg->messages(msgIdx);
+    int results = batchMsg->messages_size();
+    for (int msgIdx = 0; msgIdx < results; msgIdx++) {
+        // Every result of every worker comes through here under one lock:
+        // take the message over rather than copy it. Nothing reads the batch
+        // afterwards.
+        auto msgPtr = std::make_shared<faabric::Message>();
+        msgPtr->Swap(batchMsg->mutable_messages(msgIdx));
+        const faabric::Message& msg = *msgPtr;
         int appId = msg.appid();
         int msgId = msg.id();
 
@@ -402,23 +411,23 @@ void Planner::setMessageResultBatch(
         }
 
         // Store the result for the current message
-        state.appResults[appId][msgId] =
-          std::make_shared<faabric::Message>(msg);
+        auto& resultRecord = state.appResults[appId];
+        resultRecord[msgId] = msgPtr;
 
         // For each message this one chained to, add it to the in-flight set
         // ONLY if we haven't already seen its result.
+        auto& inFlightMsgs = state.inFlightApps[appId];
         for (int32_t chainedMsgId : msg.chainedmsgids()) {
-            auto resultRecord = state.appResults.at(appId);
             if (!resultRecord.contains(chainedMsgId)) {
-                state.inFlightApps[appId].insert(chainedMsgId);
+                inFlightMsgs.insert(chainedMsgId);
             }
         }
 
         // Remove the current message from the in-flight set
-        state.inFlightApps[appId].erase(msgId);
+        inFlightMsgs.erase(msgId);
 
         // If this was the last in-flight message for the app, clean up.
-        if (state.inFlightApps.at(appId).empty()) {
+        if (inFlightMsgs.empty()) {
             int inFlightCount = state.inFlightApps.size() - 1;
             // Record metrics before erasing the results
             int64_t recordStartTime = state.appStartTimes[appId];
@@ -433,6 +442,14 @@ void Planner::setMessageResultBatch(
         }
     }
     SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
+    if (state.applicationMetrics) {
+        int64_t cpuEndNs = faabric::util::getCpuTimeNano();
+        state.applicationMetrics->recordPlannerResults(
+          results,
+          cpuStartNs >= 0 && cpuEndNs >= cpuStartNs ? cpuEndNs - cpuStartNs : 0,
+          heldStartUs - waitStartUs,
+          faabric::util::getGlobalClock().epochMicros() - heldStartUs);
+    }
 }
 
 std::shared_ptr<faabric::BatchExecuteRequestStatus> Planner::getBatchResults(

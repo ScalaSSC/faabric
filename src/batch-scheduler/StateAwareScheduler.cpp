@@ -1502,10 +1502,13 @@ double StateAwareScheduler::remoteWaitUsFlux(
                   ? static_cast<int>(std::floor(capacitySlotsFlux(workerStats)))
                   : 0;
     int cap = workerStats.paridxcap();
+    // Held executors as the capacity counts them, averaged over time.
+    // executorsNum is sampled when executors start, which reads several
+    // times too many on a busy worker.
     int freeSlots =
-      slots > 0
-        ? slots - static_cast<int>(std::ceil(workerStats.executorsnum()))
-        : 0;
+      slots > 0 ? slots - static_cast<int>(
+                            std::ceil(workerStats.fluxoccupiedexecutors()))
+                : 0;
     int parallel = running + std::max(0, freeSlots);
     if (cap > 0) {
         parallel = std::min(parallel, cap);

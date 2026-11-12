@@ -130,6 +130,17 @@ class ApplicationMetrics
         }
         count++;
         int64_t tempLatencyMicro = tempEndTime - tempStartTime;
+        // From the end of the input's last request on its worker to here,
+        // where the planner frees its in-flight slot.
+        if (tempEndTime > 0) {
+            plannerResults.finishedInputs.fetch_add(1,
+                                                    std::memory_order_relaxed);
+            plannerResults.lagUs.fetch_add(
+              std::max<int64_t>(
+                0,
+                faabric::util::getGlobalClock().epochMicros() - tempEndTime),
+              std::memory_order_relaxed);
+        }
 
         // Latency in microseconds is less than 10ms (10,000 us)
         if (tempLatencyMicro < 10000) {
@@ -477,6 +488,42 @@ class ApplicationMetrics
                           perWorkerObj,
                           alloc);
             doc.AddMember("fluxOverheadSummary", summaryObj, alloc);
+        }
+
+        // ---- Planner: taking results in (any mode) ----
+        {
+            auto load = [](const std::atomic<int64_t>& v) {
+                return static_cast<double>(v.load(std::memory_order_relaxed));
+            };
+            double batches = load(plannerResults.batches);
+            double results = load(plannerResults.results);
+            double finished = load(plannerResults.finishedInputs);
+            auto per = [](double sum, double n) {
+                return n > 0 ? sum / n : 0.0;
+            };
+            rapidjson::Value obj(rapidjson::kObjectType);
+            obj.AddMember("batches", static_cast<int64_t>(batches), alloc);
+            obj.AddMember("results", static_cast<int64_t>(results), alloc);
+            obj.AddMember("results_per_batch", per(results, batches), alloc);
+            obj.AddMember("cpu_us_per_result",
+                          per(load(plannerResults.cpuNs) / 1000.0, results),
+                          alloc);
+            obj.AddMember("cpu_s_total",
+                          load(plannerResults.cpuNs) / 1e9,
+                          alloc);
+            obj.AddMember("lock_wait_us_per_batch",
+                          per(load(plannerResults.lockWaitUs), batches),
+                          alloc);
+            obj.AddMember("lock_held_s_total",
+                          load(plannerResults.heldUs) / 1e6,
+                          alloc);
+            obj.AddMember("finished_inputs",
+                          static_cast<int64_t>(finished),
+                          alloc);
+            obj.AddMember("result_lag_us_mean",
+                          per(load(plannerResults.lagUs), finished),
+                          alloc);
+            doc.AddMember("plannerResultSummary", obj, alloc);
         }
 
         // ---- Planner ----
@@ -1749,6 +1796,29 @@ class ApplicationMetrics
         int64_t inputs = 0;
     };
     std::map<int64_t, PlannerRoutingSecond> plannerRouting;
+    // Planner, any mode: what taking the workers' results in costs. Every
+    // finished request passes through it under one lock, and an input frees
+    // its in-flight slot only once its last result has.
+    struct PlannerResultCounters
+    {
+        std::atomic<int64_t> batches{ 0 };
+        std::atomic<int64_t> results{ 0 };
+        std::atomic<int64_t> cpuNs{ 0 };
+        std::atomic<int64_t> lockWaitUs{ 0 };
+        std::atomic<int64_t> heldUs{ 0 };
+        std::atomic<int64_t> finishedInputs{ 0 };
+        std::atomic<int64_t> lagUs{ 0 };
+        void reset()
+        {
+            batches = 0;
+            results = 0;
+            cpuNs = 0;
+            lockWaitUs = 0;
+            heldUs = 0;
+            finishedInputs = 0;
+            lagUs = 0;
+        }
+    } plannerResults;
 
     // The cumulative counters of FluxMigrationStats, in output order.
     struct FluxCounterField
@@ -1872,6 +1942,21 @@ class ApplicationMetrics
         faabric::util::FullLock lock(opMx);
         fluxControlPlaneRounds.emplace_back(
           faabric::util::getGlobalClock().epochSeconds(), round);
+    }
+
+    // Planner: one batch of `results` results from a worker took `cpuNs` of
+    // CPU time, after `lockWaitUs` waiting for the lock it held for `heldUs`.
+    void recordPlannerResults(int64_t results,
+                              int64_t cpuNs,
+                              int64_t lockWaitUs,
+                              int64_t heldUs)
+    {
+        plannerResults.batches.fetch_add(1, std::memory_order_relaxed);
+        plannerResults.results.fetch_add(results, std::memory_order_relaxed);
+        plannerResults.cpuNs.fetch_add(cpuNs, std::memory_order_relaxed);
+        plannerResults.lockWaitUs.fetch_add(lockWaitUs,
+                                            std::memory_order_relaxed);
+        plannerResults.heldUs.fetch_add(heldUs, std::memory_order_relaxed);
     }
 
     // ModeFlux, planner: routing `inputs` inputs took `cpuNs` of CPU time.
@@ -2426,6 +2511,7 @@ class ApplicationMetrics
         latencyBySecond.clear();
         fluxControlPlaneRounds.clear();
         plannerRouting.clear();
+        plannerResults.reset();
         fluxExecStable.clear();
         fluxSlotTimeBySecond.clear();
 

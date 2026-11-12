@@ -174,9 +174,12 @@ void PlannerServer::recvSetMessageResult(std::span<const uint8_t> buffer)
 
 void PlannerServer::recvSetMessageResultBatch(std::span<const uint8_t> buffer)
 {
-    PARSE_MSG(BatchExecuteRequest, buffer.data(), buffer.size());
-    planner.setMessageResultBatch(
-      std::make_shared<faabric::BatchExecuteRequest>(parsedMsg));
+    // Parsed straight into what the planner takes over, not copied into it.
+    auto req = std::make_shared<faabric::BatchExecuteRequest>();
+    if (!req->ParseFromArray(buffer.data(), buffer.size())) {
+        throw std::runtime_error("Error deserialising message");
+    }
+    planner.setMessageResultBatch(req);
 }
 
 std::unique_ptr<google::protobuf::Message> PlannerServer::recvGetMessageResult(
