@@ -451,6 +451,17 @@ class BatchQueue : public BatchQueueBase
         }();
     }
 
+    // When the input the next message to leave descends from reached the
+    // planner; 0 if the queue is empty or the message carries none.
+    int64_t headInputArrivalTime()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (batchQueue.empty()) {
+            return 0;
+        }
+        return batchQueue.begin()->second->inputarrivaltime();
+    }
+
     // The key of the message that would leave next, if any.
     std::optional<OrderKey> headKey()
     {

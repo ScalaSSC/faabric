@@ -180,6 +180,10 @@ class Scheduler
 
     std::tuple<std::map<std::string, int>, double, double> getStatsSnapshot();
 
+    // Per queue with requests waiting: the age (us) of the input its next
+    // request descends from.
+    std::map<std::string, int64_t> getQueueHeadAgesUs();
+
     // Hands the planner's previous-round stats of all workers to
     // decentralScheduler.
     void setClusterWorkerStats(

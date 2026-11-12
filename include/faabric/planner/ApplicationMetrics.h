@@ -880,6 +880,74 @@ class ApplicationMetrics
                       perWorkerObj,
                       alloc);
         doc.AddMember("fluxCapacitySummary", summaryObj, alloc);
+
+        // ---- How old the waiting work is, worker by worker ----
+        // A worker's age in a second is that of its oldest queue head, 0 with
+        // nothing waiting. The gap is between the oldest and the youngest
+        // worker in the same second: what moving old work could even out.
+        rapidjson::Value ageObj(rapidjson::kObjectType);
+        std::map<time_t, std::pair<double, double>> minMaxBySecond;
+        for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+            double sum = 0;
+            double max = 0;
+            long n = 0;
+            std::map<std::string, double> operatorSum;
+            for (const auto& [second, ages] : workerNode.queueHeadAgeHistory) {
+                if (second < stableFromSec) {
+                    continue;
+                }
+                double oldest = 0;
+                for (const auto& [userFunc, ageMs] : ages) {
+                    oldest = std::max(oldest, ageMs);
+                    operatorSum[userFunc] += ageMs;
+                }
+                sum += oldest;
+                max = std::max(max, oldest);
+                n++;
+                auto [it, fresh] =
+                  minMaxBySecond.try_emplace(second, oldest, oldest);
+                if (!fresh) {
+                    it->second.first = std::min(it->second.first, oldest);
+                    it->second.second = std::max(it->second.second, oldest);
+                }
+            }
+            if (n == 0) {
+                continue;
+            }
+            rapidjson::Value obj(rapidjson::kObjectType);
+            obj.AddMember("seconds", static_cast<int64_t>(n), alloc);
+            obj.AddMember("head_age_ms_mean", sum / n, alloc);
+            obj.AddMember("head_age_ms_max", max, alloc);
+            rapidjson::Value operators(rapidjson::kObjectType);
+            for (const auto& [userFunc, ageSum] : operatorSum) {
+                operators.AddMember(
+                  rapidjson::Value(userFunc.c_str(), alloc).Move(),
+                  ageSum / n,
+                  alloc);
+            }
+            obj.AddMember("operator_head_age_ms_mean", operators, alloc);
+            ageObj.AddMember(
+              rapidjson::Value(ip.c_str(), alloc).Move(), obj, alloc);
+        }
+        if (!minMaxBySecond.empty()) {
+            double gapSum = 0;
+            double gapMax = 0;
+            double oldestSum = 0;
+            for (const auto& [second, minMax] : minMaxBySecond) {
+                double gap = minMax.second - minMax.first;
+                gapSum += gap;
+                gapMax = std::max(gapMax, gap);
+                oldestSum += minMax.second;
+            }
+            double seconds = static_cast<double>(minMaxBySecond.size());
+            rapidjson::Value obj(rapidjson::kObjectType);
+            obj.AddMember("seconds", static_cast<int64_t>(seconds), alloc);
+            obj.AddMember("oldest_worker_ms_mean", oldestSum / seconds, alloc);
+            obj.AddMember("worker_gap_ms_mean", gapSum / seconds, alloc);
+            obj.AddMember("worker_gap_ms_max", gapMax, alloc);
+            ageObj.AddMember("cluster", obj, alloc);
+        }
+        doc.AddMember("queueHeadAgeSummary", ageObj, alloc);
     }
 
     void addFluxMigrationMetrics(rapidjson::Document& doc) const
@@ -1747,6 +1815,10 @@ class ApplicationMetrics
         // ModeFlux: what its cores carried each second -- executors held and
         // cores busy over its capacity window -- and the slots planned with.
         std::map<time_t, FluxCapacityPoint> fluxCapacityHistory;
+        // Each second, per operator with requests waiting there: the age
+        // (ms) of the oldest input at the head of one of its queues. An
+        // entry every report, empty when nothing waits.
+        std::map<time_t, std::map<std::string, double>> queueHeadAgeHistory;
     };
 
     // The cumulative counters of FluxOverheadStats, in output order. `nanos`
@@ -1993,6 +2065,16 @@ class ApplicationMetrics
             if (statsPtr->has_fluxmigration()) {
                 clusterWorkerMetrics[ip].fluxMigrationHistory[currentTime] =
                   statsPtr->fluxmigration();
+            }
+            // How old the work waiting there is, per operator.
+            {
+                auto& ages =
+                  clusterWorkerMetrics[ip].queueHeadAgeHistory[currentTime];
+                for (const auto& [queueKey, ageUs] :
+                     statsPtr->queueheadageus()) {
+                    double& ageMs = ages[operatorOfQueue(queueKey)];
+                    ageMs = std::max(ageMs, ageUs / 1000.0);
+                }
             }
             // ModeFlux: what its cores carried, and the slots planned with
             // (as StateAwareScheduler::capacitySlotsFlux reads them).

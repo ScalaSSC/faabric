@@ -503,6 +503,11 @@ message WorkerStats{
     double fluxOccupiedExecutors = 22;
     double fluxBusyCores = 23;
     double fluxCapacitySlots = 24;
+    // Per queue with requests waiting (keyed like instanceQueueNum): how long
+    // ago (us) the input of the request that leaves next reached the planner.
+    // The planner stamps the arrival and the worker reads the age, so it is
+    // off by the skew between their clocks. Reported only, not planned with.
+    map<string, int64> queueHeadAgeUs = 25;
 }
 
 // ModeFlux: what one worker's scheduling, rebalancing and stats cost,

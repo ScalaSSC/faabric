@@ -4440,6 +4440,20 @@ Scheduler::getStatsSnapshot()
     return { queueSizes, runningExecutorsCount, lastCpu };
 }
 
+std::map<std::string, int64_t> Scheduler::getQueueHeadAgesUs()
+{
+    std::map<std::string, int64_t> ages;
+    int64_t nowUs = faabric::util::getGlobalClock().epochMicros();
+    faabric::util::SharedLock lock(waitingQueuesMx);
+    for (const auto& [userFuncPar, queue] : waitingQueues) {
+        int64_t arrivalUs = queue->headInputArrivalTime();
+        if (arrivalUs > 0) {
+            ages[userFuncPar] = std::max<int64_t>(0, nowUs - arrivalUs);
+        }
+    }
+    return ages;
+}
+
 void Scheduler::setClusterWorkerStats(
   std::map<std::string, faabric::WorkerStats>&& stats)
 {

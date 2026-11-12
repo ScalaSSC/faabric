@@ -423,6 +423,11 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
     out.set_executorsnum(executorsCount);
     out.set_cpuload(cpuLoadVal);
 
+    auto* protoHeadAges = out.mutable_queueheadageus();
+    for (const auto& [instanceName, ageUs] : scheduler.getQueueHeadAgesUs()) {
+        (*protoHeadAges)[instanceName] = ageUs;
+    }
+
     for (auto& move : scheduler.getFluxShardMoves()) {
         *out.add_shardmoves() = std::move(move);
     }
