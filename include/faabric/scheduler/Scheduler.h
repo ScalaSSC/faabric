@@ -429,7 +429,12 @@ class Scheduler
     std::map<std::string, FluxParidxLoad> fluxParidxLoad;
     // Batches running over every paridx, guarded by fluxParidxRunMx.
     // Pheromone caps it at maxExecutors: a fixed set of executors per worker.
+    // ModeFlux caps it at fluxWorkerExecutors when that is set.
     int fluxRunningTotal = 0;
+    // A queue found the worker at its executor cap and gave up: the next
+    // batch to end must wake every queue, not only its own. Guarded by
+    // fluxParidxRunMx.
+    bool fluxWorkerCapWaiting = false;
 
     // Accounts the time since `running` last changed, and opens the first
     // window of a paridx seen for the first time.
@@ -461,14 +466,16 @@ class Scheduler
       const std::map<std::string, FluxParidxLoad>& loads);
 
     // Takes one of the paridx's run slots for a batch about to be dispatched,
-    // or returns false if all are in use. Handed back by
-    // releaseParidxRunFlux if no batch ends up dispatched, or by
-    // finishParidxRunFlux when the batch finishes.
+    // or returns false if all are in use -- the paridx's (maxExecutors) or the
+    // worker's (fluxWorkerExecutors). Handed back by releaseParidxRunFlux if
+    // no batch ends up dispatched, or by finishParidxRunFlux when the batch
+    // finishes; both return whether a queue was left waiting for the worker's
+    // cap, and so every queue should be woken.
     bool reserveParidxRunFlux(const std::string& funcParStr);
 
-    void releaseParidxRunFlux(const std::string& funcParStr);
+    bool releaseParidxRunFlux(const std::string& funcParStr);
 
-    void finishParidxRunFlux(const std::string& funcParStr, int requests);
+    bool finishParidxRunFlux(const std::string& funcParStr, int requests);
 
     // Closes the current measurement window of every paridx and opens the
     // next. Once per rebalancing period.
@@ -746,6 +753,10 @@ class Scheduler
     // Executors a worker can run at once. Flux caps executors per paridx, not
     // per worker; this is what bounds a worker as a whole.
     int fluxWorkerSlots = 0;
+    // ModeFlux: the most batches this worker runs at once, over all its
+    // queues -- a hard cap on top of maxExecutors per paridx, and the most
+    // slots its capacity can be taken to have. 0 (default): no cap.
+    std::atomic<int> fluxWorkerExecutors{ 0 };
 
     // ModeFlux: what this worker's cores carry. Every window closed by
     // rollFluxParidxWindows adds one sample -- its length, the executor time

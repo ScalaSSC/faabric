@@ -181,8 +181,9 @@ class StateAwareScheduler : public BatchScheduler
      * waiting on locks and state as well as running, so a core carries more
      * than one: each worker measures how many over the last
      * kFluxCapacityWindowSec and reports workerSlots cores times that
-     * (fluxCapacitySlots). Before it has, or with the dynamic capacity
-     * ablated, its configured slots.
+     * (fluxCapacitySlots), or its configured slots with the dynamic capacity
+     * ablated -- never more than its executor cap (flux_worker_executors),
+     * if it has one. A worker that reported none: its configured slots.
      */
     static double capacitySlotsFlux(const faabric::WorkerStats& workerStats)
     {

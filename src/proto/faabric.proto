@@ -495,8 +495,10 @@ message WorkerStats{
     // run slot, integrated over time), cores this process kept busy on
     // average, and the executor slots the worker is taken to have --
     // workerSlots cores, each carrying as many executors as it did:
-    // max(workerSlots, workerSlots x occupied / busy). 0 = not measured; then
-    // workerSlots is the capacity.
+    // max(workerSlots, workerSlots x occupied / busy), or workerSlots with the
+    // dynamic capacity ablated -- either within flux_worker_executors, the
+    // worker's hard cap, if set. These are the slots it plans with. 0 outside
+    // ModeFlux and under Pheromone; then workerSlots is the capacity.
     double fluxOccupiedExecutors = 22;
     double fluxBusyCores = 23;
     double fluxCapacitySlots = 24;

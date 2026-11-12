@@ -29,6 +29,7 @@
 #include <limits>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 
 using namespace faabric::util;
 using namespace faabric::snapshot;
@@ -385,6 +386,7 @@ void Scheduler::reset()
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
         fluxParidxLoad.clear();
         fluxRunningTotal = 0;
+        fluxWorkerCapWaiting = false;
     }
     {
         // The queues are gone. A dispatcher still working on one finds it
@@ -596,15 +598,23 @@ bool Scheduler::reserveParidxRunFlux(const std::string& funcParStr)
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
         auto& load = fluxParidxLoad[funcParStr];
         // Pheromone has a fixed set of executors per worker, whatever runs
-        // on them.
-        bool workerFree =
-          !decentralScheduler.isPheromone() || fluxRunningTotal < maxExecutors;
-        if (workerFree && load.running < maxExecutors) {
+        // on them. ModeFlux caps the worker as a whole only if asked to.
+        int workerCap = decentralScheduler.isPheromone()
+                          ? maxExecutors
+                          : fluxWorkerExecutors.load(std::memory_order_relaxed);
+        bool workerFree = workerCap <= 0 || fluxRunningTotal < workerCap;
+        bool paridxFree = load.running < maxExecutors;
+        if (workerFree && paridxFree) {
             advanceFluxLoad(load,
                             faabric::util::getGlobalClock().epochMicros());
             load.running++;
             fluxRunningTotal++;
             return true;
+        }
+        // Held back by the worker, not by its own cap: whichever batch ends
+        // next frees the slot, and must wake this queue too.
+        if (!workerFree && paridxFree) {
+            fluxWorkerCapWaiting = true;
         }
     }
     // At the cap: this queue will not drain until one of its batches ends.
@@ -612,7 +622,7 @@ bool Scheduler::reserveParidxRunFlux(const std::string& funcParStr)
     return false;
 }
 
-void Scheduler::releaseParidxRunFlux(const std::string& funcParStr)
+bool Scheduler::releaseParidxRunFlux(const std::string& funcParStr)
 {
     std::lock_guard<std::mutex> lock(fluxParidxRunMx);
     auto it = fluxParidxLoad.find(funcParStr);
@@ -622,21 +632,23 @@ void Scheduler::releaseParidxRunFlux(const std::string& funcParStr)
         it->second.running--;
         fluxRunningTotal = std::max(0, fluxRunningTotal - 1);
     }
+    return std::exchange(fluxWorkerCapWaiting, false);
 }
 
-void Scheduler::finishParidxRunFlux(const std::string& funcParStr, int requests)
+bool Scheduler::finishParidxRunFlux(const std::string& funcParStr, int requests)
 {
     std::lock_guard<std::mutex> lock(fluxParidxRunMx);
     auto it = fluxParidxLoad.find(funcParStr);
-    if (it == fluxParidxLoad.end()) {
-        return;
+    if (it != fluxParidxLoad.end()) {
+        advanceFluxLoad(it->second,
+                        faabric::util::getGlobalClock().epochMicros());
+        if (it->second.running > 0) {
+            it->second.running--;
+            fluxRunningTotal = std::max(0, fluxRunningTotal - 1);
+        }
+        it->second.finished += std::max(1, requests);
     }
-    advanceFluxLoad(it->second, faabric::util::getGlobalClock().epochMicros());
-    if (it->second.running > 0) {
-        it->second.running--;
-        fluxRunningTotal = std::max(0, fluxRunningTotal - 1);
-    }
-    it->second.finished += std::max(1, requests);
+    return std::exchange(fluxWorkerCapWaiting, false);
 }
 
 void Scheduler::rollFluxParidxWindows()
@@ -755,12 +767,19 @@ bool Scheduler::fluxDynamicCapacityOn() const
 
 double Scheduler::fluxCapacitySlotsNow() const
 {
-    double cores = std::max(1, fluxWorkerSlots);
-    if (!fluxDynamicCapacityOn()) {
-        return cores;
+    double slots = std::max(1, fluxWorkerSlots);
+    if (fluxDynamicCapacityOn()) {
+        double measured = fluxCapacitySlots.load(std::memory_order_relaxed);
+        if (measured > 0) {
+            slots = measured;
+        }
     }
-    double measured = fluxCapacitySlots.load(std::memory_order_relaxed);
-    return measured > 0 ? measured : cores;
+    // Never more than the worker will run at once.
+    int workerCap = fluxWorkerExecutors.load(std::memory_order_relaxed);
+    if (workerCap > 0 && !decentralScheduler.isPheromone()) {
+        slots = std::min(slots, static_cast<double>(workerCap));
+    }
+    return slots;
 }
 
 void Scheduler::countFluxArrivals(const std::map<std::string, int>& perParidx,
@@ -817,6 +836,7 @@ Scheduler::fluxLocalLoadOf(const std::string& userFuncPar)
     }
 
     int running = 0;
+    int runningTotal = 0;
     {
         std::lock_guard<std::mutex> lock(fluxParidxRunMx);
         auto it = fluxParidxLoad.find(fluxFuncParStrOf(userFuncPar));
@@ -824,13 +844,21 @@ Scheduler::fluxLocalLoadOf(const std::string& userFuncPar)
             running = it->second.running;
             local.slotTimeUs = it->second.slotTimeUs;
         }
+        runningTotal = fluxRunningTotal;
     }
 
+    // Batches that could start now: the paridx's free run slots, but no more
+    // than the worker's cap leaves, if it has one.
     bool workerSlotFree =
       runningExecutors.load(std::memory_order_relaxed) < fluxCapacitySlotsNow();
-    local.freeRequests = workerSlotFree ? std::max(0, maxExecutors - running) *
-                                            std::max(1, executeBatchsize)
-                                        : 0;
+    int freeBatches = std::max(0, maxExecutors - running);
+    int workerCap = fluxWorkerExecutors.load(std::memory_order_relaxed);
+    if (workerCap > 0) {
+        freeBatches =
+          std::min(freeBatches, std::max(0, workerCap - runningTotal));
+    }
+    local.freeRequests =
+      workerSlotFree ? freeBatches * std::max(1, executeBatchsize) : 0;
     return local;
 }
 
@@ -935,10 +963,14 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
     out.set_fluxoccupiedexecutors(
       fluxOccupiedExecutors.load(std::memory_order_relaxed));
     out.set_fluxbusycores(fluxBusyCores.load(std::memory_order_relaxed));
-    out.set_fluxcapacityslots(
-      fluxDynamicCapacityOn()
-        ? fluxCapacitySlots.load(std::memory_order_relaxed)
-        : 0);
+    // The slots planned with here -- measured, or configured, and within the
+    // worker's executor cap -- so that the planner and the other workers plan
+    // with the same. 0 outside ModeFlux and under Pheromone.
+    out.set_fluxcapacityslots(scheduleMode ==
+                                    faabric::batch_scheduler::ModeFlux &&
+                                  !decentralScheduler.isPheromone()
+                                ? fluxCapacitySlotsNow()
+                                : 0);
     {
         auto [arrivalWorkUs, processWorkUs] =
           fluxWorkRates(snapshotFluxParidxLoads());
@@ -1432,8 +1464,10 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             bool held = false;
             ~ParidxRunSlot()
             {
-                if (held) {
-                    scheduler->releaseParidxRunFlux(funcParStr);
+                // A slot handed back unused may be what a queue held back by
+                // the worker's cap is waiting for.
+                if (held && scheduler->releaseParidxRunFlux(funcParStr)) {
+                    scheduler->markAllDispatchPending();
                 }
             }
         } runSlot{ this, funcStr };
@@ -2012,6 +2046,12 @@ void Scheduler::resetParameter(std::string key, int32_t value)
     } else if (key == "flux_worker_slots") {
         fluxWorkerSlots = value;
         SPDLOG_INFO("Reset flux_worker_slots parameter to : {}", value);
+    } else if (key == "flux_worker_executors") {
+        // ModeFlux: the most batches a worker runs at once, over all its
+        // queues. 0 (default): no cap beyond max_executors per paridx.
+        fluxWorkerExecutors.store(std::max(0, value),
+                                  std::memory_order_relaxed);
+        SPDLOG_INFO("Reset flux_worker_executors parameter to : {}", value);
     } else if (key == "light_reset") {
         // Any mode: executors restore their module in place after a batch
         // instead of re-instantiating it. 0 (default) keeps the full reset.
@@ -2122,9 +2162,10 @@ void Scheduler::notifyExecutorStart()
 void Scheduler::notifyExecutorFinished(const faabric::Message& msg)
 {
     // The batch held one of its paridx's run slots since it was dispatched.
+    bool capWaiting = false;
     if (scheduleMode == faabric::batch_scheduler::ModeFlux) {
-        finishParidxRunFlux(faabric::util::funcParToString(msg, false),
-                            msg.executebatchsize());
+        capWaiting = finishParidxRunFlux(
+          faabric::util::funcParToString(msg, false), msg.executebatchsize());
     }
 
     int current = runningExecutors.load(std::memory_order_relaxed);
@@ -2139,8 +2180,10 @@ void Scheduler::notifyExecutorFinished(const faabric::Message& msg)
     // Its run slot and executor are free again, so its queue may dispatch.
     // Only now: a dispatcher woken any earlier would find neither free, and
     // nothing would wake it again. Under Pheromone the executor is the
-    // worker's, so any queue may be the one waiting for it.
-    if (decentralScheduler.isPheromone()) {
+    // worker's, so any queue may be the one waiting for it; so it is when a
+    // queue was held back by the worker's cap, and the slot then goes to the
+    // queue whose next request descends from the oldest input.
+    if (decentralScheduler.isPheromone() || capWaiting) {
         markAllDispatchPending();
     } else {
         markDispatchPending(faabric::util::getUserFuncPar(msg));
