@@ -382,6 +382,36 @@ void Planner::setMessageResultBatch(
                  batchMsg->messages_size());
 
     RETURN_IF_OUTPUTTING
+    resultBatchQueue.enqueue(std::move(batchMsg));
+    while (true) {
+        // Someone is taking results in: ours goes with theirs.
+        {
+            std::unique_lock<std::mutex> drain(resultDrainMx,
+                                               std::try_to_lock);
+            if (!drain.owns_lock()) {
+                return;
+            }
+            drainMessageResults();
+        }
+        // A batch left between the last look and the unlock found the drain
+        // taken and nobody to hand it to.
+        if (resultBatchQueue.size() == 0) {
+            return;
+        }
+    }
+}
+
+void Planner::drainMessageResults()
+{
+    std::vector<std::shared_ptr<faabric::BatchExecuteRequest>> batches;
+    std::shared_ptr<faabric::BatchExecuteRequest> next;
+    while (resultBatchQueue.try_dequeue(next)) {
+        batches.push_back(std::move(next));
+    }
+    if (batches.empty()) {
+        return;
+    }
+
     int64_t cpuStartNs = faabric::util::getCpuTimeNano();
     int64_t waitStartUs = faabric::util::getGlobalClock().epochMicros();
     faabric::util::FullLock reqStatusLock(state.reqStatusMx);
@@ -389,66 +419,75 @@ void Planner::setMessageResultBatch(
     RETURN_IF_OUTPUTTING
 
     SPDLOG_DEBUG("InFlightApps size before set: {}", state.inFlightApps.size());
-    int results = batchMsg->messages_size();
-    for (int msgIdx = 0; msgIdx < results; msgIdx++) {
-        // Every result of every worker comes through here under one lock:
-        // take the message over rather than copy it. Nothing reads the batch
-        // afterwards.
-        auto msgPtr = std::make_shared<faabric::Message>();
-        msgPtr->Swap(batchMsg->mutable_messages(msgIdx));
-        const faabric::Message& msg = *msgPtr;
-        int appId = msg.appid();
-        int msgId = msg.id();
+    int results = 0;
+    bool anyFinished = false;
+    for (auto& batchMsg : batches) {
+        results += batchMsg->messages_size();
+        for (int msgIdx = 0; msgIdx < batchMsg->messages_size(); msgIdx++) {
+            // Every result of every worker comes through here under one
+            // lock: take the message over rather than copy it. Nothing reads
+            // the batch afterwards.
+            auto msgPtr = std::make_shared<faabric::Message>();
+            msgPtr->Swap(batchMsg->mutable_messages(msgIdx));
+            const faabric::Message& msg = *msgPtr;
+            int appId = msg.appid();
+            int msgId = msg.id();
 
-        // This check ensures we don't process results for an app that
-        // should have already been cleaned up.
-        if (!state.inFlightApps.contains(appId)) {
-            SPDLOG_WARN(
-              "App {} is not in flight but received result for msg {}",
-              appId,
-              msgId);
-            continue;
-        }
-
-        // Store the result for the current message
-        auto& resultRecord = state.appResults[appId];
-        resultRecord[msgId] = msgPtr;
-
-        // For each message this one chained to, add it to the in-flight set
-        // ONLY if we haven't already seen its result.
-        auto& inFlightMsgs = state.inFlightApps[appId];
-        for (int32_t chainedMsgId : msg.chainedmsgids()) {
-            if (!resultRecord.contains(chainedMsgId)) {
-                inFlightMsgs.insert(chainedMsgId);
+            // This check ensures we don't process results for an app that
+            // should have already been cleaned up.
+            if (!state.inFlightApps.contains(appId)) {
+                SPDLOG_WARN(
+                  "App {} is not in flight but received result for msg {}",
+                  appId,
+                  msgId);
+                continue;
             }
-        }
 
-        // Remove the current message from the in-flight set
-        inFlightMsgs.erase(msgId);
+            // Store the result for the current message
+            auto& resultRecord = state.appResults[appId];
+            resultRecord[msgId] = msgPtr;
 
-        // If this was the last in-flight message for the app, clean up.
-        if (inFlightMsgs.empty()) {
-            int inFlightCount = state.inFlightApps.size() - 1;
-            // Record metrics before erasing the results
-            int64_t recordStartTime = state.appStartTimes[appId];
-            state.applicationMetrics->record(
-              state.appResults.at(appId), inFlightCount, recordStartTime);
-            // Erase the app from tracking
-            state.appResults.erase(appId);
-            state.inFlightApps.erase(appId);
-            state.appStartTimes.erase(appId);
-            // An in-flight slot is free: inputs held back may go now.
-            inputWake.notify();
+            // For each message this one chained to, add it to the in-flight
+            // set ONLY if we haven't already seen its result.
+            auto& inFlightMsgs = state.inFlightApps[appId];
+            for (int32_t chainedMsgId : msg.chainedmsgids()) {
+                if (!resultRecord.contains(chainedMsgId)) {
+                    inFlightMsgs.insert(chainedMsgId);
+                }
+            }
+
+            // Remove the current message from the in-flight set
+            inFlightMsgs.erase(msgId);
+
+            // If this was the last in-flight message for the app, clean up.
+            if (inFlightMsgs.empty()) {
+                int inFlightCount = state.inFlightApps.size() - 1;
+                // Record metrics before erasing the results
+                int64_t recordStartTime = state.appStartTimes[appId];
+                state.applicationMetrics->record(
+                  state.appResults.at(appId), inFlightCount, recordStartTime);
+                // Erase the app from tracking
+                state.appResults.erase(appId);
+                state.inFlightApps.erase(appId);
+                state.appStartTimes.erase(appId);
+                anyFinished = true;
+            }
         }
     }
     SPDLOG_DEBUG("InFlightApps size after set: {}", state.inFlightApps.size());
     if (state.applicationMetrics) {
         int64_t cpuEndNs = faabric::util::getCpuTimeNano();
         state.applicationMetrics->recordPlannerResults(
+          static_cast<int64_t>(batches.size()),
           results,
           cpuStartNs >= 0 && cpuEndNs >= cpuStartNs ? cpuEndNs - cpuStartNs : 0,
           heldStartUs - waitStartUs,
           faabric::util::getGlobalClock().epochMicros() - heldStartUs);
+    }
+    reqStatusLock.unlock();
+    // In-flight slots are free: inputs held back may go now.
+    if (anyFinished) {
+        inputWake.notify();
     }
 }
 

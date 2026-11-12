@@ -502,7 +502,12 @@ class ApplicationMetrics
                 return n > 0 ? sum / n : 0.0;
             };
             rapidjson::Value obj(rapidjson::kObjectType);
+            // `batches` are holds of the lock; each takes in every batch the
+            // workers sent meanwhile (`worker_batches`).
             obj.AddMember("batches", static_cast<int64_t>(batches), alloc);
+            obj.AddMember("worker_batches",
+                          static_cast<int64_t>(load(plannerResults.workerBatches)),
+                          alloc);
             obj.AddMember("results", static_cast<int64_t>(results), alloc);
             obj.AddMember("results_per_batch", per(results, batches), alloc);
             obj.AddMember("cpu_us_per_result",
@@ -1874,6 +1879,7 @@ class ApplicationMetrics
     struct PlannerResultCounters
     {
         std::atomic<int64_t> batches{ 0 };
+        std::atomic<int64_t> workerBatches{ 0 };
         std::atomic<int64_t> results{ 0 };
         std::atomic<int64_t> cpuNs{ 0 };
         std::atomic<int64_t> lockWaitUs{ 0 };
@@ -1883,6 +1889,7 @@ class ApplicationMetrics
         void reset()
         {
             batches = 0;
+            workerBatches = 0;
             results = 0;
             cpuNs = 0;
             lockWaitUs = 0;
@@ -2016,14 +2023,18 @@ class ApplicationMetrics
           faabric::util::getGlobalClock().epochSeconds(), round);
     }
 
-    // Planner: one batch of `results` results from a worker took `cpuNs` of
-    // CPU time, after `lockWaitUs` waiting for the lock it held for `heldUs`.
-    void recordPlannerResults(int64_t results,
+    // Planner: taking in `results` results, which the workers sent in
+    // `workerBatches` batches, under one hold of the lock took `cpuNs` of CPU
+    // time, after `lockWaitUs` waiting for the lock it held for `heldUs`.
+    void recordPlannerResults(int64_t workerBatches,
+                              int64_t results,
                               int64_t cpuNs,
                               int64_t lockWaitUs,
                               int64_t heldUs)
     {
         plannerResults.batches.fetch_add(1, std::memory_order_relaxed);
+        plannerResults.workerBatches.fetch_add(workerBatches,
+                                               std::memory_order_relaxed);
         plannerResults.results.fetch_add(results, std::memory_order_relaxed);
         plannerResults.cpuNs.fetch_add(cpuNs, std::memory_order_relaxed);
         plannerResults.lockWaitUs.fetch_add(lockWaitUs,

@@ -74,6 +74,10 @@ class Planner
     void setMessageResultBatch(
       std::shared_ptr<faabric::BatchExecuteRequest> batchMsg);
 
+    // Takes in every result batch that is waiting under one hold of the
+    // request-status lock.
+    void drainMessageResults();
+
     // Get all the results recorded for one batch
     std::shared_ptr<faabric::BatchExecuteRequestStatus> getBatchResults(
       int32_t appId);
@@ -165,6 +169,15 @@ class Planner
     std::atomic<uint64_t> flushGeneration{ 0 };
     std::thread processWaitingQueueThread;
     void processWaitingQueueLoop();
+
+    // Result batches from the workers, waiting to be taken in. Whichever
+    // server thread holds resultDrainMx takes in all of them at once; the
+    // others leave theirs here and return. Taking the request-status lock
+    // once per batch instead had every server thread queue up on it, and a
+    // worker sends a batch for every couple of results.
+    faabric::util::ThreadSafeQueue<std::shared_ptr<faabric::BatchExecuteRequest>>
+      resultBatchQueue;
+    std::mutex resultDrainMx;
 
     // Wake the input scheduler (inputs arrived, or an app finished and freed
     // an in-flight slot) and the dispatcher (requests scheduled), instead of
