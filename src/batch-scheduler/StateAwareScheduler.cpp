@@ -191,14 +191,9 @@ bool StateAwareScheduler::registerApp(
     // known, so for now it counts for none of them.
     auto dag = std::make_shared<FluxDag>();
     std::unordered_map<std::string, std::unordered_set<std::string>> callers;
-    std::unordered_map<std::string, std::unordered_set<std::string>> linked;
     for (const auto& [src, dests] : application->getConnections()) {
         for (const auto& dest : dests) {
             callers[dest].insert(src);
-            if (dest != src) {
-                linked[src].insert(dest);
-                linked[dest].insert(src);
-            }
         }
     }
     const auto& nodes = application->getNodes();
@@ -214,9 +209,6 @@ bool StateAwareScheduler::registerApp(
             dag->localChildren[src].push_back(dest);
             dag->localChildOps.insert(dest);
         }
-    }
-    for (const auto& [userFunc, others] : linked) {
-        dag->neighbours[userFunc].assign(others.begin(), others.end());
     }
     for (const auto& [name, node] : nodes) {
         if (node->type != NodeType::STATELESS) {
@@ -449,7 +441,9 @@ void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
 
     // Every unit starts on one worker: the operator's home, fixed by whoever
     // routes to it first -- unless an experiment fixes where state goes.
-    bool placedStatically = fluxStaticPlacement.load() != 0;
+    // Ablated co-location spreads the units as static placement 1 does.
+    bool placedStatically = fluxStaticPlacement.load() != 0 ||
+                            fluxDisabled(kFluxDisableColocation);
     std::string home =
       placedStatically ? std::string("static") : fluxHomeOf(userFunc, hostMap);
 
@@ -519,6 +513,9 @@ std::string StateAwareScheduler::fluxStaticOwner(const std::string& unitKey,
                                                  const HostMap& hostMap)
 {
     int mode = fluxStaticPlacement.load();
+    if (mode == 0 && fluxDisabled(kFluxDisableColocation)) {
+        mode = 1;
+    }
     if (mode == 0 || hostMap.empty()) {
         return "";
     }
@@ -1182,8 +1179,6 @@ void StateAwareScheduler::planFluxMerges(
     if (fluxDisabled(kFluxDisableMerge)) {
         return;
     }
-    bool affinity = !fluxDisabled(kFluxDisableAffinity);
-
     std::deque<std::shared_ptr<const FluxClusterSnapshot>> history;
     {
         std::lock_guard<std::mutex> lock(fluxHistoryMx);
@@ -1210,27 +1205,6 @@ void StateAwareScheduler::planFluxMerges(
         double capacityUs = valueOf(round.capacityUs, ip);
         return round.demandUs.contains(ip) && capacityUs > 0 &&
                valueOf(round.demandUs, ip) + extraUs <= capacityUs;
-    };
-    // The share of the requests of `userFunc`'s neighbours that were on `ip`.
-    auto neighbourShare = [&now](const std::string& userFunc,
-                                 const std::string& ip) {
-        auto it = now.dag->neighbours.find(userFunc);
-        if (it == now.dag->neighbours.end()) {
-            return 0.0;
-        }
-        double here = 0;
-        double total = 0;
-        for (const auto& [worker, rates] : now.opRatePerSec) {
-            for (const auto& neighbour : it->second) {
-                auto rateIt = rates.find(neighbour);
-                double rate = rateIt == rates.end() ? 0 : rateIt->second;
-                total += rate;
-                if (worker == ip) {
-                    here += rate;
-                }
-            }
-        }
-        return total > 0 ? here / total : 0.0;
     };
 
     // Every stateful operator held on more than one worker, with how much of
@@ -1284,18 +1258,11 @@ void StateAwareScheduler::planFluxMerges(
             unitsTotal += units;
         }
 
-        // Where it could go: where its DAG neighbours are most active, so
-        // the most of its chained calls -- to the state downstream of it
-        // too -- stay local; then where most of it already is, which moves
-        // the least state; then the least loaded.
+        // Where it could go: where most of it already is, which moves the
+        // least state; then the least loaded.
         auto targets = spread.holding;
         std::sort(
           targets.begin(), targets.end(), [&](const auto& a, const auto& b) {
-              double shareA = affinity ? neighbourShare(userFunc, a.first) : 0;
-              double shareB = affinity ? neighbourShare(userFunc, b.first) : 0;
-              if (shareA != shareB) {
-                  return shareA > shareB;
-              }
               if (a.second != b.second) {
                   return a.second > b.second;
               }
@@ -1307,16 +1274,12 @@ void StateAwareScheduler::planFluxMerges(
                 continue;
             }
 
-            // Those that may hand theirs over: not short themselves, in no
-            // other merge this round, and with the operator's neighbours no
-            // more active on them than on the target. The smallest first.
-            double targetShare = neighbourShare(userFunc, target);
+            // Those that may hand theirs over: not short themselves and in
+            // no other merge this round. The smallest first.
             std::vector<std::pair<std::string, int>> candidates;
             for (const auto& [source, units] : spread.holding) {
                 if (source == target || involved.contains(source) ||
-                    !keepsUp(now, source, 0) ||
-                    (affinity &&
-                     neighbourShare(userFunc, source) > targetShare)) {
+                    !keepsUp(now, source, 0)) {
                     continue;
                 }
                 candidates.emplace_back(source, units);
@@ -1590,9 +1553,9 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
             }
         }
 
-        // Short: to an advised worker, the one where most of the operator's
-        // neighbours run first, then the one it already goes to this round,
-        // then one already running it, then the one with the most quota left
+        // Short: to an advised worker, the one it already goes to this round
+        // first, then one already running it, then the one with the most
+        // quota left
         // -- so it spreads over as few workers as it must. Picked and drawn
         // in one go, so two requests cannot both spend the same quota.
         bool packing = !fluxDisabled(kFluxDisablePacking);
@@ -1601,17 +1564,16 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         {
             std::lock_guard<std::mutex> lock(fluxOffloadMx);
             double* targetQuotaUs = nullptr;
-            std::tuple<int, bool, bool, double> bestKey{ 0, false, false, 0 };
+            std::tuple<bool, bool, double> bestKey{ false, false, 0 };
             for (auto& [ip, quotaUs] : fluxOffloadQuotaUs) {
                 if (ip == localHost || !hostMap.contains(ip) ||
                     quotaUs < workUs) {
                     continue;
                 }
-                // Ablated packing drops filling one target first; ablated
-                // affinity drops neighbours and where it already runs.
-                std::tuple<int, bool, bool, double> key{
-                    affinity ? snapshot->neighboursOn(ip, userFunc) : 0,
-                    packing && sentThisRound.contains(ip),
+                // Ablated packing or affinity drops filling one target
+                // first; ablated affinity also where it already runs.
+                std::tuple<bool, bool, double> key{
+                    packing && affinity && sentThisRound.contains(ip),
                     affinity && snapshot->runs(ip, userFunc),
                     quotaUs
                 };
@@ -1674,14 +1636,13 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     // planner routed there the round before, plus those it has routed there
     // since: the planner's own share as it now stands.
     //
-    // The input goes to the first host with room for it: the one where most
-    // of its DAG neighbours run, then the one with most of the operator
-    // there, then one with warm executors for it, then the one with the most
-    // room. An operator thus
-    // fills one host before it spills onto the next. Only if no host has room
+    // The input goes to the first host with room for it: the one with most
+    // of the operator there, then one with warm executors for it, then the
+    // one with the most room. An operator thus fills one host before it
+    // spills onto the next. Only if no host has room
     // does it go to the least loaded one.
     const std::string* chosen = nullptr;
-    std::tuple<int, int, bool, double> chosenKey{ 0, 0, false, 0 };
+    std::tuple<int, bool, double> chosenKey{ 0, false, 0 };
     const std::string* leastLoaded = nullptr;
     double leastLoad = std::numeric_limits<double>::infinity();
     std::lock_guard<std::mutex> lock(fluxAssignedMx);
@@ -1722,14 +1683,13 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                 routedHere = it->second;
             }
         }
-        // Neighbours, then how much of the operator is there already -- what
-        // this round routed there included, which the snapshot does not show
-        // yet -- then warm executors, then room: the order the workers place
-        // by too.
-        std::tuple<int, int, bool, double> key{ 0, 0, false, 0 };
+        // How much of the operator is there already -- what this round
+        // routed there included, which the snapshot does not show yet --
+        // then warm executors, then room: the order the workers place by
+        // too.
+        std::tuple<int, bool, double> key{ 0, false, 0 };
         if (affinity) {
-            key = { snapshot->neighboursOn(ip, userFunc),
-                    snapshot->presenceOf(ip, userFunc) + routedHere,
+            key = { snapshot->presenceOf(ip, userFunc) + routedHere,
                     snapshot->runs(ip, userFunc),
                     capacityUs - demandUs };
         }
@@ -1759,9 +1719,8 @@ std::string StateAwareScheduler::scheduleStatelessByWaitFlux(
 {
     // Where it starts soonest: by executor time if measured, else by queue
     // length -- an operator nobody has measured yet takes no telling how
-    // much room. Among hosts about as good, the one where most of its DAG
-    // neighbours run, then one already running it, unless affinity is
-    // ablated.
+    // much room. Among hosts about as good, the one with most of the operator
+    // there, then one already running it, unless affinity is ablated.
     const std::string queueKey = userFunc + "_0";
     const auto& stats = snapshot.stats;
     double slotTimeUs = snapshot.slotTimeOf(queueKey);
@@ -1799,7 +1758,7 @@ std::string StateAwareScheduler::scheduleStatelessByWaitFlux(
             continue;
         }
         std::tuple<int, bool, double> key{
-            affinity ? snapshot.neighboursOn(*ip, userFunc) : 0,
+            affinity ? snapshot.presenceOf(*ip, userFunc) : 0,
             affinity && snapshot.runs(*ip, userFunc),
             -waitUs
         };

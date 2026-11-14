@@ -150,8 +150,6 @@ class StateAwareScheduler : public BatchScheduler
         // Every operator in some localChildren list: its requests are set
         // off here by work already counted with its caller's.
         std::unordered_set<std::string> localChildOps;
-        // Per operator, every operator it calls or is called by.
-        std::unordered_map<std::string, std::vector<std::string>> neighbours;
         // The stateful operators, partitioned or not: their requests can
         // only go to their unit's owner.
         std::unordered_set<std::string> statefulOps;
@@ -276,28 +274,6 @@ class StateAwareScheduler : public BatchScheduler
             return opIt == it->second.end() ? 0 : opIt->second;
         }
 
-        // How many of `userFunc`'s DAG neighbours were active on `ip` in
-        // the round: the more, the more of its chained calls stay local
-        // there.
-        int neighboursOn(const std::string& ip,
-                         const std::string& userFunc) const
-        {
-            if (!dag) {
-                return 0;
-            }
-            auto it = dag->neighbours.find(userFunc);
-            if (it == dag->neighbours.end()) {
-                return 0;
-            }
-            int n = 0;
-            for (const auto& neighbour : it->second) {
-                if (valueIn(opRatePerSec, ip, neighbour) > 0) {
-                    n++;
-                }
-            }
-            return n;
-        }
-
         int presenceOf(const std::string& ip, const std::string& userFunc) const
         {
             auto it = presence.find(ip);
@@ -388,9 +364,8 @@ class StateAwareScheduler : public BatchScheduler
      * operator spread over several workers back together, step by step, once
      * its load is low enough -- conservatively, performance first.
      *
-     * The target is the holder where the operator's DAG neighbours are most
-     * active, so the most chained calls stay local, then the one holding
-     * most of it. Holders hand theirs over smallest first, as many as the
+     * The target is the holder with most of it, then the least loaded.
+     * Holders hand theirs over smallest first, as many as the
      * target can take: all of them onto one if the operator is light, onto
      * one fewer worker if only part fits, the rest left for a later round. A
      * holder takes part only if:
@@ -400,8 +375,6 @@ class StateAwareScheduler : public BatchScheduler
      *    downstream included, so those still run there: the recent peak,
      *    not the current load, has to fit;
      *  - neither it nor the target is short of executors in this round;
-     *  - the operator's neighbours are no more active on it than on the
-     *    target, so no more chained calls cross workers than before;
      *  - it takes part in no other merge this round.
      * Operators go least spread first. Call after setClusterWorkerStats,
      * with the round's plans.
@@ -446,8 +419,8 @@ class StateAwareScheduler : public BatchScheduler
     // it starts soonest, and a worker keeps a chained request only while a
     // run slot is free.
     static constexpr int kFluxDisablePacking = 4;
-    // Targets are chosen by room alone: neither DAG neighbours nor where the
-    // operator already runs count.
+    // Targets are chosen by room alone: where the operator already is or
+    // runs counts nothing.
     static constexpr int kFluxDisableAffinity = 8;
     // A request is sized by its own executor time: what it sets off
     // downstream counts nothing.
@@ -455,6 +428,12 @@ class StateAwareScheduler : public BatchScheduler
     // A worker's capacity is its configured slots (flux_worker_slots), not
     // what its cores were measured to carry (capacitySlotsFlux).
     static constexpr int kFluxDisableDynamicCapacity = 32;
+    // Nothing is kept together: on top of kFluxDisablePacking, which it
+    // implies, an operator's units of state start spread over the hosts
+    // (unit i on the i-th, as flux_static_placement 1 does) instead of all on
+    // its home, and the planner advises no merges, which would bring them
+    // back together. A congested worker still splits state off.
+    static constexpr int kFluxDisableColocation = 64;
 
     void setFluxDisable(int value) { fluxDisable = value; }
 
@@ -476,6 +455,9 @@ class StateAwareScheduler : public BatchScheduler
         int off = fluxDisable.load(std::memory_order_relaxed);
         if (fluxStaticPlacement.load(std::memory_order_relaxed) != 0) {
             off |= kFluxDisableStateMigration | kFluxDisableMerge;
+        }
+        if ((off & kFluxDisableColocation) != 0) {
+            off |= kFluxDisablePacking | kFluxDisableMerge;
         }
         return (off & mechanisms) != 0;
     }
@@ -587,22 +569,19 @@ class StateAwareScheduler : public BatchScheduler
      * that of the stateless requests downstream of it, which run where it
      * runs (FluxClusterSnapshot::downstreamWorkUs).
      *
-     * Among places with room, the one where the operator's DAG neighbours
-     * run comes first -- so the fewest chained calls cross workers -- then
-     * the one where the operator itself runs, then the one with most room.
+     * Among places with room, the one with most of the operator already
+     * comes first, then one with warm executors for it, then the one with
+     * most room.
      *
-     * A worker keeps its own chained requests -- the caller runs here, so
-     * here is where its neighbour is -- while a run slot is free or it still
+     * A worker keeps its own chained requests while a run slot is free or it still
      * gets through them, and all else it has, before its next round. Past
      * that, if the planner has advised it where to send work, they go to an
-     * advised worker: the one where most of the operator's neighbours run,
-     * then the one this operator already goes to this round, then one
-     * already running it, then the one with the most quota left.
+     * advised worker: the one this operator already goes to this round,
+     * then one already running it, then the one with the most quota left.
      *
      * The planner sends each input to the first host with room for it before
-     * the next stats round: the one where most of its neighbours run, then
-     * one already running it, most of it first, then the one with the most
-     * room. If none has room, the least loaded host.
+     * the next stats round: the one with most of the operator there, then
+     * one with warm executors for it, then the one with the most room. If none has room, the least loaded host.
      */
     std::string scheduleStatelessMessageFlux(
       std::string& userFunc,

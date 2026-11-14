@@ -3156,27 +3156,24 @@ void Scheduler::rebalanceFlux()
     };
     std::map<std::string, FluxShipment> shipments;
     // The advised worker to send `workUs` of operator `userFunc` to, among
-    // those with that much quota left: the one where most of its DAG
-    // neighbours are active, so the fewest of its chained calls cross
-    // workers; then one this round already sends the operator to, then one
-    // already running it, then the most quota. An operator thus fills one
+    // those with that much quota left: one this round already sends the
+    // operator to, then one already running it, then the most quota. An operator thus fills one
     // target before it spills onto the next.
     bool affinity = !decentralScheduler.fluxDisabled(
       StateAwareScheduler::kFluxDisableAffinity);
     auto pickTarget = [&](const std::string& userFunc,
                           double workUs) -> std::string {
         std::string best;
-        std::tuple<int, bool, bool, double> bestKey{ 0, false, false, 0 };
+        std::tuple<bool, bool, double> bestKey{ false, false, 0 };
         for (const auto& [ip, us] : quota) {
             if (us <= 0 || us < workUs) {
                 continue;
             }
             auto shipmentIt = shipments.find(ip);
-            // Ablated affinity looks at neither neighbours nor where the
-            // operator already runs.
-            std::tuple<int, bool, bool, double> key{
-                affinity ? snapshot->neighboursOn(ip, userFunc) : 0,
-                shipmentIt != shipments.end() &&
+            // Ablated affinity looks at neither where the operator already
+            // goes this round nor where it already runs.
+            std::tuple<bool, bool, double> key{
+                affinity && shipmentIt != shipments.end() &&
                   shipmentIt->second.operators.contains(userFunc),
                 affinity && snapshot->runs(ip, userFunc),
                 us
