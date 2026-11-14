@@ -1675,12 +1675,13 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     // since: the planner's own share as it now stands.
     //
     // The input goes to the first host with room for it: the one where most
-    // of its DAG neighbours run, then one already running the operator, with
-    // most of it there, then the one with the most room. An operator thus
+    // of its DAG neighbours run, then the one with most of the operator
+    // there, then one with warm executors for it, then the one with the most
+    // room. An operator thus
     // fills one host before it spills onto the next. Only if no host has room
     // does it go to the least loaded one.
     const std::string* chosen = nullptr;
-    std::tuple<int, bool, int, double> chosenKey{ 0, false, 0, 0 };
+    std::tuple<int, int, bool, double> chosenKey{ 0, 0, false, 0 };
     const std::string* leastLoaded = nullptr;
     double leastLoad = std::numeric_limits<double>::infinity();
     std::lock_guard<std::mutex> lock(fluxAssignedMx);
@@ -1721,11 +1722,15 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                 routedHere = it->second;
             }
         }
-        std::tuple<int, bool, int, double> key{ 0, false, 0, 0 };
+        // Neighbours, then how much of the operator is there already -- what
+        // this round routed there included, which the snapshot does not show
+        // yet -- then warm executors, then room: the order the workers place
+        // by too.
+        std::tuple<int, int, bool, double> key{ 0, 0, false, 0 };
         if (affinity) {
             key = { snapshot->neighboursOn(ip, userFunc),
-                    snapshot->runs(ip, userFunc),
                     snapshot->presenceOf(ip, userFunc) + routedHere,
+                    snapshot->runs(ip, userFunc),
                     capacityUs - demandUs };
         }
         if (chosen == nullptr || key > chosenKey) {
