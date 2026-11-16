@@ -113,7 +113,14 @@ class Planner
     bool resetParameter(
       const faabric::planner::ResetStreamParameterRequest& req);
 
-    void rescheduleApp(int rescheduleMode, int hostNum = 0);
+    // `trigger` says who asked: "external" (the HTTP endpoint), or the
+    // planner itself on "qos" / "degradation" (FaaSFlow, schedule mode 3),
+    // then with the latency that set it off and what it was held against.
+    void rescheduleApp(int rescheduleMode,
+                       int hostNum = 0,
+                       const std::string& trigger = "external",
+                       double triggerLatencyMs = 0,
+                       double triggerReferenceMs = 0);
 
     void setPersistentState(const faabric::planner::MapMessage& mapMsg);
 
@@ -223,6 +230,54 @@ class Planner
     // Record duration and old/new worker counts for each migration version.
     std::map<int, MigrationRecord> migrationDurations;
 
+    // What the workers reported for the last state-info sync, summed over
+    // them (doDistributeStatesInfo). Guarded by plannerMx.
+    struct SyncCost
+    {
+        int workers = 0;
+        int64_t workerPauseUsSum = 0;
+        int64_t workerPauseUsMax = 0;
+        int64_t packUsMax = 0;
+        int64_t sendUsMax = 0;
+        int64_t waitUsMax = 0;
+        int64_t stateBytes = 0;
+        int64_t sentStateBytes = 0;
+        int64_t queuedMessages = 0;
+        int64_t sentMessages = 0;
+    };
+    SyncCost lastSyncCost;
+
+    // One re-plan of the application as the planner saw it (rescheduleApp):
+    // while it runs the planner holds plannerMx, so it schedules no input.
+    struct RescheduleRecord
+    {
+        int version = 0;
+        int mode = 0;
+        std::string trigger;
+        double triggerLatencyMs = 0;
+        double triggerReferenceMs = 0;
+        int64_t startMs = 0;
+        // Waiting for plannerMx, then holding it: planning, the workers'
+        // hand-over, re-routing what the planner had queued.
+        int64_t lockWaitMs = 0;
+        int64_t planMs = 0;
+        int64_t distributeMs = 0;
+        int64_t requeueMs = 0;
+        int64_t pauseMs = 0;
+        int inFlightInputs = 0;
+        int plannerRequeued = 0;
+        int operators = 0;
+        // Operators running on a different set of workers than before, and
+        // the share of all operator weight now on a worker that did not have
+        // it.
+        int operatorsMoved = 0;
+        double weightMoved = 0;
+        int oldHosts = 0;
+        int newHosts = 0;
+        SyncCost workers;
+    };
+    std::vector<RescheduleRecord> rescheduleRecords;
+
     // std::atomic<unsigned int> atomicChainedCounter{ 1 };
 
     // Snapshot registry to distribute snapshots in THREADS requests
@@ -264,6 +319,26 @@ class Planner
     // Periodic reschedule interval
     long periodicRescheduleIntervalMs = 10000; // ms
     long lastPeriodicRescheduleMs = 0;
+
+    // FaaSFlow (schedule mode 3) partition iterations started by the planner
+    // itself, as the paper has it: "each partition iteration is activated
+    // when the workflow experiences significant performance degradation or
+    // QoS violation". Checked once per stats round on the mean end-to-end
+    // latency of the last faasFlowLatencyWindowSec seconds:
+    //  - QoS violation: above faasFlowQosMs (0 = no target);
+    //  - degradation: more than faasFlowDegradePct percent above the best
+    //    the current partition has delivered (0 = off).
+    // Never sooner than faasFlowCooldownMs after the previous iteration,
+    // which is also the time its feedback metrics have to build up. Both
+    // thresholds 0 (the default) leaves re-partitioning to the endpoint.
+    std::atomic<int> faasFlowQosMs = 0;
+    std::atomic<int> faasFlowDegradePct = 0;
+    std::atomic<int> faasFlowCooldownMs = 10000;
+    std::atomic<int> faasFlowLatencyWindowSec = 3;
+    // When the last re-plan finished, and the best window latency since.
+    std::atomic<int64_t> lastRescheduleEndMs = 0;
+    std::atomic<double> faasFlowReferenceLatencyUs = 0;
+    void evaluateFaaSFlowRepartition();
 
     // Input-rate change detection
     double stableInputRate = 0.0;       // baseline rate at last reschedule
@@ -334,7 +409,8 @@ class Planner
 
     void doDistributeCustomInfo(std::shared_ptr<faabric::CustomRequest> msg);
 
-    void doRescheduleMessages();
+    // Returns how many queued messages it routed again.
+    int doRescheduleMessages();
 
     void updateRuntimeStats();
 

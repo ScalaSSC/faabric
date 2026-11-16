@@ -201,12 +201,13 @@ void FunctionCallClient::executeFunctionsBatch(
 // Decentralized Scheduler Information Sync
 // -----------------------------------
 
-void FunctionCallClient::syncStateInfo(
+faabric::planner::SyncStatesInfoResponse FunctionCallClient::syncStateInfo(
   std::shared_ptr<faabric::planner::SyncStatesInfoRequest> req)
 {
     faabric::planner::SyncStatesInfoResponse resp;
     syncSend(
       faabric::scheduler::FunctionCalls::SyncStatesInfo, req.get(), &resp);
+    return resp;
 }
 
 void FunctionCallClient::migrateStates(

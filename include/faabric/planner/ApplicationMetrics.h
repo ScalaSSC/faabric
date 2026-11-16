@@ -243,6 +243,24 @@ class ApplicationMetrics
         }
     }
 
+    // Mean end-to-end latency (us) of the inputs that finished in the last
+    // `windowSec` whole seconds, and how many there were.
+    std::pair<double, long> getWindowLatencyUs(int windowSec) const
+    {
+        faabric::util::SharedLock lock(opMx);
+        int64_t nowSec = faabric::util::getGlobalClock().epochSeconds();
+        int64_t sumMicros = 0;
+        long count = 0;
+        for (auto it = latencyBySecond.lower_bound(nowSec - windowSec);
+             it != latencyBySecond.end() && it->first < nowSec;
+             ++it) {
+            sumMicros += it->second.sumMicros;
+            count += it->second.count;
+        }
+        return { count > 0 ? static_cast<double>(sumMicros) / count : 0.0,
+                 count };
+    }
+
     std::map<std::string, long> getWorkloads()
     {
         faabric::util::FullLock lock(opMx);
@@ -1678,6 +1696,142 @@ class ApplicationMetrics
           "queueNum / queueTime / num_dest_workers / total_chained_count",
           workerMetricDetailsObj,
           alloc);
+
+        // How unevenly the workers are loaded: each worker's requests and
+        // how long they waited in its queues (worker enqueue to dispatch),
+        // over the whole run, and the spread between workers. A worker that
+        // got nothing counts as a worker with no wait.
+        {
+            struct WorkerQueueTotals
+            {
+                int64_t dispatched = 0;
+                int64_t processed = 0;
+                double waitUsSum = 0;
+                double waitUsMaxSecond = 0;
+                double queueNumSum = 0;
+                int64_t queueNumCount = 0;
+                int seconds = 0;
+            };
+            std::map<std::string, WorkerQueueTotals> totals;
+            for (const auto& [ip, workerNode] : clusterWorkerMetrics) {
+                auto& t = totals[ip];
+                std::map<time_t, std::pair<double, int64_t>> bySecond;
+                for (const auto& [instanceName, timeSeries] :
+                     workerNode.instances) {
+                    for (const auto& [second, rec] : timeSeries.history) {
+                        t.processed += rec.throughput;
+                        if (rec.workerQueueTime.count > 0) {
+                            double waitUs =
+                              static_cast<double>(rec.workerQueueTime.average) *
+                              rec.workerQueueTime.count;
+                            t.waitUsSum += waitUs;
+                            t.dispatched += rec.workerQueueTime.count;
+                            bySecond[second].first += waitUs;
+                            bySecond[second].second +=
+                              rec.workerQueueTime.count;
+                        }
+                        if (rec.workerQueueNum.count > 0) {
+                            t.queueNumSum +=
+                              static_cast<double>(rec.workerQueueNum.average) *
+                              rec.workerQueueNum.count;
+                            t.queueNumCount += rec.workerQueueNum.count;
+                        }
+                    }
+                }
+                t.seconds = static_cast<int>(bySecond.size());
+                for (const auto& [second, sums] : bySecond) {
+                    t.waitUsMaxSecond =
+                      std::max(t.waitUsMaxSecond, sums.first / sums.second);
+                }
+            }
+
+            rapidjson::Value summary(rapidjson::kObjectType);
+            int64_t clusterDispatched = 0;
+            int64_t clusterProcessed = 0;
+            double clusterWaitUs = 0;
+            std::vector<double> workerMeansMs;
+            int64_t maxProcessed = 0;
+            for (const auto& [ip, t] : totals) {
+                double meanMs =
+                  t.dispatched > 0 ? t.waitUsSum / t.dispatched / 1000.0 : 0.0;
+                workerMeansMs.push_back(meanMs);
+                clusterDispatched += t.dispatched;
+                clusterProcessed += t.processed;
+                clusterWaitUs += t.waitUsSum;
+                maxProcessed = std::max(maxProcessed, t.processed);
+
+                rapidjson::Value o(rapidjson::kObjectType);
+                o.AddMember("processed", t.processed, alloc);
+                o.AddMember("queue_wait_ms_mean", meanMs, alloc);
+                o.AddMember("queue_wait_ms_max_second",
+                            t.waitUsMaxSecond / 1000.0,
+                            alloc);
+                o.AddMember("queue_len_mean",
+                            t.queueNumCount > 0
+                              ? t.queueNumSum / t.queueNumCount
+                              : 0.0,
+                            alloc);
+                o.AddMember("seconds", t.seconds, alloc);
+                summary.AddMember(
+                  rapidjson::Value(ip.c_str(), alloc).Move(), o, alloc);
+            }
+            for (auto& member : summary.GetObject()) {
+                int64_t processed = member.value["processed"].GetInt64();
+                member.value.AddMember("processed_share",
+                                       clusterProcessed > 0
+                                         ? static_cast<double>(processed) /
+                                             clusterProcessed
+                                         : 0.0,
+                                       alloc);
+            }
+
+            rapidjson::Value cluster(rapidjson::kObjectType);
+            double n = static_cast<double>(workerMeansMs.size());
+            double meanOfWorkers = 0;
+            double maxWorker = 0;
+            double minWorker = 0;
+            double stddev = 0;
+            if (!workerMeansMs.empty()) {
+                for (double v : workerMeansMs) {
+                    meanOfWorkers += v;
+                }
+                meanOfWorkers /= n;
+                maxWorker =
+                  *std::max_element(workerMeansMs.begin(), workerMeansMs.end());
+                minWorker =
+                  *std::min_element(workerMeansMs.begin(), workerMeansMs.end());
+                for (double v : workerMeansMs) {
+                    stddev += (v - meanOfWorkers) * (v - meanOfWorkers);
+                }
+                stddev = std::sqrt(stddev / n);
+            }
+            cluster.AddMember(
+              "workers", static_cast<int>(workerMeansMs.size()), alloc);
+            cluster.AddMember("queue_wait_ms_mean",
+                              clusterDispatched > 0
+                                ? clusterWaitUs / clusterDispatched / 1000.0
+                                : 0.0,
+                              alloc);
+            cluster.AddMember("worker_wait_ms_max", maxWorker, alloc);
+            cluster.AddMember("worker_wait_ms_min", minWorker, alloc);
+            cluster.AddMember("worker_wait_ms_mean", meanOfWorkers, alloc);
+            cluster.AddMember("worker_wait_ms_stddev", stddev, alloc);
+            cluster.AddMember("worker_wait_cv",
+                              meanOfWorkers > 0 ? stddev / meanOfWorkers : 0.0,
+                              alloc);
+            cluster.AddMember("worker_wait_max_over_mean",
+                              meanOfWorkers > 0 ? maxWorker / meanOfWorkers
+                                                : 0.0,
+                              alloc);
+            cluster.AddMember("processed_share_max",
+                              clusterProcessed > 0
+                                ? static_cast<double>(maxProcessed) /
+                                    clusterProcessed
+                                : 0.0,
+                              alloc);
+            summary.AddMember("cluster", cluster, alloc);
+            doc.AddMember("workerQueueSummary", summary, alloc);
+        }
 
         addFluxMigrationMetrics(doc);
         addFluxOverheadMetrics(doc);

@@ -143,7 +143,22 @@ class Scheduler
 
     void updateHosts(const std::vector<std::string>& hosts);
 
-    void updateStatesInfo(
+    // What one re-plan cost this worker. The pause runs from the moment
+    // dispatching stops to the moment it resumes; state and messages count
+    // everything packed, the sent ones only what left for another worker.
+    struct StateUpdateCost
+    {
+        int64_t pauseUs = 0;
+        int64_t packUs = 0;
+        int64_t sendUs = 0;
+        int64_t waitUs = 0;
+        int64_t stateBytes = 0;
+        int64_t sentStateBytes = 0;
+        int queuedMessages = 0;
+        int sentMessages = 0;
+    };
+
+    StateUpdateCost updateStatesInfo(
       const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
         scheduledOperatorMap,
       const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&

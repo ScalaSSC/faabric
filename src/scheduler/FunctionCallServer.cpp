@@ -162,14 +162,24 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
         transSourceMap[ip] = std::move(hosts);
     }
 
-    scheduler.updateStatesInfo(scheuduledOperatorMap,
-                               tempStatesInfoMap,
-                               migrationVersion,
-                               isInitialization,
-                               transDestinationMap,
-                               transSourceMap);
+    auto cost = scheduler.updateStatesInfo(scheuduledOperatorMap,
+                                           tempStatesInfoMap,
+                                           migrationVersion,
+                                           isInitialization,
+                                           transDestinationMap,
+                                           transSourceMap);
 
-    return std::make_unique<planner::SyncStatesInfoResponse>();
+    auto response = std::make_unique<planner::SyncStatesInfoResponse>();
+    response->set_success(true);
+    response->set_pauseus(cost.pauseUs);
+    response->set_packus(cost.packUs);
+    response->set_sendus(cost.sendUs);
+    response->set_waitus(cost.waitUs);
+    response->set_statebytes(cost.stateBytes);
+    response->set_sentstatebytes(cost.sentStateBytes);
+    response->set_queuedmessages(cost.queuedMessages);
+    response->set_sentmessages(cost.sentMessages);
+    return response;
 }
 
 std::unique_ptr<google::protobuf::Message>

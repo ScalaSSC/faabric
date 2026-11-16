@@ -2460,7 +2460,7 @@ void Scheduler::updateActiveHosts(
     }
 }
 
-void Scheduler::updateStatesInfo(
+Scheduler::StateUpdateCost Scheduler::updateStatesInfo(
   const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
     scheduledOperatorMap,
   const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
@@ -2472,6 +2472,9 @@ void Scheduler::updateStatesInfo(
 {
     SPDLOG_DEBUG("State Update: Starting state update for migration version {}",
                 migrationVersion);
+    StateUpdateCost cost;
+    auto& clock = faabric::util::getGlobalClock();
+    int64_t pauseStartUs = clock.epochMicros();
     isUpdateState.store(true, std::memory_order_release);
     faabric::util::FullLock stateLock(stateUpdateMx);
     SPDLOG_DEBUG("State Update: Acquired stateUpdateMx lock");
@@ -2499,7 +2502,8 @@ void Scheduler::updateStatesInfo(
         chainedWake.notify();
         SPDLOG_DEBUG(
           "State Update: initialization complete, no migration needed");
-        return;
+        cost.pauseUs = clock.epochMicros() - pauseStartUs;
+        return cost;
     }
 
     currentMigrationVersion = migrationVersion;
@@ -2510,13 +2514,35 @@ void Scheduler::updateStatesInfo(
 
     SPDLOG_DEBUG("State Update: Migration data start");
 
+    int64_t packStartUs = clock.epochMicros();
     auto migrationStatesMap = packState(statesInfo);
     auto migrationMessagesMap = packMessage();
+    for (const auto& [destHost, funcData] : migrationStatesMap) {
+        for (const auto& [funcPar, bytes] : funcData) {
+            cost.stateBytes += static_cast<int64_t>(bytes.size());
+            if (destHost != thisHost) {
+                cost.sentStateBytes += static_cast<int64_t>(bytes.size());
+            }
+        }
+    }
+    for (const auto& [destHost, batchPtr] : migrationMessagesMap) {
+        if (!batchPtr) {
+            continue;
+        }
+        cost.queuedMessages += batchPtr->messages_size();
+        if (destHost != thisHost) {
+            cost.sentMessages += batchPtr->messages_size();
+        }
+    }
+    int64_t sendStartUs = clock.epochMicros();
+    cost.packUs = sendStartUs - packStartUs;
 
     transferData(migrationVersion,
                  migrationStatesMap,
                  std::move(migrationMessagesMap),
                  migrationDestinations);
+    int64_t waitStartUs = clock.epochMicros();
+    cost.sendUs = waitStartUs - sendStartUs;
 
     SPDLOG_DEBUG("State Update: Migration hurdle");
 
@@ -2538,6 +2564,8 @@ void Scheduler::updateStatesInfo(
           });
     }
 
+    cost.waitUs = clock.epochMicros() - waitStartUs;
+
     createLocalState(statesInfo);
 
     faabric::util::FullLock migrateStateLock(migratedStateMapMx);
@@ -2551,6 +2579,7 @@ void Scheduler::updateStatesInfo(
     // Dispatching was paused for the update: resume it.
     markAllDispatchPending();
     chainedWake.notify();
+    cost.pauseUs = clock.epochMicros() - pauseStartUs;
 
     while (!migratedMsgs.empty()) {
         auto msgBatch = migratedMsgs.dequeue();
@@ -2558,6 +2587,21 @@ void Scheduler::updateStatesInfo(
     }
 
     receivedMigrationSources.erase(migrationVersion);
+
+    SPDLOG_INFO("State update {} paused {} for {} ms: pack {} / send {} / "
+                "wait {} us, {} state bytes ({} sent), {} queued requests "
+                "({} sent)",
+                migrationVersion,
+                thisHost,
+                cost.pauseUs / 1000,
+                cost.packUs,
+                cost.sendUs,
+                cost.waitUs,
+                cost.stateBytes,
+                cost.sentStateBytes,
+                cost.queuedMessages,
+                cost.sentMessages);
+    return cost;
 }
 
 void Scheduler::calculateMaxReplicas(

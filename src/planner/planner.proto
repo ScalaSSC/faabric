@@ -189,6 +189,16 @@ message SyncStatesInfoRequest {
 
 message SyncStatesInfoResponse {
     bool success = 1;
+    // What the update cost this worker: how long it dispatched nothing, and
+    // what it packed and sent on.
+    int64 pauseUs = 2;
+    int64 packUs = 3;
+    int64 sendUs = 4;
+    int64 waitUs = 5;
+    int64 stateBytes = 6;
+    int64 sentStateBytes = 7;
+    int32 queuedMessages = 8;
+    int32 sentMessages = 9;
 }
 
 message RemoveHostRequest {

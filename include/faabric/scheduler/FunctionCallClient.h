@@ -65,7 +65,7 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
     void executeFunctionsBatch(
       std::list<std::unique_ptr<faabric::Message>>&& reqs);
 
-    void syncStateInfo(
+    faabric::planner::SyncStatesInfoResponse syncStateInfo(
       std::shared_ptr<faabric::planner::SyncStatesInfoRequest> info);
 
     void migrateStates(std::shared_ptr<faabric::StateMigrationRequest> req);

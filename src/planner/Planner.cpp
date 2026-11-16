@@ -190,6 +190,9 @@ void Planner::flushExecutors()
 
     migrationVersion = 0;
     migrationDurations.clear();
+    rescheduleRecords.clear();
+    lastSyncCost = {};
+    lastRescheduleEndMs = 0;
 
     auto availableHosts = getAvailableHosts(true);
     for (const auto& host : availableHosts) {
@@ -843,6 +846,10 @@ bool Planner::registerApp(faabric::planner::RegisterApplicationRequest& rawReq,
     stateAwareScheduler->scheduleApp(state.activeHosts);
     int curVersion = migrationVersion++;
     doDistributeStatesInfo(curVersion, {}, true);
+    // The first partition counts as an iteration: the next one waits out its
+    // cooldown and is judged against what this one delivers.
+    lastRescheduleEndMs = faabric::util::getGlobalClock().epochMillis();
+    faasFlowReferenceLatencyUs = 0;
 
     return true;
 }
@@ -1000,13 +1007,31 @@ void Planner::doDistributeStatesInfo(
     req->set_is_initialize(initialize);
 
     SPDLOG_INFO("Planner begin sending states");
+    SyncCost syncCost;
+    std::mutex syncCostMx;
     std::vector<std::thread> threads;
     for (const auto& [ip, host] : state.hostMap) {
         threads.emplace_back([&, ip]() {
             try {
                 SPDLOG_DEBUG("Planner sync state info to host {}", ip);
-                faabric::scheduler::getFunctionCallClient(ip)->syncStateInfo(
-                  req);
+                auto resp =
+                  faabric::scheduler::getFunctionCallClient(ip)->syncStateInfo(
+                    req);
+                std::lock_guard<std::mutex> costLock(syncCostMx);
+                syncCost.workers++;
+                syncCost.workerPauseUsSum += resp.pauseus();
+                syncCost.workerPauseUsMax =
+                  std::max<int64_t>(syncCost.workerPauseUsMax, resp.pauseus());
+                syncCost.packUsMax =
+                  std::max<int64_t>(syncCost.packUsMax, resp.packus());
+                syncCost.sendUsMax =
+                  std::max<int64_t>(syncCost.sendUsMax, resp.sendus());
+                syncCost.waitUsMax =
+                  std::max<int64_t>(syncCost.waitUsMax, resp.waitus());
+                syncCost.stateBytes += resp.statebytes();
+                syncCost.sentStateBytes += resp.sentstatebytes();
+                syncCost.queuedMessages += resp.queuedmessages();
+                syncCost.sentMessages += resp.sentmessages();
             } catch (const std::exception& e) {
                 SPDLOG_ERROR(
                   "Failed to sync state info to host {}: {}", ip, e.what());
@@ -1035,11 +1060,12 @@ void Planner::doDistributeStatesInfo(
     migrationDurations[curVersion] = { migrationDuration,
                                        (int)oldHostSet.size(),
                                        (int)newHostSet.size() };
+    lastSyncCost = syncCost;
 
     SPDLOG_INFO("Planner distributes state info finished");
 }
 
-void Planner::doRescheduleMessages()
+int Planner::doRescheduleMessages()
 {
     SPDLOG_DEBUG("Planner starts reschedule messages");
 
@@ -1056,8 +1082,9 @@ void Planner::doRescheduleMessages()
 
     if (messages.empty()) {
         SPDLOG_DEBUG("No messages to reschedule.");
-        return;
+        return 0;
     }
+    int rescheduled = static_cast<int>(messages.size());
 
     // Recalculate scheduling decisions using the updated batch scheduler host
     // map.
@@ -1067,6 +1094,7 @@ void Planner::doRescheduleMessages()
     // Re-enqueue the messages: this sets a new planner pop time and assigns
     // them to the new hosts.
     doEnqueueSchedMessages(newHosts, std::move(messages));
+    return rescheduled;
 }
 
 bool Planner::resetParameter(
@@ -1110,6 +1138,10 @@ bool Planner::resetParameter(
         "nl_min_fit_samples",
         "clast_placement",
         "faasflow_adaptive_hosts",
+        "faasflow_qos_ms",
+        "faasflow_degrade_pct",
+        "faasflow_repartition_cooldown",
+        "faasflow_latency_window",
         "stable_warmup_sec",
     };
 
@@ -1210,6 +1242,22 @@ bool Planner::resetParameter(
             }
             SPDLOG_INFO("Planner CLAST placement for schedule modes 3/4: {}",
                         isClastPlacement ? "ON" : "OFF");
+        } else if (key == "faasflow_qos_ms") {
+            faasFlowQosMs = std::max(0, static_cast<int>(value));
+            SPDLOG_INFO("Planner FaaSFlow QoS target: {} ms",
+                        faasFlowQosMs.load());
+        } else if (key == "faasflow_degrade_pct") {
+            faasFlowDegradePct = std::max(0, static_cast<int>(value));
+            SPDLOG_INFO("Planner FaaSFlow degradation threshold: {}%",
+                        faasFlowDegradePct.load());
+        } else if (key == "faasflow_repartition_cooldown") {
+            faasFlowCooldownMs = std::max(0, static_cast<int>(value));
+            SPDLOG_INFO("Planner FaaSFlow re-partition cooldown: {} ms",
+                        faasFlowCooldownMs.load());
+        } else if (key == "faasflow_latency_window") {
+            faasFlowLatencyWindowSec = std::max(1, static_cast<int>(value));
+            SPDLOG_INFO("Planner FaaSFlow latency window: {} s",
+                        faasFlowLatencyWindowSec.load());
         } else if (key == "faasflow_adaptive_hosts") {
             // Mode 3: 0 re-partitions over every worker, as FaaSFlow does.
             if (stateAwareScheduler) {
@@ -1317,14 +1365,94 @@ bool Planner::resetParameter(
     return true;
 }
 
-void Planner::rescheduleApp(int rescheduleMode, int hostNum)
+void Planner::evaluateFaaSFlowRepartition()
+{
+    int qosMs = faasFlowQosMs.load();
+    int degradePct = faasFlowDegradePct.load();
+    if (scheduleMode != 3 || (qosMs <= 0 && degradePct <= 0) ||
+        !stateAwareScheduler || !state.applicationMetrics || isOutputting ||
+        isWarmup.load()) {
+        return;
+    }
+
+    // Judge only seconds that lie wholly after the last re-plan: the ones
+    // before it measured the old partition, or the pause itself.
+    int64_t nowMs = faabric::util::getGlobalClock().epochMillis();
+    int windowSec = faasFlowLatencyWindowSec.load();
+    int64_t sinceMs = nowMs - lastRescheduleEndMs.load();
+    if (sinceMs < static_cast<int64_t>(windowSec + 1) * 1000) {
+        return;
+    }
+    auto [latencyUs, finished] =
+      state.applicationMetrics->getWindowLatencyUs(windowSec);
+    if (finished <= 0) {
+        return;
+    }
+
+    // What the current partition has shown it can do: its best window.
+    double referenceUs = faasFlowReferenceLatencyUs.load();
+    if (referenceUs <= 0 || latencyUs < referenceUs) {
+        referenceUs = latencyUs;
+        faasFlowReferenceLatencyUs = referenceUs;
+    }
+    if (sinceMs < faasFlowCooldownMs.load()) {
+        return;
+    }
+
+    std::string trigger;
+    double referenceMs = 0;
+    if (qosMs > 0 && latencyUs > qosMs * 1000.0) {
+        trigger = "qos";
+        referenceMs = qosMs;
+    } else if (degradePct > 0 &&
+               latencyUs > referenceUs * (1.0 + degradePct / 100.0)) {
+        trigger = "degradation";
+        referenceMs = referenceUs / 1000.0;
+    }
+    if (trigger.empty()) {
+        return;
+    }
+
+    // Over every registered worker: a re-plan narrows the active set to the
+    // workers it used, and the next one must be free to spread again.
+    int hostNum = 0;
+    {
+        faabric::util::SharedLock lock(plannerMx);
+        hostNum = static_cast<int>(state.hostMap.size());
+    }
+    SPDLOG_INFO("Planner starts a FaaSFlow partition iteration on {}: "
+                "latency {:.1f} ms over the last {} s against {:.1f} ms",
+                trigger,
+                latencyUs / 1000.0,
+                windowSec,
+                referenceMs);
+    rescheduleApp(0, hostNum, trigger, latencyUs / 1000.0, referenceMs);
+}
+
+void Planner::rescheduleApp(int rescheduleMode,
+                            int hostNum,
+                            const std::string& trigger,
+                            double triggerLatencyMs,
+                            double triggerReferenceMs)
 {
     SPDLOG_INFO("Planner reschedules application");
-    lastPeriodicRescheduleMs = faabric::util::getGlobalClock().epochMillis();
+    auto& clock = faabric::util::getGlobalClock();
+    lastPeriodicRescheduleMs = clock.epochMillis();
     // rescheduleMode == 0 means reschedule immediately.
     // rescheduleMode == 1 means wait until all running messages are finished.
 
+    RescheduleRecord record;
+    record.mode = rescheduleMode;
+    record.trigger = trigger;
+    record.triggerLatencyMs = triggerLatencyMs;
+    record.triggerReferenceMs = triggerReferenceMs;
+    record.startMs = lastPeriodicRescheduleMs;
+    record.inFlightInputs = getInFlightAppsSize();
+
     faabric::util::FullLock lock(plannerMx);
+    // From here on the planner schedules nothing.
+    int64_t lockedMs = clock.epochMillis();
+    record.lockWaitMs = lockedMs - record.startMs;
 
     // ModeFlux always runs on the whole cluster; see registerApp.
     if (scheduleMode == batch_scheduler::ModeFlux) {
@@ -1352,6 +1480,8 @@ void Planner::rescheduleApp(int rescheduleMode, int hostNum)
     auto edgeWeightMap = state.applicationMetrics->getEdgeWeightMap();
 
     auto preOperatorsMap = stateAwareScheduler->getScheduledOperatorsMap();
+    // The drain above (mode 1) is waiting, not planning.
+    int64_t planStartMs = clock.epochMillis();
     // Update the processed tuples.
     stateAwareScheduler->updateApp(operatorWorkloadMap, edgeWeightMap);
     stateAwareScheduler->rescheduleApp(state.activeHosts,
@@ -1384,8 +1514,75 @@ void Planner::rescheduleApp(int rescheduleMode, int hostNum)
     // stateAwareScheduler->updateReqDist();
     int curVersion = migrationVersion++;
     bool initialize = (rescheduleMode == 1) ? true : false;
+    int64_t distributeStartMs = clock.epochMillis();
     doDistributeStatesInfo(curVersion, preOperatorsMap, initialize);
-    doRescheduleMessages();
+    int64_t requeueStartMs = clock.epochMillis();
+    record.plannerRequeued = doRescheduleMessages();
+    int64_t doneMs = clock.epochMillis();
+
+    record.version = curVersion;
+    record.planMs = distributeStartMs - planStartMs;
+    record.distributeMs = requeueStartMs - distributeStartMs;
+    record.requeueMs = doneMs - requeueStartMs;
+    record.pauseMs = doneMs - lockedMs;
+    record.workers = lastSyncCost;
+
+    // How much of the placement changed: operators on a different set of
+    // workers, and the weight now on a worker that did not carry it.
+    {
+        auto newOperatorsMap = stateAwareScheduler->getScheduledOperatorsMap();
+        std::set<std::string> oldHostSet, newHostSet;
+        double totalWeight = 0;
+        double movedWeight = 0;
+        for (const auto& [func, op] : newOperatorsMap) {
+            record.operators++;
+            auto preIt = preOperatorsMap.find(func);
+            bool sameHosts = preIt != preOperatorsMap.end() &&
+                             preIt->second.weightDist.size() ==
+                               op.weightDist.size();
+            for (const auto& [host, weight] : op.weightDist) {
+                newHostSet.insert(host);
+                double before = 0;
+                if (preIt != preOperatorsMap.end()) {
+                    auto hostIt = preIt->second.weightDist.find(host);
+                    if (hostIt != preIt->second.weightDist.end()) {
+                        before = hostIt->second;
+                    } else {
+                        sameHosts = false;
+                    }
+                }
+                totalWeight += weight;
+                movedWeight += std::max(0.0, weight - before);
+            }
+            if (!sameHosts) {
+                record.operatorsMoved++;
+            }
+        }
+        for (const auto& [func, op] : preOperatorsMap) {
+            for (const auto& [host, weight] : op.weightDist) {
+                oldHostSet.insert(host);
+            }
+        }
+        record.weightMoved = totalWeight > 0 ? movedWeight / totalWeight : 0;
+        record.oldHosts = static_cast<int>(oldHostSet.size());
+        record.newHosts = static_cast<int>(newHostSet.size());
+    }
+    rescheduleRecords.push_back(record);
+    // The new partition starts with a clean record of what it can do.
+    lastRescheduleEndMs = doneMs;
+    faasFlowReferenceLatencyUs = 0;
+    SPDLOG_INFO("Planner reschedule {} paused scheduling for {} ms: plan {} / "
+                "workers {} / requeue {} ms, {} of {} operators moved, "
+                "{} state bytes and {} requests sent between workers",
+                curVersion,
+                record.pauseMs,
+                record.planMs,
+                record.distributeMs,
+                record.requeueMs,
+                record.operatorsMoved,
+                record.operators,
+                record.workers.sentStateBytes,
+                record.workers.sentMessages);
 
     // If reschedule mode is pre-warm, clear the statistics
     if (rescheduleMode == 1) {
@@ -1472,6 +1669,151 @@ std::string Planner::outputResult()
     doc.AddMember("workerStats", workerStatsObj, alloc);
     doc.AddMember("maxReplicaInfo", maxReplicaObj, alloc);
     doc.AddMember("migrationDurations", migrationDurationsObj, alloc);
+
+    // Every re-plan of the application (rescheduleApp), and what they came
+    // to over the run. The planner schedules nothing for pause_ms; each
+    // worker dispatches nothing for its own pause.
+    {
+        rapidjson::Value history(rapidjson::kArrayType);
+        int64_t pauseSumMs = 0;
+        int64_t pauseMaxMs = 0;
+        int64_t planSumMs = 0;
+        int64_t distributeSumMs = 0;
+        int64_t requeueSumMs = 0;
+        int64_t workerPauseSumUs = 0;
+        int64_t workerPauseMaxUs = 0;
+        int64_t workerReports = 0;
+        int64_t stateBytes = 0;
+        int64_t sentStateBytes = 0;
+        int64_t queuedMessages = 0;
+        int64_t sentMessages = 0;
+        int64_t plannerRequeued = 0;
+        int64_t operatorsMoved = 0;
+        double weightMoved = 0;
+        int unchanged = 0;
+        int counted = 0;
+        int byQos = 0;
+        int byDegradation = 0;
+        int byEndpoint = 0;
+        int64_t firstStartMs = 0;
+        int64_t lastStartMs = 0;
+        for (const auto& r : rescheduleRecords) {
+            rapidjson::Value o(rapidjson::kObjectType);
+            o.AddMember("version", r.version, alloc);
+            o.AddMember("mode", r.mode, alloc);
+            o.AddMember(
+              "trigger", rapidjson::Value(r.trigger.c_str(), alloc).Move(), alloc);
+            o.AddMember("trigger_latency_ms", r.triggerLatencyMs, alloc);
+            o.AddMember("trigger_reference_ms", r.triggerReferenceMs, alloc);
+            o.AddMember("start_ms", r.startMs, alloc);
+            o.AddMember("lock_wait_ms", r.lockWaitMs, alloc);
+            o.AddMember("pause_ms", r.pauseMs, alloc);
+            o.AddMember("plan_ms", r.planMs, alloc);
+            o.AddMember("distribute_ms", r.distributeMs, alloc);
+            o.AddMember("requeue_ms", r.requeueMs, alloc);
+            o.AddMember("inflight_inputs", r.inFlightInputs, alloc);
+            o.AddMember("planner_requeued", r.plannerRequeued, alloc);
+            o.AddMember("operators", r.operators, alloc);
+            o.AddMember("operators_moved", r.operatorsMoved, alloc);
+            o.AddMember("weight_moved", r.weightMoved, alloc);
+            o.AddMember("old_hosts", r.oldHosts, alloc);
+            o.AddMember("new_hosts", r.newHosts, alloc);
+            o.AddMember("workers_reported", r.workers.workers, alloc);
+            o.AddMember("worker_pause_ms_mean",
+                        r.workers.workers > 0
+                          ? r.workers.workerPauseUsSum / 1000.0 /
+                              r.workers.workers
+                          : 0.0,
+                        alloc);
+            o.AddMember(
+              "worker_pause_ms_max", r.workers.workerPauseUsMax / 1000.0, alloc);
+            o.AddMember(
+              "worker_pack_ms_max", r.workers.packUsMax / 1000.0, alloc);
+            o.AddMember(
+              "worker_send_ms_max", r.workers.sendUsMax / 1000.0, alloc);
+            o.AddMember(
+              "worker_wait_ms_max", r.workers.waitUsMax / 1000.0, alloc);
+            o.AddMember("state_bytes", r.workers.stateBytes, alloc);
+            o.AddMember("sent_state_bytes", r.workers.sentStateBytes, alloc);
+            o.AddMember("queued_requests", r.workers.queuedMessages, alloc);
+            o.AddMember("sent_requests", r.workers.sentMessages, alloc);
+            history.PushBack(o, alloc);
+
+            // The summary leaves out drains (mode 1): they wait for the
+            // cluster to empty, which is no cost of re-planning.
+            if (r.mode != 0) {
+                continue;
+            }
+            if (counted == 0) {
+                firstStartMs = r.startMs;
+            }
+            lastStartMs = r.startMs;
+            counted++;
+            if (r.trigger == "qos") {
+                byQos++;
+            } else if (r.trigger == "degradation") {
+                byDegradation++;
+            } else {
+                byEndpoint++;
+            }
+            pauseSumMs += r.pauseMs;
+            pauseMaxMs = std::max(pauseMaxMs, r.pauseMs);
+            planSumMs += r.planMs;
+            distributeSumMs += r.distributeMs;
+            requeueSumMs += r.requeueMs;
+            workerPauseSumUs += r.workers.workerPauseUsSum;
+            workerPauseMaxUs =
+              std::max(workerPauseMaxUs, r.workers.workerPauseUsMax);
+            workerReports += r.workers.workers;
+            stateBytes += r.workers.stateBytes;
+            sentStateBytes += r.workers.sentStateBytes;
+            queuedMessages += r.workers.queuedMessages;
+            sentMessages += r.workers.sentMessages;
+            plannerRequeued += r.plannerRequeued;
+            operatorsMoved += r.operatorsMoved;
+            weightMoved += r.weightMoved;
+            if (r.operatorsMoved == 0 && r.weightMoved < 1e-9) {
+                unchanged++;
+            }
+        }
+        doc.AddMember("rescheduleHistory", history, alloc);
+
+        rapidjson::Value summary(rapidjson::kObjectType);
+        double n = counted > 0 ? static_cast<double>(counted) : 1.0;
+        double periodMs = counted > 1
+                            ? static_cast<double>(lastStartMs - firstStartMs) /
+                                (counted - 1)
+                            : 0.0;
+        summary.AddMember("reschedules", counted, alloc);
+        summary.AddMember("triggered_by_qos", byQos, alloc);
+        summary.AddMember("triggered_by_degradation", byDegradation, alloc);
+        summary.AddMember("triggered_by_endpoint", byEndpoint, alloc);
+        summary.AddMember("unchanged_placements", unchanged, alloc);
+        summary.AddMember("period_ms_mean", periodMs, alloc);
+        summary.AddMember("pause_ms_mean", pauseSumMs / n, alloc);
+        summary.AddMember("pause_ms_max", pauseMaxMs, alloc);
+        summary.AddMember("pause_ms_total", pauseSumMs, alloc);
+        summary.AddMember(
+          "pause_share", periodMs > 0 ? pauseSumMs / n / periodMs : 0.0, alloc);
+        summary.AddMember("plan_ms_mean", planSumMs / n, alloc);
+        summary.AddMember("distribute_ms_mean", distributeSumMs / n, alloc);
+        summary.AddMember("requeue_ms_mean", requeueSumMs / n, alloc);
+        summary.AddMember("worker_pause_ms_mean",
+                          workerReports > 0
+                            ? workerPauseSumUs / 1000.0 / workerReports
+                            : 0.0,
+                          alloc);
+        summary.AddMember(
+          "worker_pause_ms_max", workerPauseMaxUs / 1000.0, alloc);
+        summary.AddMember("operators_moved_mean", operatorsMoved / n, alloc);
+        summary.AddMember("weight_moved_mean", weightMoved / n, alloc);
+        summary.AddMember("state_bytes_mean", stateBytes / n, alloc);
+        summary.AddMember("sent_state_bytes_mean", sentStateBytes / n, alloc);
+        summary.AddMember("queued_requests_mean", queuedMessages / n, alloc);
+        summary.AddMember("sent_requests_mean", sentMessages / n, alloc);
+        summary.AddMember("planner_requeued_mean", plannerRequeued / n, alloc);
+        doc.AddMember("rescheduleSummary", summary, alloc);
+    }
     // doc.AddMember("allWorkerMetrics", allWorkerMetricsObj, alloc);
 
     isOutputting = false;
@@ -1669,6 +2011,10 @@ void Planner::updateRuntimeStats()
             }
             state.applicationMetrics->recordQueueSnapshot(qSize, qAgeMicros);
         }
+
+        // FaaSFlow: a partition iteration of the planner's own, if the
+        // workflow has degraded or violates its QoS. No lock is held here.
+        evaluateFaaSFlowRepartition();
     }
 }
 
