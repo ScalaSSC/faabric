@@ -277,6 +277,9 @@ class Planner
         SyncCost workers;
     };
     std::vector<RescheduleRecord> rescheduleRecords;
+    // Re-plans that came out with the placement they started from: nothing
+    // migrated, so they are no migration cost and get no record.
+    int unchangedReschedules = 0;
 
     // std::atomic<unsigned int> atomicChainedCounter{ 1 };
 

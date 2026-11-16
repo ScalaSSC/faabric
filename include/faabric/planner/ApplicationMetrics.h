@@ -240,19 +240,28 @@ class ApplicationMetrics
             auto& secondAccum = latencyBySecond[secondKey];
             secondAccum.sumMicros += tempTotalLatencyMicro;
             secondAccum.count++;
+
+            // The same by the second the planner took the input in, which is
+            // what a look at "the last few seconds" has to go by: results
+            // can reach the planner seconds after the input ended, and the
+            // seconds above are then still filling up.
+            auto& recordAccum = latencyByRecordSecond
+              [faabric::util::getGlobalClock().epochMicros() / 1000000];
+            recordAccum.sumMicros += tempTotalLatencyMicro;
+            recordAccum.count++;
         }
     }
 
-    // Mean end-to-end latency (us) of the inputs that finished in the last
-    // `windowSec` whole seconds, and how many there were.
+    // Mean end-to-end latency (us) of the inputs the planner took in during
+    // the last `windowSec` whole seconds, and how many there were.
     std::pair<double, long> getWindowLatencyUs(int windowSec) const
     {
         faabric::util::SharedLock lock(opMx);
         int64_t nowSec = faabric::util::getGlobalClock().epochSeconds();
         int64_t sumMicros = 0;
         long count = 0;
-        for (auto it = latencyBySecond.lower_bound(nowSec - windowSec);
-             it != latencyBySecond.end() && it->first < nowSec;
+        for (auto it = latencyByRecordSecond.lower_bound(nowSec - windowSec);
+             it != latencyByRecordSecond.end() && it->first < nowSec;
              ++it) {
             sumMicros += it->second.sumMicros;
             count += it->second.count;
@@ -2756,6 +2765,7 @@ class ApplicationMetrics
         arrivalForwardedStableLatencies = {};
         arrivalDirectStableLatencies = {};
         latencyBySecond.clear();
+        latencyByRecordSecond.clear();
         fluxControlPlaneRounds.clear();
         plannerRouting.clear();
         plannerResults.reset();
@@ -2863,6 +2873,8 @@ class ApplicationMetrics
         long count = 0;
     };
     std::map<int64_t, LatencySecondAccum> latencyBySecond;
+    // Keyed by the second the input was recorded in; see record().
+    std::map<int64_t, LatencySecondAccum> latencyByRecordSecond;
 
     // Nearest-rank percentile over an ascending-sorted vector: with 600
     // samples p50 is the 300th, p95 the 570th and p99 the 594th. Matches the

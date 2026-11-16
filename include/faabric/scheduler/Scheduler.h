@@ -704,6 +704,22 @@ class Scheduler
     // the executor is running.
     std::shared_mutex stateUpdateMx;
 
+    // FaaSFlow (schedule mode 3) deploys a new partition red-black, as its
+    // paper does (Section 4.2.2): the up-to-date sub-graphs take over all
+    // triggering at once, while what the out-of-date ones have running or
+    // queued finishes where it is. Nothing stops, and no request or state
+    // moves between workers. These two guard what is swapped under running
+    // work: the routing tables against the chained-call router, the replica
+    // budgets against the dispatchers.
+    std::shared_mutex routeSwapMx;
+    std::shared_mutex maxReplicasMx;
+    StateUpdateCost deployRedBlack(
+      const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
+        scheduledOperatorMap,
+      const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+        statesInfo,
+      int migrationVersion);
+
     // scheduledMsgsMapMx is used for scheduledMsgsMap which are the chained
     // call messages to be dispatched.
     std::shared_mutex scheduledMsgsMapMx;

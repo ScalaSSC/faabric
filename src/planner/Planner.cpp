@@ -191,6 +191,7 @@ void Planner::flushExecutors()
     migrationVersion = 0;
     migrationDurations.clear();
     rescheduleRecords.clear();
+    unchangedReschedules = 0;
     lastSyncCost = {};
     lastRescheduleEndMs = 0;
 
@@ -1567,10 +1568,22 @@ void Planner::rescheduleApp(int rescheduleMode,
         record.oldHosts = static_cast<int>(oldHostSet.size());
         record.newHosts = static_cast<int>(newHostSet.size());
     }
-    rescheduleRecords.push_back(record);
     // The new partition starts with a clean record of what it can do.
     lastRescheduleEndMs = doneMs;
     faasFlowReferenceLatencyUs = 0;
+    if (record.operatorsMoved == 0 && record.weightMoved < 1e-9) {
+        // Same placement as before: nothing migrated, nothing to count.
+        unchangedReschedules++;
+        SPDLOG_INFO("Planner reschedule {} ({}) left the placement as it "
+                    "was; not counted as a migration",
+                    curVersion,
+                    trigger);
+        if (rescheduleMode == 1) {
+            state.applicationMetrics->reset();
+        }
+        return;
+    }
+    rescheduleRecords.push_back(record);
     SPDLOG_INFO("Planner reschedule {} paused scheduling for {} ms: plan {} / "
                 "workers {} / requeue {} ms, {} of {} operators moved, "
                 "{} state bytes and {} requests sent between workers",
@@ -1690,7 +1703,6 @@ std::string Planner::outputResult()
         int64_t plannerRequeued = 0;
         int64_t operatorsMoved = 0;
         double weightMoved = 0;
-        int unchanged = 0;
         int counted = 0;
         int byQos = 0;
         int byDegradation = 0;
@@ -1772,9 +1784,6 @@ std::string Planner::outputResult()
             plannerRequeued += r.plannerRequeued;
             operatorsMoved += r.operatorsMoved;
             weightMoved += r.weightMoved;
-            if (r.operatorsMoved == 0 && r.weightMoved < 1e-9) {
-                unchanged++;
-            }
         }
         doc.AddMember("rescheduleHistory", history, alloc);
 
@@ -1788,7 +1797,8 @@ std::string Planner::outputResult()
         summary.AddMember("triggered_by_qos", byQos, alloc);
         summary.AddMember("triggered_by_degradation", byDegradation, alloc);
         summary.AddMember("triggered_by_endpoint", byEndpoint, alloc);
-        summary.AddMember("unchanged_placements", unchanged, alloc);
+        // Left out of everything else here.
+        summary.AddMember("unchanged_placements", unchangedReschedules, alloc);
         summary.AddMember("period_ms_mean", periodMs, alloc);
         summary.AddMember("pause_ms_mean", pauseSumMs / n, alloc);
         summary.AddMember("pause_ms_max", pauseMaxMs, alloc);

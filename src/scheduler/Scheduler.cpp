@@ -1468,6 +1468,31 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
           node->type != faabric::batch_scheduler::NodeType::STATELESS;
     }
 
+    // FaaSFlow deploys red-black, worker by worker: a request routed by a
+    // worker already on the new partition can get here before this one has
+    // heard of it, or after the operator left. It runs here all the same, so
+    // a stateful operator needs its state object, empty if it never had one.
+    if (scheduleMode == faabric::batch_scheduler::ModeFaaSFlowAdaptive) {
+        auto node = decentralScheduler.lookupNode(user + "_" + func);
+        if (node != nullptr &&
+            node->type != faabric::batch_scheduler::NodeType::STATELESS) {
+            auto& stateServer = faabric::state::getGlobalState();
+            int parIdx = std::stoi(par);
+            if (!stateServer.hasFS(user, func, parIdx)) {
+                // The update creates state under mx too; look again there.
+                faabric::util::FullLock lock(mx);
+                if (!stateServer.hasFS(user, func, parIdx)) {
+                    stateServer.createFS(
+                      user,
+                      func,
+                      parIdx,
+                      node->type == faabric::batch_scheduler::NodeType::
+                                      PARTITIONED_STATEFUL);
+                }
+            }
+        }
+    }
+
     // Out of time with requests left: hand the queue back so the others get
     // a turn, and pick it up again straight after.
     bool outOfTime = false;
@@ -1912,10 +1937,13 @@ void Scheduler::dispatchChainedMsgs()
             // Schedule the chained calls
             // auto start = faabric::util::getCpuTimeNano();
             // Routing only, in CPU time: what the scheduling decisions cost.
+            // Against a red-black swap of the tables (deployRedBlack).
+            faabric::util::SharedLock routeLock(routeSwapMx);
             auto routable = routableHosts();
             int64_t routingStartNs = faabric::util::getCpuTimeNano();
             auto hosts = decentralScheduler.scheduleMessagesBatch(
               routable, localChainedCallMsgs);
+            routeLock.unlock();
             int64_t routingEndNs = faabric::util::getCpuTimeNano();
             if (routingStartNs >= 0 && routingEndNs >= routingStartNs) {
                 fluxOverhead.routingCpuNs.fetch_add(
@@ -2143,11 +2171,13 @@ bool Scheduler::executorAvailable(const std::string& funcStr)
         return true;
     }
 
-    int maxReplicas;
-    try {
-        maxReplicas = util::getOrThrow(maxReplicasMap, funcStr);
-    } catch (const std::runtime_error& e) {
-        maxReplicas = 1;
+    int maxReplicas = 1;
+    {
+        faabric::util::SharedLock replicasLock(maxReplicasMx);
+        auto replicasIt = maxReplicasMap.find(funcStr);
+        if (replicasIt != maxReplicasMap.end()) {
+            maxReplicas = replicasIt->second;
+        }
     }
 
     if (currentExecutorsSize < maxReplicas) {
@@ -2472,6 +2502,11 @@ Scheduler::StateUpdateCost Scheduler::updateStatesInfo(
 {
     SPDLOG_DEBUG("State Update: Starting state update for migration version {}",
                 migrationVersion);
+    if (!isInitialization &&
+        scheduleMode == faabric::batch_scheduler::ModeFaaSFlowAdaptive) {
+        return deployRedBlack(
+          scheduledOperatorMap, statesInfo, migrationVersion);
+    }
     StateUpdateCost cost;
     auto& clock = faabric::util::getGlobalClock();
     int64_t pauseStartUs = clock.epochMicros();
@@ -2601,6 +2636,79 @@ Scheduler::StateUpdateCost Scheduler::updateStatesInfo(
                 cost.sentStateBytes,
                 cost.queuedMessages,
                 cost.sentMessages);
+    return cost;
+}
+
+Scheduler::StateUpdateCost Scheduler::deployRedBlack(
+  const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
+    scheduledOperatorMap,
+  const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
+    statesInfo,
+  int migrationVersion)
+{
+    StateUpdateCost cost;
+    auto& clock = faabric::util::getGlobalClock();
+    int64_t startUs = clock.epochMicros();
+
+    // What is left behind for the out-of-date sub-graphs to finish here.
+    int leftQueued = 0;
+    {
+        faabric::util::SharedLock queuesLock(waitingQueuesMx);
+        for (const auto& [userFuncPar, queue] : waitingQueues) {
+            leftQueued += queue->getMessagesCount();
+        }
+    }
+
+    {
+        // isUpdateState stays off and stateUpdateMx is not taken: nothing
+        // waits for running batches, dispatching goes on throughout.
+        faabric::util::FullLock lock(mx);
+        faabric::util::FullLock rflock(reconfigMx);
+        faabric::util::FullLock routeLock(routeSwapMx);
+        {
+            // An operator that has left this worker keeps its budget: its
+            // executors serve what is still queued for it, then sit idle
+            // until the reaper recycles them.
+            faabric::util::FullLock replicasLock(maxReplicasMx);
+            auto outOfDate = maxReplicasMap;
+            calculateMaxReplicas(scheduledOperatorMap);
+            for (const auto& [funcStr, replicas] : outOfDate) {
+                maxReplicasMap.try_emplace(funcStr, replicas);
+            }
+        }
+        updateActiveHosts(scheduledOperatorMap);
+        decentralScheduler.resetScheduler();
+        decentralScheduler.setScheuduledOperatorMap(scheduledOperatorMap);
+        decentralScheduler.syncStatesInfo(statesInfo);
+
+        // State is not part of FaaSFlow's sub-graphs and nothing ships it.
+        // What is here stays for the requests still addressed to it; a
+        // stateful operator arriving here starts from empty state.
+        auto& stateServer = faabric::state::getGlobalState();
+        for (const auto& [stateKey, stateInfo] : statesInfo) {
+            auto [user, func] = faabric::util::splitUserFunc(stateKey);
+            bool isPartitionable =
+              stateInfo.partitionBy != "" && stateInfo.partitionBy != "None";
+            for (const auto& [id, ip] : stateInfo.stateHost) {
+                if (ip == thisHost && !stateServer.hasFS(user, func, id)) {
+                    stateServer.createFS(user, func, id, isPartitionable);
+                }
+            }
+        }
+        currentMigrationVersion = migrationVersion;
+    }
+    markAllDispatchPending();
+    chainedWake.notify();
+
+    // The swap is all there is: no pack, no send, no wait.
+    cost.pauseUs = clock.epochMicros() - startUs;
+    cost.queuedMessages = leftQueued;
+    SPDLOG_INFO("Red-black deployment {} on {}: tables swapped in {} us, {} "
+                "queued requests left to the out-of-date sub-graphs",
+                migrationVersion,
+                thisHost,
+                cost.pauseUs,
+                leftQueued);
     return cost;
 }
 
@@ -4459,6 +4567,7 @@ void Scheduler::flushState()
 
 std::map<std::string, int> Scheduler::getMaxReplicasMap()
 {
+    faabric::util::SharedLock replicasLock(maxReplicasMx);
     return maxReplicasMap;
 }
 
