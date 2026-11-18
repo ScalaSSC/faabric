@@ -47,6 +47,7 @@ State::redirectState(
     // state migration map : MAP <IP, <UserFuncPar, serialized states>>
     std::map<std::string, std::map<std::string, std::vector<uint8_t>>>
       migrationStateMap;
+    faabric::util::SharedLock lock(fsmapMutex);
     for (const auto& [preFuncName, state] : fsMap) {
         std::string userFunc = state->getUserFunc();
         if (!statesInfo.contains(userFunc)) {
@@ -54,6 +55,9 @@ State::redirectState(
             throw std::runtime_error("Function not found in states info");
         }
         const auto& info = statesInfo.at(userFunc);
+        // Where each part of it goes, by the new partition: a partitioned
+        // state is split by the new hash ring, any other moves whole to the
+        // instance of its own index.
         std::map<int, std::vector<uint8_t>> migratedState;
         if (state->getIsPartitioned()) {
             if (!hashRings.contains(userFunc)) {
@@ -61,15 +65,29 @@ State::redirectState(
                 throw std::runtime_error("Hash ring not found for function");
             }
             HashRingPtr hashRing = hashRings.at(userFunc);
-            auto migratedState = state->redirectLocalParState(hashRing);
+            migratedState = state->redirectLocalParState(hashRing);
         } else {
-            auto migratedState = state->redirectLocalState();
+            migratedState = state->redirectLocalState();
         }
-        for (const auto& [parIdx, serializedState] : migratedState) {
-            std::string ip = info.stateHost.at(parIdx);
+        for (auto& [parIdx, serializedState] : migratedState) {
+            if (serializedState.empty()) {
+                continue;
+            }
+            auto hostIt = info.stateHost.find(parIdx);
+            if (hostIt == info.stateHost.end()) {
+                // The new partition has fewer instances of an operator whose
+                // instances do not share keys: this one has nowhere to go.
+                SPDLOG_ERROR("State {}_{} ({} bytes) has no instance in the "
+                             "new partition of {} instances and is dropped",
+                             userFunc,
+                             parIdx,
+                             serializedState.size(),
+                             info.parallelism);
+                continue;
+            }
             std::string userFuncPar = userFunc + "_" + std::to_string(parIdx);
-            migrationStateMap[ip].emplace(userFuncPar,
-                                          std::move(serializedState));
+            migrationStateMap[hostIt->second].emplace(
+              userFuncPar, std::move(serializedState));
         }
     }
 
@@ -93,10 +111,13 @@ void State::loadMigrateState(
     faabric::util::FullLock lock(fsmapMutex);
 
     for (const auto& [userFuncPar, serializedState] : migrateStates) {
+        // Thrown out of here it would leave this worker paused for good.
         if (!fsMap.contains(userFuncPar)) {
-            SPDLOG_ERROR("Function state {} not found for migration",
-                         userFuncPar);
-            throw std::runtime_error("Function state not found for migration");
+            SPDLOG_ERROR("Function state {} not found for migration; {} bytes "
+                         "dropped",
+                         userFuncPar,
+                         serializedState.size());
+            continue;
         }
         fsMap.at(userFuncPar)->addMigrateState(serializedState);
     }

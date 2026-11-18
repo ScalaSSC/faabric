@@ -119,6 +119,20 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
 
     PARSE_MSG(planner::SyncStatesInfoRequest, buffer.data(), buffer.size())
 
+    // Rounds 1 and 3 of a re-plan carry no tables (see the request).
+    int phase = parsedMsg.phase();
+    if (phase == 1 || phase == 3) {
+        auto cost = phase == 1
+                      ? scheduler.pauseForReplan(parsedMsg.migrationversion())
+                      : scheduler.resumeAfterReplan(
+                          parsedMsg.migrationversion());
+        auto response = std::make_unique<planner::SyncStatesInfoResponse>();
+        response->set_success(true);
+        response->set_drainus(cost.drainUs);
+        response->set_pauseus(cost.pauseUs);
+        return response;
+    }
+
     auto scheuduledOperatorMap =
       faabric::util::parseScheduledOperatorMap(parsedMsg);
 
@@ -167,7 +181,8 @@ FunctionCallServer::recvSyncStatesInfo(std::span<const uint8_t> buffer)
                                            migrationVersion,
                                            isInitialization,
                                            transDestinationMap,
-                                           transSourceMap);
+                                           transSourceMap,
+                                           phase != 2);
 
     auto response = std::make_unique<planner::SyncStatesInfoResponse>();
     response->set_success(true);

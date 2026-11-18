@@ -185,6 +185,15 @@ message SyncStatesInfoRequest {
     bool is_initialize = 4;
     map<string, HostList> transDestinationMap = 5;
     map<string, HostList> transSourceMap = 6;
+    // A re-plan goes to every worker in three rounds, each one finished on
+    // every worker before the next starts, so that no worker runs on new
+    // tables while another still routes by old ones:
+    //  1 pause: stop executing and routing, wait out running batches;
+    //  2 migrate: take the new tables, ship and take in state and queued
+    //    requests, stay paused;
+    //  3 resume: execute again.
+    // 0 does it all in one call (initialisation).
+    int32 phase = 7;
 }
 
 message SyncStatesInfoResponse {
@@ -199,6 +208,8 @@ message SyncStatesInfoResponse {
     int64 sentStateBytes = 7;
     int32 queuedMessages = 8;
     int32 sentMessages = 9;
+    // Phase 1: how long it waited for the batches already running.
+    int64 drainUs = 10;
 }
 
 message RemoveHostRequest {

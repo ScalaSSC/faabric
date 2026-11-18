@@ -319,8 +319,13 @@ void FunctionState::writePartitionStateUnlocks(std::vector<uint8_t>& states)
 std::map<int, std::vector<uint8_t>> FunctionState::redirectLocalState()
 {
     faabric::util::FullLock lock(funcStateMutex);
+    // Its own instance, whatever the index: instances do not share state.
+    if (sharedMemory == nullptr || stateSize == 0) {
+        return { { parallelismId, {} } };
+    }
     auto bytePtr = BYTES(sharedMemory);
-    return { { 0, std::vector<uint8_t>(bytePtr, bytePtr + stateSize) } };
+    return { { parallelismId,
+               std::vector<uint8_t>(bytePtr, bytePtr + stateSize) } };
 }
 
 std::map<int, std::vector<uint8_t>> FunctionState::redirectLocalParState(

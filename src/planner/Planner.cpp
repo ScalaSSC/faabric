@@ -27,6 +27,7 @@
 #include <rapidjson/prettywriter.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1010,49 +1011,132 @@ void Planner::doDistributeStatesInfo(
     SPDLOG_INFO("Planner begin sending states");
     SyncCost syncCost;
     std::mutex syncCostMx;
-    std::vector<std::thread> threads;
-    for (const auto& [ip, host] : state.hostMap) {
-        threads.emplace_back([&, ip]() {
-            try {
-                SPDLOG_DEBUG("Planner sync state info to host {}", ip);
-                auto resp =
-                  faabric::scheduler::getFunctionCallClient(ip)->syncStateInfo(
-                    req);
-                int64_t ackUs = faabric::util::getGlobalClock().epochMicros();
-                std::lock_guard<std::mutex> costLock(syncCostMx);
-                syncCost.lastAckUs = std::max(syncCost.lastAckUs, ackUs);
-                syncCost.workers++;
-                syncCost.workerPauseUsSum += resp.pauseus();
-                syncCost.workerPauseUsMax =
-                  std::max<int64_t>(syncCost.workerPauseUsMax, resp.pauseus());
-                syncCost.packUsMax =
-                  std::max<int64_t>(syncCost.packUsMax, resp.packus());
-                syncCost.sendUsMax =
-                  std::max<int64_t>(syncCost.sendUsMax, resp.sendus());
-                syncCost.waitUsMax =
-                  std::max<int64_t>(syncCost.waitUsMax, resp.waitus());
-                syncCost.stateBytes += resp.statebytes();
-                syncCost.sentStateBytes += resp.sentstatebytes();
-                syncCost.queuedMessages += resp.queuedmessages();
-                syncCost.sentMessages += resp.sentmessages();
-            } catch (const std::exception& e) {
-                // An exception leaving this thread would terminate the
-                // planner: skip the worker and say so instead.
-                SPDLOG_ERROR(
-                  "Failed to sync state info to host {}: {}", ip, e.what());
-                std::lock_guard<std::mutex> costLock(syncCostMx);
-                syncCost.failedWorkers++;
-            } catch (...) {
-                SPDLOG_ERROR("Failed to sync state info to host {}", ip);
-                std::lock_guard<std::mutex> costLock(syncCostMx);
-                syncCost.failedWorkers++;
-            }
+    auto& clock = faabric::util::getGlobalClock();
+    // One round: the request to every worker at once, back when all have
+    // answered. Returns how many did not.
+    auto broadcast =
+      [&](const std::shared_ptr<faabric::planner::SyncStatesInfoRequest>&
+            roundReq,
+          const std::function<void(
+            const faabric::planner::SyncStatesInfoResponse&)>& onReply) {
+          int failed = 0;
+          std::vector<std::thread> threads;
+          for (const auto& [ip, host] : state.hostMap) {
+              threads.emplace_back([&, ip]() {
+                  try {
+                      SPDLOG_DEBUG("Planner sync state info to host {}", ip);
+                      auto resp = faabric::scheduler::getFunctionCallClient(ip)
+                                    ->syncStateInfo(roundReq);
+                      int64_t ackUs = clock.epochMicros();
+                      std::lock_guard<std::mutex> costLock(syncCostMx);
+                      syncCost.lastAckUs = std::max(syncCost.lastAckUs, ackUs);
+                      onReply(resp);
+                  } catch (const std::exception& e) {
+                      // An exception leaving this thread would terminate the
+                      // planner: skip the worker and say so instead.
+                      SPDLOG_ERROR("Failed to sync state info (phase {}) to "
+                                   "host {}: {}",
+                                   roundReq->phase(),
+                                   ip,
+                                   e.what());
+                      std::lock_guard<std::mutex> costLock(syncCostMx);
+                      failed++;
+                  } catch (...) {
+                      SPDLOG_ERROR("Failed to sync state info (phase {}) to "
+                                   "host {}",
+                                   roundReq->phase(),
+                                   ip);
+                      std::lock_guard<std::mutex> costLock(syncCostMx);
+                      failed++;
+                  }
+              });
+          }
+          for (auto& t : threads) {
+              if (t.joinable()) {
+                  t.join();
+              }
+          }
+          return failed;
+      };
+    // What a worker says once it has its tables, state and requests.
+    auto takeMigrated = [&](const faabric::planner::SyncStatesInfoResponse&
+                              resp) {
+        syncCost.workers++;
+        syncCost.packUsMax =
+          std::max<int64_t>(syncCost.packUsMax, resp.packus());
+        syncCost.sendUsMax =
+          std::max<int64_t>(syncCost.sendUsMax, resp.sendus());
+        syncCost.waitUsMax =
+          std::max<int64_t>(syncCost.waitUsMax, resp.waitus());
+        syncCost.stateBytes += resp.statebytes();
+        syncCost.sentStateBytes += resp.sentstatebytes();
+        syncCost.queuedMessages += resp.queuedmessages();
+        syncCost.sentMessages += resp.sentmessages();
+    };
+    auto takePause = [&](const faabric::planner::SyncStatesInfoResponse& resp) {
+        syncCost.workerPauseUsSum += resp.pauseus();
+        syncCost.workerPauseUsMax =
+          std::max<int64_t>(syncCost.workerPauseUsMax, resp.pauseus());
+    };
+
+    if (initialize) {
+        // Nothing runs yet: one call does it.
+        req->set_phase(0);
+        syncCost.failedWorkers =
+          broadcast(req, [&](const auto& resp) {
+              takeMigrated(resp);
+              takePause(resp);
+          });
+    } else {
+        // Three rounds with a barrier between them (see the request): every
+        // worker stops, then every worker migrates, then every worker
+        // resumes. A worker that failed a round is still asked to resume,
+        // so none is left paused.
+        auto controlReq =
+          std::make_shared<faabric::planner::SyncStatesInfoRequest>();
+        controlReq->set_migrationversion(curVersion);
+
+        int64_t pauseAtUs = clock.epochMicros();
+        controlReq->set_phase(1);
+        int pauseFailed = broadcast(controlReq, [&](const auto& resp) {
+            syncCost.drainUsMax =
+              std::max<int64_t>(syncCost.drainUsMax, resp.drainus());
         });
-    }
-    for (auto& t : threads) {
-        if (t.joinable()) {
-            t.join();
+        if (pauseFailed > 0) {
+            SPDLOG_ERROR("Planner state info version {}: {} of {} workers did "
+                         "not pause; they may still route by the old tables",
+                         curVersion,
+                         pauseFailed,
+                         hostSize);
         }
+
+        int64_t migrateAtUs = clock.epochMicros();
+        req->set_phase(2);
+        syncCost.failedWorkers = broadcast(req, takeMigrated);
+
+        int64_t resumeAtUs = clock.epochMicros();
+        auto resumeReq =
+          std::make_shared<faabric::planner::SyncStatesInfoRequest>();
+        resumeReq->set_migrationversion(curVersion);
+        resumeReq->set_phase(3);
+        int resumeFailed = broadcast(resumeReq, takePause);
+        int64_t resumedAtUs = clock.epochMicros();
+        if (resumeFailed > 0) {
+            SPDLOG_ERROR("Planner state info version {}: {} of {} workers did "
+                         "not confirm they resumed",
+                         curVersion,
+                         resumeFailed,
+                         hostSize);
+        }
+        syncCost.pausePhaseUs = migrateAtUs - pauseAtUs;
+        syncCost.migratePhaseUs = resumeAtUs - migrateAtUs;
+        syncCost.resumePhaseUs = resumedAtUs - resumeAtUs;
+        SPDLOG_INFO("Planner state info version {}: pause {} / migrate {} / "
+                    "resume {} us",
+                    curVersion,
+                    syncCost.pausePhaseUs,
+                    syncCost.migratePhaseUs,
+                    syncCost.resumePhaseUs);
     }
     if (syncCost.failedWorkers > 0) {
         SPDLOG_ERROR("Planner state info version {}: {} of {} workers did not "
@@ -1534,14 +1618,15 @@ void Planner::rescheduleApp(int rescheduleMode,
     bool initialize = (rescheduleMode == 1) ? true : false;
     int64_t distributeStartMs = clock.epochMillis();
     doDistributeStatesInfo(curVersion, preOperatorsMap, initialize);
-    // Ends at the last worker's reply. With no reply at all (every worker
-    // failed) it falls back to when the planner stopped waiting.
-    int64_t migrationEndUs =
-      lastSyncCost.lastAckUs > 0 ? lastSyncCost.lastAckUs : clock.epochMicros();
-    record.migrationMs = (migrationEndUs - planStartUs) / 1000.0;
     int64_t requeueStartMs = clock.epochMillis();
     record.plannerRequeued = doRescheduleMessages();
-    int64_t doneMs = clock.epochMillis();
+    // Migration: from starting the plan until everything runs again. A
+    // worker replies only once it has sent and taken in its state and
+    // requests and resumed executing, and the planner schedules again from
+    // here, so this is after both.
+    int64_t doneUs = clock.epochMicros();
+    int64_t doneMs = doneUs / 1000;
+    record.migrationMs = (doneUs - planStartUs) / 1000.0;
 
     record.version = curVersion;
     record.planMs = distributeStartMs - planStartMs;
@@ -1614,7 +1699,7 @@ void Planner::rescheduleApp(int rescheduleMode,
     }
     rescheduleRecords.push_back(record);
     SPDLOG_INFO("Planner reschedule {} migrated {} of {} operators ({} on "
-                "other workers) in {:.3f} ms (plan to last worker reply), "
+                "other workers) in {:.3f} ms (plan until all execute again), "
                 "paused scheduling for {} ms: plan {} / workers {} / requeue "
                 "{} ms, {} state bytes and {} requests sent between workers",
                 curVersion,
@@ -1730,6 +1815,9 @@ std::string Planner::outputResult()
         int64_t requeueSumMs = 0;
         int64_t workerPauseSumUs = 0;
         int64_t workerPauseMaxUs = 0;
+        int64_t pauseRoundSumUs = 0;
+        int64_t migrateRoundSumUs = 0;
+        int64_t resumeRoundSumUs = 0;
         int64_t workerReports = 0;
         int64_t stateBytes = 0;
         int64_t sentStateBytes = 0;
@@ -1784,6 +1872,16 @@ std::string Planner::outputResult()
               "worker_send_ms_max", r.workers.sendUsMax / 1000.0, alloc);
             o.AddMember(
               "worker_wait_ms_max", r.workers.waitUsMax / 1000.0, alloc);
+            // The re-plan's three rounds: every worker stopped, migrated,
+            // resumed; and the longest any took to stop.
+            o.AddMember(
+              "pause_round_ms", r.workers.pausePhaseUs / 1000.0, alloc);
+            o.AddMember(
+              "migrate_round_ms", r.workers.migratePhaseUs / 1000.0, alloc);
+            o.AddMember(
+              "resume_round_ms", r.workers.resumePhaseUs / 1000.0, alloc);
+            o.AddMember(
+              "worker_drain_ms_max", r.workers.drainUsMax / 1000.0, alloc);
             o.AddMember("state_bytes", r.workers.stateBytes, alloc);
             o.AddMember("sent_state_bytes", r.workers.sentStateBytes, alloc);
             o.AddMember("queued_requests", r.workers.queuedMessages, alloc);
@@ -1818,6 +1916,9 @@ std::string Planner::outputResult()
             workerPauseSumUs += r.workers.workerPauseUsSum;
             workerPauseMaxUs =
               std::max(workerPauseMaxUs, r.workers.workerPauseUsMax);
+            pauseRoundSumUs += r.workers.pausePhaseUs;
+            migrateRoundSumUs += r.workers.migratePhaseUs;
+            resumeRoundSumUs += r.workers.resumePhaseUs;
             workerReports += r.workers.workers;
             stateBytes += r.workers.stateBytes;
             sentStateBytes += r.workers.sentStateBytes;
@@ -1861,6 +1962,12 @@ std::string Planner::outputResult()
                           alloc);
         summary.AddMember(
           "worker_pause_ms_max", workerPauseMaxUs / 1000.0, alloc);
+        summary.AddMember(
+          "pause_round_ms_mean", pauseRoundSumUs / 1000.0 / n, alloc);
+        summary.AddMember(
+          "migrate_round_ms_mean", migrateRoundSumUs / 1000.0 / n, alloc);
+        summary.AddMember(
+          "resume_round_ms_mean", resumeRoundSumUs / 1000.0 / n, alloc);
         summary.AddMember("operators_moved_mean", operatorsMoved / n, alloc);
         summary.AddMember("weight_moved_mean", weightMoved / n, alloc);
         summary.AddMember("state_bytes_mean", stateBytes / n, alloc);

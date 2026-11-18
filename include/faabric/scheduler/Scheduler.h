@@ -148,6 +148,8 @@ class Scheduler
     // everything packed, the sent ones only what left for another worker.
     struct StateUpdateCost
     {
+        // Phase 1 of a re-plan: waiting out the batches already running.
+        int64_t drainUs = 0;
         int64_t pauseUs = 0;
         int64_t packUs = 0;
         int64_t sendUs = 0;
@@ -166,7 +168,16 @@ class Scheduler
       int migrationVersion,
       bool isInitialization,
       std::map<std::string, std::set<std::string>>& transDestinationMap,
-      std::map<std::string, std::set<std::string>>& transSourceMap);
+      std::map<std::string, std::set<std::string>>& transSourceMap,
+      bool resumeAfter = true);
+
+    // A re-plan in three rounds the planner runs over every worker in turn
+    // (SyncStatesInfoRequest.phase): pauseForReplan, then updateStatesInfo
+    // with resumeAfter false, then resumeAfterReplan. No worker resumes until
+    // every worker has the new tables and state, so none can still route by
+    // the old ones to a worker that has already moved on.
+    StateUpdateCost pauseForReplan(int migrationVersion);
+    StateUpdateCost resumeAfterReplan(int migrationVersion);
 
     void storeMigrateState(
       std::map<std::string, std::vector<uint8_t>>&& migrateState);
@@ -704,21 +715,11 @@ class Scheduler
     // the executor is running.
     std::shared_mutex stateUpdateMx;
 
-    // FaaSFlow (schedule mode 3) deploys a new partition red-black, as its
-    // paper does (Section 4.2.2): the up-to-date sub-graphs take over all
-    // triggering at once, while what the out-of-date ones have running or
-    // queued finishes where it is. Nothing stops, and no request or state
-    // moves between workers. These two guard what is swapped under running
-    // work: the routing tables against the chained-call router, the replica
-    // budgets against the dispatchers.
+    // A re-plan (updateStatesInfo) swaps what is read without stopping for
+    // it: the routing tables, by the chained-call router and dispatchers,
+    // and the replica budgets, by the dispatchers.
     std::shared_mutex routeSwapMx;
     std::shared_mutex maxReplicasMx;
-    StateUpdateCost deployRedBlack(
-      const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
-        scheduledOperatorMap,
-      const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
-        statesInfo,
-      int migrationVersion);
 
     // scheduledMsgsMapMx is used for scheduledMsgsMap which are the chained
     // call messages to be dispatched.
@@ -974,6 +975,9 @@ class Scheduler
     std::thread dispatchChainedMsgsThread;
 
     std::atomic<bool> isUpdateState{ false };
+    // When this worker stopped for the current re-plan (pauseForReplan; 0
+    // when not paused by one), so its pause can be told whole at the end.
+    std::atomic<int64_t> replanPauseStartUs{ 0 };
 
     InstancesRuntimeStats runtimeStats;
 

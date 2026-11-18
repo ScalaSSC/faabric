@@ -239,8 +239,16 @@ class Planner
         int failedWorkers = 0;
         // When the planner had the last worker's reply (epoch us; 0: none).
         int64_t lastAckUs = 0;
+        // Each worker's whole pause, stop to resume (round 3's reply).
         int64_t workerPauseUsSum = 0;
         int64_t workerPauseUsMax = 0;
+        // The longest a worker took to stop: its running batches finishing.
+        int64_t drainUsMax = 0;
+        // The three rounds of a re-plan as the planner saw them, each from
+        // sending to the last reply.
+        int64_t pausePhaseUs = 0;
+        int64_t migratePhaseUs = 0;
+        int64_t resumePhaseUs = 0;
         int64_t packUsMax = 0;
         int64_t sendUsMax = 0;
         int64_t waitUsMax = 0;
@@ -269,7 +277,8 @@ class Planner
         int64_t requeueMs = 0;
         int64_t pauseMs = 0;
         // The migration: from the planner starting to compute the partition
-        // to the planner having every worker's reply that it finished.
+        // until every worker has moved its state and requests and executes
+        // again (its reply) and the planner schedules again.
         double migrationMs = 0;
         int inFlightInputs = 0;
         int plannerRequeued = 0;

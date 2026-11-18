@@ -369,6 +369,22 @@ void Scheduler::reset()
         faabric::util::FullLock chainedCallMsgslock(chainedCallMsgsMx);
         chainedCallMsgs.clear();
     }
+    // Not left paused by a re-plan the planner never finished.
+    replanPauseStartUs.store(0, std::memory_order_release);
+    isUpdateState.store(false, std::memory_order_release);
+    {
+        faabric::util::FullLock migrateStateLock(migratedStateMapMx);
+        migratedStateMap.clear();
+    }
+    {
+        std::lock_guard<std::mutex> migrationLock(migrationMx);
+        receivedMigrationSources.clear();
+    }
+    {
+        std::unique_ptr<faabric::MessageBatch> leftover;
+        while (migratedMsgs.try_dequeue(leftover)) {
+        }
+    }
     {
         faabric::util::FullLock setResultMsgslock(setResultMsgsMx);
         setResultMsgs.clear();
@@ -1468,10 +1484,11 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
           node->type != faabric::batch_scheduler::NodeType::STATELESS;
     }
 
-    // FaaSFlow deploys red-black, worker by worker: a request routed by a
-    // worker already on the new partition can get here before this one has
-    // heard of it, or after the operator left. It runs here all the same, so
-    // a stateful operator needs its state object, empty if it never had one.
+    // A re-plan reaches the workers one by one: a request routed by a worker
+    // still on the old partition can reach one that has already moved on and
+    // no longer holds its state. It runs here all the same, so a stateful
+    // operator needs its state object, empty if it never had one -- which
+    // should not happen, so say so.
     if (scheduleMode == faabric::batch_scheduler::ModeFaaSFlowAdaptive) {
         auto node = decentralScheduler.lookupNode(user + "_" + func);
         if (node != nullptr &&
@@ -1482,6 +1499,13 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                 // The update creates state under mx too; look again there.
                 faabric::util::FullLock lock(mx);
                 if (!stateServer.hasFS(user, func, parIdx)) {
+                    SPDLOG_WARN("FaaSFlow: {}/{}/{} has no state on {}; a "
+                                "request routed before the re-plan starts "
+                                "it empty",
+                                user,
+                                func,
+                                parIdx,
+                                thisHost);
                     stateServer.createFS(
                       user,
                       func,
@@ -1601,7 +1625,7 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                 // when it is routed, and by rebalancing.
                 host = thisHost;
             } else {
-                // Against a red-black swap of the tables (deployRedBlack),
+                // Against a re-plan swapping the tables (updateStatesInfo),
                 // which clears the operators map before refilling it: a
                 // lookup in between throws and kills the dispatch thread.
                 faabric::util::SharedLock routeLock(routeSwapMx);
@@ -1941,7 +1965,7 @@ void Scheduler::dispatchChainedMsgs()
             // Schedule the chained calls
             // auto start = faabric::util::getCpuTimeNano();
             // Routing only, in CPU time: what the scheduling decisions cost.
-            // Against a red-black swap of the tables (deployRedBlack).
+            // Against a re-plan swapping the tables (updateStatesInfo).
             faabric::util::SharedLock routeLock(routeSwapMx);
             auto routable = routableHosts();
             int64_t routingStartNs = faabric::util::getCpuTimeNano();
@@ -2502,18 +2526,17 @@ Scheduler::StateUpdateCost Scheduler::updateStatesInfo(
   int migrationVersion,
   bool isInitialization,
   std::map<std::string, std::set<std::string>>& transDestinationMap,
-  std::map<std::string, std::set<std::string>>& transSourceMap)
+  std::map<std::string, std::set<std::string>>& transSourceMap,
+  bool resumeAfter)
 {
     SPDLOG_DEBUG("State Update: Starting state update for migration version {}",
                 migrationVersion);
-    if (!isInitialization &&
-        scheduleMode == faabric::batch_scheduler::ModeFaaSFlowAdaptive) {
-        return deployRedBlack(
-          scheduledOperatorMap, statesInfo, migrationVersion);
-    }
     StateUpdateCost cost;
     auto& clock = faabric::util::getGlobalClock();
-    int64_t pauseStartUs = clock.epochMicros();
+    // Paused already if the re-plan's first round got here; if not, from now.
+    int64_t pausedAtUs = replanPauseStartUs.load(std::memory_order_acquire);
+    int64_t pauseStartUs = pausedAtUs > 0 ? pausedAtUs : clock.epochMicros();
+    replanPauseStartUs.store(pauseStartUs, std::memory_order_release);
     isUpdateState.store(true, std::memory_order_release);
     faabric::util::FullLock stateLock(stateUpdateMx);
     SPDLOG_DEBUG("State Update: Acquired stateUpdateMx lock");
@@ -2522,19 +2545,27 @@ Scheduler::StateUpdateCost Scheduler::updateStatesInfo(
     SPDLOG_DEBUG("State Update: Acquired mx and reconfigMx locks");
     // 1. Update the local max replicas map based on the new scheduling
     // decision.
-    calculateMaxReplicas(scheduledOperatorMap);
+    {
+        faabric::util::FullLock replicasLock(maxReplicasMx);
+        calculateMaxReplicas(scheduledOperatorMap);
+    }
     // 2. Update the local scheduler and update the states info in decentralized
-    // scheduler
-    updateActiveHosts(scheduledOperatorMap);
-    decentralScheduler.resetScheduler();
-    decentralScheduler.setScheuduledOperatorMap(scheduledOperatorMap);
-    // update runtime summary and states info.
-    decentralScheduler.syncStatesInfo(statesInfo);
+    // scheduler. A router that got in before the pause still holds the
+    // tables; wait it out rather than clear them under it.
+    {
+        faabric::util::FullLock routeLock(routeSwapMx);
+        updateActiveHosts(scheduledOperatorMap);
+        decentralScheduler.resetScheduler();
+        decentralScheduler.setScheuduledOperatorMap(scheduledOperatorMap);
+        // update runtime summary and states info.
+        decentralScheduler.syncStatesInfo(statesInfo);
+    }
 
     // If it's initialization, we don't need to migrate. Just return after
     // updating the states info.
     if (isInitialization) {
         createLocalState(statesInfo);
+        replanPauseStartUs.store(0, std::memory_order_release);
         isUpdateState = false;
         // Dispatching was paused for the update: resume it.
         markAllDispatchPending();
@@ -2607,30 +2638,31 @@ Scheduler::StateUpdateCost Scheduler::updateStatesInfo(
 
     createLocalState(statesInfo);
 
-    faabric::util::FullLock migrateStateLock(migratedStateMapMx);
-    auto& stateServer = faabric::state::getGlobalState();
-    stateServer.loadMigrateState(migratedStateMap);
+    {
+        // Loaded once: what came in for this version must not be loaded
+        // again over newer state at the next one.
+        faabric::util::FullLock migrateStateLock(migratedStateMapMx);
+        auto& stateServer = faabric::state::getGlobalState();
+        stateServer.loadMigrateState(migratedStateMap);
+        migratedStateMap.clear();
+    }
 
     SPDLOG_DEBUG(
       "State Update: states reallocation complete, reschedule requests now");
 
-    isUpdateState = false;
-    // Dispatching was paused for the update: resume it.
-    markAllDispatchPending();
-    chainedWake.notify();
-    cost.pauseUs = clock.epochMicros() - pauseStartUs;
-
-    while (!migratedMsgs.empty()) {
-        auto msgBatch = migratedMsgs.dequeue();
-        enqueueMessageBatch(std::move(msgBatch));
+    if (resumeAfter) {
+        auto resumed = resumeAfterReplan(migrationVersion);
+        cost.pauseUs = resumed.pauseUs;
+    } else {
+        // The planner resumes every worker together once all are here.
+        cost.pauseUs = clock.epochMicros() - pauseStartUs;
     }
 
-    receivedMigrationSources.erase(migrationVersion);
-
-    SPDLOG_INFO("State update {} paused {} for {} ms: pack {} / send {} / "
-                "wait {} us, {} state bytes ({} sent), {} queued requests "
+    SPDLOG_INFO("State update {} {} {} after {} ms paused: pack {} / send {} "
+                "/ wait {} us, {} state bytes ({} sent), {} queued requests "
                 "({} sent)",
                 migrationVersion,
+                resumeAfter ? "resumed" : "migrated, still paused,",
                 thisHost,
                 cost.pauseUs / 1000,
                 cost.packUs,
@@ -2643,76 +2675,56 @@ Scheduler::StateUpdateCost Scheduler::updateStatesInfo(
     return cost;
 }
 
-Scheduler::StateUpdateCost Scheduler::deployRedBlack(
-  const std::map<std::string, faabric::batch_scheduler::ScheduledOperator>&
-    scheduledOperatorMap,
-  const std::map<std::string, faabric::batch_scheduler::FunctionStateInfo>&
-    statesInfo,
-  int migrationVersion)
+Scheduler::StateUpdateCost Scheduler::pauseForReplan(int migrationVersion)
 {
     StateUpdateCost cost;
     auto& clock = faabric::util::getGlobalClock();
     int64_t startUs = clock.epochMicros();
-
-    // What is left behind for the out-of-date sub-graphs to finish here.
-    int leftQueued = 0;
+    replanPauseStartUs.store(startUs, std::memory_order_release);
+    // From here no batch starts, nothing is routed, and what arrives waits
+    // in chainedCallMsgs to be routed by the new tables after the resume.
+    isUpdateState.store(true, std::memory_order_release);
+    // Wait out every batch already running: each holds stateUpdateMx shared
+    // until it has finished and checks isUpdateState again once it has it.
     {
-        faabric::util::SharedLock queuesLock(waitingQueuesMx);
-        for (const auto& [userFuncPar, queue] : waitingQueues) {
-            leftQueued += queue->getMessagesCount();
-        }
+        faabric::util::FullLock stateLock(stateUpdateMx);
     }
-
+    // And a router already past its check: it routes under routeSwapMx.
     {
-        // isUpdateState stays off and stateUpdateMx is not taken: nothing
-        // waits for running batches, dispatching goes on throughout.
-        faabric::util::FullLock lock(mx);
-        faabric::util::FullLock rflock(reconfigMx);
         faabric::util::FullLock routeLock(routeSwapMx);
-        {
-            // An operator that has left this worker keeps its budget: its
-            // executors serve what is still queued for it, then sit idle
-            // until the reaper recycles them.
-            faabric::util::FullLock replicasLock(maxReplicasMx);
-            auto outOfDate = maxReplicasMap;
-            calculateMaxReplicas(scheduledOperatorMap);
-            for (const auto& [funcStr, replicas] : outOfDate) {
-                maxReplicasMap.try_emplace(funcStr, replicas);
-            }
-        }
-        updateActiveHosts(scheduledOperatorMap);
-        decentralScheduler.resetScheduler();
-        decentralScheduler.setScheuduledOperatorMap(scheduledOperatorMap);
-        decentralScheduler.syncStatesInfo(statesInfo);
-
-        // State is not part of FaaSFlow's sub-graphs and nothing ships it.
-        // What is here stays for the requests still addressed to it; a
-        // stateful operator arriving here starts from empty state.
-        auto& stateServer = faabric::state::getGlobalState();
-        for (const auto& [stateKey, stateInfo] : statesInfo) {
-            auto [user, func] = faabric::util::splitUserFunc(stateKey);
-            bool isPartitionable =
-              stateInfo.partitionBy != "" && stateInfo.partitionBy != "None";
-            for (const auto& [id, ip] : stateInfo.stateHost) {
-                if (ip == thisHost && !stateServer.hasFS(user, func, id)) {
-                    stateServer.createFS(user, func, id, isPartitionable);
-                }
-            }
-        }
-        currentMigrationVersion = migrationVersion;
     }
-    markAllDispatchPending();
-    chainedWake.notify();
-
-    // The swap is all there is: no pack, no send, no wait.
-    cost.pauseUs = clock.epochMicros() - startUs;
-    cost.queuedMessages = leftQueued;
-    SPDLOG_INFO("Red-black deployment {} on {}: tables swapped in {} us, {} "
-                "queued requests left to the out-of-date sub-graphs",
+    cost.drainUs = clock.epochMicros() - startUs;
+    SPDLOG_INFO("State update {}: {} paused in {} us",
                 migrationVersion,
                 thisHost,
-                cost.pauseUs,
-                leftQueued);
+                cost.drainUs);
+    return cost;
+}
+
+Scheduler::StateUpdateCost Scheduler::resumeAfterReplan(int migrationVersion)
+{
+    StateUpdateCost cost;
+    auto& clock = faabric::util::getGlobalClock();
+    int64_t pausedAtUs = replanPauseStartUs.exchange(0);
+    isUpdateState.store(false, std::memory_order_release);
+    // Dispatching was paused for the update: resume it.
+    markAllDispatchPending();
+    chainedWake.notify();
+    cost.pauseUs = pausedAtUs > 0 ? clock.epochMicros() - pausedAtUs : 0;
+
+    // What the other workers handed over, routed to here by the new tables.
+    while (!migratedMsgs.empty()) {
+        auto msgBatch = migratedMsgs.dequeue();
+        enqueueMessageBatch(std::move(msgBatch));
+    }
+    {
+        std::lock_guard<std::mutex> lock(migrationMx);
+        receivedMigrationSources.erase(migrationVersion);
+    }
+    SPDLOG_INFO("State update {}: {} resumed after {} ms paused",
+                migrationVersion,
+                thisHost,
+                cost.pauseUs / 1000);
     return cost;
 }
 
