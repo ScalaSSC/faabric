@@ -1018,7 +1018,9 @@ void Planner::doDistributeStatesInfo(
                 auto resp =
                   faabric::scheduler::getFunctionCallClient(ip)->syncStateInfo(
                     req);
+                int64_t ackUs = faabric::util::getGlobalClock().epochMicros();
                 std::lock_guard<std::mutex> costLock(syncCostMx);
+                syncCost.lastAckUs = std::max(syncCost.lastAckUs, ackUs);
                 syncCost.workers++;
                 syncCost.workerPauseUsSum += resp.pauseus();
                 syncCost.workerPauseUsMax =
@@ -1034,9 +1036,16 @@ void Planner::doDistributeStatesInfo(
                 syncCost.queuedMessages += resp.queuedmessages();
                 syncCost.sentMessages += resp.sentmessages();
             } catch (const std::exception& e) {
+                // An exception leaving this thread would terminate the
+                // planner: skip the worker and say so instead.
                 SPDLOG_ERROR(
                   "Failed to sync state info to host {}: {}", ip, e.what());
-                throw e;
+                std::lock_guard<std::mutex> costLock(syncCostMx);
+                syncCost.failedWorkers++;
+            } catch (...) {
+                SPDLOG_ERROR("Failed to sync state info to host {}", ip);
+                std::lock_guard<std::mutex> costLock(syncCostMx);
+                syncCost.failedWorkers++;
             }
         });
     }
@@ -1044,6 +1053,13 @@ void Planner::doDistributeStatesInfo(
         if (t.joinable()) {
             t.join();
         }
+    }
+    if (syncCost.failedWorkers > 0) {
+        SPDLOG_ERROR("Planner state info version {}: {} of {} workers did not "
+                     "take it and keep the previous tables",
+                     curVersion,
+                     syncCost.failedWorkers,
+                     hostSize);
     }
 
     long endTime = faabric::util::getGlobalClock().epochMillis();
@@ -1482,7 +1498,8 @@ void Planner::rescheduleApp(int rescheduleMode,
 
     auto preOperatorsMap = stateAwareScheduler->getScheduledOperatorsMap();
     // The drain above (mode 1) is waiting, not planning.
-    int64_t planStartMs = clock.epochMillis();
+    int64_t planStartUs = clock.epochMicros();
+    int64_t planStartMs = planStartUs / 1000;
     // Update the processed tuples.
     stateAwareScheduler->updateApp(operatorWorkloadMap, edgeWeightMap);
     stateAwareScheduler->rescheduleApp(state.activeHosts,
@@ -1517,6 +1534,11 @@ void Planner::rescheduleApp(int rescheduleMode,
     bool initialize = (rescheduleMode == 1) ? true : false;
     int64_t distributeStartMs = clock.epochMillis();
     doDistributeStatesInfo(curVersion, preOperatorsMap, initialize);
+    // Ends at the last worker's reply. With no reply at all (every worker
+    // failed) it falls back to when the planner stopped waiting.
+    int64_t migrationEndUs =
+      lastSyncCost.lastAckUs > 0 ? lastSyncCost.lastAckUs : clock.epochMicros();
+    record.migrationMs = (migrationEndUs - planStartUs) / 1000.0;
     int64_t requeueStartMs = clock.epochMillis();
     record.plannerRequeued = doRescheduleMessages();
     int64_t doneMs = clock.epochMillis();
@@ -1571,9 +1593,16 @@ void Planner::rescheduleApp(int rescheduleMode,
     // The new partition starts with a clean record of what it can do.
     lastRescheduleEndMs = doneMs;
     faasFlowReferenceLatencyUs = 0;
-    if (record.operatorsMoved == 0 && record.weightMoved < 1e-9) {
-        // Same placement as before: nothing migrated, nothing to count.
+    record.placementChanged =
+      record.operatorsMoved > 0 || record.weightMoved >= 1e-9;
+    bool migratesAll = scheduleMode == batch_scheduler::ModeFaaSFlowAdaptive;
+    record.operatorsMigrated =
+      migratesAll ? record.operators : record.operatorsMoved;
+    if (!record.placementChanged) {
         unchangedReschedules++;
+    }
+    if (!record.placementChanged && !migratesAll) {
+        // Same placement as before: nothing migrated, nothing to count.
         SPDLOG_INFO("Planner reschedule {} ({}) left the placement as it "
                     "was; not counted as a migration",
                     curVersion,
@@ -1584,16 +1613,19 @@ void Planner::rescheduleApp(int rescheduleMode,
         return;
     }
     rescheduleRecords.push_back(record);
-    SPDLOG_INFO("Planner reschedule {} paused scheduling for {} ms: plan {} / "
-                "workers {} / requeue {} ms, {} of {} operators moved, "
-                "{} state bytes and {} requests sent between workers",
+    SPDLOG_INFO("Planner reschedule {} migrated {} of {} operators ({} on "
+                "other workers) in {:.3f} ms (plan to last worker reply), "
+                "paused scheduling for {} ms: plan {} / workers {} / requeue "
+                "{} ms, {} state bytes and {} requests sent between workers",
                 curVersion,
+                record.operatorsMigrated,
+                record.operators,
+                record.operatorsMoved,
+                record.migrationMs,
                 record.pauseMs,
                 record.planMs,
                 record.distributeMs,
                 record.requeueMs,
-                record.operatorsMoved,
-                record.operators,
                 record.workers.sentStateBytes,
                 record.workers.sentMessages);
 
@@ -1690,6 +1722,9 @@ std::string Planner::outputResult()
         rapidjson::Value history(rapidjson::kArrayType);
         int64_t pauseSumMs = 0;
         int64_t pauseMaxMs = 0;
+        double migrationSumMs = 0;
+        double migrationMaxMs = 0;
+        int64_t operatorsMigrated = 0;
         int64_t planSumMs = 0;
         int64_t distributeSumMs = 0;
         int64_t requeueSumMs = 0;
@@ -1719,6 +1754,7 @@ std::string Planner::outputResult()
             o.AddMember("trigger_reference_ms", r.triggerReferenceMs, alloc);
             o.AddMember("start_ms", r.startMs, alloc);
             o.AddMember("lock_wait_ms", r.lockWaitMs, alloc);
+            o.AddMember("migration_ms", r.migrationMs, alloc);
             o.AddMember("pause_ms", r.pauseMs, alloc);
             o.AddMember("plan_ms", r.planMs, alloc);
             o.AddMember("distribute_ms", r.distributeMs, alloc);
@@ -1726,11 +1762,14 @@ std::string Planner::outputResult()
             o.AddMember("inflight_inputs", r.inFlightInputs, alloc);
             o.AddMember("planner_requeued", r.plannerRequeued, alloc);
             o.AddMember("operators", r.operators, alloc);
+            o.AddMember("operators_migrated", r.operatorsMigrated, alloc);
             o.AddMember("operators_moved", r.operatorsMoved, alloc);
             o.AddMember("weight_moved", r.weightMoved, alloc);
+            o.AddMember("placement_changed", r.placementChanged, alloc);
             o.AddMember("old_hosts", r.oldHosts, alloc);
             o.AddMember("new_hosts", r.newHosts, alloc);
             o.AddMember("workers_reported", r.workers.workers, alloc);
+            o.AddMember("workers_failed", r.workers.failedWorkers, alloc);
             o.AddMember("worker_pause_ms_mean",
                         r.workers.workers > 0
                           ? r.workers.workerPauseUsSum / 1000.0 /
@@ -1770,6 +1809,9 @@ std::string Planner::outputResult()
             }
             pauseSumMs += r.pauseMs;
             pauseMaxMs = std::max(pauseMaxMs, r.pauseMs);
+            migrationSumMs += r.migrationMs;
+            migrationMaxMs = std::max(migrationMaxMs, r.migrationMs);
+            operatorsMigrated += r.operatorsMigrated;
             planSumMs += r.planMs;
             distributeSumMs += r.distributeMs;
             requeueSumMs += r.requeueMs;
@@ -1800,6 +1842,10 @@ std::string Planner::outputResult()
         // Left out of everything else here.
         summary.AddMember("unchanged_placements", unchangedReschedules, alloc);
         summary.AddMember("period_ms_mean", periodMs, alloc);
+        summary.AddMember("migration_ms_mean", migrationSumMs / n, alloc);
+        summary.AddMember("migration_ms_max", migrationMaxMs, alloc);
+        summary.AddMember(
+          "operators_migrated_mean", operatorsMigrated / n, alloc);
         summary.AddMember("pause_ms_mean", pauseSumMs / n, alloc);
         summary.AddMember("pause_ms_max", pauseMaxMs, alloc);
         summary.AddMember("pause_ms_total", pauseSumMs, alloc);

@@ -1601,6 +1601,10 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
                 // when it is routed, and by rebalancing.
                 host = thisHost;
             } else {
+                // Against a red-black swap of the tables (deployRedBlack),
+                // which clears the operators map before refilling it: a
+                // lookup in between throws and kills the dispatch thread.
+                faabric::util::SharedLock routeLock(routeSwapMx);
                 host =
                   decentralScheduler.scheduleMessage(routableHosts(), *src);
             }

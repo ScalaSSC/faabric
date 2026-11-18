@@ -235,6 +235,10 @@ class Planner
     struct SyncCost
     {
         int workers = 0;
+        // Workers whose syncStateInfo failed (down, timed out): skipped.
+        int failedWorkers = 0;
+        // When the planner had the last worker's reply (epoch us; 0: none).
+        int64_t lastAckUs = 0;
         int64_t workerPauseUsSum = 0;
         int64_t workerPauseUsMax = 0;
         int64_t packUsMax = 0;
@@ -264,6 +268,9 @@ class Planner
         int64_t distributeMs = 0;
         int64_t requeueMs = 0;
         int64_t pauseMs = 0;
+        // The migration: from the planner starting to compute the partition
+        // to the planner having every worker's reply that it finished.
+        double migrationMs = 0;
         int inFlightInputs = 0;
         int plannerRequeued = 0;
         int operators = 0;
@@ -272,6 +279,9 @@ class Planner
         // it.
         int operatorsMoved = 0;
         double weightMoved = 0;
+        bool placementChanged = false;
+        // Operators the re-plan redeployed.
+        int operatorsMigrated = 0;
         int oldHosts = 0;
         int newHosts = 0;
         SyncCost workers;
