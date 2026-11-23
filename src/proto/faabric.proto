@@ -678,12 +678,30 @@ message WorkerRuntimeStatsRequest {
 // anything, and when.
 message FluxOffloadPlan
 {
-  // Target worker -> executor time (us) this worker may send it until the
-  // next plan arrives.
-  map<string, double> quotaUs = 1;
+  // Target worker -> its room (us of executor time) as the planner saw it:
+  // capacity over the period less its demand. Shared by every worker that
+  // sends to it; a starting point that the targets' replies replace.
+  map<string, double> roomUs = 1;
   // Stateful operator (user_func) -> the worker to hand every unit of it
   // held here to, once load has stayed low enough for it to run on one
   // worker. Advice too: the worker only acts on it in a round it is not
   // short itself.
   map<string, string> mergeTo = 2;
+  // Where to send stateless work that cannot stay here, in order: the
+  // placement rule over the targets' room, with the room the workers served
+  // before this one would take deducted, so that not every worker tries the
+  // same target first.
+  repeated string preference = 3;
+  // How much the input rate has changed since the period the stats measured:
+  // stateful arrivals are scaled by it to forecast the next period.
+  double inputRateScale = 4;
+}
+
+// A worker's reply to requests it was sent: its room right after taking
+// them in (us of executor time; capacity over the period less its demand),
+// and whether it was busy over its last period.
+message FluxRoom
+{
+  double roomUs = 1;
+  bool busy = 2;
 }

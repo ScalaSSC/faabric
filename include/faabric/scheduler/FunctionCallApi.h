@@ -20,5 +20,7 @@ enum FunctionCalls
     GetWorkerStats = 14,
     GetWorkerRuntimeStats = 15,
     MigrateShardFlux = 16,
+    // ExecuteFunctionsBatch, answered with the receiver's room (FluxRoom).
+    ExecuteFunctionsBatchSync = 17,
 };
 }

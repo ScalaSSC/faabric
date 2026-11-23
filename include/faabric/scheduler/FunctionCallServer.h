@@ -64,5 +64,8 @@ class FunctionCallServer final
     void recvResetParameter(std::span<const uint8_t> buffer);
 
     void recvExecuteFunctionsBatch(std::span<const uint8_t> buffer);
+
+    std::unique_ptr<google::protobuf::Message> recvExecuteFunctionsBatchSync(
+      std::span<const uint8_t> buffer);
 };
 }

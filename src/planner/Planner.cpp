@@ -768,22 +768,32 @@ void Planner::dequeueScheduledMsgs()
             continue;
         }
 
-        // Parallel execution of function calls for each host. A send waits
-        // until the socket takes it, so the hosts go side by side -- the last
-        // one on this thread, which would only be waiting otherwise.
+        // Parallel execution of function calls for each host, every mode
+        // alike: synchronously, each reply carrying the worker's room, which
+        // ModeFlux routes the next inputs by. The hosts side by side -- the
+        // last one on this thread, which would only be waiting otherwise.
+        bool keepRoom = scheduleMode == batch_scheduler::ModeFlux &&
+                        !stateAwareScheduler->isPheromone();
+        auto sendTo = [this, keepRoom](
+                        const std::string& hostIp,
+                        std::list<std::unique_ptr<faabric::Message>> msgsIn) {
+            try {
+                auto room = faabric::scheduler::getFunctionCallClient(hostIp)
+                              ->executeFunctionsBatchSync(std::move(msgsIn));
+                if (keepRoom) {
+                    stateAwareScheduler->noteFluxRoom(hostIp, room);
+                }
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR(
+                  "Could not send inputs to {}: {}", hostIp, e.what());
+            }
+        };
         std::vector<std::thread> threads;
         auto lastHost = std::prev(msgsCallMap.end());
         for (auto it = msgsCallMap.begin(); it != lastHost; ++it) {
-            threads.emplace_back(
-              [hostIp = it->first](
-                std::list<std::unique_ptr<faabric::Message>> msgsIn) mutable {
-                  faabric::scheduler::getFunctionCallClient(hostIp)
-                    ->executeFunctionsBatch(std::move(msgsIn));
-              },
-              std::move(it->second));
+            threads.emplace_back(sendTo, it->first, std::move(it->second));
         }
-        faabric::scheduler::getFunctionCallClient(lastHost->first)
-          ->executeFunctionsBatch(std::move(lastHost->second));
+        sendTo(lastHost->first, std::move(lastHost->second));
         // Join all threads to ensure they complete before next iteration
         for (auto& t : threads) {
             if (t.joinable()) {

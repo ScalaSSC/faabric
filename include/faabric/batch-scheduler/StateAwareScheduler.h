@@ -159,18 +159,22 @@ class StateAwareScheduler : public BatchScheduler
     std::shared_ptr<const FluxDag> getFluxDag();
 
     /**
-     * ModeFlux: what a worker has to get through before its next round, in
-     * executor time, from what it reported: every request queued there with
-     * the stateless requests it will set off there, and the same of what
-     * arrives over `horizonUs`. Of an operator's local children only what
-     * arrives from elsewhere counts: what their callers there set off is in
-     * those callers' share already.
+     * ModeFlux: a worker's demand -- what it has and means to run there
+     * before its next round -- in executor time, from what it reported: every
+     * request queued there with the stateless requests it will set off
+     * there, and the same of the stateful requests that will arrive over
+     * `horizonUs`, which only it can run. Their arrival rate as measured over
+     * its last period, times `inputRateScale`: how much the input rate has
+     * moved since. Stateless requests still to arrive are not counted: where
+     * they go is decided as they arrive, against this demand.
      */
     static double demandWorkUsFlux(const faabric::WorkerStats& workerStats,
-                                   double horizonUs)
+                                   double horizonUs,
+                                   double inputRateScale = 1.0)
     {
-        return workerStats.queuedchainworkus() +
-               workerStats.arrivalchainworkus() * horizonUs / 1e6;
+        return workerStats.queuedchainworkus() + inputRateScale *
+                                                   workerStats.arrivalchainworkus() *
+                                                   horizonUs / 1e6;
     }
 
     /**
@@ -193,6 +197,11 @@ class StateAwareScheduler : public BatchScheduler
     // carry: as long as the planner's metrics window, so a merge's backtest
     // and the capacity it is checked against cover the same span.
     static constexpr int kFluxCapacityWindowSec = 10;
+
+    // The planner's view of the input rate now: its last this many ms of
+    // inputs, against the whole period the stats measured (the input rate
+    // scale). Inputs come in batches, so not much shorter than a few of them.
+    static constexpr int kFluxInputRateWindowMs = 500;
 
     // One stats round, and what routing reads off it, worked out once when
     // the round arrives rather than for every request until the next.
@@ -310,13 +319,12 @@ class StateAwareScheduler : public BatchScheduler
     }
 
     /**
-     * ModeFlux: what a worker has to get through before its next
-     * rebalancing round -- every request queued there and every request
-     * bound to arrive, stateless ones included, each with the stateless
-     * requests it will set off there: the demand the planner judges it by
-     * (demandWorkUsFlux) -- and what it can, its executor slots over that
-     * time. Stateless arrivals count because, routed here by the planner or
-     * another worker, they run here too unless rebalancing moves them later.
+     * ModeFlux: a worker's demand -- every request queued there and every
+     * stateful request bound to arrive before its next rebalancing round,
+     * each with the stateless requests it will set off there, as the planner
+     * counts it (demandWorkUsFlux) -- and what it can get through, its
+     * executor slots over that time. Stateless requests still to arrive are
+     * decided as they come, against these.
      */
     struct FluxLocalWork
     {
@@ -342,19 +350,21 @@ class StateAwareScheduler : public BatchScheduler
 
     /**
      * ModeFlux, planner: from the workers' last stats, advise every worker
-     * that is falling behind where to send what it cannot get through before
-     * the next round (`horizonUs`) -- see FluxOffloadPlan.
+     * where to send the stateless work it cannot run itself -- see
+     * FluxOffloadPlan. How much each will receive in the next round depends
+     * on routing not yet done, so the advice says where, not how much: an
+     * ordered list of targets, each with the room it has now (its capacity
+     * over `horizonUs` less its demand), which the targets' replies then keep
+     * up to date.
      *
-     * Kept deliberately cheap: one pass over the stats and a greedy match.
-     * A worker is behind when what it has to get through in the horizon --
-     * its queued work (requests x executor time per request) and the work
-     * arriving meanwhile -- exceeds what it can run, and has room when it is
-     * the other way round. Those behind, most first, are matched with those
-     * with room in the order workers place work in: most of the operators
-     * backed up there already there first (queued or running), then warm
-     * executors for one of them, then the most room -- room alone if
-     * affinity is ablated. Each worker's room is handed out once, so no two
-     * workers are sent to the same room.
+     * Workers are served most short first. Each ranks the others by the
+     * placement rule -- most of its backed-up operators (or, none backed up,
+     * of those it runs) already there, then warm executors for one of them,
+     * then room -- room alone if affinity is ablated, and targets the workers
+     * before it have used up last. What it is short of then comes off the
+     * room of its first targets, so the next worker's list starts elsewhere
+     * and not every worker sends to the same one. Also sets the planner's own
+     * view of every worker's room, for routing inputs.
      */
     std::map<std::string, faabric::FluxOffloadPlan> planFluxOffload(
       const FluxClusterSnapshot& snapshot,
@@ -385,19 +395,33 @@ class StateAwareScheduler : public BatchScheduler
     void planFluxMerges(std::map<std::string, faabric::FluxOffloadPlan>& plans);
 
     /**
-     * ModeFlux, workers: the planner's latest advice for this worker. The
-     * quotas are drawn down as work is sent, by chained-call routing and by
-     * rebalancing alike, and start afresh with every new plan.
+     * ModeFlux, workers: the planner's latest advice for this worker -- the
+     * targets to send stateless work to, in order, each with the room the
+     * planner saw it had -- and the input rate scale. A target's room is
+     * shared by everyone sending to it: what is known of it is taken down as
+     * work is sent, by chained-call routing and rebalancing alike, and
+     * replaced by the target's own reply to each send (noteFluxRoom).
      */
-    void setFluxOffloadQuota(std::map<std::string, double> quotaUs);
+    void setFluxAdvice(std::vector<std::string> preference,
+                       std::map<std::string, double> roomUs,
+                       double inputRateScale);
 
-    std::map<std::string, double> getFluxOffloadQuota();
+    // The advised targets in order, with the room last known of each.
+    std::vector<std::pair<std::string, double>> getFluxAdvice();
 
-    // Draws `us` from the quota for `target`. Fails, drawing nothing, if the
-    // quota is short -- unless `allowOver`, which lets it go to zero.
-    bool drawFluxOffloadQuota(const std::string& target,
-                              double us,
-                              bool allowOver = false);
+    // Takes `us` off the room known of `target`, to zero at the least.
+    void drawFluxRoom(const std::string& target, double us);
+
+    // A target's room as it replied, in place of what was known of it. A
+    // busy target has none. Planner and workers alike.
+    void noteFluxRoom(const std::string& target, const faabric::FluxRoom& room);
+
+    // How much the input rate has moved since the period the stats measured
+    // (planner: as it observed; workers: as advised). 1 when unknown.
+    double fluxInputRateScale() const
+    {
+        return fluxInputScale.load(std::memory_order_relaxed);
+    }
 
     // Shard count of every partitioned stateful operator under ModeFlux. A
     // partitioned operator has a single paridx (0); its keys are hashed onto
@@ -941,9 +965,17 @@ class StateAwareScheduler : public BatchScheduler
     // stats arrive.
     std::mutex fluxAssignedMx;
     std::map<std::string, std::map<std::string, int>> fluxAssignedSinceStats;
-    // Workers only: the planner's latest advice, drawn down as work is sent.
+    // The room known of each worker (us of executor time), drawn down as work
+    // is sent and replaced by replies: on workers, from the planner's advice,
+    // with fluxPreference, its order; on the planner, from the stats, for
+    // routing inputs.
     std::mutex fluxOffloadMx;
-    std::map<std::string, double> fluxOffloadQuotaUs;
+    std::map<std::string, double> fluxKnownRoomUs;
+    std::vector<std::string> fluxPreference;
+    std::atomic<double> fluxInputScale{ 1.0 };
+    // Planner only, guarded by fluxAssignedMx: inputs routed since the last
+    // stats round, by when, for the input rate scale.
+    std::deque<std::pair<int64_t, int64_t>> fluxInputLog;
     // Workers only: requests the current routing pass kept here, per queue,
     // and their executor time with what they set off downstream. The live
     // queue does not show them until the pass is over and they are enqueued.
@@ -974,12 +1006,8 @@ class StateAwareScheduler : public BatchScheduler
                                          const std::string& userFunc,
                                          const std::unique_ptr<Message>& msg,
                                          FluxOpRoutes& routes);
-    // Planner only, guarded by fluxAssignedMx: executor time, with what it
-    // sets off downstream, routed to each host since the last stats round;
-    // the same per second over the round before, which that round's stats
-    // already count among the host's arrivals; and when that round came.
-    std::unordered_map<std::string, double> fluxAssignedWorkUs;
-    std::unordered_map<std::string, double> fluxPrevAssignedRateUs;
+    // Planner only, guarded by fluxAssignedMx: when the last stats round
+    // came.
     int64_t fluxLastStatsUs = 0;
     // Planner only, guarded by fluxAssignedMx: before any stats round, the
     // one host each operator's inputs go to.

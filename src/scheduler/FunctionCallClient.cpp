@@ -197,6 +197,22 @@ void FunctionCallClient::executeFunctionsBatch(
               batchMsgsList.get());
 }
 
+faabric::FluxRoom FunctionCallClient::executeFunctionsBatchSync(
+  std::list<std::unique_ptr<faabric::Message>>&& msgs)
+{
+    faabric::MessageBatch batch;
+    batch.set_invokehost(faabric::util::getSystemConfig().endpointHost);
+    for (auto& msg : msgs) {
+        batch.mutable_messages()->AddAllocated(msg.release());
+    }
+    msgs.clear();
+    faabric::FluxRoom resp;
+    syncSend(faabric::scheduler::FunctionCalls::ExecuteFunctionsBatchSync,
+             &batch,
+             &resp);
+    return resp;
+}
+
 // -----------------------------------
 // Decentralized Scheduler Information Sync
 // -----------------------------------
@@ -218,15 +234,16 @@ void FunctionCallClient::migrateStates(
       faabric::scheduler::FunctionCalls::MigrateStates, req.get(), &resp);
 }
 
-void FunctionCallClient::migrateShardFlux(
+faabric::FluxRoom FunctionCallClient::migrateShardFlux(
   const faabric::FluxShardMigrationRequest& req)
 {
     std::string buffer = req.SerializeAsString();
-    faabric::EmptyResponse resp;
+    faabric::FluxRoom resp;
     syncSend(faabric::scheduler::FunctionCalls::MigrateShardFlux,
              reinterpret_cast<const uint8_t*>(buffer.data()),
              buffer.size(),
              &resp);
+    return resp;
 }
 
 // -----------------------------------

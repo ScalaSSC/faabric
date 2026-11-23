@@ -435,6 +435,7 @@ void Scheduler::reset()
         fluxQueueWaitSumUs.store(0, std::memory_order_relaxed);
         fluxQueueWaitCount.store(0, std::memory_order_relaxed);
         fluxBusyLastPeriod.store(false, std::memory_order_relaxed);
+        fluxBusyPeriods.clear();
         fluxQueueWaitLastUs.store(0, std::memory_order_relaxed);
         // What the last run's workers carried says nothing about the next.
         fluxObservedCapacitySlots.store(0, std::memory_order_relaxed);
@@ -775,8 +776,22 @@ void Scheduler::rollFluxCapacity(int64_t nowUs,
                         : (queued ? static_cast<double>(periodUs) : 0.0),
           std::memory_order_relaxed);
         if (busy && fluxDynamicCapacityOn()) {
+            // Over the last fluxCapacityBusyPeriods busy periods, weighted
+            // by their length.
+            fluxBusyPeriods.emplace_back(periodUs, occupiedUs);
+            size_t keep = static_cast<size_t>(std::max(
+              1, fluxCapacityBusyPeriods.load(std::memory_order_relaxed)));
+            while (fluxBusyPeriods.size() > keep) {
+                fluxBusyPeriods.pop_front();
+            }
+            int64_t busySpanUs = 0;
+            double busyHeldUs = 0;
+            for (const auto& [spanUs, heldUs] : fluxBusyPeriods) {
+                busySpanUs += spanUs;
+                busyHeldUs += heldUs;
+            }
             fluxObservedCapacitySlots.store(
-              std::clamp(occupiedUs / periodUs, 1.0, fluxExecutorCap()),
+              std::clamp(busyHeldUs / busySpanUs, 1.0, fluxExecutorCap()),
               std::memory_order_relaxed);
             SPDLOG_DEBUG("Flux {} busy: {:.1f} ms queue wait over {} starts, "
                          "{:.1f} batches running on average",
@@ -1025,17 +1040,32 @@ Scheduler::FluxWorkerWork Scheduler::fluxWorkerWorkOf()
 faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork
 Scheduler::fluxLocalWorkOf()
 {
-    // All that is queued and all that is bound to arrive before the next
-    // round, as the planner counts it: stateless arrivals too, since what is
-    // routed here runs here unless rebalancing moves it later.
+    // Its demand, as the planner counts it: all that is queued here, and the
+    // stateful requests bound to arrive before the next round, scaled by how
+    // the input rate has moved. Stateless requests still to arrive are
+    // decided as they come, against this.
     double horizonUs =
       (fluxRebalancePeriod > 0 ? fluxRebalancePeriod : 1000) * 1000.0;
     auto workerWork = fluxWorkerWorkOf();
     faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork work;
-    work.demandUs =
-      workerWork.queuedUs + workerWork.arrivalUsPerSec * horizonUs / 1e6;
+    work.demandUs = workerWork.queuedUs +
+                    decentralScheduler.fluxInputRateScale() *
+                      workerWork.pinnedUsPerSec * horizonUs / 1e6;
     work.capacityUs = fluxCapacitySlotsNow() * horizonUs;
     return work;
+}
+
+faabric::FluxRoom Scheduler::fluxRoomNow()
+{
+    faabric::FluxRoom room;
+    if (scheduleMode != faabric::batch_scheduler::ModeFlux ||
+        decentralScheduler.isPheromone()) {
+        return room;
+    }
+    auto work = fluxLocalWorkOf();
+    room.set_roomus(work.capacityUs - work.demandUs);
+    room.set_busy(fluxBusyLastPeriod.load(std::memory_order_relaxed));
+    return room;
 }
 
 void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
@@ -1078,7 +1108,8 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
         out.set_processworkus(processWorkUs);
         auto work = fluxWorkerWorkOf();
         out.set_queuedchainworkus(work.queuedUs);
-        out.set_arrivalchainworkus(work.arrivalUsPerSec);
+        // Of what arrives, only what must run here counts in its demand.
+        out.set_arrivalchainworkus(work.pinnedUsPerSec);
     }
 
     auto* migration = out.mutable_fluxmigration();
@@ -2101,19 +2132,43 @@ void Scheduler::dispatchChainedMsgs()
         scheduledMsgsMap.clear();
         lock.unlock();
 
-        for (auto& [hostIp, msgs] : msgsCallMap) {
-            SPDLOG_DEBUG("Dispatching messages to host {} with message size {}",
-                         hostIp,
-                         msgs.size());
-            // If locally, we put the messages into a batch directly. Chained
-            // calls set off here and kept here: their work, for an exclusive
-            // stateless successor, is in its caller's chain work already.
-            if (hostIp == thisHost) {
-                enqueueMessageBatch(std::move(msgs), thisHost, true);
-            } else {
-                // Otherwise, we send the messages to the remote host
-                faabric::scheduler::getFunctionCallClient(hostIp)
-                  ->executeFunctionsBatch(std::move(msgs));
+        // Chained calls set off here and kept here go straight into a batch:
+        // their work, for an exclusive stateless successor, is in its
+        // caller's chain work already.
+        auto localIt = msgsCallMap.find(thisHost);
+        if (localIt != msgsCallMap.end()) {
+            enqueueMessageBatch(std::move(localIt->second), thisHost, true);
+            msgsCallMap.erase(localIt);
+        }
+        // The rest go to their hosts, every mode alike: synchronously, each
+        // reply carrying the receiver's room (ModeFlux keeps it, the others
+        // ignore it). The hosts side by side, the last on this thread.
+        bool keepRoom = scheduleMode == faabric::batch_scheduler::ModeFlux &&
+                        !decentralScheduler.isPheromone();
+        auto sendTo = [this, keepRoom](
+                        const std::string& hostIp,
+                        std::list<std::unique_ptr<faabric::Message>> msgs) {
+            try {
+                auto room = faabric::scheduler::getFunctionCallClient(hostIp)
+                              ->executeFunctionsBatchSync(std::move(msgs));
+                if (keepRoom) {
+                    decentralScheduler.noteFluxRoom(hostIp, room);
+                }
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR("Could not send chained calls to {}: {}",
+                             hostIp,
+                             e.what());
+            }
+        };
+        if (!msgsCallMap.empty()) {
+            std::vector<std::thread> senders;
+            auto lastHost = std::prev(msgsCallMap.end());
+            for (auto it = msgsCallMap.begin(); it != lastHost; ++it) {
+                senders.emplace_back(sendTo, it->first, std::move(it->second));
+            }
+            sendTo(lastHost->first, std::move(lastHost->second));
+            for (auto& sender : senders) {
+                sender.join();
             }
         }
     }
@@ -2197,6 +2252,14 @@ void Scheduler::resetParameter(std::string key, int32_t value)
     } else if (key == "flux_worker_slots") {
         fluxWorkerSlots = value;
         SPDLOG_INFO("Reset flux_worker_slots parameter to : {}", value);
+    } else if (key == "flux_capacity_busy_periods") {
+        // ModeFlux: over how many of its last busy periods a worker averages
+        // what it ran to take as its capacity. Default 10; 1 is the last
+        // busy period alone.
+        fluxCapacityBusyPeriods.store(std::max(1, value),
+                                      std::memory_order_relaxed);
+        SPDLOG_INFO("Reset flux_capacity_busy_periods parameter to : {}",
+                    value);
     } else if (key == "flux_busy_wait_ms") {
         // ModeFlux: the mean queue wait (ms) over a period from which a
         // worker counts as busy, and what it ran then as its capacity.
@@ -3345,12 +3408,18 @@ void Scheduler::rebalanceFlux()
     double capacityUs = slots * horizonUs;
     auto loads = snapshotFluxParidxLoads();
 
-    // The planner's advice: where to send, and how much. Without it nothing
-    // moves.
-    auto quota = decentralScheduler.getFluxOffloadQuota();
-    std::erase_if(quota, [this](const auto& entry) {
-        return entry.first == thisHost || entry.second <= 0;
-    });
+    // The planner's advice: where to send, in order, and the room last known
+    // of each target -- shared with every other worker sending there, and
+    // kept up to date by the targets' replies. Without it nothing moves.
+    double inputRateScale = decentralScheduler.fluxInputRateScale();
+    std::vector<std::string> advised;
+    std::map<std::string, double> quota;
+    for (const auto& [ip, roomUs] : decentralScheduler.getFluxAdvice()) {
+        if (ip != thisHost && roomUs > 0) {
+            advised.push_back(ip);
+            quota[ip] = roomUs;
+        }
+    }
 
     std::vector<std::pair<std::string, faabric::util::BatchQueue*>> queues;
     {
@@ -3396,32 +3465,26 @@ void Scheduler::rebalanceFlux()
         bool merge = false;
     };
     std::map<std::string, FluxShipment> shipments;
-    // The advised worker to send `workUs` of operator `userFunc` to, among
-    // those with that much quota left: one this round already sends the
-    // operator to, then one already running it, then the most quota. An operator thus fills one
-    // target before it spills onto the next.
-    bool affinity = !decentralScheduler.fluxDisabled(
-      StateAwareScheduler::kFluxDisableAffinity);
+    // The advised worker to send `workUs` of operator `userFunc` to: the
+    // first on the planner's list with that much room left -- one target
+    // filled before the next -- or, with packing ablated, the one with the
+    // most. `workUs` 0 takes any with room at all.
+    bool packing = !decentralScheduler.fluxDisabled(
+      StateAwareScheduler::kFluxDisablePacking);
     auto pickTarget = [&](const std::string& userFunc,
                           double workUs) -> std::string {
+        (void)userFunc;
         std::string best;
-        std::tuple<bool, bool, double> bestKey{ false, false, 0 };
-        for (const auto& [ip, us] : quota) {
+        for (const auto& ip : advised) {
+            double us = quota[ip];
             if (us <= 0 || us < workUs) {
                 continue;
             }
-            auto shipmentIt = shipments.find(ip);
-            // Ablated affinity looks at neither where the operator already
-            // goes this round nor where it already runs.
-            std::tuple<bool, bool, double> key{
-                affinity && shipmentIt != shipments.end() &&
-                  shipmentIt->second.operators.contains(userFunc),
-                affinity && snapshot->runs(ip, userFunc),
-                us
-            };
-            if (best.empty() || key > bestKey) {
+            if (best.empty() || (!packing && us > quota[best])) {
                 best = ip;
-                bestKey = key;
+                if (packing) {
+                    break;
+                }
             }
         }
         return best;
@@ -3438,7 +3501,8 @@ void Scheduler::rebalanceFlux()
     // round: only those requests move, never one that starts here before.
     auto workerWork = fluxWorkerWorkOf();
     double excessUs = workerWork.queuedUs +
-                      workerWork.pinnedUsPerSec * horizonSec - capacityUs;
+                      inputRateScale * workerWork.pinnedUsPerSec * horizonSec -
+                      capacityUs;
     double spillUs = std::max(0.0, workerWork.queuedUs - capacityUs);
     int budgetRequests = fluxMigrateRequests;
 
@@ -3663,7 +3727,8 @@ void Scheduler::rebalanceFlux()
         // worker has to get through before the next round, each request with
         // what it sets off there, over what it can.
         double demandHereUs =
-          workerWork.queuedUs + workerWork.arrivalUsPerSec * horizonSec;
+          workerWork.queuedUs +
+          inputRateScale * workerWork.pinnedUsPerSec * horizonSec;
         double loadNow = demandHereUs / capacityUs;
         auto targetLoad = [&](const std::string& ip, double extraUs) {
             auto statsIt = stats.find(ip);
@@ -3678,7 +3743,8 @@ void Scheduler::rebalanceFlux()
             double sentUs =
               shipments.contains(ip) ? shipments.at(ip).workUs : 0;
             double demandUs =
-              StateAwareScheduler::demandWorkUsFlux(targetStats, horizonUs) +
+              StateAwareScheduler::demandWorkUsFlux(
+                targetStats, horizonUs, inputRateScale) +
               sentUs + extraUs;
             return demandUs / (targetSlots * horizonUs);
         };
@@ -3831,7 +3897,13 @@ void Scheduler::rebalanceFlux()
         if (handover.units == 0 && handover.statelessRequests == 0) {
             continue;
         }
-        decentralScheduler.drawFluxOffloadQuota(target, shipment.workUs, true);
+        // The target's reply says what room it has left; without one, take
+        // off what was sent.
+        if (handover.hasRoom) {
+            decentralScheduler.noteFluxRoom(target, handover.room);
+        } else {
+            decentralScheduler.drawFluxRoom(target, shipment.workUs);
+        }
         double tookUs = static_cast<double>(
           faabric::util::getGlobalClock().epochMicros() - startUs);
         fluxCounters.migrateUs.fetch_add(static_cast<int64_t>(tookUs),
@@ -4122,9 +4194,11 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
     // has arrived.
     int64_t sendAtUs = nowUs();
     bool installed = false;
+    faabric::FluxRoom targetRoom;
     try {
-        faabric::scheduler::getFunctionCallClient(target)->migrateShardFlux(
-          req);
+        targetRoom =
+          faabric::scheduler::getFunctionCallClient(target)->migrateShardFlux(
+            req);
         installed = true;
     } catch (const std::exception& e) {
         SPDLOG_ERROR("Flux could not hand {} units and {} stateless requests "
@@ -4317,6 +4391,8 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
                 thisHost,
                 target);
     FluxHandover handover;
+    handover.hasRoom = installed;
+    handover.room = targetRoom;
     handover.units = static_cast<int>(moves.size());
     handover.statelessRequests = statelessRequests;
     handover.stateBytes = stateBytes;

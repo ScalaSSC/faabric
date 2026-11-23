@@ -65,6 +65,11 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
     void executeFunctionsBatch(
       std::list<std::unique_ptr<faabric::Message>>&& reqs);
 
+    // The same, waiting for the receiver to have taken the requests in, and
+    // with its room then.
+    faabric::FluxRoom executeFunctionsBatchSync(
+      std::list<std::unique_ptr<faabric::Message>>&& msgs);
+
     faabric::planner::SyncStatesInfoResponse syncStateInfo(
       std::shared_ptr<faabric::planner::SyncStatesInfoRequest> info);
 
@@ -72,7 +77,8 @@ class FunctionCallClient : public faabric::transport::MessageEndpointClient
 
     // ModeFlux: synchronous, so the sender knows the shard is installed on
     // the receiver before it flips the owner in Redis.
-    void migrateShardFlux(const faabric::FluxShardMigrationRequest& req);
+    faabric::FluxRoom migrateShardFlux(
+      const faabric::FluxShardMigrationRequest& req);
 
     std::string getPersistentState(
       std::shared_ptr<faabric::planner::MapMessage> req);

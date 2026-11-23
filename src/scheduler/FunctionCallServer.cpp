@@ -68,6 +68,9 @@ std::unique_ptr<google::protobuf::Message> FunctionCallServer::doSyncRecv(
         case faabric::scheduler::FunctionCalls::MigrateShardFlux: {
             return recvMigrateShardFlux(message.udata());
         }
+        case faabric::scheduler::FunctionCalls::ExecuteFunctionsBatchSync: {
+            return recvExecuteFunctionsBatchSync(message.udata());
+        }
         case faabric::scheduler::FunctionCalls::GetPersistentState: {
             return recvGetPersistentState(message.udata());
         }
@@ -230,7 +233,7 @@ FunctionCallServer::recvMigrateShardFlux(std::span<const uint8_t> buffer)
 
     scheduler.receiveShardFlux(parsedMsg);
 
-    return std::make_unique<faabric::EmptyResponse>();
+    return std::make_unique<faabric::FluxRoom>(scheduler.fluxRoomNow());
 }
 
 std::unique_ptr<google::protobuf::Message> FunctionCallServer::recvCustom(
@@ -413,21 +416,28 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
     }
     scheduler.setClusterWorkerStats(std::move(clusterStats));
 
-    // ModeFlux: the planner's advice for this worker -- where to send work if
-    // it is behind, and what to hand over to bring an operator together.
-    std::map<std::string, double> offloadQuotaUs;
+    // ModeFlux: the planner's advice for this worker -- where to send the
+    // stateless work it cannot run itself, and what to hand over to bring an
+    // operator together.
+    std::vector<std::string> preference;
+    std::map<std::string, double> roomUs;
+    double inputRateScale = 1.0;
     std::map<std::string, std::string> mergeTo;
     auto planIt = parsedMsg.fluxoffloadplans().find(
       faabric::util::getSystemConfig().endpointHost);
     if (planIt != parsedMsg.fluxoffloadplans().end()) {
-        for (const auto& [target, quotaUs] : planIt->second.quotaus()) {
-            offloadQuotaUs[target] = quotaUs;
+        preference.assign(planIt->second.preference().begin(),
+                          planIt->second.preference().end());
+        for (const auto& [target, us] : planIt->second.roomus()) {
+            roomUs[target] = us;
         }
+        inputRateScale = planIt->second.inputratescale();
         for (const auto& [userFunc, target] : planIt->second.mergeto()) {
             mergeTo[userFunc] = target;
         }
     }
-    scheduler.setFluxOffloadQuota(std::move(offloadQuotaUs));
+    scheduler.setFluxAdvice(
+      std::move(preference), std::move(roomUs), inputRateScale);
     scheduler.setFluxMergeAdvice(std::move(mergeTo));
 
     faabric::WorkerStats out;
@@ -519,6 +529,17 @@ void FunctionCallServer::recvExecuteFunctionsBatch(
 
     scheduler.enqueueMessageBatch(
       std::make_unique<faabric::MessageBatch>(parsedMsg));
+}
+
+std::unique_ptr<google::protobuf::Message>
+FunctionCallServer::recvExecuteFunctionsBatchSync(
+  std::span<const uint8_t> buffer)
+{
+    PARSE_MSG(faabric::MessageBatch, buffer.data(), buffer.size())
+    scheduler.enqueueMessageBatch(
+      std::make_unique<faabric::MessageBatch>(std::move(parsedMsg)));
+    // Taken in: its room now counts them.
+    return std::make_unique<faabric::FluxRoom>(scheduler.fluxRoomNow());
 }
 
 void FunctionCallServer::recvSetMessageResult(std::span<const uint8_t> buffer)

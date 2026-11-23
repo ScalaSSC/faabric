@@ -288,11 +288,19 @@ class Scheduler
     }
 
     // ModeFlux: the planner's advice for this worker (see FluxOffloadPlan).
-    // Empty when the planner saw no need, or nowhere to send.
-    void setFluxOffloadQuota(std::map<std::string, double> quotaUs)
+    void setFluxAdvice(std::vector<std::string> preference,
+                       std::map<std::string, double> roomUs,
+                       double inputRateScale)
     {
-        decentralScheduler.setFluxOffloadQuota(std::move(quotaUs));
+        decentralScheduler.setFluxAdvice(
+          std::move(preference), std::move(roomUs), inputRateScale);
     }
+
+    // ModeFlux: this worker's room now -- its capacity over a period less its
+    // demand over its live queues -- and whether it was busy over its last
+    // period. What it replies to the requests it is sent. Zero outside
+    // ModeFlux and under Pheromone.
+    faabric::FluxRoom fluxRoomNow();
 
     // ModeFlux: the planner's advice to hand every unit of an operator held
     // here to another worker (FluxOffloadPlan.mergeTo). Acted on, at most
@@ -834,10 +842,11 @@ class Scheduler
     // is busy over a period when the requests it started then waited for a
     // run slot fluxBusyWaitMs or more on average -- or none started while
     // some waited. While busy it runs as many executors as it can, whatever
-    // holds it back, so the batches it ran on average over a busy period
-    // are what it can carry: taken as its capacity, and kept after, renewed
-    // by the next busy period -- an idle worker shows nothing new. Until the
-    // first, nothing says it cannot run its executor cap (fluxExecutorCap).
+    // holds it back, so the batches it ran on average over its busy periods
+    // are what it can carry: the capacity is that average over the last
+    // fluxCapacityBusyPeriods of them, kept when it is not busy -- an idle
+    // worker shows nothing new. Until the first, nothing says it cannot run
+    // its executor cap (fluxExecutorCap).
     // CPU is not consulted: locks and state keep cores idle however many
     // executors run. Reset by flushes.
     //
@@ -846,6 +855,11 @@ class Scheduler
     std::atomic<int64_t> fluxQueueWaitCount{ 0 };
     // flux_busy_wait_ms.
     std::atomic<int> fluxBusyWaitMs{ 50 };
+    // flux_capacity_busy_periods, and the last that many busy periods:
+    // their length and the executor time held over each (us). Under
+    // fluxParidxRunMx.
+    std::atomic<int> fluxCapacityBusyPeriods{ 5 };
+    std::deque<std::pair<int64_t, double>> fluxBusyPeriods;
     // The last period closed: whether busy, and its mean queue wait (us).
     std::atomic<bool> fluxBusyLastPeriod{ false };
     std::atomic<double> fluxQueueWaitLastUs{ 0 };
@@ -942,6 +956,9 @@ class Scheduler
         int64_t forwardUs = 0;
         // Requests parked while the units were frozen.
         int64_t parked = 0;
+        // The target's reply: its room once it had taken them in.
+        bool hasRoom = false;
+        faabric::FluxRoom room;
     };
     FluxHandover migrateToWorkerFlux(
       const std::string& target,
