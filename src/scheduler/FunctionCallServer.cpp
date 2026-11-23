@@ -419,25 +419,28 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
     // ModeFlux: the planner's advice for this worker -- where to send the
     // stateless work it cannot run itself, and what to hand over to bring an
     // operator together.
-    std::vector<std::string> preference;
-    std::map<std::string, double> roomUs;
+    faabric::batch_scheduler::StateAwareScheduler::FluxAdvice advice;
     double inputRateScale = 1.0;
     std::map<std::string, std::string> mergeTo;
     auto planIt = parsedMsg.fluxoffloadplans().find(
       faabric::util::getSystemConfig().endpointHost);
     if (planIt != parsedMsg.fluxoffloadplans().end()) {
-        preference.assign(planIt->second.preference().begin(),
-                          planIt->second.preference().end());
+        advice.preference.assign(planIt->second.preference().begin(),
+                                 planIt->second.preference().end());
         for (const auto& [target, us] : planIt->second.roomus()) {
-            roomUs[target] = us;
+            advice.roomUs[target] = us;
         }
+        for (const auto& [target, claimed] : planIt->second.claims()) {
+            advice.claims[target] = claimed;
+        }
+        advice.coverTargets = planIt->second.covertargets();
+        advice.spareTargets = planIt->second.sparetargets();
         inputRateScale = planIt->second.inputratescale();
         for (const auto& [userFunc, target] : planIt->second.mergeto()) {
             mergeTo[userFunc] = target;
         }
     }
-    scheduler.setFluxAdvice(
-      std::move(preference), std::move(roomUs), inputRateScale);
+    scheduler.setFluxAdvice(std::move(advice), inputRateScale);
     scheduler.setFluxMergeAdvice(std::move(mergeTo));
 
     faabric::WorkerStats out;

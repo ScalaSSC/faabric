@@ -394,14 +394,27 @@ class ApplicationMetrics
                                   long long bytesReports,
                                   int64_t bytesMax) {
             rapidjson::Value obj(rapidjson::kObjectType);
-            for (const auto& field : fluxOverheadFields()) {
-                obj.AddMember(rapidjson::StringRef(field.name),
-                              static_cast<int64_t>((total.*field.get)()),
-                              alloc);
+            for (const auto* fields :
+                 { &fluxOverheadFields(), &fluxOverheadSummaryFields() }) {
+                for (const auto& field : *fields) {
+                    obj.AddMember(rapidjson::StringRef(field.name),
+                                  static_cast<int64_t>((total.*field.get)()),
+                                  alloc);
+                }
             }
             auto ratio = [](double num, double den) {
                 return den > 0 ? num / den : 0.0;
             };
+            // Of the chained requests that did not fit where they were made,
+            // how many went to a spare, to one of the rest, or stayed.
+            double sentOn = static_cast<double>(
+              total.routedspare() + total.routedrest() + total.routedheld());
+            obj.AddMember(
+              "routed_spare_share", ratio(total.routedspare(), sentOn), alloc);
+            obj.AddMember(
+              "routed_rest_share", ratio(total.routedrest(), sentOn), alloc);
+            obj.AddMember(
+              "routed_held_share", ratio(total.routedheld(), sentOn), alloc);
             obj.AddMember(
               "routing_us_per_request",
               ratio(total.routingcpuns() / 1000.0, total.routedrequests()),
@@ -456,12 +469,15 @@ class ApplicationMetrics
                 // What the counters grew by since the report before; one
                 // that went down was reset by a flush, so all of it is new.
                 faabric::FluxOverheadStats delta;
-                for (const auto& field : fluxOverheadFields()) {
-                    int64_t now = (report.*field.get)();
-                    int64_t before = (previous.*field.get)();
-                    (delta.*field.set)(now >= before ? now - before : now);
-                    (total.*field.set)((total.*field.get)() +
-                                       (delta.*field.get)());
+                for (const auto* fields :
+                     { &fluxOverheadFields(), &fluxOverheadSummaryFields() }) {
+                    for (const auto& field : *fields) {
+                        int64_t now = (report.*field.get)();
+                        int64_t before = (previous.*field.get)();
+                        (delta.*field.set)(now >= before ? now - before : now);
+                        (total.*field.set)((total.*field.get)() +
+                                           (delta.*field.get)());
+                    }
                 }
                 previous = report;
                 int64_t bytes = report.laststatsbytes();
@@ -491,9 +507,12 @@ class ApplicationMetrics
               rapidjson::Value(ip.c_str(), alloc).Move(),
               summarise(total, bytesSum, bytesReports, bytesMax),
               alloc);
-            for (const auto& field : fluxOverheadFields()) {
-                (clusterTotal.*field.set)((clusterTotal.*field.get)() +
-                                          (total.*field.get)());
+            for (const auto* fields :
+                 { &fluxOverheadFields(), &fluxOverheadSummaryFields() }) {
+                for (const auto& field : *fields) {
+                    (clusterTotal.*field.set)((clusterTotal.*field.get)() +
+                                              (total.*field.get)());
+                }
             }
             clusterBytesSum += bytesSum;
             clusterBytesReports += bytesReports;
@@ -2022,6 +2041,18 @@ class ApplicationMetrics
             { "flip_us", &S::flipus, &S::set_flipus, false },
             { "forward_us", &S::forwardus, &S::set_forwardus, false },
             { "parked", &S::parkedrequests, &S::set_parkedrequests, false },
+        };
+        return fields;
+    }
+    // Cumulative counters of FluxOverheadStats that go in the summary only,
+    // so that the per-second layout of fluxOverhead stays.
+    static const std::vector<FluxOverheadField>& fluxOverheadSummaryFields()
+    {
+        using S = faabric::FluxOverheadStats;
+        static const std::vector<FluxOverheadField> fields = {
+            { "routed_spare", &S::routedspare, &S::set_routedspare, false },
+            { "routed_rest", &S::routedrest, &S::set_routedrest, false },
+            { "routed_held", &S::routedheld, &S::set_routedheld, false },
         };
         return fields;
     }

@@ -1453,6 +1453,14 @@ bool Planner::resetParameter(
         }
         SPDLOG_INFO("Flux disabled mechanisms set to {}", value);
     }
+    if (key == "flux_advice_spare_targets") {
+        // ModeFlux: how many spare targets every worker claims in the
+        // advice, besides those covering its excess. Default 3.
+        if (stateAwareScheduler) {
+            stateAwareScheduler->setFluxSpareTargets(value);
+        }
+        SPDLOG_INFO("Flux advice spare targets set to {}", value);
+    }
     if (key == "flux_static_placement") {
         // Experiments only: 0 home, 1 spread, 2 by operator.
         if (stateAwareScheduler) {

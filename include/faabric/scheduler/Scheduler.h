@@ -288,12 +288,12 @@ class Scheduler
     }
 
     // ModeFlux: the planner's advice for this worker (see FluxOffloadPlan).
-    void setFluxAdvice(std::vector<std::string> preference,
-                       std::map<std::string, double> roomUs,
-                       double inputRateScale)
+    void setFluxAdvice(
+      faabric::batch_scheduler::StateAwareScheduler::FluxAdvice advice,
+      double inputRateScale)
     {
-        decentralScheduler.setFluxAdvice(
-          std::move(preference), std::move(roomUs), inputRateScale);
+        decentralScheduler.setFluxAdvice(std::move(advice), inputRateScale);
+        fluxAdviceArrived.store(true, std::memory_order_release);
     }
 
     // ModeFlux: this worker's room now -- its capacity over a period less its
@@ -797,6 +797,9 @@ class Scheduler
     // a round plans for: what a paridx will not get through here before the
     // next round is what is worth moving.
     int fluxRebalancePeriod = 1000;
+    // ModeFlux: set when the planner's advice arrives with its stats round.
+    // A round then rebalances at once (see fluxRebalanceLoop).
+    std::atomic<bool> fluxAdviceArrived{ false };
     // Most requests one worker hands off per round, over all targets,
     // stateless and stateful alike. A unit goes whole or not at all, so one
     // whose backlog exceeds what is left is skipped -- unless it is the first
@@ -898,32 +901,31 @@ class Scheduler
      * workers the planner advised (FluxOffloadPlan), and each target gets its
      * share of both in a single hand-over.
      *
-     * Every queue is judged by what it will not get through before the next
-     * round: D = Q + lambda_pinned H - mu H, Q what is queued, mu its rate,
-     * lambda_pinned what arrives meanwhile that can only run here. A
-     * stateless request not yet arrived can still be routed elsewhere when it
-     * does, so for a stateless paridx lambda_pinned is 0 and only the backlog
-     * counts. A unit's requests can only go to its owner, so for state the
-     * arrivals count too.
+     * The worker sheds its excess X = Q + sigma lambda_pinned H - C~ over its
+     * live queues, in executor time with what each request sets off here: Q
+     * what is queued, lambda_pinned the stateful arrivals, which can only run
+     * here. Stateless requests still to arrive are left out: routing sends
+     * them elsewhere when they do.
      *
-     * Stateless requests first, as they are cheap to move. Of a stateless
-     * paridx's excess, only what the advised workers can process in the next
-     * round goes now, oldest first -- the rest is judged again next round.
-     * Their chained calls go with them and run on the other side as local
-     * calls, so each takes up its own executor time there and that of the
-     * stateless requests downstream of it.
+     * Stateless requests first, as they are cheap to move: as many as cover
+     * X, even ones that would start here soon, rather than state. Requests
+     * start oldest input first, so they go from the back, youngest first.
      *
-     * Then units of state, from the paridx with a deficit, until the deficit
-     * is covered. A unit takes with it its backlog and its arrivals from now
-     * on, (B + l H) s over the next round. Fewest state bytes per unit of
-     * that go first -- small state, much work -- each to an advised worker
-     * with quota for it and what its requests set off downstream, and only
-     * if afterwards neither side is as loaded, (Q + lambda H) / (slots H), as
-     * this worker is now.
+     * Then units of state, for what stateless requests could not cover. A unit takes with it its
+     * backlog and its arrivals from now on, (B + l H) s^ over the next round.
+     * Fewest state bytes per unit of that go first -- small state, much work
+     * -- and only if afterwards neither side is as loaded, demand over
+     * capacity, as this worker is now.
      *
-     * Either way an operator's work fills one target before it spills onto
-     * the next: the target this round already sends it to first, then one
-     * already running it, then the one with the most quota left.
+     * Every move goes to an advised worker with room for it
+     * (StateAwareScheduler::pickAdvisedTargetFlux): one of the targets
+     * claimed to cover this worker's excess, else one of its spares, else one
+     * of the rest (fewest claims first), by most of the operator there (what
+     * this round ships included), warm executors for it, most room. An
+     * operator's work thus fills one target before it spills onto the next.
+     *
+     * Merges the planner advised go only in a calm round: no excess, and not
+     * busy over the last period.
      */
     void rebalanceFlux();
 

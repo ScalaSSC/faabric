@@ -436,6 +436,7 @@ void Scheduler::reset()
         fluxQueueWaitCount.store(0, std::memory_order_relaxed);
         fluxBusyLastPeriod.store(false, std::memory_order_relaxed);
         fluxBusyPeriods.clear();
+        fluxAdviceArrived.store(false, std::memory_order_relaxed);
         fluxQueueWaitLastUs.store(0, std::memory_order_relaxed);
         // What the last run's workers carried says nothing about the next.
         fluxObservedCapacitySlots.store(0, std::memory_order_relaxed);
@@ -1138,6 +1139,12 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
     auto* overhead = out.mutable_fluxoverhead();
     overhead->set_routingcpuns(load(fluxOverhead.routingCpuNs));
     overhead->set_routedrequests(load(fluxOverhead.routedRequests));
+    {
+        auto tiers = decentralScheduler.fluxRouteTiers();
+        overhead->set_routedspare(tiers.spare);
+        overhead->set_routedrest(tiers.rest);
+        overhead->set_routedheld(tiers.held);
+    }
     overhead->set_rebalancecpuns(load(fluxOverhead.rebalanceCpuNs));
     overhead->set_rebalancerounds(load(fluxOverhead.rebalanceRounds));
     overhead->set_statscpuns(load(fluxOverhead.statsCpuNs));
@@ -2240,6 +2247,11 @@ void Scheduler::resetParameter(std::string key, int32_t value)
     } else if (key == "flux_disable") {
         decentralScheduler.setFluxDisable(value);
         SPDLOG_INFO("Reset flux_disable parameter to : {}", value);
+    } else if (key == "flux_advice_spare_targets") {
+        // ModeFlux: the planner's (see Planner::resetParameter); nothing for
+        // a worker to do.
+        SPDLOG_INFO("Reset flux_advice_spare_targets parameter to : {}",
+                    value);
     } else if (key == "flux_static_placement") {
         decentralScheduler.setFluxStaticPlacement(value);
         SPDLOG_INFO("Reset flux_static_placement parameter to : {}", value);
@@ -3299,18 +3311,44 @@ void Scheduler::clearFluxMigrationState()
 
 void Scheduler::fluxRebalanceLoop()
 {
+    auto& clock = faabric::util::getGlobalClock();
+    int64_t lastRoundMs = clock.epochMillis();
     while (!stopThreadTimer) {
         int period = fluxRebalancePeriod > 0 ? fluxRebalancePeriod : 1000;
-        // Sleep in short steps so a long period does not hold up shutdown.
-        auto wakeAtMs = faabric::util::getGlobalClock().epochMillis() + period;
-        while (!stopThreadTimer &&
-               faabric::util::getGlobalClock().epochMillis() < wakeAtMs) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // ModeFlux rebalances as soon as the planner's advice arrives with
+        // its stats round: with advice made for this very period, and before
+        // the period's new inputs take up the room claimed for this worker's
+        // backlog. Not within half a period of the last round, and if no
+        // advice comes in twice the period, anyway. Every other mode, and
+        // Pheromone, every period. Sleep in short steps so a long period does
+        // not hold up shutdown.
+        bool byAdvice = scheduleMode == faabric::batch_scheduler::ModeFlux &&
+                        fluxRebalancePeriod > 0 &&
+                        !decentralScheduler.isPheromone();
+        if (byAdvice) {
+            int64_t earliestMs = lastRoundMs + period / 2;
+            int64_t latestMs = lastRoundMs + 2 * static_cast<int64_t>(period);
+            while (!stopThreadTimer) {
+                int64_t nowMs = clock.epochMillis();
+                if (nowMs >= latestMs ||
+                    (nowMs >= earliestMs &&
+                     fluxAdviceArrived.exchange(false,
+                                                std::memory_order_acq_rel))) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        } else {
+            auto wakeAtMs = clock.epochMillis() + period;
+            while (!stopThreadTimer && clock.epochMillis() < wakeAtMs) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
         }
 
         if (stopThreadTimer) {
             break;
         }
+        lastRoundMs = clock.epochMillis();
 
         // Close the measurement window whether or not we rebalance: the stats
         // report what it measured.
@@ -3410,14 +3448,16 @@ void Scheduler::rebalanceFlux()
 
     // The planner's advice: where to send, in order, and the room last known
     // of each target -- shared with every other worker sending there, and
-    // kept up to date by the targets' replies. Without it nothing moves.
+    // kept up to date by the targets' replies. Without room anywhere nothing
+    // moves.
     double inputRateScale = decentralScheduler.fluxInputRateScale();
-    std::vector<std::string> advised;
+    auto advice = decentralScheduler.getFluxAdvice();
     std::map<std::string, double> quota;
-    for (const auto& [ip, roomUs] : decentralScheduler.getFluxAdvice()) {
-        if (ip != thisHost && roomUs > 0) {
-            advised.push_back(ip);
+    bool advisedRoom = false;
+    for (const auto& [ip, roomUs] : advice.roomUs) {
+        if (ip != thisHost) {
             quota[ip] = roomUs;
+            advisedRoom = advisedRoom || roomUs > 0;
         }
     }
 
@@ -3465,29 +3505,50 @@ void Scheduler::rebalanceFlux()
         bool merge = false;
     };
     std::map<std::string, FluxShipment> shipments;
-    // The advised worker to send `workUs` of operator `userFunc` to: the
-    // first on the planner's list with that much room left -- one target
-    // filled before the next -- or, with packing ablated, the one with the
-    // most. `workUs` 0 takes any with room at all.
+    // Requests of each operator (user_func) this round ships to each target:
+    // there once it has, though no stats show them yet.
+    std::map<std::string, std::map<std::string, int>> shippedRequests;
+    // The advised worker to send `workUs` of operator `userFunc` to
+    // (pickAdvisedTargetFlux): the targets claimed to cover this worker's
+    // excess, then its spares, then the rest, each by the placement rule for
+    // the operator, what this round ships included -- one target filled
+    // before the next -- or, with packing ablated, the one with the most
+    // room. `workUs` 0 takes any with room at all.
     bool packing = !decentralScheduler.fluxDisabled(
       StateAwareScheduler::kFluxDisablePacking);
+    bool affinity = !decentralScheduler.fluxDisabled(
+      StateAwareScheduler::kFluxDisableAffinity);
     auto pickTarget = [&](const std::string& userFunc,
                           double workUs) -> std::string {
-        (void)userFunc;
-        std::string best;
-        for (const auto& ip : advised) {
-            double us = quota[ip];
-            if (us <= 0 || us < workUs) {
-                continue;
-            }
-            if (best.empty() || (!packing && us > quota[best])) {
-                best = ip;
-                if (packing) {
-                    break;
+        auto roomOf = [&](const std::string& ip) {
+            auto it = quota.find(ip);
+            return it == quota.end() ? 0.0 : it->second;
+        };
+        auto presenceOf = [&](const std::string& ip) {
+            int presence = snapshot->presenceOf(ip, userFunc);
+            auto targetIt = shippedRequests.find(ip);
+            if (targetIt != shippedRequests.end()) {
+                auto it = targetIt->second.find(userFunc);
+                if (it != targetIt->second.end()) {
+                    presence += it->second;
                 }
             }
-        }
-        return best;
+            return presence;
+        };
+        auto warmOf = [&](const std::string& ip) {
+            return snapshot->runs(ip, userFunc);
+        };
+        return StateAwareScheduler::pickAdvisedTargetFlux(advice.preference,
+                                                          advice.claims,
+                                                          advice.coverTargets,
+                                                          advice.spareTargets,
+                                                          /*useCover=*/true,
+                                                          workUs,
+                                                          packing,
+                                                          affinity,
+                                                          roomOf,
+                                                          presenceOf,
+                                                          warmOf);
     };
 
     // ---- What this worker cannot get through before its next round ----
@@ -3496,25 +3557,25 @@ void Scheduler::rebalanceFlux()
     //
     // in executor time, each request with the stateless requests it sets off
     // here. Stateless requests still to arrive are left out: routing sends
-    // them elsewhere. Requests start here oldest input first, so of what is
-    // queued, the work beyond C~ -- the youngest -- spills into the next
-    // round: only those requests move, never one that starts here before.
+    // them elsewhere.
     auto workerWork = fluxWorkerWorkOf();
     double excessUs = workerWork.queuedUs +
                       inputRateScale * workerWork.pinnedUsPerSec * horizonSec -
                       capacityUs;
-    double spillUs = std::max(0.0, workerWork.queuedUs - capacityUs);
     int budgetRequests = fluxMigrateRequests;
 
     // ---- Stateless requests first: they are cheap to move ----
     //
-    // Of the spill, the stateless requests that would start last -- youngest
-    // input first over all stateless queues -- each to an advised worker
-    // (pickTarget), taking up its executor time there with that of what it
-    // sets off there, until the excess is covered, the spill used up or the
-    // advice spent. Only the queues' tails are read: per queue as many keys
-    // as could cover the excess on their own.
-    double statelessGoalUs = std::min(std::max(0.0, excessUs), spillUs);
+    // Whatever stateless requests can cover of the excess, they do, rather
+    // than state: even one that would start here soon is cheaper to move
+    // than a unit. Requests start here oldest input first, so they go from
+    // the back -- youngest input first over all stateless queues, those that
+    // would start here last -- each to an advised worker (pickTarget),
+    // taking up its executor time there with that of what it sets off
+    // there, until the excess is covered, the queues run out or the advice
+    // is spent. Only the queues' tails are read: per queue as many keys as
+    // could cover the excess on their own.
+    double statelessGoalUs = std::max(0.0, excessUs);
     struct StatelessTail
     {
         std::string userFuncPar;
@@ -3524,7 +3585,7 @@ void Scheduler::rebalanceFlux()
         size_t next = 0;
     };
     std::vector<StatelessTail> tails;
-    if (statelessGoalUs > 0 && !quota.empty()) {
+    if (statelessGoalUs > 0 && advisedRoom) {
         for (const auto& [userFuncPar, queue] : queues) {
             if (!isStateless(userFuncPar)) {
                 continue;
@@ -3570,6 +3631,7 @@ void Scheduler::rebalanceFlux()
         shipment.stateless[tail.userFuncPar]++;
         shipment.workUs += tail.requestUs;
         shipment.operators.insert(tail.userFunc);
+        shippedRequests[target][tail.userFunc]++;
         quota[target] -= tail.requestUs;
         statelessWorkUs += tail.requestUs;
         budgetRequests--;
@@ -3593,7 +3655,7 @@ void Scheduler::rebalanceFlux()
     // has to get through before the next round over what it can.
     double needUs = excessUs - statelessWorkUs;
 
-    if (needUs > 0 && quota.empty()) {
+    if (needUs > 0 && !advisedRoom) {
         SPDLOG_DEBUG("Flux {} keeps its state: {:.0f}us too much but no "
                      "advice where to send it",
                      thisHost,
@@ -3785,6 +3847,7 @@ void Scheduler::rebalanceFlux()
             shipment.units.push_back(candidate.unitKey);
             shipment.workUs += candidate.workUs;
             shipment.operators.insert(candidate.userFunc);
+            shippedRequests[target][candidate.userFunc] += candidate.backlog;
             quota[target] = std::max(0.0, quota[target] - candidate.workUs);
             movedUs += candidate.workUs;
             budgetRequests -= candidate.backlog;

@@ -1109,47 +1109,64 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
                             workers.size() });
         roomUs[ip] = capacityUs - demandUs;
     }
-    {
-        // The planner routes inputs by the same room.
-        std::lock_guard<std::mutex> lock(fluxOffloadMx);
-        fluxKnownRoomUs = roomUs;
-    }
-
     std::map<std::string, faabric::FluxOffloadPlan> plans;
     if (workers.empty()) {
+        std::lock_guard<std::mutex> lock(fluxOffloadMx);
+        fluxKnownRoomUs.clear();
         return plans;
     }
-    std::sort(workers.begin(), workers.end(), [](const auto& a, const auto& b) {
-        return a.roomUs < b.roomUs;
-    });
+    // Most short first: the congested ones by excess, then the others, least
+    // room first -- the likeliest to send pick first.
+    std::stable_sort(workers.begin(),
+                     workers.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.roomUs < b.roomUs;
+                     });
+
+    // Only workers with room take anything, and what the congested claim of
+    // it to cover their excess is theirs: the room left. If the cluster's
+    // room cannot cover all the excess, every worker's is scaled down alike,
+    // so that each gets some.
+    std::map<std::string, double> leftUs;
+    double totalRoomUs = 0;
+    double totalShortUs = 0;
+    for (const auto& worker : workers) {
+        if (worker.roomUs > 0) {
+            leftUs[worker.ip] = worker.roomUs;
+            totalRoomUs += worker.roomUs;
+        } else {
+            totalShortUs -= worker.roomUs;
+        }
+    }
+    double coverScale =
+      totalShortUs > totalRoomUs ? totalRoomUs / totalShortUs : 1.0;
 
     bool affinity = !fluxDisabled(kFluxDisableAffinity);
+    int spares = fluxSpareTargets.load(std::memory_order_relaxed);
     size_t n = workers.size();
-    // Room as the workers served so far leave it.
-    std::map<std::string, double> leftUs = roomUs;
-    for (const auto& source : workers) {
-        struct Candidate
-        {
-            const Worker* target;
-            bool hasRoom;
-            int presence;
-            bool warm;
-            double roomUs;
-            // Ties go round from the source, so that workers alike in
-            // every other respect do not all try the same one first.
-            size_t turn;
-        };
-        std::vector<Candidate> candidates;
+    struct Candidate
+    {
+        const Worker* target;
+        int presence;
+        bool warm;
+        // Ties go round from the source, so that workers alike in every
+        // other respect do not all pick the same one.
+        size_t turn;
+    };
+    // How many workers claimed each target, to cover or as a spare.
+    std::map<std::string, int> claims;
+    // Per worker: what it claimed, and every target it may use.
+    std::vector<std::set<std::string>> claimedBy(n);
+    std::vector<std::vector<Candidate>> candidatesOf(n);
+    for (size_t s = 0; s < n; s++) {
+        const Worker& source = workers[s];
         for (const auto& target : workers) {
-            if (target.ip == source.ip) {
+            if (target.ip == source.ip || target.roomUs <= 0) {
                 continue;
             }
-            Candidate candidate{ &target,
-                                 leftUs[target.ip] > 0,
-                                 0,
-                                 false,
-                                 leftUs[target.ip],
-                                 (target.index + n - source.index) % n };
+            Candidate candidate{
+                &target, 0, false, (target.index + n - source.index) % n
+            };
             if (affinity) {
                 for (const auto& op : source.operators) {
                     candidate.presence += snapshot.presenceOf(target.ip, op);
@@ -1157,42 +1174,135 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
                       candidate.warm || snapshot.runs(target.ip, op);
                 }
             }
-            candidates.push_back(candidate);
+            candidatesOf[s].push_back(candidate);
         }
-        std::sort(candidates.begin(),
-                  candidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return std::make_tuple(a.hasRoom,
-                                             a.presence,
-                                             a.warm,
-                                             a.roomUs,
-                                             b.turn) >
-                             std::make_tuple(b.hasRoom,
-                                             b.presence,
-                                             b.warm,
-                                             b.roomUs,
-                                             a.turn);
-                  });
+    }
+    // For worker s: room left, fewer claims by the other workers, then the
+    // placement rule; ties round from s.
+    auto beforeFor = [&](size_t s) {
+        auto keyOf = [&, s](const Candidate& c) {
+            const std::string& ip = c.target->ip;
+            auto claimIt = claims.find(ip);
+            int claimed = claimIt == claims.end() ? 0 : claimIt->second;
+            if (claimedBy[s].contains(ip)) {
+                claimed--;
+            }
+            auto leftIt = leftUs.find(ip);
+            double left = leftIt == leftUs.end() ? 0 : leftIt->second;
+            return std::make_tuple(
+              left > 0, -claimed, c.presence, c.warm, left);
+        };
+        return [keyOf](const Candidate& a, const Candidate& b) {
+            auto keyA = keyOf(a);
+            auto keyB = keyOf(b);
+            if (keyA != keyB) {
+                return keyA > keyB;
+            }
+            return a.turn < b.turn;
+        };
+    };
+    auto noteClaim = [&](size_t s, const std::string& ip) {
+        if (claimedBy[s].insert(ip).second) {
+            claims[ip]++;
+        }
+    };
 
-        auto& plan = plans[source.ip];
+    // Cover: the congested, most short first, each until room left covers
+    // its excess.
+    std::vector<std::vector<Candidate>> covers(n);
+    std::vector<std::map<std::string, double>> takenUs(n);
+    for (size_t s = 0; s < n; s++) {
+        double needUs = -workers[s].roomUs * coverScale;
+        auto pool = candidatesOf[s];
+        while (needUs > 0 && !pool.empty()) {
+            auto best = std::min_element(pool.begin(), pool.end(), beforeFor(s));
+            const std::string& ip = best->target->ip;
+            double& left = leftUs[ip];
+            if (left <= 0) {
+                // No room left anywhere it could claim.
+                break;
+            }
+            double takeUs = std::min(needUs, left);
+            left -= takeUs;
+            needUs -= takeUs;
+            takenUs[s][ip] = takeUs;
+            noteClaim(s, ip);
+            covers[s].push_back(*best);
+            pool.erase(best);
+        }
+    }
+
+    // What is taken to cover a congested worker's excess is kept for it:
+    // the planner routes inputs by the room left, so that they do not take
+    // up what the backlog was given, and so does every worker but the one it
+    // was given to.
+    {
+        std::lock_guard<std::mutex> lock(fluxOffloadMx);
+        fluxKnownRoomUs = roomUs;
+        for (const auto& [ip, left] : leftUs) {
+            fluxKnownRoomUs[ip] = left;
+        }
+    }
+
+    // Spares: every worker in turn, one at a time, without taking room. A
+    // congested worker's may be among its cover targets, when one still has
+    // the most room left of all: its own claim there counts nothing against
+    // it.
+    std::vector<std::vector<Candidate>> sparesOf(n);
+    std::vector<std::vector<Candidate>> sparePools = candidatesOf;
+    for (int round = 0; round < spares; round++) {
+        for (size_t s = 0; s < n; s++) {
+            auto& pool = sparePools[s];
+            if (pool.empty()) {
+                continue;
+            }
+            auto best = std::min_element(pool.begin(), pool.end(), beforeFor(s));
+            noteClaim(s, best->target->ip);
+            sparesOf[s].push_back(*best);
+            pool.erase(best);
+        }
+    }
+
+    // The rest -- every target it did not claim -- by the same order over
+    // the final claims: a worker goes first to those fewest have claimed.
+    for (size_t s = 0; s < n; s++) {
+        std::vector<Candidate> rest;
+        for (const auto& candidate : candidatesOf[s]) {
+            if (!claimedBy[s].contains(candidate.target->ip)) {
+                rest.push_back(candidate);
+            }
+        }
+        std::sort(rest.begin(), rest.end(), beforeFor(s));
+
+        auto& plan = plans[workers[s].ip];
         plan.set_inputratescale(scale);
-        double shortUs = std::max(0.0, -source.roomUs);
-        for (const auto& candidate : candidates) {
-            const std::string& ip = candidate.target->ip;
-            plan.add_preference(ip);
-            (*plan.mutable_roomus())[ip] = std::max(0.0, roomUs[ip]);
-            double takeUs = std::min(shortUs, std::max(0.0, leftUs[ip]));
-            leftUs[ip] -= takeUs;
-            shortUs -= takeUs;
+        plan.set_covertargets(static_cast<int>(covers[s].size()));
+        plan.set_sparetargets(static_cast<int>(sparesOf[s].size()));
+        for (const auto* list : { &covers[s], &sparesOf[s], &rest }) {
+            for (const auto& candidate : *list) {
+                const std::string& ip = candidate.target->ip;
+                plan.add_preference(ip);
+                auto takenIt = takenUs[s].find(ip);
+                double mineUs =
+                  takenIt == takenUs[s].end() ? 0 : takenIt->second;
+                (*plan.mutable_roomus())[ip] =
+                  std::max(0.0, leftUs[ip] + mineUs);
+            }
+        }
+        for (const auto& [ip, claimed] : claims) {
+            (*plan.mutable_claims())[ip] = claimed;
         }
     }
 
     for (const auto& [ip, plan] : plans) {
         if (plan.preference_size() > 0) {
-            SPDLOG_DEBUG("Flux advises {} to send to {} first ({:.0f} ms room)",
+            SPDLOG_DEBUG("Flux advises {} to send to {} first ({:.0f} ms "
+                         "room; {} covering, {} spare)",
                          ip,
                          plan.preference(0),
-                         plan.roomus().at(plan.preference(0)) / 1000);
+                         plan.roomus().at(plan.preference(0)) / 1000,
+                         plan.covertargets(),
+                         plan.sparetargets());
         }
     }
     return plans;
@@ -1288,6 +1398,16 @@ void StateAwareScheduler::planFluxMerges(
         return a.spreadUs < b.spreadUs;
     });
 
+    // Workers claimed this round to cover someone's excess take no merge:
+    // their room is spoken for.
+    std::set<std::string> covering;
+    for (const auto& [ip, plan] : plans) {
+        for (int i = 0; i < plan.covertargets() && i < plan.preference_size();
+             i++) {
+            covering.insert(plan.preference(i));
+        }
+    }
+
     std::set<std::string> involved;
     for (const auto& spread : spreads) {
         const std::string& userFunc = spread.userFunc;
@@ -1308,8 +1428,8 @@ void StateAwareScheduler::planFluxMerges(
           });
 
         for (const auto& [target, targetUnits] : targets) {
-            if (involved.contains(target) || !keepsUp(now, target, 0) ||
-                busyInWindow(target)) {
+            if (involved.contains(target) || covering.contains(target) ||
+                !keepsUp(now, target, 0) || busyInWindow(target)) {
                 continue;
             }
 
@@ -1400,26 +1520,31 @@ void StateAwareScheduler::planFluxMerges(
     }
 }
 
-void StateAwareScheduler::setFluxAdvice(std::vector<std::string> preference,
-                                        std::map<std::string, double> roomUs,
+void StateAwareScheduler::setFluxAdvice(FluxAdvice advice,
                                         double inputRateScale)
 {
     std::lock_guard<std::mutex> lock(fluxOffloadMx);
-    fluxPreference = std::move(preference);
-    fluxKnownRoomUs = std::move(roomUs);
+    fluxPreference = std::move(advice.preference);
+    fluxKnownRoomUs = std::move(advice.roomUs);
+    fluxClaims = std::move(advice.claims);
+    fluxCoverTargets = advice.coverTargets;
+    fluxSpareTargetsAdvised = advice.spareTargets;
     fluxInputScale.store(inputRateScale > 0 ? inputRateScale : 1.0,
                          std::memory_order_relaxed);
 }
 
-std::vector<std::pair<std::string, double>> StateAwareScheduler::getFluxAdvice()
+StateAwareScheduler::FluxAdvice StateAwareScheduler::getFluxAdvice()
 {
     std::lock_guard<std::mutex> lock(fluxOffloadMx);
-    std::vector<std::pair<std::string, double>> advice;
-    advice.reserve(fluxPreference.size());
+    FluxAdvice advice;
+    advice.preference = fluxPreference;
     for (const auto& ip : fluxPreference) {
         auto it = fluxKnownRoomUs.find(ip);
-        advice.emplace_back(ip, it == fluxKnownRoomUs.end() ? 0 : it->second);
+        advice.roomUs[ip] = it == fluxKnownRoomUs.end() ? 0 : it->second;
     }
+    advice.claims = fluxClaims;
+    advice.coverTargets = fluxCoverTargets;
+    advice.spareTargets = fluxSpareTargetsAdvised;
     return advice;
 }
 
@@ -1595,38 +1720,66 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
             }
         }
 
-        // Short: to the first target on the planner's list with room for it
-        // as last known -- one filled before the next, so this worker's
-        // requests go to as few others as they must -- or, with packing
-        // ablated, the one with the most. Picked and drawn in one go, so two
-        // requests cannot both spend the same room; the target's reply to
-        // the send then says how much it really has left.
+        // Short: to an advised target with room for it as last known
+        // (pickAdvisedTargetFlux): its spares, then the rest, each by the
+        // placement rule for this operator, what this worker sent where this
+        // round included -- so its requests go to as few others as they
+        // must. Never to the targets claimed to cover its excess: those take
+        // the backlog rebalancing moves, and every worker, congested or not,
+        // routes alike. Picked and drawn in one
+        // go, so two requests cannot both spend the same room; the target's
+        // reply to the send then says how much it really has left.
         bool packing = !fluxDisabled(kFluxDisablePacking);
-        std::string target;
-        {
-            std::lock_guard<std::mutex> lock(fluxOffloadMx);
-            double* targetRoomUs = nullptr;
-            for (const auto& ip : fluxPreference) {
-                if (ip == localHost || !hostMap.contains(ip)) {
-                    continue;
+        bool affinity = !fluxDisabled(kFluxDisableAffinity);
+        std::map<std::string, int> sentThere;
+        if (affinity) {
+            std::lock_guard<std::mutex> lock(fluxAssignedMx);
+            for (const auto& [ip, perQueue] : fluxAssignedSinceStats) {
+                auto it = perQueue.find(queueKey);
+                if (it != perQueue.end()) {
+                    sentThere[ip] = it->second;
                 }
-                auto it = fluxKnownRoomUs.find(ip);
-                if (it == fluxKnownRoomUs.end() || it->second < workUs) {
-                    continue;
-                }
-                if (targetRoomUs == nullptr ||
-                    (!packing && it->second > *targetRoomUs)) {
-                    target = ip;
-                    targetRoomUs = &it->second;
-                    if (packing) {
-                        break;
-                    }
-                }
-            }
-            if (targetRoomUs != nullptr) {
-                *targetRoomUs = std::max(0.0, *targetRoomUs - workUs);
             }
         }
+        std::string target;
+        int tier = -1;
+        {
+            std::lock_guard<std::mutex> lock(fluxOffloadMx);
+            auto roomOf = [&](const std::string& ip) {
+                if (ip == localHost || !hostMap.contains(ip)) {
+                    return 0.0;
+                }
+                auto it = fluxKnownRoomUs.find(ip);
+                return it == fluxKnownRoomUs.end() ? 0.0 : it->second;
+            };
+            auto presenceOf = [&](const std::string& ip) {
+                auto it = sentThere.find(ip);
+                return snapshot->presenceOf(ip, userFunc) +
+                       (it == sentThere.end() ? 0 : it->second);
+            };
+            auto warmOf = [&](const std::string& ip) {
+                return snapshot->runs(ip, userFunc);
+            };
+            target = pickAdvisedTargetFlux(fluxPreference,
+                                           fluxClaims,
+                                           fluxCoverTargets,
+                                           fluxSpareTargetsAdvised,
+                                           /*useCover=*/false,
+                                           workUs,
+                                           packing,
+                                           affinity,
+                                           roomOf,
+                                           presenceOf,
+                                           warmOf,
+                                           &tier);
+            if (!target.empty()) {
+                double& roomUs = fluxKnownRoomUs[target];
+                roomUs = std::max(0.0, roomUs - workUs);
+            }
+        }
+        (target.empty() ? fluxRoutedHeld
+                        : (tier == 2 ? fluxRoutedRest : fluxRoutedSpare))
+          .fetch_add(1, std::memory_order_relaxed);
 
         std::lock_guard<std::mutex> lock(fluxAssignedMx);
         if (target.empty()) {
@@ -6520,8 +6673,14 @@ void StateAwareScheduler::resetScheduler()
         std::lock_guard<std::mutex> lock(fluxOffloadMx);
         fluxKnownRoomUs.clear();
         fluxPreference.clear();
+        fluxClaims.clear();
+        fluxCoverTargets = 0;
+        fluxSpareTargetsAdvised = 0;
         fluxInputScale.store(1.0, std::memory_order_relaxed);
     }
+    fluxRoutedSpare.store(0, std::memory_order_relaxed);
+    fluxRoutedRest.store(0, std::memory_order_relaxed);
+    fluxRoutedHeld.store(0, std::memory_order_relaxed);
     stateHashRing.clear();
     statePartitionBy.clear();
     funcStateRegMap.clear();
