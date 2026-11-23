@@ -532,8 +532,8 @@ class Scheduler
     fluxLocalLoadOf(const std::string& userFuncPar);
 
     // What the StateAwareScheduler reads about this worker as a whole when
-    // routing chained requests: the executor time queued here, against its
-    // executor slots over a rebalancing period.
+    // routing chained requests: the executor time queued here and expected
+    // to arrive, against its executor slots over a rebalancing period.
     faabric::batch_scheduler::StateAwareScheduler::FluxLocalWork
     fluxLocalWorkOf();
 
@@ -671,10 +671,6 @@ class Scheduler
         msg.set_forwardcount(msg.forwardcount() + 1);
     }
 
-    // Queue depths the last rebalancing round saw, by queue key: tells a
-    // paridx that has had work waiting all along from one hit by a fresh
-    // burst. Only touched by the rebalancing thread.
-    std::map<std::string, int> fluxPreviousDepths;
 
     std::shared_ptr<faabric::executor::Executor> claimExecutor(
       faabric::Message& msg
@@ -807,14 +803,12 @@ class Scheduler
     // slots its capacity can be taken to have. 0 (default): no cap.
     std::atomic<int> fluxWorkerExecutors{ 0 };
 
-    // ModeFlux: what this worker's cores carry. Every window closed by
-    // rollFluxParidxWindows adds one sample -- its length, the executor time
-    // held over it, and the CPU time this process took -- and the last
-    // kFluxCapacityWindowSec of them give the executors held and the cores
-    // kept busy on average, and the slots the worker is taken to have:
-    // fluxWorkerSlots cores, each carrying held / busy executors, and never
-    // fewer than fluxWorkerSlots. Samples under fluxParidxRunMx; the results
-    // are read without it. Reset by flushes.
+    // ModeFlux: the executors held and cores kept busy here, for the logs.
+    // Every window closed by rollFluxParidxWindows adds one sample -- its
+    // length, the executor time held over it, the CPU time this process
+    // took -- and the last kFluxCapacityWindowSec of them give the averages.
+    // Samples under fluxParidxRunMx; the results are read without it. Reset
+    // by flushes. The capacity itself comes from busy periods (rollFluxCapacity).
     struct FluxCapacitySample
     {
         int64_t spanUs = 0;
@@ -829,8 +823,38 @@ class Scheduler
     // 0 until measured.
     std::atomic<double> fluxCapacitySlots{ 0 };
 
-    // Caller holds fluxParidxRunMx.
-    void rollFluxCapacity(int64_t nowUs, int64_t cpuNs, double occupiedUs);
+    // Caller holds fluxParidxRunMx. `queued`: whether requests wait here
+    // now.
+    void rollFluxCapacity(int64_t nowUs,
+                          int64_t cpuNs,
+                          double occupiedUs,
+                          bool queued);
+
+    // ModeFlux: how many executors this worker can keep running. A worker
+    // is busy over a period when the requests it started then waited for a
+    // run slot fluxBusyWaitMs or more on average -- or none started while
+    // some waited. While busy it runs as many executors as it can, whatever
+    // holds it back, so the batches it ran on average over a busy period
+    // are what it can carry: taken as its capacity, and kept after, renewed
+    // by the next busy period -- an idle worker shows nothing new. Until the
+    // first, nothing says it cannot run its executor cap (fluxExecutorCap).
+    // CPU is not consulted: locks and state keep cores idle however many
+    // executors run. Reset by flushes.
+    //
+    // Queue waits of the requests started since the last period closed.
+    std::atomic<int64_t> fluxQueueWaitSumUs{ 0 };
+    std::atomic<int64_t> fluxQueueWaitCount{ 0 };
+    // flux_busy_wait_ms.
+    std::atomic<int> fluxBusyWaitMs{ 50 };
+    // The last period closed: whether busy, and its mean queue wait (us).
+    std::atomic<bool> fluxBusyLastPeriod{ false };
+    std::atomic<double> fluxQueueWaitLastUs{ 0 };
+    // The capacity last observed so (slots); 0 until the first busy period.
+    std::atomic<double> fluxObservedCapacitySlots{ 0 };
+
+    // The most executors this worker runs at once: its cap if it has one,
+    // else what one operator may run (maxExecutors; K = M).
+    double fluxExecutorCap() const;
 
     // The slots to plan with here: as measured, or fluxWorkerSlots before
     // they are, outside ModeFlux, under Pheromone, or with the dynamic

@@ -2135,7 +2135,7 @@ void Planner::updateRuntimeStats()
                     auto snapshot = stateAwareScheduler->getClusterSnapshot();
                     int64_t offloadStartNs = faabric::util::getCpuTimeNano();
                     auto plans = stateAwareScheduler->planFluxOffload(
-                      snapshot->stats, runtimeReconfigPeriod * 1000.0);
+                      *snapshot, runtimeReconfigPeriod * 1000.0);
                     int64_t mergeStartNs = faabric::util::getCpuTimeNano();
                     stateAwareScheduler->planFluxMerges(plans);
                     round.offloadCpuNs = mergeStartNs - offloadStartNs;

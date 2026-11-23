@@ -1058,10 +1058,10 @@ StateAwareScheduler::getClusterWorkerStats()
 }
 
 std::map<std::string, faabric::FluxOffloadPlan>
-StateAwareScheduler::planFluxOffload(
-  const std::map<std::string, faabric::WorkerStats>& stats,
-  double horizonUs)
+StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
+                                     double horizonUs)
 {
+    const auto& stats = snapshot.stats;
     struct Side
     {
         std::string ip;
@@ -1100,14 +1100,7 @@ StateAwareScheduler::planFluxOffload(
 
         double roomUs = slots * horizonUs - demandUs;
         if (roomUs > 0) {
-            // Everything it has run, not only what is backed up now: warm
-            // executors are what count here.
-            std::set<std::string> runs;
-            for (const auto& [queueKey, depth] :
-                 workerStats.instancequeuenum()) {
-                runs.insert(operatorOfQueue(queueKey));
-            }
-            room.push_back({ ip, roomUs, std::move(runs) });
+            room.push_back({ ip, roomUs, {} });
         }
     }
 
@@ -1120,39 +1113,49 @@ StateAwareScheduler::planFluxOffload(
         return a.workUs > b.workUs;
     });
 
+    // Ablated affinity picks by room alone.
+    bool affinity = !fluxDisabled(kFluxDisableAffinity);
     for (auto& source : behind) {
-        // Room already running one of the operators backed up here first,
-        // then the most room.
-        std::vector<Side*> candidates;
+        // In the order workers place work in (placement rule): where most of
+        // the operators backed up here already is -- their requests queued
+        // or running there -- then where there are warm executors for one
+        // of them, then the most room left.
+        struct Candidate
+        {
+            Side* target;
+            int presence;
+            bool warm;
+        };
+        std::vector<Candidate> candidates;
         for (auto& target : room) {
-            if (target.workUs > 0) {
-                candidates.push_back(&target);
+            if (target.workUs <= 0) {
+                continue;
             }
-        }
-        auto warm = [&source](const Side* target) {
-            for (const auto& op : source.operators) {
-                if (target->operators.contains(op)) {
-                    return true;
+            Candidate candidate{ &target, 0, false };
+            if (affinity) {
+                for (const auto& op : source.operators) {
+                    candidate.presence += snapshot.presenceOf(target.ip, op);
+                    candidate.warm =
+                      candidate.warm || snapshot.runs(target.ip, op);
                 }
             }
-            return false;
-        };
+            candidates.push_back(candidate);
+        }
         std::sort(candidates.begin(),
                   candidates.end(),
-                  [&warm](const Side* a, const Side* b) {
-                      bool warmA = warm(a);
-                      bool warmB = warm(b);
-                      if (warmA != warmB) {
-                          return warmA;
-                      }
-                      return a->workUs > b->workUs;
+                  [](const Candidate& a, const Candidate& b) {
+                      return std::make_tuple(
+                               a.presence, a.warm, a.target->workUs) >
+                             std::make_tuple(
+                               b.presence, b.warm, b.target->workUs);
                   });
 
         auto& quota = *plans[source.ip].mutable_quotaus();
-        for (auto* target : candidates) {
+        for (const auto& candidate : candidates) {
             if (source.workUs <= 0) {
                 break;
             }
+            Side* target = candidate.target;
             double shareUs = std::min(source.workUs, target->workUs);
             quota[target->ip] = shareUs;
             source.workUs -= shareUs;
@@ -1205,6 +1208,19 @@ void StateAwareScheduler::planFluxMerges(
         double capacityUs = valueOf(round.capacityUs, ip);
         return round.demandUs.contains(ip) && capacityUs > 0 &&
                valueOf(round.demandUs, ip) + extraUs <= capacityUs;
+    };
+
+    // Whether `ip` was busy -- its requests waited flux_busy_wait_ms on
+    // average -- in any round of the window. Such a worker takes no merge:
+    // it has shown it is short already.
+    auto busyInWindow = [&history](const std::string& ip) {
+        for (const auto& round : history) {
+            auto it = round->stats.find(ip);
+            if (it != round->stats.end() && it->second.fluxbusy()) {
+                return true;
+            }
+        }
+        return false;
     };
 
     // Every stateful operator held on more than one worker, with how much of
@@ -1270,7 +1286,8 @@ void StateAwareScheduler::planFluxMerges(
           });
 
         for (const auto& [target, targetUnits] : targets) {
-            if (involved.contains(target) || !keepsUp(now, target, 0)) {
+            if (involved.contains(target) || !keepsUp(now, target, 0) ||
+                busyInWindow(target)) {
                 continue;
             }
 
@@ -1527,9 +1544,9 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         }
 
         // It stays if a run slot is free -- it starts at once -- or if this
-        // worker still gets through it, with everything else it has and
-        // everything this pass kept, before its next round. Only a worker
-        // short of executors sends work on.
+        // worker still gets through it, with everything it has and expects
+        // and everything this pass kept, before its next round. Only a
+        // worker short of executors sends work on.
         std::set<std::string> sentThisRound;
         {
             std::lock_guard<std::mutex> lock(fluxAssignedMx);
@@ -1538,7 +1555,7 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
             // Ablated packing keeps it only while a run slot is free.
             bool keepsUp = !fluxDisabled(kFluxDisablePacking) &&
                            passWork.has_value() &&
-                           passWork->queuedUs + fluxKeptWorkThisPass + workUs <=
+                           passWork->demandUs + fluxKeptWorkThisPass + workUs <=
                              passWork->capacityUs;
             if (slotFree || keepsUp || workUs <= 0) {
                 kept++;

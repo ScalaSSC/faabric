@@ -527,6 +527,34 @@ class BatchQueue : public BatchQueueBase
         return taken;
     }
 
+    // The keys of up to `count` messages off the back: the last to leave
+    // first.
+    std::vector<OrderKey> tailKeys(int count)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<OrderKey> keys;
+        for (auto it = batchQueue.rbegin();
+             it != batchQueue.rend() && static_cast<int>(keys.size()) < count;
+             ++it) {
+            keys.push_back(it->first);
+        }
+        return keys;
+    }
+
+    // Up to `count` messages off the back, the last to leave first.
+    virtual std::vector<std::unique_ptr<faabric::Message>> takeLast(int count)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::unique_ptr<faabric::Message>> taken;
+        while (!batchQueue.empty() && static_cast<int>(taken.size()) < count) {
+            auto it = std::prev(batchQueue.end());
+            taken.push_back(std::move(it->second));
+            batchQueue.erase(it);
+            messagesCount--;
+        }
+        return taken;
+    }
+
     // Every message for which `pred` holds, in queue order. The rest keep
     // their order.
     virtual std::vector<std::unique_ptr<faabric::Message>> takeIf(

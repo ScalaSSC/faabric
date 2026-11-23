@@ -494,12 +494,11 @@ message WorkerStats{
     // ModeFlux, over the last capacity window (StateAwareScheduler::
     // kFluxCapacityWindowSec): executors held on average (batches holding a
     // run slot, integrated over time), cores this process kept busy on
-    // average, and the executor slots the worker is taken to have --
-    // workerSlots cores, each carrying as many executors as it did:
-    // max(workerSlots, workerSlots x occupied / busy), or workerSlots with the
-    // dynamic capacity ablated -- either within flux_worker_executors, the
-    // worker's hard cap, if set. These are the slots it plans with. 0 outside
-    // ModeFlux and under Pheromone; then workerSlots is the capacity.
+    // average, and the executor slots the worker is taken to have -- the
+    // batches it ran on average over its last busy period, or its executor
+    // cap before it has been busy, or workerSlots with the dynamic capacity
+    // ablated. These are the slots it plans with. 0 outside ModeFlux and
+    // under Pheromone; then workerSlots is the capacity.
     double fluxOccupiedExecutors = 22;
     double fluxBusyCores = 23;
     double fluxCapacitySlots = 24;
@@ -508,6 +507,12 @@ message WorkerStats{
     // The planner stamps the arrival and the worker reads the age, so it is
     // off by the skew between their clocks. Reported only, not planned with.
     map<string, int64> queueHeadAgeUs = 25;
+    // ModeFlux, over the last rebalancing period: whether this worker was
+    // busy -- the requests it started then waited flux_busy_wait_ms or more
+    // on average for a run slot, or none started while some waited -- and
+    // that mean wait (us).
+    bool fluxBusy = 26;
+    double fluxQueueWaitUs = 27;
 }
 
 // ModeFlux: what one worker's scheduling, rebalancing and stats cost,

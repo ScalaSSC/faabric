@@ -175,13 +175,11 @@ class StateAwareScheduler : public BatchScheduler
 
     /**
      * ModeFlux: the executor slots a worker is taken to have, as it
-     * reported them. An executor holds its slot for the whole of a request,
-     * waiting on locks and state as well as running, so a core carries more
-     * than one: each worker measures how many over the last
-     * kFluxCapacityWindowSec and reports workerSlots cores times that
-     * (fluxCapacitySlots), or its configured slots with the dynamic capacity
-     * ablated -- never more than its executor cap (flux_worker_executors),
-     * if it has one. A worker that reported none: its configured slots.
+     * reported them (fluxCapacitySlots): as many executors as it kept
+     * running while requests waited for a slot over the last
+     * kFluxCapacityWindowSec, if they waited long enough to show it, else
+     * its executor cap; or its configured slots with the dynamic capacity
+     * ablated. A worker that reported none: its configured slots.
      */
     static double capacitySlotsFlux(const faabric::WorkerStats& workerStats)
     {
@@ -313,15 +311,16 @@ class StateAwareScheduler : public BatchScheduler
 
     /**
      * ModeFlux: what a worker has to get through before its next
-     * rebalancing round that it cannot send elsewhere -- every request
-     * queued there, and every stateful request bound to arrive, each with
-     * the stateless requests it will set off there -- and what it can, its
-     * executor slots over that time. Stateless requests yet to arrive are
-     * left out: they can still be routed elsewhere when they do.
+     * rebalancing round -- every request queued there and every request
+     * bound to arrive, stateless ones included, each with the stateless
+     * requests it will set off there: the demand the planner judges it by
+     * (demandWorkUsFlux) -- and what it can, its executor slots over that
+     * time. Stateless arrivals count because, routed here by the planner or
+     * another worker, they run here too unless rebalancing moves them later.
      */
     struct FluxLocalWork
     {
-        double queuedUs = 0;
+        double demandUs = 0;
         double capacityUs = 0;
     };
 
@@ -351,12 +350,14 @@ class StateAwareScheduler : public BatchScheduler
      * its queued work (requests x executor time per request) and the work
      * arriving meanwhile -- exceeds what it can run, and has room when it is
      * the other way round. Those behind, most first, are matched with those
-     * with room, most first -- a worker already running one of the operators
-     * backed up there going first, for its warm executors -- and each worker's
-     * room is handed out once, so no two workers are sent to the same room.
+     * with room in the order workers place work in: most of the operators
+     * backed up there already there first (queued or running), then warm
+     * executors for one of them, then the most room -- room alone if
+     * affinity is ablated. Each worker's room is handed out once, so no two
+     * workers are sent to the same room.
      */
     std::map<std::string, faabric::FluxOffloadPlan> planFluxOffload(
-      const std::map<std::string, faabric::WorkerStats>& stats,
+      const FluxClusterSnapshot& snapshot,
       double horizonUs);
 
     /**
@@ -374,7 +375,9 @@ class StateAwareScheduler : public BatchScheduler
      *    and what is merged onto it, the stateless requests that sets off
      *    downstream included, so those still run there: the recent peak,
      *    not the current load, has to fit;
-     *  - neither it nor the target is short of executors in this round;
+     *  - neither it nor the target is short of executors in this round, and
+     *    the target was not busy (WorkerStats.fluxBusy) in any
+     *    round of the window;
      *  - it takes part in no other merge this round.
      * Operators go least spread first. Call after setClusterWorkerStats,
      * with the round's plans.
@@ -426,7 +429,7 @@ class StateAwareScheduler : public BatchScheduler
     // downstream counts nothing.
     static constexpr int kFluxDisableDownstream = 16;
     // A worker's capacity is its configured slots (flux_worker_slots), not
-    // what its cores were measured to carry (capacitySlotsFlux).
+    // what it was measured to carry (capacitySlotsFlux).
     static constexpr int kFluxDisableDynamicCapacity = 32;
     // Nothing is kept together: on top of kFluxDisablePacking, which it
     // implies, an operator's units of state start spread over the hosts
@@ -574,7 +577,8 @@ class StateAwareScheduler : public BatchScheduler
      * most room.
      *
      * A worker keeps its own chained requests while a run slot is free or it still
-     * gets through them, and all else it has, before its next round. Past
+     * gets through them, and all else it has and expects, before its next
+     * round. Past
      * that, if the planner has advised it where to send work, they go to an
      * advised worker: the one this operator already goes to this round,
      * then one already running it, then the one with the most quota left.
