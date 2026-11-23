@@ -37,6 +37,9 @@ using namespace faabric::snapshot;
 constexpr int DEFAULT_SLOT_NUM = 100;
 
 const std::string WORKER_ENQUEUE_TIME_KEY = "worker_queue_time_key";
+// When a request was queued on the worker it is on now: unlike the key above,
+// reset on every worker it reaches, so the wait it measures is this one's.
+const std::string FLUX_LOCAL_ENQUEUE_KEY = "flux_local_enqueue_key";
 const std::string WORKER_ENQUEUE_SIZE_KEY = "worker_queue_size_key";
 
 namespace {
@@ -1273,6 +1276,7 @@ void Scheduler::enqueueMessageBatch(
         // starts: one migrated, forwarded or rerouted on from another worker
         // keeps that first arrival, so its wait there and the hops count as
         // queueing. Dispatch time is the router's hop to that first worker.
+        (*msg.mutable_metricrecorder())[FLUX_LOCAL_ENQUEUE_KEY] = current;
         if (!queuedOnWorker(msg)) {
             (*msg.mutable_metricrecorder())[WORKER_ENQUEUE_TIME_KEY] = current;
             msg.set_dispatchreceivetime(current);
@@ -1715,11 +1719,17 @@ bool Scheduler::executeBatchForQueue(const std::string& userFuncPar,
             auto* metrics = message->mutable_metricrecorder();
             int workerQueueTime = now - (*metrics)[WORKER_ENQUEUE_TIME_KEY];
             message->set_workerqueuewaittime(workerQueueTime);
-            // What tells whether this worker is busy (rollFluxCapacity).
-            fluxQueueWaitSumUs.fetch_add(std::max(0, workerQueueTime),
-                                         std::memory_order_relaxed);
-            fluxQueueWaitCount.fetch_add(1, std::memory_order_relaxed);
             metrics->erase(WORKER_ENQUEUE_TIME_KEY);
+            // What tells whether this worker is busy (rollFluxCapacity): the
+            // wait here only, not what a request moved here waited before.
+            auto localIt = metrics->find(FLUX_LOCAL_ENQUEUE_KEY);
+            if (localIt != metrics->end()) {
+                fluxQueueWaitSumUs.fetch_add(
+                  std::max<int64_t>(0, now - localIt->second),
+                  std::memory_order_relaxed);
+                fluxQueueWaitCount.fetch_add(1, std::memory_order_relaxed);
+                metrics->erase(localIt);
+            }
             // Pheromone: it got an executor here in time.
             metrics->erase(faabric::batch_scheduler::PHEROMONE_DEFER_KEY);
         }
