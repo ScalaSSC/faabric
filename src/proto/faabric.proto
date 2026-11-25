@@ -718,8 +718,8 @@ message FluxOffloadPlan
   int32 coverTargets = 6;
   int32 spareTargets = 7;
   // Cover target -> how much of this worker's excess (us of executor time)
-  // the planner gave it: what rebalancing moves there, at most, before it
-  // turns to the spares.
+  // the planner gave it: what rebalancing moves there, at most. Rebalancing
+  // moves nowhere else: spares and the rest are for routing.
   map<string, double> coverUs = 8;
 }
 

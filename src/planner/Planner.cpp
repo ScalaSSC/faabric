@@ -13,6 +13,7 @@
 #include <faabric/util/func.h>
 #include <faabric/util/gids.h>
 #include <faabric/util/locks.h>
+#include <faabric/util/ParallelRunner.h>
 #include <faabric/util/logging.h>
 #include <faabric/util/map.h>
 #include <faabric/util/message.h>
@@ -727,6 +728,8 @@ void Planner::doEnqueueSchedMessages(
 
 void Planner::dequeueScheduledMsgs()
 {
+    // The sends to the hosts, side by side, on threads kept for it.
+    faabric::util::ParallelRunner senders;
     while (!stopThreadTimer) {
         // Send scheduled requests as soon as there are some; whatever is
         // scheduled while a round is being sent goes with the next one.
@@ -788,18 +791,14 @@ void Planner::dequeueScheduledMsgs()
                   "Could not send inputs to {}: {}", hostIp, e.what());
             }
         };
-        std::vector<std::thread> threads;
-        auto lastHost = std::prev(msgsCallMap.end());
-        for (auto it = msgsCallMap.begin(); it != lastHost; ++it) {
-            threads.emplace_back(sendTo, it->first, std::move(it->second));
+        // All of them done before the next round.
+        std::vector<std::function<void()>> sends;
+        sends.reserve(msgsCallMap.size());
+        for (auto it = msgsCallMap.begin(); it != msgsCallMap.end(); ++it) {
+            sends.emplace_back(
+              [&sendTo, it]() { sendTo(it->first, std::move(it->second)); });
         }
-        sendTo(lastHost->first, std::move(lastHost->second));
-        // Join all threads to ensure they complete before next iteration
-        for (auto& t : threads) {
-            if (t.joinable()) {
-                t.join();
-            }
-        }
+        senders.run(sends);
     }
 }
 

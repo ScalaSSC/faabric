@@ -1067,6 +1067,12 @@ StateAwareScheduler::getClusterSnapshot()
     return clusterSnapshot;
 }
 
+bool StateAwareScheduler::isLatestSnapshot(const FluxClusterSnapshot* snapshot)
+{
+    faabric::util::SharedLock lock(clusterWorkerStatsMx);
+    return clusterSnapshot.get() == snapshot;
+}
+
 std::shared_ptr<const std::map<std::string, faabric::WorkerStats>>
 StateAwareScheduler::getClusterWorkerStats()
 {
@@ -1108,6 +1114,7 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
         std::lock_guard<std::mutex> lock(fluxOffloadMx);
         fluxKnownRoomUs.clear();
         fluxCapacityUs.clear();
+        fluxCapacityGen++;
         return plans;
     }
     // Most short first: the congested ones by excess, then the others, least
@@ -1228,6 +1235,7 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
             fluxKnownRoomUs[ip] = left;
         }
         fluxCapacityUs = std::move(capacityOf);
+        fluxCapacityGen++;
     }
 
     // Spares serve the period after the planned moves, so workers take turns
@@ -1698,7 +1706,8 @@ double StateAwareScheduler::remoteWaitUsFlux(
 std::string StateAwareScheduler::scheduleStatelessMessageFlux(
   std::string& userFunc,
   const HostMap& hostMap,
-  const std::unique_ptr<Message>& msg)
+  const std::unique_ptr<Message>& msg,
+  const FluxOpRoute* route)
 {
     msg->set_messagetype(0);
 
@@ -1728,16 +1737,16 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         double workUs =
           slotTimeUs > 0 ? slotTimeUs + snapshot->downstreamOf(userFunc) : 0;
 
-        // What this worker has to get through, read once per routing pass.
-        std::optional<FluxLocalWork> passWork;
-        {
-            std::lock_guard<std::mutex> lock(fluxAssignedMx);
-            passWork = fluxPassWork;
-        }
-        if (!passWork && fluxLocalWork) {
-            passWork = fluxLocalWork();
-            std::lock_guard<std::mutex> lock(fluxAssignedMx);
-            fluxPassWork = passWork;
+        // What this worker has to get through, read once per routing pass --
+        // outside the lock, as it reads the scheduler's queues.
+        std::unique_lock<std::mutex> assignedLock(fluxAssignedMx);
+        if (!fluxPassWork && fluxLocalWork) {
+            assignedLock.unlock();
+            FluxLocalWork passWork = fluxLocalWork();
+            assignedLock.lock();
+            if (!fluxPassWork) {
+                fluxPassWork = passWork;
+            }
         }
 
         // It stays if a run slot is free -- it starts at once -- or if this
@@ -1745,14 +1754,13 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         // here (its demand) and everything this pass kept, before its next
         // round. Only a worker short of executors sends work on.
         {
-            std::lock_guard<std::mutex> lock(fluxAssignedMx);
             int& kept = fluxKeptThisPass[queueKey];
             bool slotFree = local.queued + kept < local.freeRequests;
             // Ablated packing keeps it only while a run slot is free.
-            bool keepsUp = !fluxDisabled(kFluxDisablePacking) &&
-                           passWork.has_value() &&
-                           passWork->demandUs + fluxKeptWorkThisPass + workUs <=
-                             passWork->capacityUs;
+            bool keepsUp =
+              !fluxDisabled(kFluxDisablePacking) && fluxPassWork.has_value() &&
+              fluxPassWork->demandUs + fluxKeptWorkThisPass + workUs <=
+                fluxPassWork->capacityUs;
             if (slotFree || keepsUp || workUs <= 0) {
                 kept++;
                 fluxKeptWorkThisPass += workUs;
@@ -1769,18 +1777,10 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         // routes alike. Picked and drawn in one
         // go, so two requests cannot both spend the same room; the target's
         // reply to the send then says how much it really has left.
+        // Still under fluxAssignedMx, so that what this worker sent where is
+        // read in place; fluxOffloadMx only ever nests inside it.
         bool packing = !fluxDisabled(kFluxDisablePacking);
         bool affinity = !fluxDisabled(kFluxDisableAffinity);
-        std::map<std::string, int> sentThere;
-        if (affinity) {
-            std::lock_guard<std::mutex> lock(fluxAssignedMx);
-            for (const auto& [ip, perQueue] : fluxAssignedSinceStats) {
-                auto it = perQueue.find(queueKey);
-                if (it != perQueue.end()) {
-                    sentThere[ip] = it->second;
-                }
-            }
-        }
         std::string target;
         int tier = -1;
         {
@@ -1799,9 +1799,15 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                                                         : us - coverIt->second;
             };
             auto presenceOf = [&](const std::string& ip) {
-                auto it = sentThere.find(ip);
-                return snapshot->presenceOf(ip, userFunc) +
-                       (it == sentThere.end() ? 0 : it->second);
+                int sent = 0;
+                auto targetIt = fluxAssignedSinceStats.find(ip);
+                if (targetIt != fluxAssignedSinceStats.end()) {
+                    auto it = targetIt->second.find(queueKey);
+                    if (it != targetIt->second.end()) {
+                        sent = it->second;
+                    }
+                }
+                return snapshot->presenceOf(ip, userFunc) + sent;
             };
             auto warmOf = [&](const std::string& ip) {
                 return snapshot->runs(ip, userFunc);
@@ -1810,7 +1816,7 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                                            fluxClaims,
                                            fluxCoverTargets,
                                            fluxSpareTargetsAdvised,
-                                           /*useCover=*/false,
+                                           /*cover=*/false,
                                            workUs,
                                            packing,
                                            affinity,
@@ -1827,7 +1833,6 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                         : (tier == 2 ? fluxRoutedRest : fluxRoutedSpare))
           .fetch_add(1, std::memory_order_relaxed);
 
-        std::lock_guard<std::mutex> lock(fluxAssignedMx);
         if (target.empty()) {
             // Nowhere advised to go: it waits here.
             fluxKeptThisPass[queueKey]++;
@@ -1840,8 +1845,27 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     }
 
     // ---- Planner: where the operator already runs, until it is full ----
-    auto snapshot = getClusterSnapshot();
-    const auto& stats = snapshot->stats;
+    //
+    // What does not change from one input to the next -- the cluster view,
+    // and each host's capacity as of the last advice -- is looked up once per
+    // pass for the operator (`route`), and again only once either changes.
+    FluxOpRoute ownRoute;
+    const FluxOpRoute& cache = route != nullptr ? *route : ownRoute;
+    if (cache.snapshot == nullptr || cache.hostMap != &hostMap ||
+        !isLatestSnapshot(cache.snapshot.get())) {
+        cache.snapshot = getClusterSnapshot();
+        cache.hostMap = &hostMap;
+        cache.slotTimeUs = cache.snapshot->slotTimeOf(queueKey);
+        // Its executor time, with that of the stateless requests it sets
+        // off, which run where it runs.
+        cache.workUs =
+          cache.slotTimeUs > 0
+            ? cache.slotTimeUs + cache.snapshot->downstreamOf(userFunc)
+            : 0;
+        cache.hostsBuilt = false;
+    }
+    const FluxClusterSnapshot& snapshot = *cache.snapshot;
+    const auto& stats = snapshot.stats;
     // No cluster view yet: at startup, or just after a flush, before a stats
     // round. Each operator's inputs go to one host, operators dealt round
     // robin.
@@ -1856,18 +1880,14 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         return it->second;
     }
 
-    double slotTimeUs = snapshot->slotTimeOf(queueKey);
     // Ablated packing balances instead: where it starts soonest.
-    if (slotTimeUs <= 0 || fluxDisabled(kFluxDisablePacking)) {
-        return scheduleStatelessByWaitFlux(userFunc, hostMap, *snapshot);
+    if (cache.slotTimeUs <= 0 || fluxDisabled(kFluxDisablePacking)) {
+        return scheduleStatelessByWaitFlux(userFunc, hostMap, snapshot);
     }
     // Ablated affinity still fills one host before the next, in a fixed
     // order of hosts, but without looking at where anything runs.
     bool affinity = !fluxDisabled(kFluxDisableAffinity);
-    // Its executor time, with that of the stateless requests it sets off,
-    // which run where it runs.
-    double workUs = slotTimeUs + snapshot->downstreamOf(userFunc);
-    double horizonUs = snapshot->roundUs > 0 ? snapshot->roundUs : 1e6;
+    double workUs = cache.workUs;
 
     // Each host's room as last known: its capacity over the period less its
     // demand, as of the stats round, then taken down by what this planner
@@ -1880,29 +1900,44 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     // spills onto the next. Only if no host has room does it go to the one
     // least loaded for its capacity, rho = D / C~ = 1 - room / C~ -- room
     // given to cover a worker's excess counting as load.
-    (void)horizonUs;
-    std::map<std::string, double> roomUs;
-    std::map<std::string, double> capacityUs;
-    {
-        std::lock_guard<std::mutex> lock(fluxOffloadMx);
-        roomUs = fluxKnownRoomUs;
-        capacityUs = fluxCapacityUs;
+    //
+    // Picked and drawn in one go, under fluxAssignedMx and, nested in it,
+    // fluxOffloadMx.
+    std::unique_lock<std::mutex> assignedLock(fluxAssignedMx);
+    std::unique_lock<std::mutex> roomLock(fluxOffloadMx);
+    if (!cache.hostsBuilt || cache.capacityGen != fluxCapacityGen) {
+        cache.hosts.clear();
+        cache.hosts.reserve(hostMap.size());
+        for (const auto& [ip, host] : hostMap) {
+            if (!stats.contains(ip)) {
+                // Did not report: nothing to say it has room.
+                continue;
+            }
+            auto capacityIt = fluxCapacityUs.find(ip);
+            cache.hosts.push_back({ &ip,
+                                    snapshot.presenceOf(ip, userFunc),
+                                    snapshot.runs(ip, userFunc),
+                                    capacityIt == fluxCapacityUs.end()
+                                      ? 0.0
+                                      : capacityIt->second });
+        }
+        cache.capacityGen = fluxCapacityGen;
+        cache.hostsBuilt = true;
     }
+
     const std::string* chosen = nullptr;
     std::tuple<int, bool, double> chosenKey{ 0, false, 0 };
     const std::string* leastLoaded = nullptr;
     double leastRho = std::numeric_limits<double>::infinity();
-    std::lock_guard<std::mutex> lock(fluxAssignedMx);
-    for (const auto& [ip, host] : hostMap) {
-        auto roomIt = roomUs.find(ip);
-        if (!stats.contains(ip) || roomIt == roomUs.end()) {
-            // Did not report: nothing to say it has room.
+    for (const auto& host : cache.hosts) {
+        const std::string& ip = *host.ip;
+        auto roomIt = fluxKnownRoomUs.find(ip);
+        if (roomIt == fluxKnownRoomUs.end()) {
             continue;
         }
         double hostRoomUs = roomIt->second;
-        auto capacityIt = capacityUs.find(ip);
-        double rho = capacityIt != capacityUs.end() && capacityIt->second > 0
-                       ? 1.0 - hostRoomUs / capacityIt->second
+        double rho = host.capacityUs > 0
+                       ? 1.0 - hostRoomUs / host.capacityUs
                        : std::numeric_limits<double>::infinity();
         if (leastLoaded == nullptr || rho < leastRho) {
             leastRho = rho;
@@ -1912,23 +1947,21 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
             continue;
         }
 
-        int routedHere = 0;
-        auto assignedIt = fluxAssignedSinceStats.find(ip);
-        if (assignedIt != fluxAssignedSinceStats.end()) {
-            auto it = assignedIt->second.find(queueKey);
-            if (it != assignedIt->second.end()) {
-                routedHere = it->second;
-            }
-        }
         // How much of the operator is there already -- what this round
         // routed there included, which the snapshot does not show yet --
         // then warm executors, then room: the order the workers place by
         // too.
         std::tuple<int, bool, double> key{ 0, false, hostRoomUs };
         if (affinity) {
-            key = { snapshot->presenceOf(ip, userFunc) + routedHere,
-                    snapshot->runs(ip, userFunc),
-                    hostRoomUs };
+            int routedHere = 0;
+            auto assignedIt = fluxAssignedSinceStats.find(ip);
+            if (assignedIt != fluxAssignedSinceStats.end()) {
+                auto it = assignedIt->second.find(queueKey);
+                if (it != assignedIt->second.end()) {
+                    routedHere = it->second;
+                }
+            }
+            key = { host.presence + routedHere, host.warm, hostRoomUs };
         }
         if (chosen == nullptr || key > chosenKey) {
             chosen = &ip;
@@ -1941,14 +1974,13 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
     }
     if (chosen == nullptr) {
         // Nobody reported: spread round robin.
+        roomLock.unlock();
+        assignedLock.unlock();
         auto counter = getNextCounter(userFunc);
         return faabric::util::getNthKey(hostMap, counter % hostMap.size());
     }
     fluxAssignedSinceStats[*chosen][queueKey]++;
-    {
-        std::lock_guard<std::mutex> roomLock(fluxOffloadMx);
-        fluxKnownRoomUs[*chosen] -= workUs;
-    }
+    fluxKnownRoomUs[*chosen] -= workUs;
     return *chosen;
 }
 
@@ -2234,11 +2266,11 @@ std::string StateAwareScheduler::scheduleMessageFlux(
         // and it is never wrong in the way a made-up shard would be.
         SPDLOG_WARN("Flux: {} is not in the registered DAG, routing by load",
                     userFunc);
-        return scheduleStatelessMessageFlux(userFunc, hostMap, msg);
+        return scheduleStatelessMessageFlux(userFunc, hostMap, msg, &route);
     }
 
     if (route.node->type == NodeType::STATELESS) {
-        return scheduleStatelessMessageFlux(userFunc, hostMap, msg);
+        return scheduleStatelessMessageFlux(userFunc, hostMap, msg, &route);
     }
 
     auto parallelismInfo =
@@ -6726,6 +6758,7 @@ void StateAwareScheduler::resetScheduler()
         std::lock_guard<std::mutex> lock(fluxOffloadMx);
         fluxKnownRoomUs.clear();
         fluxCapacityUs.clear();
+        fluxCapacityGen++;
         fluxPreference.clear();
         fluxClaims.clear();
         fluxCoverTargets = 0;

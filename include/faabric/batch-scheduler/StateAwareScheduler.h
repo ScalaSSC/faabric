@@ -295,6 +295,9 @@ class StateAwareScheduler : public BatchScheduler
 
     std::shared_ptr<const FluxClusterSnapshot> getClusterSnapshot();
 
+    // Whether `snapshot` is still the latest one.
+    bool isLatestSnapshot(const FluxClusterSnapshot* snapshot);
+
     /**
      * ModeFlux: what a worker knows about one of its own queues right now.
      * The cluster stats are a round old, and a worker routing its own chained
@@ -421,7 +424,8 @@ class StateAwareScheduler : public BatchScheduler
     struct FluxAdvice
     {
         // Every other worker with room, in order: first the targets this
-        // worker claimed to cover its excess, then its spares, then the rest.
+        // worker claimed to cover its excess (rebalancing's), then its spares,
+        // then the rest (routing's).
         std::vector<std::string> preference;
         // The room known of each: as the planner saw it, less what other
         // workers claimed of it to cover their excess, until its replies say.
@@ -442,20 +446,21 @@ class StateAwareScheduler : public BatchScheduler
 
     /**
      * ModeFlux, workers: which advised target takes `workUs` of work of an
-     * operator. The advice's tiers in turn -- the targets claimed to cover
-     * this worker's excess (only with `useCover`: rebalancing, which moves
-     * that excess; routing new requests skips them, so that every worker
-     * routes alike, by its spares), then its spares, then the rest -- and
-     * within the first tier with room for the work, by the placement rule
-     * for the operator: most of it there (`presenceOf`, what this worker sent
-     * there since the stats included), warm executors for it (`warmOf`),
-     * most room (`roomOf(ip, tier)`: in the cover tier, what is left of what
-     * the planner gave it; elsewhere, the room known less that); in the last
-     * tier fewest claims come first. Ties
-     * in list order. Affinity ablated: presence, warmth and room do not
-     * count, so a tier fills in list order. Packing ablated: the one with the
-     * most room of all those it may use. "" if none has room for it. The
-     * tier picked from (0 cover, 1 spare, 2 rest) goes to `tierOut`.
+     * operator. With `cover` (rebalancing), only the targets claimed to
+     * cover this worker's excess, each up to what the planner gave it:
+     * rebalancing moves no more than the planner provided for, and nowhere
+     * else. Without (routing new requests), its spares, then the rest -- never
+     * its cover targets, so that every worker routes alike. Within the first
+     * tier with room for the work, by the placement rule for the operator:
+     * most of it there (`presenceOf`, what this worker sent there since the
+     * stats included), warm executors for it (`warmOf`), most room
+     * (`roomOf(ip, tier)`: in the cover tier, what is left of what the
+     * planner gave it; elsewhere, the room known less that); in the rest
+     * fewest claims come first. Ties in list order. Affinity ablated:
+     * presence, warmth and room do not count, so a tier fills in list order.
+     * Packing ablated: the one with the most room of all those it may use.
+     * "" if none has room for it. The tier picked from (0 cover, 1 spare,
+     * 2 rest) goes to `tierOut`.
      */
     template<typename RoomOf, typename PresenceOf, typename WarmOf>
     static std::string pickAdvisedTargetFlux(
@@ -463,7 +468,7 @@ class StateAwareScheduler : public BatchScheduler
       const std::map<std::string, int>& claims,
       int coverTargets,
       int spareTargets,
-      bool useCover,
+      bool cover,
       double workUs,
       bool packing,
       bool affinity,
@@ -476,18 +481,24 @@ class StateAwareScheduler : public BatchScheduler
             return roomUs > 0 && roomUs >= workUs;
         };
         size_t coverEnd = std::min(
-          preference.size(),
-          static_cast<size_t>(std::max(0, coverTargets)));
-        size_t spareEnd = std::min(
-          preference.size(),
-          coverEnd + static_cast<size_t>(std::max(0, spareTargets)));
-        size_t firstUsable = useCover ? 0 : coverEnd;
+          preference.size(), static_cast<size_t>(std::max(0, coverTargets)));
+        size_t spareEnd =
+          std::min(preference.size(),
+                   coverEnd + static_cast<size_t>(std::max(0, spareTargets)));
+        auto tierOf = [&](size_t i) {
+            return i < coverEnd ? 0 : (i < spareEnd ? 1 : 2);
+        };
+        // The tiers it may use: [firstTier, lastTier].
+        int firstTier = cover ? 0 : 1;
+        int lastTier = cover ? 0 : 2;
+        const size_t tierBegin[] = { 0, coverEnd, spareEnd };
+        const size_t tierEnd[] = { coverEnd, spareEnd, preference.size() };
         std::string best;
         if (!packing) {
             double bestUs = 0;
-            for (size_t i = firstUsable; i < preference.size(); i++) {
+            for (size_t i = tierBegin[firstTier]; i < tierEnd[lastTier]; i++) {
                 const std::string& ip = preference[i];
-                int tier = i < coverEnd ? 0 : (i < spareEnd ? 1 : 2);
+                int tier = tierOf(i);
                 double us = roomOf(ip, tier);
                 if (fits(us) && (best.empty() || us > bestUs)) {
                     best = ip;
@@ -499,17 +510,11 @@ class StateAwareScheduler : public BatchScheduler
             }
             return best;
         }
-        const size_t tierEnds[] = { coverEnd, spareEnd, preference.size() };
-        size_t tierStart = 0;
-        for (size_t tier = 0; tier < 3; tier++) {
-            if (tier == 0 && !useCover) {
-                tierStart = coverEnd;
-                continue;
-            }
+        for (int tier = firstTier; tier <= lastTier; tier++) {
             std::tuple<int, int, bool, double> bestKey{ 0, 0, false, 0 };
-            for (size_t i = tierStart; i < tierEnds[tier]; i++) {
+            for (size_t i = tierBegin[tier]; i < tierEnd[tier]; i++) {
                 const std::string& ip = preference[i];
-                double us = roomOf(ip, static_cast<int>(tier));
+                double us = roomOf(ip, tier);
                 if (!fits(us)) {
                     continue;
                 }
@@ -529,11 +534,10 @@ class StateAwareScheduler : public BatchScheduler
             }
             if (!best.empty()) {
                 if (tierOut != nullptr) {
-                    *tierOut = static_cast<int>(tier);
+                    *tierOut = tier;
                 }
                 return best;
             }
-            tierStart = tierEnds[tier];
         }
         return best;
     }
@@ -770,10 +774,13 @@ class StateAwareScheduler : public BatchScheduler
      * none has room, the one least loaded for its capacity: lowest
      * rho = D / C~ = 1 - room / C~.
      */
+    struct FluxOpRoute;
+    // `route`: what this pass has looked up for the operator, if any.
     std::string scheduleStatelessMessageFlux(
       std::string& userFunc,
       const HostMap& hostMap,
-      const std::unique_ptr<Message>& msg);
+      const std::unique_ptr<Message>& msg,
+      const FluxOpRoute* route = nullptr);
 
     // The planner's fallback for an operator nobody has measured yet: where
     // an input starts soonest by queue length, warm hosts breaking ties.
@@ -842,6 +849,26 @@ class StateAwareScheduler : public BatchScheduler
         std::shared_ptr<faabric::util::ConsistentHashRing> ring;
         // Non-partitioned stateful only: its shuffle counter.
         std::shared_ptr<std::atomic_uint> counter;
+
+        // Stateless, on the planner: what routing its inputs takes of the
+        // cluster view and the advice, which stay put for many inputs --
+        // looked up again only once either has changed.
+        struct StatelessHost
+        {
+            // Into the pass's host map.
+            const std::string* ip;
+            int presence;
+            bool warm;
+            double capacityUs;
+        };
+        mutable std::shared_ptr<const FluxClusterSnapshot> snapshot;
+        mutable const HostMap* hostMap = nullptr;
+        mutable uint64_t capacityGen = 0;
+        mutable double slotTimeUs = 0;
+        mutable double workUs = 0;
+        // Every host with stats, in host map order.
+        mutable std::vector<StatelessHost> hosts;
+        mutable bool hostsBuilt = false;
     };
     using FluxOpRoutes = std::unordered_map<std::string, FluxOpRoute>;
 
@@ -1134,6 +1161,8 @@ class StateAwareScheduler : public BatchScheduler
     // time) as of the last plan, to rank workers by load, rho = 1 - room /
     // capacity, when none has room for an input.
     std::map<std::string, double> fluxCapacityUs;
+    // Bumped whenever fluxCapacityUs changes, for what caches it.
+    uint64_t fluxCapacityGen = 0;
     std::vector<std::string> fluxPreference;
     std::map<std::string, int> fluxClaims;
     int fluxCoverTargets = 0;

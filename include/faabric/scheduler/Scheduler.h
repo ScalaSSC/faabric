@@ -907,24 +907,29 @@ class Scheduler
      * here. Stateless requests still to arrive are left out: routing sends
      * them elsewhere when they do.
      *
-     * Stateless requests first, as they are cheap to move: as many as cover
-     * X, even ones that would start here soon, rather than state. Requests
-     * start oldest input first, so they go from the back, youngest first.
+     * It moves min(X, what the planner gave its cover targets): what X has
+     * grown by since the planner's view waits for a later round. First it
+     * chooses what moves, then where.
      *
-     * Then units of state, for what stateless requests could not cover. A unit takes with it its
-     * backlog and its arrivals from now on, (B + l H) s^ over the next round.
-     * Fewest state bytes per unit of that go first -- small state, much work
-     * -- and only if afterwards neither side is as loaded, demand over
-     * capacity, as this worker is now.
+     * What: stateless requests first, as they are cheap to move -- as many
+     * as that takes, even ones that would start here soon, rather than
+     * state; requests start oldest input first, so they are taken from the
+     * back, youngest first. Then units of state, for what stateless requests
+     * could not cover: a unit takes with it its backlog and its arrivals from
+     * now on, (B + l H) s^ over the next round, and fewest state bytes per
+     * unit of that go first -- small state, much work.
      *
-     * Every move goes to an advised worker with room for it
-     * (StateAwareScheduler::pickAdvisedTargetFlux): one of the targets
-     * claimed to cover this worker's excess, each up to what the planner gave
-     * it, else one of its spares, else one of the rest (fewest claims first),
-     * by most of the operator there (what this round ships included), warm
-     * executors for it, most room. An operator's work thus fills one target
-     * before it spills onto the next. Once the round is done, what was given
-     * to cover targets and not moved is released for routing.
+     * Where: the chosen units first, most work first, then the chosen
+     * stateless requests a queue at a time (small and alike, so unsorted),
+     * each to one of the targets claimed to cover this worker's excess, up to
+     * what the planner gave it -- never to its spares or the rest, which are
+     * for routing -- (StateAwareScheduler::pickAdvisedTargetFlux, with
+     * `cover`), by most of the operator there (what this round ships included),
+     * warm executors for it, most left; a unit only where afterwards neither
+     * side is as loaded, demand over capacity, as this worker is now. What fits
+     * on none stays. An operator's work thus fills one target before it spills
+     * onto the next. Once the round is done, what was given to cover targets
+     * and not moved is released for routing.
      *
      * Merges the planner advised go only in a calm round: no excess, and not
      * busy over the last period.
