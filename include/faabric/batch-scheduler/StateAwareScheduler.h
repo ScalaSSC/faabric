@@ -358,23 +358,28 @@ class StateAwareScheduler : public BatchScheduler
      * over `horizonUs` less its demand), which the targets' replies then keep
      * up to date.
      *
-     * The planner's job is that workers do not all send to the same one:
-     * their lists are staggered by claims. Only workers with room are
-     * targets. First, most short first, every congested worker claims as
-     * many targets as cover its excess, taking that much of their room (all
-     * excess scaled down alike when the room in the cluster cannot cover
-     * it). Then every worker in turn claims spares, one at a time,
-     * flux_advice_spare_targets in all (setFluxSpareTargets), without taking
-     * room; a congested worker's may be among its cover targets. Each claim
-     * takes one with room left, fewest claims by other workers so far, then
-     * by the placement rule: most of its
-     * backed-up operators (or, none backed up, of those it runs) already
-     * there, then warm executors for one of them, then most room left (room
-     * alone if affinity is ablated), then a rotation. The rest of each list
-     * follows the same order over the final claims, which go with the advice
-     * (pickAdvisedTargetFlux). Room taken to cover a worker's excess is kept
-     * for it: every other worker is told of, and the planner routes inputs
-     * by, the room left (the planner's own view of every worker's room).
+     * The planner's job is that workers do not all route to the same one:
+     * their spares are staggered by claims. It knows how much each worker
+     * must move or may send, not which requests -- what a worker moves
+     * depends on what is queued when it rebalances, what it sends is called
+     * on during the period -- so it gives out room only, and each worker
+     * places what it holds by the placement rule for its operator
+     * (pickAdvisedTargetFlux). Only workers with room are targets. First,
+     * most short first, every congested worker claims as many targets as
+     * cover its excess, most room left first (a rotation on ties), taking
+     * that much of their room (all excess scaled down alike when the room
+     * in the cluster cannot cover it): what each takes is its own, so two
+     * may share a target, and the excess spreads over few. Then every worker
+     * in turn -- least room first once the planned moves are made: a
+     * target's room left, a congested worker's covered amount less its
+     * excess -- claims up to flux_advice_spare_targets spares, one at a
+     * time, among the targets with room left, without taking room: fewest
+     * spare claims first, then most room left; a congested worker's may be
+     * among its cover targets. The rest, every other target with room left,
+     * follows by the spares' order over the final spare claims, which go
+     * with the advice. Room taken to cover a worker's excess is kept for it:
+     * every other worker is told of, and the planner routes inputs by, the
+     * room left (the planner's own view of every worker's room).
      */
     std::map<std::string, faabric::FluxOffloadPlan> planFluxOffload(
       const FluxClusterSnapshot& snapshot,
@@ -421,10 +426,14 @@ class StateAwareScheduler : public BatchScheduler
         // The room known of each: as the planner saw it, less what other
         // workers claimed of it to cover their excess, until its replies say.
         std::map<std::string, double> roomUs;
-        // How many workers claimed each.
+        // How many workers claimed each as a spare.
         std::map<std::string, int> claims;
         int coverTargets = 0;
         int spareTargets = 0;
+        // Per cover target, how much of this worker's excess it was given
+        // and is not yet moved there; released once the period's
+        // rebalancing round has run (releaseFluxCover).
+        std::map<std::string, double> coverUs;
     };
     void setFluxAdvice(FluxAdvice advice, double inputRateScale);
 
@@ -440,7 +449,9 @@ class StateAwareScheduler : public BatchScheduler
      * within the first tier with room for the work, by the placement rule
      * for the operator: most of it there (`presenceOf`, what this worker sent
      * there since the stats included), warm executors for it (`warmOf`),
-     * most room (`roomOf`); in the last tier fewest claims come first. Ties
+     * most room (`roomOf(ip, tier)`: in the cover tier, what is left of what
+     * the planner gave it; elsewhere, the room known less that); in the last
+     * tier fewest claims come first. Ties
      * in list order. Affinity ablated: presence, warmth and room do not
      * count, so a tier fills in list order. Packing ablated: the one with the
      * most room of all those it may use. "" if none has room for it. The
@@ -476,12 +487,13 @@ class StateAwareScheduler : public BatchScheduler
             double bestUs = 0;
             for (size_t i = firstUsable; i < preference.size(); i++) {
                 const std::string& ip = preference[i];
-                double us = roomOf(ip);
+                int tier = i < coverEnd ? 0 : (i < spareEnd ? 1 : 2);
+                double us = roomOf(ip, tier);
                 if (fits(us) && (best.empty() || us > bestUs)) {
                     best = ip;
                     bestUs = us;
                     if (tierOut != nullptr) {
-                        *tierOut = i < coverEnd ? 0 : (i < spareEnd ? 1 : 2);
+                        *tierOut = tier;
                     }
                 }
             }
@@ -497,7 +509,7 @@ class StateAwareScheduler : public BatchScheduler
             std::tuple<int, int, bool, double> bestKey{ 0, 0, false, 0 };
             for (size_t i = tierStart; i < tierEnds[tier]; i++) {
                 const std::string& ip = preference[i];
-                double us = roomOf(ip);
+                double us = roomOf(ip, static_cast<int>(tier));
                 if (!fits(us)) {
                     continue;
                 }
@@ -525,6 +537,10 @@ class StateAwareScheduler : public BatchScheduler
         }
         return best;
     }
+
+    // Workers: the period's rebalancing round has run, so what was given to
+    // cover targets and not moved is room like any other.
+    void releaseFluxCover();
 
     // Takes `us` off the room known of `target`, to zero at the least.
     void drawFluxRoom(const std::string& target, double us);
@@ -750,7 +766,9 @@ class StateAwareScheduler : public BatchScheduler
      *
      * The planner sends each input to the first host with room for it before
      * the next stats round: the one with most of the operator there, then
-     * one with warm executors for it, then the one with the most room. If none has room, the least loaded host.
+     * one with warm executors for it, then the one with the most room. If
+     * none has room, the one least loaded for its capacity: lowest
+     * rho = D / C~ = 1 - room / C~.
      */
     std::string scheduleStatelessMessageFlux(
       std::string& userFunc,
@@ -1112,10 +1130,16 @@ class StateAwareScheduler : public BatchScheduler
     // routing inputs.
     std::mutex fluxOffloadMx;
     std::map<std::string, double> fluxKnownRoomUs;
+    // Planner only: each worker's capacity over the period (us of executor
+    // time) as of the last plan, to rank workers by load, rho = 1 - room /
+    // capacity, when none has room for an input.
+    std::map<std::string, double> fluxCapacityUs;
     std::vector<std::string> fluxPreference;
     std::map<std::string, int> fluxClaims;
     int fluxCoverTargets = 0;
     int fluxSpareTargetsAdvised = 0;
+    // Workers: see FluxAdvice::coverUs.
+    std::map<std::string, double> fluxCoverLeftUs;
     std::atomic<double> fluxInputScale{ 1.0 };
     // Planner only, guarded by fluxAssignedMx: inputs routed since the last
     // stats round, by when, for the input rate scale.

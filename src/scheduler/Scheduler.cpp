@@ -3446,13 +3446,15 @@ void Scheduler::rebalanceFlux()
     double capacityUs = slots * horizonUs;
     auto loads = snapshotFluxParidxLoads();
 
-    // The planner's advice: where to send, in order, and the room last known
-    // of each target -- shared with every other worker sending there, and
-    // kept up to date by the targets' replies. Without room anywhere nothing
+    // The planner's advice: where to send, in order, the room last known of
+    // each target -- shared with every other worker sending there, and kept
+    // up to date by the targets' replies -- and how much of this worker's
+    // excess each cover target was given. Without room anywhere nothing
     // moves.
     double inputRateScale = decentralScheduler.fluxInputRateScale();
     auto advice = decentralScheduler.getFluxAdvice();
     std::map<std::string, double> quota;
+    std::map<std::string, double> coverLeft = advice.coverUs;
     bool advisedRoom = false;
     for (const auto& [ip, roomUs] : advice.roomUs) {
         if (ip != thisHost) {
@@ -3460,6 +3462,26 @@ void Scheduler::rebalanceFlux()
             advisedRoom = advisedRoom || roomUs > 0;
         }
     }
+    auto valueIn = [](const std::map<std::string, double>& map,
+                      const std::string& ip) {
+        auto it = map.find(ip);
+        return it == map.end() ? 0.0 : it->second;
+    };
+    // Room for more on `ip` as a target of `tier`: a cover target takes what
+    // the planner gave it, as far as its room goes; past that, a target's
+    // room less what is still given for this worker's backlog.
+    auto roomOf = [&](const std::string& ip, int tier) {
+        double roomUs = valueIn(quota, ip);
+        double givenUs = valueIn(coverLeft, ip);
+        return tier == 0 ? std::min(givenUs, roomUs) : roomUs - givenUs;
+    };
+    // `us` sent to `ip` as a target of `tier`.
+    auto take = [&](const std::string& ip, int tier, double us) {
+        quota[ip] = std::max(0.0, valueIn(quota, ip) - us);
+        if (tier == 0) {
+            coverLeft[ip] = std::max(0.0, valueIn(coverLeft, ip) - us);
+        }
+    };
 
     std::vector<std::pair<std::string, faabric::util::BatchQueue*>> queues;
     {
@@ -3509,21 +3531,19 @@ void Scheduler::rebalanceFlux()
     // there once it has, though no stats show them yet.
     std::map<std::string, std::map<std::string, int>> shippedRequests;
     // The advised worker to send `workUs` of operator `userFunc` to
-    // (pickAdvisedTargetFlux): the targets claimed to cover this worker's
-    // excess, then its spares, then the rest, each by the placement rule for
-    // the operator, what this round ships included -- one target filled
-    // before the next -- or, with packing ablated, the one with the most
-    // room. `workUs` 0 takes any with room at all.
+    // (pickAdvisedTargetFlux), and the tier it was picked from: the targets
+    // claimed to cover this worker's excess, each up to what the planner gave
+    // it, then its spares, then the rest, each by the placement rule for the
+    // operator, what this round ships included -- one target filled before
+    // the next -- or, with packing ablated, the one with the most room.
+    // `workUs` 0 takes any with room at all.
     bool packing = !decentralScheduler.fluxDisabled(
       StateAwareScheduler::kFluxDisablePacking);
     bool affinity = !decentralScheduler.fluxDisabled(
       StateAwareScheduler::kFluxDisableAffinity);
     auto pickTarget = [&](const std::string& userFunc,
-                          double workUs) -> std::string {
-        auto roomOf = [&](const std::string& ip) {
-            auto it = quota.find(ip);
-            return it == quota.end() ? 0.0 : it->second;
-        };
+                          double workUs,
+                          int& tier) -> std::string {
         auto presenceOf = [&](const std::string& ip) {
             int presence = snapshot->presenceOf(ip, userFunc);
             auto targetIt = shippedRequests.find(ip);
@@ -3548,7 +3568,8 @@ void Scheduler::rebalanceFlux()
                                                           affinity,
                                                           roomOf,
                                                           presenceOf,
-                                                          warmOf);
+                                                          warmOf,
+                                                          &tier);
     };
 
     // ---- What this worker cannot get through before its next round ----
@@ -3622,7 +3643,8 @@ void Scheduler::rebalanceFlux()
         size_t i = youngest.top();
         youngest.pop();
         auto& tail = tails[i];
-        std::string target = pickTarget(tail.userFunc, tail.requestUs);
+        int tier = -1;
+        std::string target = pickTarget(tail.userFunc, tail.requestUs, tier);
         if (target.empty()) {
             // No advised worker has room for this operator's requests.
             continue;
@@ -3632,7 +3654,7 @@ void Scheduler::rebalanceFlux()
         shipment.workUs += tail.requestUs;
         shipment.operators.insert(tail.userFunc);
         shippedRequests[target][tail.userFunc]++;
-        quota[target] -= tail.requestUs;
+        take(target, tier, tail.requestUs);
         statelessWorkUs += tail.requestUs;
         budgetRequests--;
         if (++tail.next < tail.keys.size()) {
@@ -3825,10 +3847,11 @@ void Scheduler::rebalanceFlux()
             }
             // Where its work fits. The round's first unit goes even if it
             // fits nowhere, or a unit bigger than any advice could never move.
+            int tier = -1;
             std::string target =
-              pickTarget(candidate.userFunc, candidate.workUs);
+              pickTarget(candidate.userFunc, candidate.workUs, tier);
             if (target.empty() && unitsPicked == 0) {
-                target = pickTarget(candidate.userFunc, 0);
+                target = pickTarget(candidate.userFunc, 0, tier);
             }
             if (target.empty()) {
                 noRoom++;
@@ -3848,7 +3871,7 @@ void Scheduler::rebalanceFlux()
             shipment.workUs += candidate.workUs;
             shipment.operators.insert(candidate.userFunc);
             shippedRequests[target][candidate.userFunc] += candidate.backlog;
-            quota[target] = std::max(0.0, quota[target] - candidate.workUs);
+            take(target, tier, candidate.workUs);
             movedUs += candidate.workUs;
             budgetRequests -= candidate.backlog;
             unitsPicked++;
@@ -4027,6 +4050,10 @@ void Scheduler::rebalanceFlux()
                     statelessMoved,
                     targetsUsed);
     }
+
+    // What was given for the backlog and not moved is room like any other
+    // for the rest of the period.
+    decentralScheduler.releaseFluxCover();
 }
 
 Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(

@@ -694,28 +694,33 @@ message FluxOffloadPlan
   // worker. Advice too: the worker only acts on it in a round it is not
   // short itself.
   map<string, string> mergeTo = 2;
-  // Every other worker with room, in order: first the targets this worker
+  // The workers this worker may send to, in order: first the targets it
   // claimed (coverTargets, then spareTargets), then the rest. A congested
-  // worker claims, most short first, as many as cover its excess, their
-  // room taken by it; then every worker in turn claims spares, one at a
-  // time, flux_advice_spare_targets each -- a congested worker's possibly
-  // among its cover targets, which then appear twice. Each claim takes one
-  // with room left, fewest claims by other workers so far, then by the
-  // placement rule (most of the worker's operators there, warm executors for
-  // them, most room left). The rest, every target it did not claim, by the
-  // same order over the final claims.
+  // worker claims, most short first, as many as cover its excess, most
+  // room left first, their room taken by it (coverUs); then every worker in
+  // turn, least room first once those moves are made, claims up to
+  // flux_advice_spare_targets spares, one at a time, among the targets with
+  // room left, fewest spare claims first, then most room left -- a
+  // congested worker's possibly among its cover targets, which then appear
+  // twice. The rest, every other target with room left, by the spares'
+  // order over the final claims. Room only: each worker places what it
+  // holds among them by the placement rule for its operator.
   repeated string preference = 3;
   // How much the input rate has changed since the period the stats measured:
   // stateful arrivals are scaled by it to forecast the next period.
   double inputRateScale = 4;
-  // Target worker -> how many workers claimed it. Past its own targets, a
-  // worker sends to the one with fewest, then by the placement rule for the
-  // operator at hand.
+  // Target worker -> how many workers claimed it as a spare. Past its own
+  // targets, a worker sends to the one with fewest, then by the placement
+  // rule for the operator at hand.
   map<string, int32> claims = 5;
   // How many of the first targets in `preference` cover this worker's
   // excess, and how many after them are its spares.
   int32 coverTargets = 6;
   int32 spareTargets = 7;
+  // Cover target -> how much of this worker's excess (us of executor time)
+  // the planner gave it: what rebalancing moves there, at most, before it
+  // turns to the spares.
+  map<string, double> coverUs = 8;
 }
 
 // A worker's reply to requests it was sent: its room right after taking

@@ -435,6 +435,9 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
         }
         advice.coverTargets = planIt->second.covertargets();
         advice.spareTargets = planIt->second.sparetargets();
+        for (const auto& [target, us] : planIt->second.coverus()) {
+            advice.coverUs[target] = us;
+        }
         inputRateScale = planIt->second.inputratescale();
         for (const auto& [userFunc, target] : planIt->second.mergeto()) {
             mergeTo[userFunc] = target;

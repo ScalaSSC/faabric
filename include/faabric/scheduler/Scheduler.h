@@ -919,10 +919,12 @@ class Scheduler
      *
      * Every move goes to an advised worker with room for it
      * (StateAwareScheduler::pickAdvisedTargetFlux): one of the targets
-     * claimed to cover this worker's excess, else one of its spares, else one
-     * of the rest (fewest claims first), by most of the operator there (what
-     * this round ships included), warm executors for it, most room. An
-     * operator's work thus fills one target before it spills onto the next.
+     * claimed to cover this worker's excess, each up to what the planner gave
+     * it, else one of its spares, else one of the rest (fewest claims first),
+     * by most of the operator there (what this round ships included), warm
+     * executors for it, most room. An operator's work thus fills one target
+     * before it spills onto the next. Once the round is done, what was given
+     * to cover targets and not moved is released for routing.
      *
      * Merges the planner advised go only in a calm round: no excess, and not
      * busy over the last period.
