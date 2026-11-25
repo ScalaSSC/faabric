@@ -3568,7 +3568,6 @@ void Scheduler::rebalanceFlux()
             return admits(ip) ? roomOf(ip, t) : 0.0;
         };
         return StateAwareScheduler::pickAdvisedTargetFlux(advice.preference,
-                                                          advice.claims,
                                                           advice.coverTargets,
                                                           advice.spareTargets,
                                                           /*cover=*/true,

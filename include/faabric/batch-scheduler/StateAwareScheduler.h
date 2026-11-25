@@ -379,8 +379,8 @@ class StateAwareScheduler : public BatchScheduler
      * time, among the targets with room left, without taking room: fewest
      * spare claims first, then most room left; a congested worker's may be
      * among its cover targets. The rest, every other target with room left,
-     * follows by the spares' order over the final spare claims, which go
-     * with the advice. Room taken to cover a worker's excess is kept for it:
+     * follows by the spares' order over the final spare claims -- the order
+     * a worker takes them in only with affinity ablated. Room taken to cover a worker's excess is kept for it:
      * every other worker is told of, and the planner routes inputs by, the
      * room left (the planner's own view of every worker's room).
      */
@@ -430,8 +430,6 @@ class StateAwareScheduler : public BatchScheduler
         // The room known of each: as the planner saw it, less what other
         // workers claimed of it to cover their excess, until its replies say.
         std::map<std::string, double> roomUs;
-        // How many workers claimed each as a spare.
-        std::map<std::string, int> claims;
         int coverTargets = 0;
         int spareTargets = 0;
         // Per cover target, how much of this worker's excess it was given
@@ -455,8 +453,8 @@ class StateAwareScheduler : public BatchScheduler
      * most of it there (`presenceOf`, what this worker sent there since the
      * stats included), warm executors for it (`warmOf`), most room
      * (`roomOf(ip, tier)`: in the cover tier, what is left of what the
-     * planner gave it; elsewhere, the room known less that); in the rest
-     * fewest claims come first. Ties in list order. Affinity ablated:
+     * planner gave it; elsewhere, the room known less that), alike in every
+     * tier. Ties in list order. Affinity ablated:
      * presence, warmth and room do not count, so a tier fills in list order.
      * Packing ablated: the one with the most room of all those it may use.
      * "" if none has room for it. The tier picked from (0 cover, 1 spare,
@@ -465,7 +463,6 @@ class StateAwareScheduler : public BatchScheduler
     template<typename RoomOf, typename PresenceOf, typename WarmOf>
     static std::string pickAdvisedTargetFlux(
       const std::vector<std::string>& preference,
-      const std::map<std::string, int>& claims,
       int coverTargets,
       int spareTargets,
       bool cover,
@@ -511,21 +508,16 @@ class StateAwareScheduler : public BatchScheduler
             return best;
         }
         for (int tier = firstTier; tier <= lastTier; tier++) {
-            std::tuple<int, int, bool, double> bestKey{ 0, 0, false, 0 };
+            std::tuple<int, bool, double> bestKey{ 0, false, 0 };
             for (size_t i = tierBegin[tier]; i < tierEnd[tier]; i++) {
                 const std::string& ip = preference[i];
                 double us = roomOf(ip, tier);
                 if (!fits(us)) {
                     continue;
                 }
-                int claimed = 0;
-                if (tier == 2) {
-                    auto it = claims.find(ip);
-                    claimed = it == claims.end() ? 0 : it->second;
-                }
-                std::tuple<int, int, bool, double> key{ -claimed, 0, false, 0 };
+                std::tuple<int, bool, double> key{ 0, false, 0 };
                 if (affinity) {
-                    key = { -claimed, presenceOf(ip), warmOf(ip), us };
+                    key = { presenceOf(ip), warmOf(ip), us };
                 }
                 if (best.empty() || key > bestKey) {
                     best = ip;
@@ -1164,7 +1156,6 @@ class StateAwareScheduler : public BatchScheduler
     // Bumped whenever fluxCapacityUs changes, for what caches it.
     uint64_t fluxCapacityGen = 0;
     std::vector<std::string> fluxPreference;
-    std::map<std::string, int> fluxClaims;
     int fluxCoverTargets = 0;
     int fluxSpareTargetsAdvised = 0;
     // Workers: see FluxAdvice::coverUs.

@@ -1293,8 +1293,8 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
     }
 
     // The rest -- every other target with room left -- by the same order
-    // over the final claims: a worker goes first to those fewest have
-    // claimed. Those with none left are no use to it.
+    // over the final claims, which workers go by only with affinity
+    // ablated. Those with none left are no use to it.
     for (size_t s = 0; s < n; s++) {
         std::vector<Candidate> rest;
         for (const auto& candidate : candidatesOf[s]) {
@@ -1321,9 +1321,6 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
                 (*plan.mutable_roomus())[ip] =
                   std::max(0.0, leftUs[ip] + mineUs);
             }
-        }
-        for (const auto& [ip, claimed] : claims) {
-            (*plan.mutable_claims())[ip] = claimed;
         }
         for (const auto& [ip, us] : takenUs[s]) {
             (*plan.mutable_coverus())[ip] = us;
@@ -1562,7 +1559,6 @@ void StateAwareScheduler::setFluxAdvice(FluxAdvice advice,
     std::lock_guard<std::mutex> lock(fluxOffloadMx);
     fluxPreference = std::move(advice.preference);
     fluxKnownRoomUs = std::move(advice.roomUs);
-    fluxClaims = std::move(advice.claims);
     fluxCoverTargets = advice.coverTargets;
     fluxSpareTargetsAdvised = advice.spareTargets;
     fluxCoverLeftUs = std::move(advice.coverUs);
@@ -1579,7 +1575,6 @@ StateAwareScheduler::FluxAdvice StateAwareScheduler::getFluxAdvice()
         auto it = fluxKnownRoomUs.find(ip);
         advice.roomUs[ip] = it == fluxKnownRoomUs.end() ? 0 : it->second;
     }
-    advice.claims = fluxClaims;
     advice.coverTargets = fluxCoverTargets;
     advice.spareTargets = fluxSpareTargetsAdvised;
     advice.coverUs = fluxCoverLeftUs;
@@ -1813,7 +1808,6 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                 return snapshot->runs(ip, userFunc);
             };
             target = pickAdvisedTargetFlux(fluxPreference,
-                                           fluxClaims,
                                            fluxCoverTargets,
                                            fluxSpareTargetsAdvised,
                                            /*cover=*/false,
@@ -6760,7 +6754,6 @@ void StateAwareScheduler::resetScheduler()
         fluxCapacityUs.clear();
         fluxCapacityGen++;
         fluxPreference.clear();
-        fluxClaims.clear();
         fluxCoverTargets = 0;
         fluxSpareTargetsAdvised = 0;
         fluxCoverLeftUs.clear();

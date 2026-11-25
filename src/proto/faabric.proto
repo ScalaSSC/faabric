@@ -709,10 +709,9 @@ message FluxOffloadPlan
   // How much the input rate has changed since the period the stats measured:
   // stateful arrivals are scaled by it to forecast the next period.
   double inputRateScale = 4;
-  // Target worker -> how many workers claimed it as a spare. Past its own
-  // targets, a worker sends to the one with fewest, then by the placement
-  // rule for the operator at hand.
-  map<string, int32> claims = 5;
+  // 5 was how many workers claimed each target as a spare: workers no
+  // longer use it -- the rest go by the placement rule, like the spares.
+  reserved 5;
   // How many of the first targets in `preference` cover this worker's
   // excess, and how many after them are its spares.
   int32 coverTargets = 6;

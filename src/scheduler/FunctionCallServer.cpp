@@ -430,9 +430,6 @@ FunctionCallServer::recvGetWorkerRuntimeStats(std::span<const uint8_t> buffer)
         for (const auto& [target, us] : planIt->second.roomus()) {
             advice.roomUs[target] = us;
         }
-        for (const auto& [target, claimed] : planIt->second.claims()) {
-            advice.claims[target] = claimed;
-        }
         advice.coverTargets = planIt->second.covertargets();
         advice.spareTargets = planIt->second.sparetargets();
         for (const auto& [target, us] : planIt->second.coverus()) {
