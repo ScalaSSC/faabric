@@ -1602,9 +1602,18 @@ void StateAwareScheduler::noteFluxRoom(const std::string& target,
     // Kept below zero when over capacity: no one sends where room is short
     // of the work anyway, and the planner, when no worker has room, ranks
     // them by how far over they are. A saturated worker has none.
-    std::lock_guard<std::mutex> lock(fluxOffloadMx);
-    fluxKnownRoomUs[target] =
-      room.busy() ? std::min(0.0, room.roomus()) : room.roomus();
+    {
+        std::lock_guard<std::mutex> lock(fluxOffloadMx);
+        fluxKnownRoomUs[target] =
+          room.busy() ? std::min(0.0, room.roomus()) : room.roomus();
+    }
+    // The target forwarded some of what it was sent: the units it named have
+    // moved on, so the next request for them goes straight there.
+    for (const auto& move : room.moves()) {
+        updateStateHostFlux(fluxUnitKey(move.userfuncpar(), move.shardid()),
+                            move.host(),
+                            move.epoch());
+    }
 }
 
 std::string StateAwareScheduler::fluxHomeOf(const std::string& userFunc,

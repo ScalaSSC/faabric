@@ -729,4 +729,9 @@ message FluxRoom
 {
   double roomUs = 1;
   bool busy = 2;
+  // Where units now live that the sender still routed here: if any request
+  // in the batch was forwarded on a tombstone, every unit handed off in the
+  // same rebalancing round as its unit -- the sender is stale on all of
+  // them alike. The receiver keeps each one whose epoch is newer.
+  repeated ShardMove moves = 3;
 }

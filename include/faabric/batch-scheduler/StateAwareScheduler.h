@@ -542,7 +542,8 @@ class StateAwareScheduler : public BatchScheduler
     void drawFluxRoom(const std::string& target, double us);
 
     // A target's room as it replied, in place of what was known of it. A
-    // busy target has none. Planner and workers alike.
+    // busy target has none. And where the units it said have moved now live,
+    // newer epochs winning. Planner and workers alike.
     void noteFluxRoom(const std::string& target, const faabric::FluxRoom& room);
 
     // How much the input rate has moved since the period the stats measured

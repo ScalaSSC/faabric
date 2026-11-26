@@ -1216,7 +1216,8 @@ bool Scheduler::registerApp(std::unique_ptr<batch_scheduler::Application> app)
 
 // Enqueue the request messages from remote into local unprocess queue for
 // further processing.
-void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
+void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs,
+                                    std::vector<faabric::ShardMove>* movedOut)
 {
     // 1. Handle null input
     if (!msgs) {
@@ -1242,7 +1243,7 @@ void Scheduler::enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs)
     }
 
     msgs->mutable_messages()->Clear();
-    enqueueMessageBatch(std::move(msgList), invokeHost);
+    enqueueMessageBatch(std::move(msgList), invokeHost, false, movedOut);
 }
 
 std::unique_ptr<faabric::MessageBatch> convertListToBatch(
@@ -1263,7 +1264,8 @@ std::unique_ptr<faabric::MessageBatch> convertListToBatch(
 void Scheduler::enqueueMessageBatch(
   std::list<std::unique_ptr<faabric::Message>> msgs,
   std::string invokeHost,
-  bool locallyTriggered)
+  bool locallyTriggered,
+  std::vector<faabric::ShardMove>* movedOut)
 {
     // If the scheduler is updating state information, we may need to transfer
     // them to other nodes. So, just enqueue them in chained call temporarily.
@@ -1299,6 +1301,8 @@ void Scheduler::enqueueMessageBatch(
     // ModeFlux: requests for units we do not hold, by their owner.
     std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>
       fluxForwards;
+    // The rounds the units forwarded on a tombstone left in.
+    std::set<uint64_t> forwardedRounds;
     // ModeFlux: requests queued here, per paridx and per unit of state.
     std::map<std::string, int> fluxParidxArrivals;
     std::map<std::string, int> fluxUnitArrivals;
@@ -1329,7 +1333,11 @@ void Scheduler::enqueueMessageBatch(
             if (!pheromone) {
                 // Before admitMessageFlux: a unit mid-migration or already
                 // gone must not be recreated here.
-                if (divertMessageFlux(msgPtr, unitKey, fluxForwards)) {
+                if (divertMessageFlux(msgPtr,
+                                      unitKey,
+                                      fluxForwards,
+                                      movedOut != nullptr ? &forwardedRounds
+                                                          : nullptr)) {
                     continue;
                 }
                 std::string owner = admitMessageFlux(msg, userFuncPar, unitKey);
@@ -1400,6 +1408,20 @@ void Scheduler::enqueueMessageBatch(
           host);
         faabric::scheduler::getFunctionCallClient(host)->executeFunctionsBatch(
           std::move(forwardMsgs));
+    }
+
+    // The sender routed on stale owners: tell it where every unit that left
+    // in the same rounds lives now, so that its next requests go straight
+    // there rather than through here.
+    if (movedOut != nullptr && !forwardedRounds.empty()) {
+        faabric::util::SharedLock lock(fluxMigrationMx);
+        for (const auto& [unitKey, move] : fluxMovedUnits) {
+            auto roundIt = fluxMovedRound.find(unitKey);
+            if (roundIt != fluxMovedRound.end() &&
+                forwardedRounds.contains(roundIt->second)) {
+                movedOut->push_back(move);
+            }
+        }
     }
 
     SPDLOG_DEBUG("Enqueued {} messages completed", nMessages);
@@ -3189,7 +3211,8 @@ std::shared_ptr<std::shared_mutex> Scheduler::getFluxUnitLock(
 bool Scheduler::divertMessageFlux(
   std::unique_ptr<faabric::Message>& msg,
   const std::string& unitKey,
-  std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>& forwards)
+  std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>& forwards,
+  std::set<uint64_t>* forwardedRounds)
 {
     if (fluxRouteRecords.load(std::memory_order_acquire) == 0) {
         return false;
@@ -3216,6 +3239,12 @@ bool Scheduler::divertMessageFlux(
         countForward(*msg);
         fluxCounters.fwdTombstone.fetch_add(1, std::memory_order_relaxed);
         forwards[movedIt->second.host()].push_back(std::move(msg));
+        if (forwardedRounds != nullptr) {
+            auto roundIt = fluxMovedRound.find(unitKey);
+            if (roundIt != fluxMovedRound.end()) {
+                forwardedRounds->insert(roundIt->second);
+            }
+        }
         return true;
     }
 
@@ -3307,6 +3336,7 @@ void Scheduler::clearFluxMigrationState()
     fluxMigratingUnits.clear();
     fluxPendingMsgs.clear();
     fluxMovedUnits.clear();
+    fluxMovedRound.clear();
     fluxMovedOutAtUs.clear();
     fluxRouteRecords.store(0, std::memory_order_release);
 }
@@ -3433,6 +3463,8 @@ void Scheduler::forwardDeferredPheromone()
 
 void Scheduler::rebalanceFlux()
 {
+    // A new round: the units it hands off are told of together (FluxRoom).
+    fluxRebalanceRound.fetch_add(1, std::memory_order_relaxed);
     // The decisions' CPU time, up to the hand-overs.
     int64_t decideStartNs = faabric::util::getCpuTimeNano();
     auto snapshot = decentralScheduler.getClusterSnapshot();
@@ -4440,6 +4472,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
     // was parked while we were busy. From here their requests are forwarded.
     int64_t forwardAtUs = nowUs();
     std::list<std::unique_ptr<faabric::Message>> parked;
+    uint64_t round = fluxRebalanceRound.load(std::memory_order_relaxed);
     {
         faabric::util::FullLock lock(fluxMigrationMx);
         for (const auto& move : moves) {
@@ -4451,6 +4484,7 @@ Scheduler::FluxHandover Scheduler::migrateToWorkerFlux(
             record.set_epoch(move.epoch + 1);
             // One record swapped for another: fluxRouteRecords is unchanged.
             fluxMovedUnits[move.unitKey] = std::move(record);
+            fluxMovedRound[move.unitKey] = round;
             fluxMovedOutAtUs[move.unitKey] =
               faabric::util::getGlobalClock().epochMicros();
         }
@@ -4587,6 +4621,7 @@ void Scheduler::receiveShardFlux(faabric::FluxShardMigrationRequest& req)
             if (fluxMovedUnits.erase(unitKey) > 0) {
                 fluxRouteRecords.fetch_sub(1, std::memory_order_release);
             }
+            fluxMovedRound.erase(unitKey);
             auto leftIt = fluxMovedOutAtUs.find(unitKey);
             if (leftIt != fluxMovedOutAtUs.end()) {
                 int64_t awayUs = faabric::util::getGlobalClock().epochMicros() -

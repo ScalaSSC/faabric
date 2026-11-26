@@ -539,10 +539,16 @@ FunctionCallServer::recvExecuteFunctionsBatchSync(
   std::span<const uint8_t> buffer)
 {
     PARSE_MSG(faabric::MessageBatch, buffer.data(), buffer.size())
+    std::vector<faabric::ShardMove> moved;
     scheduler.enqueueMessageBatch(
-      std::make_unique<faabric::MessageBatch>(std::move(parsedMsg)));
-    // Taken in: its room now counts them.
-    return std::make_unique<faabric::FluxRoom>(scheduler.fluxRoomNow());
+      std::make_unique<faabric::MessageBatch>(std::move(parsedMsg)), &moved);
+    // Taken in: its room now counts them. And where the units the sender
+    // still routed here live now.
+    auto room = std::make_unique<faabric::FluxRoom>(scheduler.fluxRoomNow());
+    for (auto& move : moved) {
+        *room->add_moves() = std::move(move);
+    }
+    return room;
 }
 
 void FunctionCallServer::recvSetMessageResult(std::span<const uint8_t> buffer)

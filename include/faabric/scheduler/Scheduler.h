@@ -44,13 +44,19 @@ class Scheduler
 
     ~Scheduler();
 
-    void enqueueMessageBatch(std::unique_ptr<faabric::MessageBatch> msgs);
+    // `movedOut`, if given: where units now live that the sender still sent
+    // requests for here (see FluxRoom::moves).
+    void enqueueMessageBatch(
+      std::unique_ptr<faabric::MessageBatch> msgs,
+      std::vector<faabric::ShardMove>* movedOut = nullptr);
 
     // `locallyTriggered`: the requests were set off by functions that ran
     // here and were routed back here (see FluxParidxLoad::arrivedExternal).
-    void enqueueMessageBatch(std::list<std::unique_ptr<faabric::Message>> msgs,
-                             std::string invokeHost,
-                             bool locallyTriggered = false);
+    void enqueueMessageBatch(
+      std::list<std::unique_ptr<faabric::Message>> msgs,
+      std::string invokeHost,
+      bool locallyTriggered = false,
+      std::vector<faabric::ShardMove>* movedOut = nullptr);
 
     void setMessageResults();
 
@@ -777,6 +783,11 @@ class Scheduler
     // When each unit last left this worker (us), to count one that comes
     // back soon after as a ping-pong.
     std::unordered_map<std::string, int64_t> fluxMovedOutAtUs;
+    // The rebalancing round each unit in fluxMovedUnits left in: a sender
+    // stale on one is stale on every unit that left with it.
+    std::unordered_map<std::string, uint64_t> fluxMovedRound;
+    // Counts rebalancing rounds, for fluxMovedRound.
+    std::atomic<uint64_t> fluxRebalanceRound{ 0 };
     // Size of fluxMigratingUnits + fluxMovedUnits, read lock-free by the
     // enqueue and dispatch paths to skip the mutex until the first migration.
     std::atomic<int> fluxRouteRecords{ 0 };
@@ -976,14 +987,16 @@ class Scheduler
 
     /**
      * ModeFlux enqueue hook. Parks a request for a unit being migrated, or
-     * collects one for a unit we handed off into `forwards` (by new owner).
+     * collects one for a unit we handed off into `forwards` (by new owner),
+     * noting in `forwardedRounds`, if given, the round the unit left in.
      * Returns true if the request was taken; false to queue it here.
      */
     bool divertMessageFlux(
       std::unique_ptr<faabric::Message>& msg,
       const std::string& unitKey,
       std::map<std::string, std::list<std::unique_ptr<faabric::Message>>>&
-        forwards);
+        forwards,
+      std::set<uint64_t>* forwardedRounds = nullptr);
 
     /**
      * ModeFlux dispatch hook. Takes the lock of unit `unitKey` for a batch
@@ -1133,5 +1146,4 @@ class Scheduler
 
     void cpuMonitorLoop();
 };
-
 }
