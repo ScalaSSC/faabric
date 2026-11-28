@@ -6,6 +6,7 @@
 #include <faabric/state/FunctionStateClient.h>
 #include <faabric/state/State.h>
 #include <faabric/transport/PointToPointBroker.h>
+#include <faabric/util/ParallelRunner.h>
 #include <faabric/util/batch.h>
 #include <faabric/util/clock.h>
 #include <faabric/util/config.h>
@@ -13,11 +14,11 @@
 #include <faabric/util/func.h>
 #include <faabric/util/gids.h>
 #include <faabric/util/locks.h>
-#include <faabric/util/ParallelRunner.h>
 #include <faabric/util/logging.h>
 #include <faabric/util/map.h>
 #include <faabric/util/message.h>
 #include <faabric/util/string_tools.h>
+#include <faabric/util/timing.h>
 
 #include <cmath>
 #include <fstream>
@@ -686,15 +687,20 @@ void Planner::scheduleMessages(std::shared_ptr<BatchExecuteRequest> req,
         message->Swap(req->mutable_messages(i));
         messages.push_back(std::move(message));
     }
-    // Routing only, in CPU time: what the scheduling decisions cost.
+    // Routing only, in CPU and in wall time: what the scheduling decisions
+    // cost.
     int64_t routingStartNs = faabric::util::getCpuTimeNano();
+    auto routingWallStart = faabric::util::startTimer();
     auto hosts =
       stateAwareScheduler->scheduleMessagesBatch(state.activeHosts, messages);
+    int64_t routingWallNs = faabric::util::getTimeDiffNanos(routingWallStart);
     int64_t routingEndNs = faabric::util::getCpuTimeNano();
     if (scheduleMode == batch_scheduler::ModeFlux && state.applicationMetrics &&
         routingStartNs >= 0 && routingEndNs >= routingStartNs) {
         state.applicationMetrics->recordPlannerRouting(
-          routingEndNs - routingStartNs, static_cast<int64_t>(messages.size()));
+          routingEndNs - routingStartNs,
+          routingWallNs,
+          static_cast<int64_t>(messages.size()));
     }
 
     doEnqueueSchedMessages(hosts, std::move(messages)); // Move ownership

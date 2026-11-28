@@ -10,6 +10,7 @@
 #include <faabric/snapshot/SnapshotRegistry.h>
 #include <faabric/state/State.h>
 #include <faabric/transport/PointToPointBroker.h>
+#include <faabric/util/ParallelRunner.h>
 #include <faabric/util/batch.h>
 #include <faabric/util/bytes.h>
 #include <faabric/util/clock.h>
@@ -18,11 +19,11 @@
 #include <faabric/util/func.h>
 #include <faabric/util/gids.h>
 #include <faabric/util/locks.h>
-#include <faabric/util/ParallelRunner.h>
 #include <faabric/util/logging.h>
 #include <faabric/util/snapshot.h>
 #include <faabric/util/string_tools.h>
 #include <faabric/util/testing.h>
+#include <faabric/util/timing.h>
 
 #include <algorithm>
 #include <cmath>
@@ -1139,6 +1140,7 @@ void Scheduler::fillFluxWorkerStats(faabric::WorkerStats& out)
 
     auto* overhead = out.mutable_fluxoverhead();
     overhead->set_routingcpuns(load(fluxOverhead.routingCpuNs));
+    overhead->set_routingwallns(load(fluxOverhead.routingWallNs));
     overhead->set_routedrequests(load(fluxOverhead.routedRequests));
     {
         auto tiers = decentralScheduler.fluxRouteTiers();
@@ -2096,18 +2098,24 @@ void Scheduler::dispatchChainedMsgs()
         if (!localChainedCallMsgs.empty()) {
             // Schedule the chained calls
             // auto start = faabric::util::getCpuTimeNano();
-            // Routing only, in CPU time: what the scheduling decisions cost.
+            // Routing only, in CPU and in wall time: what the scheduling
+            // decisions cost.
             // Against a re-plan swapping the tables (updateStatesInfo).
             faabric::util::SharedLock routeLock(routeSwapMx);
             auto routable = routableHosts();
             int64_t routingStartNs = faabric::util::getCpuTimeNano();
+            auto routingWallStart = faabric::util::startTimer();
             auto hosts = decentralScheduler.scheduleMessagesBatch(
               routable, localChainedCallMsgs);
             routeLock.unlock();
+            int64_t routingWallNs =
+              faabric::util::getTimeDiffNanos(routingWallStart);
             int64_t routingEndNs = faabric::util::getCpuTimeNano();
             if (routingStartNs >= 0 && routingEndNs >= routingStartNs) {
                 fluxOverhead.routingCpuNs.fetch_add(
                   routingEndNs - routingStartNs, std::memory_order_relaxed);
+                fluxOverhead.routingWallNs.fetch_add(routingWallNs,
+                                                     std::memory_order_relaxed);
                 fluxOverhead.routedRequests.fetch_add(
                   static_cast<int64_t>(localChainedCallMsgs.size()),
                   std::memory_order_relaxed);

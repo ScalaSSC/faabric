@@ -583,6 +583,9 @@ message FluxOverheadStats {
     int64 routedSpare = 32;
     int64 routedRest = 33;
     int64 routedHeld = 34;
+    // Routing chained requests, as routingCpuNs but in wall time: locks
+    // waited for and preemptions included.
+    int64 routingWallNs = 35;
 }
 
 // ModeFlux: what one worker's migrations and forwarding have cost. Counters

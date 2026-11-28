@@ -624,6 +624,7 @@ class Scheduler
     struct FluxOverheadCounters
     {
         std::atomic<int64_t> routingCpuNs{ 0 };
+        std::atomic<int64_t> routingWallNs{ 0 };
         std::atomic<int64_t> routedRequests{ 0 };
         std::atomic<int64_t> rebalanceCpuNs{ 0 };
         std::atomic<int64_t> rebalanceRounds{ 0 };
@@ -672,7 +673,8 @@ class Scheduler
                                    &lightResets,      &resetCopiedBytes,
                                    &resetZeroedBytes, &resetDroppedBytes,
                                    &grownResets,      &execMinorFaults,
-                                   &resetMinorFaults, &faultBatches }) {
+                                   &resetMinorFaults, &faultBatches,
+                                   &routingWallNs }) {
                 counter->store(0, std::memory_order_relaxed);
             }
         }

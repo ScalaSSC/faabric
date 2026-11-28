@@ -420,6 +420,10 @@ class ApplicationMetrics
               ratio(total.routingcpuns() / 1000.0, total.routedrequests()),
               alloc);
             obj.AddMember(
+              "routing_wall_us_per_request",
+              ratio(total.routingwallns() / 1000.0, total.routedrequests()),
+              alloc);
+            obj.AddMember(
               "rebalance_us_per_round",
               ratio(total.rebalancecpuns() / 1000.0, total.rebalancerounds()),
               alloc);
@@ -619,18 +623,22 @@ class ApplicationMetrics
 
         rapidjson::Value routingArr(rapidjson::kArrayType);
         int64_t routingNs = 0;
+        int64_t routingWallNs = 0;
         int64_t routedInputs = 0;
         for (const auto& [second, routing] : plannerRouting) {
             std::string entry = std::to_string(second) + " / " +
                                 std::to_string(routing.cpuNs / 1000) + " / " +
-                                std::to_string(routing.inputs);
+                                std::to_string(routing.inputs) + " / " +
+                                std::to_string(routing.wallNs / 1000);
             routingArr.PushBack(rapidjson::Value(entry.c_str(), alloc).Move(),
                                 alloc);
             routingNs += routing.cpuNs;
+            routingWallNs += routing.wallNs;
             routedInputs += routing.inputs;
         }
-        doc.AddMember(
-          "fluxPlannerRouting: second / cpu_us / inputs", routingArr, alloc);
+        doc.AddMember("fluxPlannerRouting: second / cpu_us / inputs / wall_us",
+                      routingArr,
+                      alloc);
 
         rapidjson::Value planner(rapidjson::kObjectType);
         double rounds = static_cast<double>(fluxControlPlaneRounds.size());
@@ -652,6 +660,11 @@ class ApplicationMetrics
         planner.AddMember("bytes_in_max", bytesIn.max, alloc);
         planner.AddMember("routing_us_per_input",
                           routedInputs > 0 ? routingNs / 1000.0 /
+                                               static_cast<double>(routedInputs)
+                                           : 0.0,
+                          alloc);
+        planner.AddMember("routing_wall_us_per_input",
+                          routedInputs > 0 ? routingWallNs / 1000.0 /
                                                static_cast<double>(routedInputs)
                                            : 0.0,
                           alloc);
@@ -2053,6 +2066,10 @@ class ApplicationMetrics
             { "routed_spare", &S::routedspare, &S::set_routedspare, false },
             { "routed_rest", &S::routedrest, &S::set_routedrest, false },
             { "routed_held", &S::routedheld, &S::set_routedheld, false },
+            { "routing_wall_ns",
+              &S::routingwallns,
+              &S::set_routingwallns,
+              true },
         };
         return fields;
     }
@@ -2064,6 +2081,7 @@ class ApplicationMetrics
     struct PlannerRoutingSecond
     {
         int64_t cpuNs = 0;
+        int64_t wallNs = 0;
         int64_t inputs = 0;
     };
     std::map<int64_t, PlannerRoutingSecond> plannerRouting;
@@ -2236,13 +2254,15 @@ class ApplicationMetrics
         plannerResults.heldUs.fetch_add(heldUs, std::memory_order_relaxed);
     }
 
-    // ModeFlux, planner: routing `inputs` inputs took `cpuNs` of CPU time.
-    void recordPlannerRouting(int64_t cpuNs, int64_t inputs)
+    // ModeFlux, planner: routing `inputs` inputs took `cpuNs` of CPU time
+    // and `wallNs` of wall time.
+    void recordPlannerRouting(int64_t cpuNs, int64_t wallNs, int64_t inputs)
     {
         faabric::util::FullLock lock(opMx);
         auto& second =
           plannerRouting[faabric::util::getGlobalClock().epochSeconds()];
         second.cpuNs += cpuNs;
+        second.wallNs += wallNs;
         second.inputs += inputs;
     }
 
