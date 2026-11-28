@@ -869,10 +869,7 @@ double Scheduler::fluxExecutorCap() const
 bool Scheduler::fluxDynamicCapacityOn() const
 {
     return scheduleMode == faabric::batch_scheduler::ModeFlux &&
-           !decentralScheduler.isPheromone() &&
-           !decentralScheduler.fluxDisabled(
-             faabric::batch_scheduler::StateAwareScheduler::
-               kFluxDisableDynamicCapacity);
+           !decentralScheduler.isPheromone();
 }
 
 double Scheduler::fluxCapacitySlotsNow() const
@@ -2277,8 +2274,13 @@ void Scheduler::resetParameter(std::string key, int32_t value)
         fluxRebalancePeriod = value;
         SPDLOG_INFO("Reset flux_rebalance_period parameter to : {}", value);
     } else if (key == "flux_disable") {
-        decentralScheduler.setFluxDisable(value);
-        SPDLOG_INFO("Reset flux_disable parameter to : {}", value);
+        int kept = decentralScheduler.setFluxDisable(value);
+        if (kept != value) {
+            SPDLOG_WARN("flux_disable {}: bits {} are no mechanism; ignored",
+                        value,
+                        value & ~kept);
+        }
+        SPDLOG_INFO("Reset flux_disable parameter to : {}", kept);
     } else if (key == "flux_advice_spare_targets") {
         // ModeFlux: the planner's (see Planner::resetParameter); nothing for
         // a worker to do.
@@ -3398,6 +3400,14 @@ void Scheduler::fluxRebalanceLoop()
             fluxRebalancePeriod <= 0 || decentralScheduler.isPheromone()) {
             continue;
         }
+        if (decentralScheduler.fluxDisabled(
+              faabric::batch_scheduler::StateAwareScheduler::
+                kFluxDisableRebalance)) {
+            // Ablated: nothing moves, so whatever was given to cover this
+            // worker's excess is room like any other.
+            decentralScheduler.releaseFluxCover();
+            continue;
+        }
 
         try {
             rebalanceFlux();
@@ -3581,9 +3591,7 @@ void Scheduler::rebalanceFlux()
     // (pickAdvisedTargetFlux), among those `admits` lets it go to with that
     // much left of what the planner gave them, by the placement rule for the
     // operator, what this round ships included -- one target filled before
-    // the next -- or, with packing ablated, the one with the most left.
-    bool packing = !decentralScheduler.fluxDisabled(
-      StateAwareScheduler::kFluxDisablePacking);
+    // the next -- or, with affinity ablated, the one with the most left.
     bool affinity = !decentralScheduler.fluxDisabled(
       StateAwareScheduler::kFluxDisableAffinity);
     auto pickTarget = [&](const std::string& userFunc,
@@ -3612,7 +3620,6 @@ void Scheduler::rebalanceFlux()
                                                           advice.spareTargets,
                                                           /*cover=*/true,
                                                           workUs,
-                                                          packing,
                                                           affinity,
                                                           roomFor,
                                                           presenceOf,
@@ -3739,10 +3746,9 @@ void Scheduler::rebalanceFlux()
                      excessUs,
                      coverTotalUs);
     }
-    if (needUs > 0 && decentralScheduler.fluxDisabled(
-                        StateAwareScheduler::kFluxDisableStateMigration)) {
+    if (needUs > 0 && decentralScheduler.fluxStatePinned()) {
         SPDLOG_DEBUG("Flux {} keeps its state: {:.0f}us too much, but state "
-                     "migration is switched off",
+                     "is placed statically",
                      thisHost,
                      needUs);
     } else if (needUs > 0) {
@@ -3945,12 +3951,13 @@ void Scheduler::rebalanceFlux()
                 // None fits on any cover target: they are all alike.
                 break;
             }
-            // Filling, the target picked stays the pick for as long as it
-            // has room: each request sent there only adds to its lead. So
-            // as many go at once as it has room for. Balancing instead, it
-            // is one at a time.
+            // By the placement rule, the target picked stays the pick for as
+            // long as it has room: each request sent there only adds to its
+            // lead. So as many go at once as it has room for. By room alone
+            // (affinity ablated), each takes from its lead, so it is one at
+            // a time.
             int count = 1;
-            if (packing) {
+            if (affinity) {
                 count = std::clamp(static_cast<int>(std::floor(
                                      roomOf(target, tier) / tail.requestUs)),
                                    1,
@@ -3999,8 +4006,7 @@ void Scheduler::rebalanceFlux()
     }
     bool calm =
       excessUs <= 0 && !fluxBusyLastPeriod.load(std::memory_order_relaxed);
-    if (decentralScheduler.fluxDisabled(
-          StateAwareScheduler::kFluxDisableMerge)) {
+    if (decentralScheduler.fluxStatePinned()) {
         mergeTo.clear();
     }
     if (!mergeTo.empty() && calm) {

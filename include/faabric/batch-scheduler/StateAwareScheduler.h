@@ -183,8 +183,7 @@ class StateAwareScheduler : public BatchScheduler
      * reported them (fluxCapacitySlots): as many executors as it kept
      * running while requests waited for a slot over the last
      * kFluxCapacityWindowSec, if they waited long enough to show it, else
-     * its executor cap; or its configured slots with the dynamic capacity
-     * ablated. A worker that reported none: its configured slots.
+     * its executor cap. A worker that reported none: its configured slots.
      */
     static double capacitySlotsFlux(const faabric::WorkerStats& workerStats)
     {
@@ -379,8 +378,9 @@ class StateAwareScheduler : public BatchScheduler
      * time, among the targets with room left, without taking room: fewest
      * spare claims first, then most room left; a congested worker's may be
      * among its cover targets. The rest, every other target with room left,
-     * follows by the spares' order over the final spare claims -- the order
-     * a worker takes them in only with affinity ablated. Room taken to cover a worker's excess is kept for it:
+     * follows by the spares' order over the final spare claims, which
+     * workers break ties by. Room taken to cover a worker's excess is kept
+     * for it:
      * every other worker is told of, and the planner routes inputs by, the
      * room left (the planner's own view of every worker's room).
      */
@@ -454,9 +454,8 @@ class StateAwareScheduler : public BatchScheduler
      * stats included), warm executors for it (`warmOf`), most room
      * (`roomOf(ip, tier)`: in the cover tier, what is left of what the
      * planner gave it; elsewhere, the room known less that), alike in every
-     * tier. Ties in list order. Affinity ablated:
-     * presence, warmth and room do not count, so a tier fills in list order.
-     * Packing ablated: the one with the most room of all those it may use.
+     * tier. Ties in list order. Affinity ablated: presence and warmth do not
+     * count, so within the tier the one with the most room.
      * "" if none has room for it. The tier picked from (0 cover, 1 spare,
      * 2 rest) goes to `tierOut`.
      */
@@ -467,7 +466,6 @@ class StateAwareScheduler : public BatchScheduler
       int spareTargets,
       bool cover,
       double workUs,
-      bool packing,
       bool affinity,
       RoomOf roomOf,
       PresenceOf presenceOf,
@@ -482,31 +480,12 @@ class StateAwareScheduler : public BatchScheduler
         size_t spareEnd =
           std::min(preference.size(),
                    coverEnd + static_cast<size_t>(std::max(0, spareTargets)));
-        auto tierOf = [&](size_t i) {
-            return i < coverEnd ? 0 : (i < spareEnd ? 1 : 2);
-        };
         // The tiers it may use: [firstTier, lastTier].
         int firstTier = cover ? 0 : 1;
         int lastTier = cover ? 0 : 2;
         const size_t tierBegin[] = { 0, coverEnd, spareEnd };
         const size_t tierEnd[] = { coverEnd, spareEnd, preference.size() };
         std::string best;
-        if (!packing) {
-            double bestUs = 0;
-            for (size_t i = tierBegin[firstTier]; i < tierEnd[lastTier]; i++) {
-                const std::string& ip = preference[i];
-                int tier = tierOf(i);
-                double us = roomOf(ip, tier);
-                if (fits(us) && (best.empty() || us > bestUs)) {
-                    best = ip;
-                    bestUs = us;
-                    if (tierOut != nullptr) {
-                        *tierOut = tier;
-                    }
-                }
-            }
-            return best;
-        }
         for (int tier = firstTier; tier <= lastTier; tier++) {
             std::tuple<int, bool, double> bestKey{ 0, false, 0 };
             for (size_t i = tierBegin[tier]; i < tierEnd[tier]; i++) {
@@ -515,7 +494,7 @@ class StateAwareScheduler : public BatchScheduler
                 if (!fits(us)) {
                     continue;
                 }
-                std::tuple<int, bool, double> key{ 0, false, 0 };
+                std::tuple<int, bool, double> key{ 0, false, us };
                 if (affinity) {
                     key = { presenceOf(ip), warmOf(ip), us };
                 }
@@ -566,33 +545,31 @@ class StateAwareScheduler : public BatchScheduler
     /**
      * ModeFlux ablations, for experiments only. `flux_disable` is a bitmask
      * of the mechanisms to switch off; set on the planner and every worker
-     * alike, before the application runs.
+     * alike, before the application runs. Where state is put is the other
+     * switch (setFluxStaticPlacement).
      */
-    // No unit of state is split off to another worker (Algorithm 3).
-    static constexpr int kFluxDisableStateMigration = 1;
-    // The planner advises no merges.
-    static constexpr int kFluxDisableMerge = 2;
-    // Routing balances instead of filling: the planner sends an input where
-    // it starts soonest, and a worker keeps a chained request only while a
-    // run slot is free.
-    static constexpr int kFluxDisablePacking = 4;
+    // No rebalancing: a worker moves nothing it holds -- no unit of state,
+    // no queued request, so no merge either -- and the planner claims no
+    // room to cover an excess, so that all of it is there for routing. With
+    // static placement, under which no state moves anyway, what this keeps
+    // in place is the queued stateless requests.
+    static constexpr int kFluxDisableRebalance = 1;
+    // A request is sized by its own executor time, s_o rather than
+    // \hat{s}_o: what it sets off downstream counts nothing.
+    static constexpr int kFluxDisableDownstream = 2;
     // Targets are chosen by room alone: where the operator already is or
-    // runs counts nothing.
-    static constexpr int kFluxDisableAffinity = 8;
-    // A request is sized by its own executor time: what it sets off
-    // downstream counts nothing.
-    static constexpr int kFluxDisableDownstream = 16;
-    // A worker's capacity is its configured slots (flux_worker_slots), not
-    // what it was measured to carry (capacitySlotsFlux).
-    static constexpr int kFluxDisableDynamicCapacity = 32;
-    // Nothing is kept together: on top of kFluxDisablePacking, which it
-    // implies, an operator's units of state start spread over the hosts
-    // (unit i on the i-th, as flux_static_placement 1 does) instead of all on
-    // its home, and the planner advises no merges, which would bring them
-    // back together. A congested worker still splits state off.
-    static constexpr int kFluxDisableColocation = 64;
+    // has warm executors counts nothing (eq:placement without P and omega).
+    static constexpr int kFluxDisableAffinity = 4;
+    // Every bit above; any other is no mechanism and is dropped.
+    static constexpr int kFluxDisableAll =
+      kFluxDisableRebalance | kFluxDisableDownstream | kFluxDisableAffinity;
 
-    void setFluxDisable(int value) { fluxDisable = value; }
+    // The bits kept, those that are mechanisms.
+    int setFluxDisable(int value)
+    {
+        fluxDisable = value & kFluxDisableAll;
+        return fluxDisable;
+    }
 
     // ModeFlux, workers: chained stateless requests routing sent on because
     // they did not fit here -- to a spare target, to one of the rest -- or
@@ -624,22 +601,22 @@ class StateAwareScheduler : public BatchScheduler
      *  2: by operator -- each stateful operator on a run of as many hosts as
      *     its declared parallelism, operators one after another in name
      *     order, its units spread over that run.
-     * Either way state then stays put: it implies kFluxDisableStateMigration
-     * and kFluxDisableMerge.
+     * Either way state then stays put (fluxStatePinned): no unit moves, and
+     * the planner advises no merges. Queued stateless requests still move,
+     * unless kFluxDisableRebalance.
      */
     void setFluxStaticPlacement(int value) { fluxStaticPlacement = value; }
 
     // Whether any of `mechanisms` (kFluxDisable* bits) is switched off.
     bool fluxDisabled(int mechanisms) const
     {
-        int off = fluxDisable.load(std::memory_order_relaxed);
-        if (fluxStaticPlacement.load(std::memory_order_relaxed) != 0) {
-            off |= kFluxDisableStateMigration | kFluxDisableMerge;
-        }
-        if ((off & kFluxDisableColocation) != 0) {
-            off |= kFluxDisablePacking | kFluxDisableMerge;
-        }
-        return (off & mechanisms) != 0;
+        return (fluxDisable.load(std::memory_order_relaxed) & mechanisms) != 0;
+    }
+
+    // Static placement: state stays where it was put.
+    bool fluxStatePinned() const
+    {
+        return fluxStaticPlacement.load(std::memory_order_relaxed) != 0;
     }
 
     // The window a unit moved out and back in again counts as a ping-pong:

@@ -1453,10 +1453,17 @@ bool Planner::resetParameter(
     }
     if (key == "flux_disable") {
         // Experiments only: mechanisms switched off (kFluxDisable* bits).
+        int kept =
+          value & batch_scheduler::StateAwareScheduler::kFluxDisableAll;
         if (stateAwareScheduler) {
-            stateAwareScheduler->setFluxDisable(value);
+            kept = stateAwareScheduler->setFluxDisable(value);
         }
-        SPDLOG_INFO("Flux disabled mechanisms set to {}", value);
+        if (kept != value) {
+            SPDLOG_WARN("flux_disable {}: bits {} are no mechanism; ignored",
+                        value,
+                        value & ~kept);
+        }
+        SPDLOG_INFO("Flux disabled mechanisms set to {}", kept);
     }
     if (key == "flux_advice_spare_targets") {
         // ModeFlux: how many spare targets every worker claims in the

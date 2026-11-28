@@ -886,9 +886,8 @@ class Scheduler
     // else what one operator may run (maxExecutors; K = M).
     double fluxExecutorCap() const;
 
-    // The slots to plan with here: as measured, or fluxWorkerSlots before
-    // they are, outside ModeFlux, under Pheromone, or with the dynamic
-    // capacity ablated.
+    // The slots to plan with here: as measured, or the executor cap before
+    // they are; fluxWorkerSlots outside ModeFlux and under Pheromone.
     double fluxCapacitySlotsNow() const;
     bool fluxDynamicCapacityOn() const;
 

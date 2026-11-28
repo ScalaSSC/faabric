@@ -442,9 +442,7 @@ void StateAwareScheduler::initOperatorStateFlux(const std::string& userFunc,
 
     // Every unit starts on one worker: the operator's home, fixed by whoever
     // routes to it first -- unless an experiment fixes where state goes.
-    // Ablated co-location spreads the units as static placement 1 does.
-    bool placedStatically = fluxStaticPlacement.load() != 0 ||
-                            fluxDisabled(kFluxDisableColocation);
+    bool placedStatically = fluxStatePinned();
     std::string home =
       placedStatically ? std::string("static") : fluxHomeOf(userFunc, hostMap);
 
@@ -514,9 +512,6 @@ std::string StateAwareScheduler::fluxStaticOwner(const std::string& unitKey,
                                                  const HostMap& hostMap)
 {
     int mode = fluxStaticPlacement.load();
-    if (mode == 0 && fluxDisabled(kFluxDisableColocation)) {
-        mode = 1;
-    }
     if (mode == 0 || hostMap.empty()) {
         return "";
     }
@@ -1140,8 +1135,13 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
             totalShortUs -= worker.roomUs;
         }
     }
-    double coverScale =
-      totalShortUs > totalRoomUs ? totalRoomUs / totalShortUs : 1.0;
+    // Ablated rebalancing moves nothing, so there is nothing to cover.
+    double coverScale = 1.0;
+    if (fluxDisabled(kFluxDisableRebalance)) {
+        coverScale = 0.0;
+    } else if (totalShortUs > totalRoomUs) {
+        coverScale = totalRoomUs / totalShortUs;
+    }
 
     int spares = fluxSpareTargets.load(std::memory_order_relaxed);
     size_t n = workers.size();
@@ -1293,8 +1293,8 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
     }
 
     // The rest -- every other target with room left -- by the same order
-    // over the final claims, which workers go by only with affinity
-    // ablated. Those with none left are no use to it.
+    // over the final claims, which workers break ties by. Those with none
+    // left are no use to it.
     for (size_t s = 0; s < n; s++) {
         std::vector<Candidate> rest;
         for (const auto& candidate : candidatesOf[s]) {
@@ -1344,7 +1344,8 @@ StateAwareScheduler::planFluxOffload(const FluxClusterSnapshot& snapshot,
 void StateAwareScheduler::planFluxMerges(
   std::map<std::string, faabric::FluxOffloadPlan>& plans)
 {
-    if (fluxDisabled(kFluxDisableMerge)) {
+    // State put in place stays there; ablated rebalancing would not move it.
+    if (fluxStatePinned() || fluxDisabled(kFluxDisableRebalance)) {
         return;
     }
     std::deque<std::shared_ptr<const FluxClusterSnapshot>> history;
@@ -1760,9 +1761,8 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         {
             int& kept = fluxKeptThisPass[queueKey];
             bool slotFree = local.queued + kept < local.freeRequests;
-            // Ablated packing keeps it only while a run slot is free.
             bool keepsUp =
-              !fluxDisabled(kFluxDisablePacking) && fluxPassWork.has_value() &&
+              fluxPassWork.has_value() &&
               fluxPassWork->demandUs + fluxKeptWorkThisPass + workUs <=
                 fluxPassWork->capacityUs;
             if (slotFree || keepsUp || workUs <= 0) {
@@ -1783,7 +1783,6 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         // reply to the send then says how much it really has left.
         // Still under fluxAssignedMx, so that what this worker sent where is
         // read in place; fluxOffloadMx only ever nests inside it.
-        bool packing = !fluxDisabled(kFluxDisablePacking);
         bool affinity = !fluxDisabled(kFluxDisableAffinity);
         std::string target;
         int tier = -1;
@@ -1821,7 +1820,6 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
                                            fluxSpareTargetsAdvised,
                                            /*cover=*/false,
                                            workUs,
-                                           packing,
                                            affinity,
                                            roomOf,
                                            presenceOf,
@@ -1883,12 +1881,12 @@ std::string StateAwareScheduler::scheduleStatelessMessageFlux(
         return it->second;
     }
 
-    // Ablated packing balances instead: where it starts soonest.
-    if (cache.slotTimeUs <= 0 || fluxDisabled(kFluxDisablePacking)) {
+    // Not measured yet, so no telling how much room it takes: where it
+    // starts soonest.
+    if (cache.slotTimeUs <= 0) {
         return scheduleStatelessByWaitFlux(userFunc, hostMap, snapshot);
     }
-    // Ablated affinity still fills one host before the next, in a fixed
-    // order of hosts, but without looking at where anything runs.
+    // Ablated affinity goes by room alone: the host with the most.
     bool affinity = !fluxDisabled(kFluxDisableAffinity);
     double workUs = cache.workUs;
 
@@ -1995,7 +1993,8 @@ std::string StateAwareScheduler::scheduleStatelessByWaitFlux(
     // Where it starts soonest: by executor time if measured, else by queue
     // length -- an operator nobody has measured yet takes no telling how
     // much room. Among hosts about as good, the one with most of the operator
-    // there, then one already running it, unless affinity is ablated.
+    // there, then one already running it, unless affinity is ablated, and
+    // then the one where it starts soonest.
     const std::string queueKey = userFunc + "_0";
     const auto& stats = snapshot.stats;
     double slotTimeUs = snapshot.slotTimeOf(queueKey);
